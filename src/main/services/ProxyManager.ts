@@ -582,7 +582,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         },
         clash_api: {
           external_controller: '127.0.0.1:9090',
-          external_ui: 'ui',
+          external_ui: path.join(userDataPath, 'ui'),
           external_ui_download_url: 'https://github.com/MetaCubeX/Yacd-meta/archive/gh-pages.zip',
           external_ui_download_detour: 'direct',
           default_mode: 'rule',
@@ -1007,7 +1007,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           password: srv.shadowTlsSettings.password,
           tls: {
             enabled: true,
-            server_name: srv.shadowTlsSettings.sni || srv.address,
+            server_name: srv.shadowTlsSettings.sni || undefined,
             utls: {
               enabled: true,
               fingerprint: srv.shadowTlsSettings.fingerprint || 'chrome',
@@ -1119,7 +1119,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     if (server.security === 'tls' || server.tlsSettings) {
       outbound.tls = {
         enabled: true,
-        server_name: server.tlsSettings?.serverName || server.address,
+        server_name: server.tlsSettings?.serverName || undefined,
         insecure: server.tlsSettings?.allowInsecure || false,
       };
 
@@ -1140,7 +1140,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     if (server.security === 'reality' && server.realitySettings) {
       outbound.tls = {
         enabled: true,
-        server_name: server.tlsSettings?.serverName || server.address,
+        server_name: server.tlsSettings?.serverName || undefined,
         utls: {
           enabled: true,
           fingerprint: server.tlsSettings?.fingerprint || 'chrome',
@@ -2892,6 +2892,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     const lowerMessage = message.toLowerCase();
 
     // 常见错误模式匹配
+    if (lowerMessage.includes('report handshake success: connection refused')) {
+      return `目标连接被拒绝：代理节点已连接，但目标服务器拒绝了连接（可能是节点限制或失效） [${message}]`;
+    }
+
     if (
       lowerMessage.includes('connection refused') ||
       lowerMessage.includes('connect: connection refused')

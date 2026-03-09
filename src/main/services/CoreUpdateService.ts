@@ -3,10 +3,9 @@
  * 负责检查 Sing-box 核心更新、下载并替换
  */
 
-import { app } from 'electron';
+import { app, net } from 'electron';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as https from 'https';
 
 import { LogManager } from './LogManager';
 import { ProxyManager } from './ProxyManager';
@@ -265,19 +264,16 @@ export class CoreUpdateService {
 
   private async fetchReleases(): Promise<any[]> {
     return new Promise((resolve, reject) => {
-      const options = {
-        hostname: 'api.github.com',
-        path: '/repos/SagerNet/sing-box/releases',
+      const request = net.request({
         method: 'GET',
-        headers: {
-          'User-Agent': 'FlowZ-Electron',
-          Accept: 'application/vnd.github.v3+json',
-        },
-      };
+        url: 'https://api.github.com/repos/SagerNet/sing-box/releases',
+      });
+      request.setHeader('User-Agent', 'FlowZ-Electron');
+      request.setHeader('Accept', 'application/vnd.github.v3+json');
 
-      const req = https.request(options, (res) => {
+      request.on('response', (res) => {
         let data = '';
-        res.on('data', (chunk) => (data += chunk));
+        res.on('data', (chunk) => (data += chunk.toString()));
         res.on('end', () => {
           try {
             if (res.statusCode === 200) {
@@ -291,8 +287,8 @@ export class CoreUpdateService {
         });
       });
 
-      req.on('error', reject);
-      req.end();
+      request.on('error', reject);
+      request.end();
     });
   }
 
@@ -346,14 +342,20 @@ export class CoreUpdateService {
     );
   }
 
-  private async downloadFile(url: string): Promise<string> {
-    let ext = '.zip';
+  private async downloadFile(url: string, isRetry = false): Promise<string> {
+    // 根据系统平台设置合理的默认扩展名
+    let ext = process.platform === 'win32' ? '.zip' : '.tar.gz';
     try {
       const urlObj = new URL(url);
       const pathname = urlObj.pathname;
+      // path.extname 对于 .tar.gz 只会返回 .gz
       const urlExt = path.extname(pathname);
       if (urlExt) {
-        ext = urlExt;
+        if (pathname.endsWith('.tar.gz')) {
+          ext = '.tar.gz';
+        } else {
+          ext = urlExt;
+        }
       }
     } catch (e) {
       console.error('Failed to parse URL for extension:', e);
@@ -369,32 +371,54 @@ export class CoreUpdateService {
     const file = fs.createWriteStream(tempPath);
 
     return new Promise((resolve, reject) => {
-      https
-        .get(url, { headers: { 'User-Agent': 'FlowZ-Electron' } }, (response) => {
-          if (response.statusCode === 302 || response.statusCode === 301) {
-            const redirectUrl = response.headers.location;
-            if (redirectUrl) {
-              this.downloadFile(redirectUrl).then(resolve).catch(reject);
-              return;
-            }
-          }
+      const request = net.request(url);
+      request.setHeader('User-Agent', 'FlowZ-Electron');
 
-          if (response.statusCode !== 200) {
-            reject(new Error(`Download failed: ${response.statusCode}`));
-            return;
-          }
+      request.on('response', (response) => {
+        if (response.statusCode >= 400) {
+          file.close();
+          fs.unlink(tempPath, () => {});
+          reject(new Error(`Download failed: ${response.statusCode}`));
+          return;
+        }
 
-          response.pipe(file);
+        response.on('data', (chunk) => {
+          file.write(chunk);
+        });
 
-          file.on('finish', () => {
-            file.close();
+        response.on('end', () => {
+          file.close(() => {
             resolve(tempPath);
           });
-        })
-        .on('error', (err) => {
+        });
+
+        response.on('error', (err) => {
+          file.close();
           fs.unlink(tempPath, () => {});
           reject(err);
         });
+      });
+
+      request.on('error', (err) => {
+        file.close();
+        fs.unlink(tempPath, () => {});
+
+        // 遇到网络错误，且是第一次尝试，并且是 github 链接，尝试使用加速镜像
+        if (!isRetry && url.includes('github.com')) {
+          this.logManager.addLog(
+            'warn',
+            `下载出错，尝试使用加速镜像: ${err.message}`,
+            'CoreUpdateService'
+          );
+          const mirrorUrl = `https://ghp.ci/${url}`;
+          this.downloadFile(mirrorUrl, true).then(resolve).catch(reject);
+          return;
+        }
+
+        reject(err);
+      });
+
+      request.end();
     });
   }
 
