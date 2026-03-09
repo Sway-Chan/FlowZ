@@ -278,6 +278,8 @@ export class CoreUpdateService {
           try {
             if (res.statusCode === 200) {
               resolve(JSON.parse(data));
+            } else if (res.statusCode === 403) {
+              reject(new Error('GitHub API 访问频率限制 (403)，请稍后再试或使用代理'));
             } else {
               reject(new Error(`GitHub API Error: ${res.statusCode}`));
             }
