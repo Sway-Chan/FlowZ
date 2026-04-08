@@ -12,8 +12,8 @@ export function AdvancedSettings() {
   const config = useAppStore((state) => state.config);
   const saveConfig = useAppStore((state) => state.saveConfig);
 
-  const [socksPort, setSocksPort] = useState(config?.socksPort?.toString() || '65534');
-  const [httpPort, setHttpPort] = useState(config?.httpPort?.toString() || '65533');
+  const [socksPort, setSocksPort] = useState(config?.socksPort?.toString() || '2081');
+  const [httpPort, setHttpPort] = useState(config?.httpPort?.toString() || '2080');
   const [mixedPortEnabled, setMixedPortEnabled] = useState((config?.mixedPort ?? 0) > 0);
   const [mixedPort, setMixedPort] = useState(
     config?.mixedPort && config.mixedPort > 0 ? config.mixedPort.toString() : '7890'
@@ -198,7 +198,7 @@ export function AdvancedSettings() {
                 className="max-w-[200px]"
               />
             </div>
-            <p className="text-xs text-muted-foreground">{t('settings.advanced.default')}: 65534</p>
+            <p className="text-xs text-muted-foreground">{t('settings.advanced.default')}: 2081</p>
           </div>
 
           <div className="space-y-2">
@@ -214,7 +214,7 @@ export function AdvancedSettings() {
                 className="max-w-[200px]"
               />
             </div>
-            <p className="text-xs text-muted-foreground">{t('settings.advanced.default')}: 65533</p>
+            <p className="text-xs text-muted-foreground">{t('settings.advanced.default')}: 2080</p>
           </div>
 
           {/* Mixed Port (Optional) */}

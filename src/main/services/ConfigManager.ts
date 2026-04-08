@@ -147,6 +147,15 @@ export class ConfigManager implements IConfigManager {
       throw new Error('Config is null or undefined');
     }
 
+    // 自动迁移：强制将旧版本默认的高位端口（65533/65534）升级为标准端口（2080/2081）
+    // 解决方法：如果用户当前设置的是旧默认值，自动将其重置为新默认值
+    if (config.httpPort === 65533 || !config.httpPort) {
+      config.httpPort = 2080;
+    }
+    if (config.socksPort === 65534 || !config.socksPort) {
+      config.socksPort = 2081;
+    }
+
     // 验证 subscriptions 数组 (兼容旧配置)
     if (config.subscriptions) {
       if (!Array.isArray(config.subscriptions)) {
@@ -456,8 +465,8 @@ export class ConfigManager implements IConfigManager {
       customRuleSets: [], // 默认空
       appRules: [], // 应用分流规则（实验性）默认空
 
-      socksPort: 65534,
-      httpPort: 65533,
+      socksPort: 2081,
+      httpPort: 2080,
       logLevel: 'info',
       uiTheme: 'system',
     };

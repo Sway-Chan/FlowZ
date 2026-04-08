@@ -54,8 +54,8 @@ export function registerProxyHandlers(
         console.log('[Proxy Handlers] Setting system proxy...');
         await systemProxyManager.enableProxy(
           '127.0.0.1',
-          config.httpPort || 65533,
-          config.socksPort || 65534
+          config.httpPort || 2080,
+          config.socksPort || 2081
         );
         console.log('[Proxy Handlers] System proxy enabled');
       }

@@ -112,7 +112,7 @@ interface SingBoxInbound {
   strict_route?: boolean;
   stack?: string;
   sniff?: boolean;
-  sniff_override_destination?: boolean;
+  sniff_override_destination?: boolean; // Keep for interface compatibility if needed by types, but won't be used for 1.13+
   route_exclude_address?: string[];
   platform?: {
     http_proxy?: {
@@ -202,15 +202,23 @@ interface SingBoxRouteRule {
   geosite?: string[];
   ip_cidr?: string[];
   port?: number | number[];
+  process_name?: string | string[];
+  process_name_not?: string | string[]; // sing-box 1.13+
+  inbound?: string | string[]; // sing-box 1.13+
   action: string;
   outbound?: string;
+  sniffer?: string[];
+  rewrite_target?: boolean; // sing-box 1.12+
+  timeout?: string;
 }
 
 interface SingBoxRuleSet {
   tag: string;
   type: string;
   format: string;
-  path: string;
+  path?: string;
+  url?: string;
+  download_detour?: string;
 }
 
 interface SingBoxRouteConfig {
@@ -225,6 +233,8 @@ interface SingBoxExperimental {
   cache_file?: {
     enabled: boolean;
     path: string;
+    store_fakeip?: boolean;
+    store_rdrc?: boolean;
   };
 }
 
@@ -242,6 +252,7 @@ interface SingBoxConfig {
       external_ui_download_url?: string;
       external_ui_download_detour?: string;
       default_mode?: string;
+      cache_file?: string;
     };
   };
 }
@@ -283,6 +294,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private static readonly MAX_RESTART_COUNT = 3; // 最大重启次数
   private static readonly RESTART_COOLDOWN = 60000; // 重启冷却时间（1分钟内最多重启3次）
   private isRestarting: boolean = false;
+  private coreVersion: string = 'unknown';
 
   constructor(
     logManager?: ILogManager,
@@ -334,6 +346,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       await this.killOrphanedSingBoxProcesses();
     }
 
+    // 0. 获取核心版本（用于后续生成兼容的配置文件）
+    this.coreVersion = await this.getCoreVersion();
+    this.logToManager('info', `检测到 sing-box 核心版本: ${this.coreVersion}`);
+
     // 修复可能被 root 创建的文件权限（从 TUN 模式切换到系统代理模式时）
     await this.fixFilePermissions();
 
@@ -363,7 +379,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       await this.deletePidFile();
     }
 
-    // 使用重试机制启动 sing-box 进程
+    // 5. 启动 sing-box 进程
     await retry(() => this.startSingBoxProcess(), {
       maxRetries: 2,
       delay: 2000,
@@ -552,9 +568,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       const execAsync = util.promisify(exec);
 
       const { stdout } = await execAsync(`"${this.singboxPath}" version`);
-      // 输出示例: sing-box version 1.8.0 ...
-      const match = stdout.match(/version\s+(\S+)/);
-      return match ? match[1] : '未知';
+      // 输出示例: sing-box version 1.13.0 ... 或 v1.13.0 ...
+      const match = stdout.match(/(?:version\s+|v)(\d+\.\d+(\.\d+)?)/i);
+      if (match) {
+        return match[1];
+      }
+
+      // 备选方案：尝试直接取第一组连续的数字版本号
+      const secondMatch = stdout.match(/(\d+\.\d+\.\d+)/);
+      return secondMatch ? secondMatch[1] : '未知';
     } catch (error) {
       this.logToManager('error', `获取核心版本失败: ${(error as any).message}`);
       return '未知';
@@ -582,22 +604,48 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     const userDataPath = getUserDataPath();
     const cachePath = path.join(userDataPath, 'cache.db');
 
+    // 关键优化：预先生成 ID 到 Tag 的唯一映射，使用服务器名称作为 Tag，确保拓扑和日志显示友好名称
+    // 这样做之后内容拓扑（Clash API）和日志中显示的将是“香港 01”而不是“proxy-uuid”
+    const idToTagMap = new Map<string, string>();
+    const usedTags = new Set<string>();
+
+    const getUniqueTag = (server: ServerConfig) => {
+      let baseTag = server.name.trim() || '未命名节点';
+      let tag = baseTag;
+      let count = 1;
+      while (usedTags.has(tag)) {
+        tag = `${baseTag} (${count})`;
+        count++;
+      }
+      usedTags.add(tag);
+      return tag;
+    };
+
+    // 为所有服务器预生成 Tag
+    for (const s of config.servers) {
+      idToTagMap.set(s.id, getUniqueTag(s));
+    }
+
     const singboxConfig: SingBoxConfig = {
       log: this.generateLogConfig(config),
-      dns: this.generateDnsConfig(config),
+      dns: this.generateDnsConfig(
+        config,
+        idToTagMap.get(config.selectedServerId as string) || 'proxy'
+      ),
       inbounds: this.generateInbounds(config),
-      outbounds: this.generateOutbounds(selectedServer),
-      route: this.generateRouteConfig(config),
+      outbounds: this.generateOutbounds(selectedServer, config, idToTagMap),
+      route: this.generateRouteConfig(config, idToTagMap),
       experimental: {
         cache_file: {
           enabled: true,
           path: cachePath,
+          store_fakeip: true,
+          store_rdrc: true,
         },
         clash_api: {
           external_controller: '127.0.0.1:9090',
           external_ui: path.join(userDataPath, 'ui'),
-          external_ui_download_url: 'https://github.com/MetaCubeX/Yacd-meta/archive/gh-pages.zip',
-          external_ui_download_detour: 'direct',
+          secret: '', // 为空以保持与现有渲染进程 fetch 逻辑兼容
           default_mode: 'rule',
         },
       },
@@ -662,58 +710,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     }
   }
 
-  /**
-   * 解析 DNS 地址字符串，转为 sing-box 1.12+ 新格式的 server 对象。
-   *
-   * 重要：新格式的 DNS server 不支持 detour 字段（仅旧格式支持）。
-   * 国内/国外流量分流由 DNS rules 的 server 字段控制，
-   * DoH/DoT 服务器的 bootstrap IP 解析由 route.default_domain_resolver 负责。
-   *
-   * 支持的格式:
-   *   https://doh.pub/dns-query  → { type: "https", server: "doh.pub", path: "/dns-query" }
-   *   tls://dns.google           → { type: "tls",   server: "dns.google" }
-   *   8.8.8.8 / 8.8.8.8:53     → { type: "udp",   server: "8.8.8.8", server_port: 53 }
-   */
-
-  private parseDnsAddress(address: string, tag: string): SingBoxDnsServer {
-    if (address.startsWith('https://')) {
-      const url = new URL(address);
-      const server = url.hostname;
-      // 如果 server 是域名（非 IP），必须提供 domain_resolver 让 sing-box 知道如何解析它
-      const isIp = /^[\d.]+$|^[0-9a-fA-F:]+$/.test(server);
-      return {
-        tag,
-        type: 'https',
-        server,
-        server_port: url.port ? Number(url.port) : 443,
-        path: url.pathname || '/dns-query',
-        // 使用本地 DNS 解析 DoH 服务器域名（如有必要）
-        ...(isIp ? {} : { domain_resolver: 'dns-local' }),
-      } as SingBoxDnsServer;
-    } else if (address.startsWith('tls://')) {
-      const hostPort = address.slice(6);
-      const [host, port] = hostPort.split(':');
-      const isIp = /^[\d.]+$|^[0-9a-fA-F:]+$/.test(host);
-      return {
-        tag,
-        type: 'tls',
-        server: host,
-        server_port: port ? Number(port) : 853,
-        ...(isIp ? {} : { domain_resolver: 'dns-bootstrap' }),
-      } as SingBoxDnsServer;
-    } else {
-      // 普通 UDP DNS（通常是 IP，不需要 domain_resolver）
-      const [host, portStr] = address.split(':');
-      return {
-        tag,
-        type: 'udp',
-        server: host,
-        server_port: portStr ? Number(portStr) : 53,
-      } as SingBoxDnsServer;
-    }
-  }
-
-  private generateDnsConfig(config: UserConfig): SingBoxDnsConfig {
+  private generateDnsConfig(config: UserConfig, selectedServerTag: string): SingBoxDnsConfig {
     const proxyMode = (config.proxyMode || 'smart').toLowerCase();
 
     // 获取用户 DNS 配置，不存在则使用默认值
@@ -741,28 +738,47 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     //   我们引入一个坚不可摧的 DoH IP Bootstrap：向 223.5.5.5(HTTP) 直接发包，并且 detour: 'direct' 强制绕过 TUN。
     const dnsServers: SingBoxDnsServer[] = [
       {
-        // 引导解析：专门用于解析其他 DNS 或代理域名的 IP 解析器
+        // 引导解析：专门用于解析代理节点的 IP 解析器（UDP，最稳健）
+        tag: 'dns-bootstrap-udp',
+        type: 'udp',
+        server: '223.5.5.5',
+        server_port: 53,
+      },
+      {
+        // 引导解析（DoH）：作为 UDP 的备份
         tag: 'dns-bootstrap',
         type: 'https',
         server: '223.5.5.5',
         server_port: 443,
         path: '/dns-query',
+        // 使用 IP 引导解析器来解析 DoH 域名（虽然这里是 IP，但为了结构统一）
+        domain_resolver: 'dns-bootstrap-udp',
       },
       {
-        // 兼容性和兜底的系统 DNS，尽量少用
+        // 兼容性和兜底的系统 DNS
         tag: 'dns-local',
         type: 'local',
       },
-      // 国内直连 DNS
-      this.parseDnsAddress(
-        userDnsConfig.domesticDns || 'https://doh.pub/dns-query',
-        'dns-domestic'
-      ),
-      // 远程 DNS（解析国外域名）
-      this.parseDnsAddress(
-        userDnsConfig.foreignDns || 'https://dns.google/dns-query',
-        'dns-remote'
-      ),
+      {
+        // 国内直连 DNS (推荐 DoH)
+        tag: 'dns-domestic',
+        type: 'https',
+        server: 'doh.pub',
+        server_port: 443,
+        path: '/dns-query',
+        domain_resolver: 'dns-bootstrap-udp',
+      },
+      {
+        // 远程代理 DNS (推荐 DoH)
+        tag: 'dns-remote',
+        type: 'https',
+        server: 'dns.google',
+        server_port: 443,
+        path: '/dns-query',
+        domain_resolver: 'dns-bootstrap-udp',
+        // 关键核心：远程解析必须走代理，否则在境内直接发起会因 GFW 拦截/污染导致 FakeIP 映射失败或由于 TTL 极短产生大量无效解析。
+        detour: selectedServerTag,
+      },
     ];
 
     if (enableFakeIp) {
@@ -780,7 +796,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       rules: [],
       // 默认使用国内 DNS 解析
       final: 'dns-domestic',
-      strategy: config.enableIPv6 ? 'prefer_ipv4' : 'ipv4_only',
+      // macOS 使用 RealIP 模式（嗅探），Windows 依然使用高效的 FakeIP
+      strategy: process.platform === 'darwin' || config.enableIPv6 ? 'prefer_ipv4' : 'ipv4_only',
     };
     const dnsRules: SingBoxDnsRule[] = [];
 
@@ -797,9 +814,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         domain: uniqueDomains,
         domain_suffix: uniqueDomains.flatMap((d) => [d, `.${d}`]),
         domain_keyword: uniqueDomains,
-        server: 'dns-bootstrap',
+        server: 'dns-bootstrap-udp',
       } as SingBoxDnsRule);
     }
+
+    // 处理基础 DNS 服务的地址解析，确保它们走引导解析器
+    dnsRules.push({
+      domain: ['doh.pub', 'dns.google', 'cloudflare-dns.com', 'one.one.one.one'],
+      server: 'dns-bootstrap-udp',
+    } as SingBoxDnsRule);
 
     // 处理自定义规则中的 bypassFakeIP
     if (config.customRules && enableFakeIp) {
@@ -862,6 +885,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
+   * 生成 AppRule 路由规则
+   */
+
+  /**
    * 生成 Inbound 配置（sing-box 1.12.x / 1.13.x 兼容格式）
    */
   private generateInbounds(config: UserConfig): SingBoxInbound[] {
@@ -869,9 +896,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // 使用小写比较，兼容 SystemProxy/systemProxy 和 Tun/tun
     const modeType = (config.proxyModeType || 'systemProxy').toLowerCase();
-
-    console.log('[ProxyManager] generateInbounds - proxyModeType:', config.proxyModeType);
-    console.log('[ProxyManager] generateInbounds - modeType (lowercase):', modeType);
 
     const listenAddr = config.allowLan ? '::' : '127.0.0.1';
 
@@ -882,23 +906,24 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         type: 'http',
         tag: 'http-in',
         listen: listenAddr,
-        listen_port: config.httpPort || 65533,
+        listen_port: config.httpPort || 2080,
       },
       {
         type: 'socks',
         tag: 'socks-in',
         listen: listenAddr,
-        listen_port: config.socksPort || 65534,
+        listen_port: config.socksPort || 2081,
       }
     );
 
-    // 如果开启了局域网共享，额外监听 53 端口提供 DNS 服务，让该电脑可以作为网关
+    // 如果开启了局域网共享，额外监听 DNS 端口提供服务
+    // macOS 上 53 端口通常被占用，使用 5353 或其它非准入端口更稳健
     if (config.allowLan) {
       inbounds.push({
         type: 'dns',
         tag: 'dns-in',
         listen: '::',
-        listen_port: 53,
+        listen_port: process.platform === 'darwin' ? 5353 : 53,
       } as any);
     }
 
@@ -918,27 +943,36 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       const isIpv6 = (host: string) => /^[0-9a-fA-F:]+$/.test(host) && host.includes(':');
 
       const shouldBypassLAN = config.bypassLAN !== false; // 默认为 true
-      const excludeAddr =
-        process.platform === 'win32'
-          ? shouldBypassLAN
-            ? [...PRIVATE_IP_CIDRS]
-            : []
-          : ['127.0.0.0/8', '::1/128'];
+      // macOS 必须显式排除局域网段，否则当开启 strict_route 时，发往网关的 DNS 请求会被回流导致断网
+      const excludeAddr = shouldBypassLAN ? [...PRIVATE_IP_CIDRS] : ['127.0.0.0/8', '::1/128'];
 
-      // 绝杀级修复：如果代理节点自身是一个纯 IP，在 TUN 模式（尤其是 Mac gvisor 和部分特定环境）下，
-      // sing-box 可能无法正确通过 auto_route 将其动态绑出物理网卡，从而导致连接无限回流到 TUN causing timeout。
-      // 最暴力的解法是：直接在此刻将它的 IP 扔进系统级 TUN 排除黑名单，物理级放行该 IP 走真实网卡！
-      const selectedServer = config.servers.find((s) => s.id === config.selectedServerId);
-      if (selectedServer?.address) {
-        if (isIpv4(selectedServer.address)) {
-          excludeAddr.push(`${selectedServer.address}/32`);
-        } else if (isIpv6(selectedServer.address)) {
-          excludeAddr.push(`${selectedServer.address}/128`);
+      // 绝杀级修复（多服务器版本）：如果在 应用分流 (App Policy) 中选择了其他节点，那么这些节点的 IP 也必须被排除。
+      // 否则，FlowZ 去连接这些次选节点的流量也会回流进入 TUN 产生死循环。
+      const allServerIds = new Set([
+        config.selectedServerId as string,
+        ...(config.appRules || []).map((r) => r.targetServerId),
+      ]);
+
+      for (const serverId of allServerIds) {
+        if (!serverId) continue;
+        const server = config.servers.find((s) => s.id === serverId);
+        if (server?.address) {
+          if (isIpv4(server.address)) {
+            excludeAddr.push(`${server.address}/32`);
+          } else if (isIpv6(server.address)) {
+            excludeAddr.push(`${server.address}/128`);
+          }
         }
       }
 
-      const tunAddress = [config.tunConfig?.inet4Address || '172.19.0.1/30'];
-      if (config.enableIPv6) {
+      // 核心修复：大幅精简排除列表，仅排除必须物理直连的引导 DNS。
+      // 如果排除 8.8.8.8 等公网 DNS，则浏览器对这些 IP 的查询将绕过 TUN 导致 DNS 泄漏。
+      const dnsExcludes = ['223.5.5.5/32', '223.6.6.6/32'];
+      excludeAddr.push(...dnsExcludes);
+
+      const tunAddress = [config.tunConfig?.inet4Address || '172.19.0.1/16'];
+      // macOS 暂时关闭 IPv6 分配以隔离干扰，除非用户显式要求并处于稳定环境
+      if (config.enableIPv6 && process.platform !== 'darwin') {
         tunAddress.push(config.tunConfig?.inet6Address || 'fdfe:dcba:9876::1/126');
       }
 
@@ -946,20 +980,20 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         type: 'tun',
         tag: 'tun-in',
         address: tunAddress,
-        mtu: config.tunConfig?.mtu || 1400,
         auto_route: config.tunConfig?.autoRoute ?? true,
-        // macOS 则必须使用 gvisor 栈，配合 strict_route 才能实现完整的物理网卡接管！
-        // 曾误以为 strict_route 会导致 Mac 断网，实际上只有在 system 栈（pf 规则冲突）下才会断网。
-        // 在 gvisor 栈下，如果关闭 strict_route，发往物理路由器 (192.168.1.1) 的 DHCP DNS 查询会直接漏过 TUN 导致完全被运营商污染！
-        // 开启 strict_route 后，192.168 的 DNS 请求被完美劫持进 FakeIP，本地打印机等依然能通过下面 route_config 中的 direct 或黑名单放行！
         strict_route: config.tunConfig?.strictRoute ?? true,
-        // macOS 默认使用 system 栈
-        stack: config.tunConfig?.stack || 'system',
-        // 原版 Fork 甚至只排除了本地回环：
-        // 对于 Windows：Windows 的 Wintun 机制能完美接管系统 DNS，且如果由于系统路由环路被 TUN 拦截本地网关，会导致无法上网。
-        // 所以 Windows 必须排除局域网段。
+        // macOS ARM 下 gvisor 栈在识别进程时偶发“invalid argument”报错，切换为 mixed 栈以获得极致物理兼容性。
+        // Windows/Linux 下 system 栈配合 WinTun/NFTables 性能最强且稳定。
+        stack: config.tunConfig?.stack || (process.platform === 'darwin' ? 'mixed' : 'system'),
+        // 恢复至 1380：在大带宽环境下更均衡
+        // 降低 MTU 到 1350：显著提高在复杂网络（如部分校园网、宽带 PPPoE）下的连接成功率和稳定性
+        mtu: process.platform === 'darwin' ? 1380 : config.tunConfig?.mtu || 1350,
         route_exclude_address: excludeAddr,
       };
+
+      // 核心修正：无论版本如何，TUN 入站都尝试开启 sniffing，确保最大限度的域名识别。
+      (tunInbound as any).sniff = true;
+      (tunInbound as any).sniff_override_destination = true;
 
       // macOS 平台特定配置
       if (process.platform === 'darwin') {
@@ -967,7 +1001,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           http_proxy: {
             enabled: true,
             server: '127.0.0.1',
-            server_port: config.httpPort || 65533,
+            server_port: config.httpPort || 2080,
           },
         };
       }
@@ -1009,13 +1043,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     return chain;
   }
 
-  /**
-   * 生成 Outbound 配置（sing-box 1.12.x / 1.13.x 兼容格式）
-   * 包含 proxy, direct, block 三个出站
-   */
-  private generateOutbounds(selectedServer: ServerConfig): SingBoxOutbound[] {
+  private generateOutbounds(
+    selectedServer: ServerConfig,
+    config: UserConfig,
+    idToTagMap: Map<string, string>
+  ): SingBoxOutbound[] {
     const outbounds: SingBoxOutbound[] = [];
-    const config = this.currentConfig;
 
     if (config) {
       // 1. 生成主选节点的 Outbound 及其前置节点
@@ -1023,8 +1056,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
       // 添加前置节点
       for (const detourServer of mainChain.reverse()) {
-        const detourOutbound = this.generateProxyOutbound(detourServer);
-        detourOutbound.tag = `proxy-${detourServer.id}`;
+        const detourOutbound = this.generateProxyOutbound(detourServer, idToTagMap);
+        detourOutbound.tag = idToTagMap.get(detourServer.id) || `proxy-${detourServer.id}`;
         // 避免重复添加
         if (!outbounds.some((o) => o.tag === detourOutbound.tag)) {
           outbounds.push(detourOutbound);
@@ -1032,10 +1065,16 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       }
 
       // 添加主节点
-      const mainOutbound = this.generateProxyOutbound(selectedServer);
-      // 主节点默认使用 'proxy' tag
+      const mainOutbound = this.generateProxyOutbound(selectedServer, idToTagMap);
+      // 主节点默认使用 'proxy' tag，为了兼容老的路由规则
+      // 但对于拓扑显示，我们希望看到名称，所以这里我们保留一个名为 'proxy' 的 outbound
+      // 并在最后将其 tag 设为服务器名称（或者通过 detour 链处理）
+      // 这里的策略是：主选节点 tag 设为人类可读名称，并同步给路由规则使用。
+      const selectedServerTag = idToTagMap.get(selectedServer.id) || 'proxy';
+      mainOutbound.tag = selectedServerTag;
+
       if (selectedServer.detour && config.servers.some((s) => s.id === selectedServer.detour)) {
-        mainOutbound.detour = `proxy-${selectedServer.detour}`;
+        mainOutbound.detour = idToTagMap.get(selectedServer.detour);
       }
       outbounds.push(mainOutbound);
 
@@ -1057,7 +1096,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         }
       }
 
-      for (const targetId of targetServerIds) {
+      for (const targetId of Array.from(targetServerIds)) {
         // 如果目标节点就是主节点，不需要额外添加（主节点已有 'proxy' tag）
         if (targetId === selectedServer.id) continue;
 
@@ -1070,8 +1109,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
         // 添加目标节点的前置节点
         for (const detourServer of targetChain.reverse()) {
-          const detourOutbound = this.generateProxyOutbound(detourServer);
-          detourOutbound.tag = `proxy-${detourServer.id}`;
+          const detourOutbound = this.generateProxyOutbound(detourServer, idToTagMap);
+          detourOutbound.tag = idToTagMap.get(detourServer.id) || `proxy-${detourServer.id}`;
           // 避免重复添加
           if (!outbounds.some((o) => o.tag === detourOutbound.tag)) {
             outbounds.push(detourOutbound);
@@ -1079,12 +1118,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         }
 
         // 添加目标节点本身
-        const targetOutbound = this.generateProxyOutbound(targetServer);
-        targetOutbound.tag = `proxy-${targetServer.id}`; // 使用特定 tag
+        const targetOutbound = this.generateProxyOutbound(targetServer, idToTagMap);
+        targetOutbound.tag = idToTagMap.get(targetServer.id) || `proxy-${targetServer.id}`; // 使用节点名称作为 Tag
         if (targetServer.detour && config.servers.some((s) => s.id === targetServer.detour)) {
-          // 如果 detour 就是主选节点，它的 tag 是 'proxy'，而不是 'proxy-xxx'
-          targetOutbound.detour =
-            targetServer.detour === selectedServer.id ? 'proxy' : `proxy-${targetServer.detour}`;
+          targetOutbound.detour = idToTagMap.get(targetServer.detour);
         }
 
         // 避免重复添加
@@ -1094,7 +1131,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       }
     } else {
       // Fallback if config is missing (shouldn't happen)
-      outbounds.push(this.generateProxyOutbound(selectedServer));
+      outbounds.push(this.generateProxyOutbound(selectedServer, idToTagMap));
     }
 
     // 直连出站
@@ -1156,7 +1193,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   /**
    * 生成代理 Outbound 配置（sing-box 1.12.x / 1.13.x 兼容格式）
    */
-  private generateProxyOutbound(server: ServerConfig): SingBoxOutbound {
+  private generateProxyOutbound(
+    server: ServerConfig,
+    idToTagMap: Map<string, string>
+  ): SingBoxOutbound {
     // sing-box 要求协议类型必须是小写
     const protocol = server.protocol.toLowerCase();
     const protocolLower = protocol;
@@ -1164,11 +1204,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     const outbound: SingBoxOutbound = {
       type: protocol,
-      tag: 'proxy',
+      tag: idToTagMap.get(server.id) || `proxy-${server.id}`,
       server: server.address,
       server_port: server.port,
-      // 代理服务器域名使用本地 DNS 解析
-      domain_resolver: 'dns-local',
+      // 代理服务器使用 IP-based 引导解析器，防止因 dns-local 死循环导致的连接挂起
+      domain_resolver: 'dns-bootstrap-udp',
     };
 
     // VLESS 特定配置
@@ -1383,57 +1423,140 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   /**
    * 生成路由配置（sing-box 1.12.x / 1.13.x 兼容格式）
    */
-  private generateRouteConfig(config: UserConfig): SingBoxRouteConfig {
+  private generateRouteConfig(
+    config: UserConfig,
+    idToTagMap: Map<string, string>
+  ): SingBoxRouteConfig {
     const rules: SingBoxRouteRule[] = [];
-
-    // 使用小写比较代理模式
     const proxyMode = (config.proxyMode || 'smart').toLowerCase();
 
-    // 先初始化整个 RouteConfig，随后再根据模式填充 rule_set 和 rules
-    const routeConfig: SingBoxRouteConfig = {
-      rules,
-      // 默认解析器使用本地系统 DNS (通过 TUN 内部劫持逻辑实现)
-      default_domain_resolver: 'dns-local',
-      auto_detect_interface: true,
-      final: proxyMode === 'direct' ? 'direct' : 'proxy',
-    };
+    const selectedServerTag = idToTagMap.get(config.selectedServerId as string) || 'proxy';
     // 获取当前选中的服务器，用于排除代理服务器域名
     const selectedServer = config.servers.find((s) => s.id === config.selectedServerId);
 
-    // sing-box 1.13+ 将 sniff 从 inbound 移到了 route.rules 中（替代 legacy inbound fields）
-    // action: 'sniff' 会在路由流程的最开始嗅探流量的真实域名，并覆盖目标地址
-    rules.push({
-      action: 'sniff',
-    } as any);
+    const versionArr = this.coreVersion.split('.');
+    const versionNum = parseFloat(versionArr[0] + '.' + (versionArr[1] || '0'));
 
-    // 强制引导 DNS 直连，防止解析代理节点自身的域名时产生死循环
+    // A. 嗅探规则（必须在前，用于识别域名）
+    if (!isNaN(versionNum) && versionNum >= 1.13) {
+      rules.push({
+        inbound: ['tun-in', 'mixed-in', 'socks-in', 'http-in'],
+        action: 'sniff',
+        // 关键核心：增加 dns 嗅探，这对识别 FakeIP 连接至关重要。
+        sniffer: ['http', 'tls', 'quic', 'dns'],
+        timeout: '500ms',
+      });
+    }
+
+    // 1. 强制放行 FlowZ 及其核心进程：防止 DNS 回流死循环
+    // 必须放在最高优先级，确保核心组件的 DNS 请求能直连物理网卡
     rules.push({
-      ip_cidr: ['223.5.5.5/32'],
-      port: [443],
+      process_name: [
+        'sing-box',
+        'sing-box.exe',
+        'FlowZ',
+        'FlowZ.exe',
+        'FlowZ Helper',
+        'FlowZ Helper.exe',
+        'FlowZ Helper (Plugin)',
+        'FlowZ Helper (Plugin).exe',
+      ],
       action: 'route',
       outbound: 'direct',
     });
 
-    // DNS 劫持规则（更宽泛，捕捉所有 53 端口）
+    // 绝杀级修复 E -> Top：DNS 劫持必须具有至高无上的优先级。
+    // 如果被 D 部分的 direct 规则抢先匹配，DNS 请求将直接泄漏出公网从而被 GFW 污染。
     rules.push({
       port: [53],
       action: 'hijack-dns',
     });
 
-    // 【全域禁止 QUIC】：强迫浏览器回退到 TCP (TLS)，显著提升加载成功率和稳定性
+    // B. 强制本地直连规则（解决拓扑空白、局域网访问问题）
+    // 优先级极高，确保 127.0.0.1 和局域网流量永不进代理
+    rules.push({
+      ip_cidr: ['127.0.0.0/8', '10.0.0.0/8', '172.16.0.0/12', '192.168.0.0/16', '::1/128'],
+      action: 'route',
+      outbound: 'direct',
+    });
+    // D. 强制引导核心 DNS 直连 (阿里/腾讯/114)，防止解析代理节点域名时产生死循环
+    // 覆盖了常见的 DNS IP 以及 53/443 端口
+    // 注意：必须在任何代理规则之前，确保 bootstrap dns 永远走物理网卡
+    rules.push({
+      ip_cidr: [
+        '223.5.5.5/32',
+        '223.6.6.6/32',
+        '119.29.29.29/32',
+        '119.28.28.28/32',
+        '114.114.114.114/32',
+      ],
+      port: [53, 443],
+      action: 'route',
+      outbound: 'direct',
+    });
+
+    // F. 静默屏蔽 ICMP 流量（FakeIP 下常见，但代理节点通常不支持）
+    // 放置在靠前位置，防止 ICMP 流量误入不支持的代理出站引发报错
+    rules.push({
+      protocol: 'icmp',
+      action: 'reject',
+    } as any);
+
+    rules.push({
+      process_name: [
+        'Surge',
+        'Surge 4',
+        'Surge 5',
+        'Clash',
+        'Clash for Windows',
+        'ClashX',
+        'ClashX Pro',
+        'clash-meta',
+        'Quantumult X',
+        'FlowZ',
+        'FlowZ.exe',
+        'FlowZ Helper',
+        'FlowZ Helper.exe',
+        'FlowZ Helper (Plugin)',
+        'FlowZ Helper (Plugin).exe',
+        'sing-box',
+        'sing-box.exe',
+        'mDNSResponder',
+        'apsd',
+        'nsurlsessiond',
+        'airportd',
+        'syspolicyd',
+        'trustd',
+        'ocspd',
+        'securityd',
+        'taskgated',
+        'findmydeviced',
+        'cloudd',
+      ],
+      action: 'route',
+      outbound: 'direct',
+    });
+
+    // 智能分流规则
+    const routeConfig: SingBoxRouteConfig = {
+      rules,
+      // 核心修复：macOS 下 default_domain_resolver 必须使用 IP-based 引导解析器 (dns-bootstrap-udp)
+      // 避免解析 doh.pub 域名时产生的死循环。
+      default_domain_resolver: 'dns-bootstrap-udp',
+      auto_detect_interface: true,
+      // 如果模式是全局代理 (global/proxy)，则最终出口是所选节点
+      final: proxyMode === 'direct' ? 'direct' : selectedServerTag,
+    };
+
+    // 【全域禁止 QUIC】：强迫浏览器回退到 TCP (TLS)
     rules.push({
       network: ['udp'],
       port: [443],
-      action: 'route',
-      outbound: 'block',
-    });
+      action: 'reject',
+    } as any);
 
-    // 【终极绝杀浏览器 DoH】：
-    // 现代浏览器 (Chrome/Edge) 默认开启了“安全 DNS (DoH)”，它会绕过上面的 hijack-dns，
-    // 强行向 8.8.8.8 发起 HTTPS/QUIC 请求获取真实的 Google IPv6/IPv4。
-    // 在 FlowZ 里我们把智能模式的 final 从 direct 改成了 proxy（为了支持 TG 等纯 IP 应用），
-    // 结果意外导致浏览器的 DoH 穿透了代理，拿到真实 IP 后触发了无 SNI 原生握手被节点拒绝（Connection Refused）！
-    // 解决办法：直接让常见公共 DNS 的 HTTPS/QUIC 流量被墙或丢弃，逼迫浏览器瞬间回退到系统的 UDP 53，从而被 FakeIP 完美生擒！
+    // 【DNS 引导与辅助直连】：
+    // 确保以下公共 DNS IP 不会被后面的 block 规则拦截，从而保证 DoH 握手和初次域名解析。
     rules.push({
       ip_cidr: [
         '8.8.8.8/32',
@@ -1450,6 +1573,16 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         '2606:4700:4700::1111/128',
         '2606:4700:4700::1001/128',
       ],
+      port: [53, 443, 853],
+      action: 'route',
+      outbound: 'direct',
+    });
+
+    // 【终极绝杀隐私 DoH 泄漏】：
+    // 现代浏览器会尝试通过常规 HTTPS 端口向特定域名发起 DoH 请求。
+    // 我们在这里将这些特定的 DoH 域名强制阻断（Block），从而迫使浏览器退回到系统标准的 UDP 53。
+    // 这样流量就能重新被 hijack-dns 捕获并进入我们的 DNS 分流/FakeIP 体系。
+    rules.push({
       domain_keyword: [
         'dns.google',
         'cloudflare-dns.com',
@@ -1459,7 +1592,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       ],
       port: [443, 853],
       action: 'route',
-      // 这里如果填 direct，就是丢给高墙。如果填 block，就是让 sing-box 强行断网，Chrome 回退更快。
       outbound: 'block',
     });
 
@@ -1527,7 +1659,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       const { rules: customRules, ruleSets: customRuleSets } = this.generateCustomRules(
         config.customRules || [],
         config.customRuleSets || [],
-        config.selectedServerId || undefined
+        config.selectedServerId || undefined,
+        idToTagMap,
+        selectedServerTag
       );
       rules.push(...customRules);
 
@@ -1538,37 +1672,50 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         routeConfig.rule_set.push(...customRuleSets);
       }
 
-      // 应用分流规则（实验性）
-      // geosite/geoip rule_set 已在下方 getRequiredGeoCategories 中统一注册
-      // 这里只需生成路由规则
+      // 应用分流规则（真·应用分流，基于进程名）
+      // 优先级高于后续的智能分流/全局分流，确保特定应用的流量始终走用户指定的出口
       for (const appRule of config.appRules || []) {
         if (!appRule.enabled) continue;
         const preset = getAppPreset(appRule.appId, config.customAppPresets);
         if (!preset) continue;
 
-        const ruleSets = [
-          ...preset.geositeTags.map((tag) => `geosite-${tag}`),
-          ...(preset.geoipTags || []).map((tag) => `geoip-${tag}`),
-        ];
-
+        // 确定出站方式
         let outbound = 'direct';
         if (appRule.action === 'proxy') {
-          if (appRule.targetServerId) {
-            // 校验目标节点是否依然存在，防止因节点删除导致的 outbound 不存在而启动失败
+          if (appRule.targetServerId && appRule.targetServerId !== config.selectedServerId) {
             const serverExists = config.servers.some((s) => s.id === appRule.targetServerId);
-            outbound = serverExists ? `proxy-${appRule.targetServerId}` : 'proxy';
+            outbound = serverExists
+              ? idToTagMap.get(appRule.targetServerId) || `proxy-${appRule.targetServerId}`
+              : selectedServerTag;
           } else {
-            outbound = 'proxy';
+            outbound = selectedServerTag;
           }
         } else if (appRule.action === 'block') {
           outbound = 'block';
         }
 
-        rules.push({
-          rule_set: ruleSets,
-          action: 'route',
-          outbound,
-        });
+        // a. 基于进程名的规则（最精准，适用于 macOS/Windows TUN 模式）
+        if (preset.processNames && preset.processNames.length > 0) {
+          rules.push({
+            process_name: preset.processNames,
+            action: 'route',
+            outbound,
+          });
+        }
+
+        // b. 基于原有 rule_set 的规则（兜底，基于域名/IP 识别）
+        const ruleSets = [
+          ...preset.geositeTags.map((tag) => `geosite-${tag}`),
+          ...(preset.geoipTags || []).map((tag) => `geoip-${tag}`),
+        ];
+
+        if (ruleSets.length > 0) {
+          rules.push({
+            rule_set: ruleSets,
+            action: 'route',
+            outbound,
+          });
+        }
       }
     }
 
@@ -1582,14 +1729,14 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       rules.push({
         domain_keyword: ['google', 'gmail', 'youtube', 'gstatic', 'googleapis', 'googlevideo'],
         action: 'route',
-        outbound: 'proxy',
+        outbound: selectedServerTag,
       });
 
       // 国外域名走代理
       rules.push({
         rule_set: 'geosite-geolocation-!cn',
         action: 'route',
-        outbound: 'proxy',
+        outbound: selectedServerTag,
       });
       // 中国域名直连
       rules.push({
@@ -1647,27 +1794,27 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       }
 
       // 添加 Geosite 远程规则集
-      for (const category of customGeositeCategories) {
+      for (const category of Array.from(customGeositeCategories)) {
         routeConfig.rule_set.push({
           tag: `geosite-${category}`,
           type: 'remote',
           format: 'binary',
           url:
             category === 'category-ai'
-              ? 'https://github.com/SagerNet/sing-geosite/raw/refs/heads/rule-set/geosite-category-ai-!cn.srs'
-              : `https://github.com/SagerNet/sing-geosite/raw/refs/heads/rule-set/geosite-${category}.srs`,
-          download_detour: proxyMode !== 'direct' ? 'proxy' : undefined,
+              ? 'https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-category-ai-!cn.srs'
+              : `https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/geosite-${category}.srs`,
+          download_detour: proxyMode !== 'direct' ? selectedServerTag : undefined,
         } as any);
       }
 
       // 添加 GeoIP 远程规则集
-      for (const category of customGeoipCategories) {
+      for (const category of Array.from(customGeoipCategories)) {
         routeConfig.rule_set.push({
           tag: `geoip-${category}`,
           type: 'remote',
           format: 'binary',
-          url: `https://github.com/SagerNet/sing-geoip/raw/refs/heads/rule-set/geoip-${category}.srs`,
-          download_detour: proxyMode !== 'direct' ? 'proxy' : undefined,
+          url: `https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-${category}.srs`,
+          download_detour: proxyMode !== 'direct' ? selectedServerTag : undefined,
         } as any);
       }
     }
@@ -1716,7 +1863,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private generateCustomRules(
     customRules: import('../../shared/types').DomainRule[],
     customRuleSets: import('../../shared/types').CustomRuleSet[] = [],
-    selectedServerId?: string
+    selectedServerId?: string,
+    idToTagMap?: Map<string, string>,
+    selectedServerTag: string = 'proxy'
   ): { rules: SingBoxRouteRule[]; ruleSets: SingBoxRuleSet[] } {
     const rules: SingBoxRouteRule[] = [];
     const ruleSets: SingBoxRuleSet[] = [];
@@ -1784,7 +1933,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         type: 'remote',
         format: 'binary',
         url: ruleSet.url,
-        download_detour: 'proxy', // 默认通过代理下载自定义规则集
+        download_detour: selectedServerTag, // 默认通过当前选中的代理下载自定义规则集
       } as any);
 
       const singboxRule: SingBoxRouteRule = {
@@ -1793,7 +1942,14 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       };
 
       // 此处的 CustomRuleSet 只包含 action 而无 targetServerId，不过统一走 applyRuleAction 判断
-      this.applyRuleAction(singboxRule, ruleSet.action, undefined, selectedServerId);
+      this.applyRuleAction(
+        singboxRule,
+        ruleSet.action,
+        undefined,
+        selectedServerId,
+        idToTagMap,
+        selectedServerTag
+      );
       rules.push(singboxRule);
     }
 
@@ -1807,23 +1963,26 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     singboxRule: SingBoxRouteRule,
     action: string,
     targetServerId?: string,
-    selectedServerId?: string
+    selectedServerId?: string,
+    idToTagMap?: Map<string, string>,
+    selectedServerTag: string = 'proxy'
   ): void {
     // 设置出站
     if (action === 'proxy') {
       // 如果指定了目标服务器，且不是主节点，则路由到特定的 outbound tag
       if (targetServerId && selectedServerId !== targetServerId) {
-        singboxRule.outbound = `proxy-${targetServerId}`;
+        const targetTag = idToTagMap?.get(targetServerId);
+        singboxRule.outbound = targetTag || `proxy-${targetServerId}`;
       } else {
-        singboxRule.outbound = 'proxy';
+        singboxRule.outbound = selectedServerTag;
       }
     } else if (action === 'direct') {
       singboxRule.outbound = 'direct';
     } else if (action === 'block') {
       singboxRule.outbound = 'block';
     } else {
-      // 如果没有指定，默认 proxy
-      singboxRule.outbound = 'proxy';
+      // 如果没有指定，默认使用主节点
+      singboxRule.outbound = selectedServerTag;
     }
   }
 
@@ -1885,6 +2044,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       path.join(userDataPath, 'cache.db'),
       path.join(userDataPath, 'singbox.log'),
       path.join(userDataPath, 'singbox.pid'),
+      path.join(userDataPath, 'singbox_startup.log'),
     ];
 
     const fsSync = require('fs');
@@ -2937,7 +3097,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    */
   private async waitForPidFile(): Promise<void> {
     const pidFile = this.getPidFilePath();
-    const maxWaitTime = 10000; // 最多等待 10 秒
+    const maxWaitTime = 60000; // 最多等待 60 秒（给 macOS 权限提升过程留足时间）
     const checkInterval = 200; // 每 200ms 检查一次
     const startTime = Date.now();
 
@@ -3123,16 +3283,20 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     const logInfo = this.parseSingBoxLog(line);
 
     if (logInfo) {
-      // 转换为友好的中文提示
-      const friendlyMessage = this.translateErrorMessage(logInfo.message);
+      // 先翻译消息中的代理标签
+      const resolvedMessage = this.resolveTagsToNames(logInfo.message);
+
+      // 再转换为友好的中文提示
+      const friendlyMessage = this.translateErrorMessage(resolvedMessage);
 
       // 空消息不记录（如私有 IP 超时）
       if (friendlyMessage) {
         this.logToManager(logInfo.level, friendlyMessage);
       }
     } else {
-      // 无法解析的日志，直接记录
-      this.logToManager('info', line);
+      // 无法解析的日志，尝试对原始行也进行标签转换
+      const resolvedLine = this.resolveTagsToNames(line);
+      this.logToManager('info', resolvedLine);
     }
   }
 
@@ -3219,26 +3383,43 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     return false; // 默认保留
   }
 
+  /** 最近处理过的日志消息，用于去重，最多缓存 10 条 */
+  private recentLogHistory: string[] = [];
+
   /**
    * 检查是否为重复日志
    */
   private isDuplicateLog(message: string): boolean {
     const now = Date.now();
+    const trimmedMessage = message.trim();
 
-    // 如果消息相同且在 1 秒内
-    if (message === this.lastLogMessage && now - this.lastLogTime < 1000) {
-      this.lastLogCount++;
+    // 过滤掉日志中的时间戳部分进行对比（例如：+0800 2026-04-05 12:05:01 ）
+    // 这样即便 stdout 和 logFile 的时间戳有微秒级差异，也能正确去重
+    const stripTimestamp = (msg: string) =>
+      msg.replace(/\+\d{4}\s\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\s/, '');
+    const cleanMessage = stripTimestamp(trimmedMessage);
 
-      // 如果重复超过 5 次，过滤掉
-      if (this.lastLogCount > 5) {
-        return true;
-      }
-    } else {
-      // 新消息，重置计数
-      this.lastLogMessage = message;
-      this.lastLogCount = 1;
-      this.lastLogTime = now;
+    // 1. 如果新消息与缓冲区中的任意消息内容（忽略时间戳）相同，则认为是重复
+    const normalizedHistory = this.recentLogHistory.map((m) => stripTimestamp(m));
+    if (normalizedHistory.includes(cleanMessage) && now - this.lastLogTime < 1000) {
+      return true;
     }
+
+    // 2. 特殊情况：如果消息完全相同且在 1 秒内（由于并发到达）
+    if (trimmedMessage === this.lastLogMessage && now - this.lastLogTime < 1000) {
+      this.lastLogCount++;
+      if (this.lastLogCount > 1) return true;
+    }
+
+    // 新消息，入队并重置
+    this.recentLogHistory.push(trimmedMessage);
+    if (this.recentLogHistory.length > 10) {
+      this.recentLogHistory.shift();
+    }
+
+    this.lastLogMessage = trimmedMessage;
+    this.lastLogCount = 1;
+    this.lastLogTime = now;
 
     return false;
   }
@@ -3274,6 +3455,48 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       level: level.toLowerCase() as 'debug' | 'info' | 'warn' | 'error' | 'fatal',
       message,
     };
+  }
+
+  /**
+   * 将日志中的 proxy 标签（UUID 或 "proxy"）转换为人类可读的服务器名称
+   */
+  private resolveTagsToNames(message: string): string {
+    if (!this.currentConfig || !this.currentConfig.servers) {
+      return message;
+    }
+
+    let resolvedMessage = message;
+
+    // 1. 处理这种格式：proxy-2cef4913-84f6-41f9-a251-d1f49767cef6
+    const uuidPattern = /proxy-([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/gi;
+    resolvedMessage = resolvedMessage.replace(uuidPattern, (match, id) => {
+      const server = this.currentConfig?.servers.find((s) => s.id === id);
+      return server ? server.name : match;
+    });
+
+    // 2. 处理单独的 [proxy] 或 outbound/proxy 标识
+    const selectedServer = this.currentConfig.servers.find(
+      (s) => s.id === this.currentConfig?.selectedServerId
+    );
+
+    if (selectedServer) {
+      // 替换方括号中的 [proxy]
+      resolvedMessage = resolvedMessage.replace(/\[proxy\]/g, `[${selectedServer.name}]`);
+
+      // 替换 outbound/proxy
+      resolvedMessage = resolvedMessage.replace(
+        /outbound\/proxy/g,
+        `outbound/${selectedServer.name}`
+      );
+
+      // 替换 outbound: proxy
+      resolvedMessage = resolvedMessage.replace(
+        /outbound: proxy/g,
+        `outbound: ${selectedServer.name}`
+      );
+    }
+
+    return resolvedMessage;
   }
 
   /**
@@ -3508,27 +3731,26 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       }
     } else if (process.platform === 'darwin') {
       try {
-        const { exec } = require('child_process');
-        const runCommand = (cmd: string) =>
-          new Promise((resolve, reject) => {
-            exec(cmd, (error: any) => {
-              if (error) reject(error);
-              else resolve(null);
-            });
-          });
+        const { execSync } = require('child_process');
+        const socksPort = config.socksPort || 2081;
 
-        const services = ['Wi-Fi', 'Ethernet', 'Thunderbolt Bridge'];
+        // 动态获取所有网络服务名称，避免硬编码导致部分网卡失效
+        const servicesOutput = execSync('networksetup -listallnetworkservices').toString();
+        const services = servicesOutput
+          .split('\n')
+          .filter(
+            (s: string) =>
+              s &&
+              !s.includes('*') &&
+              s !== 'An asterisk (*) denotes that a network service is disabled.'
+          );
 
         for (const service of services) {
           try {
-            await runCommand(`networksetup -setwebproxy "${service}" ${host} ${port}`);
-            await runCommand(`networksetup -setsecurewebproxy "${service}" ${host} ${port}`);
-            await runCommand(`networksetup -setsocksfirewallproxy "${service}" ${host} ${port}`);
-            if (config.socksPort) {
-              await runCommand(
-                `networksetup -setsocksfirewallproxy "${service}" ${host} ${config.socksPort}`
-              );
-            }
+            const s = service.trim();
+            execSync(`networksetup -setwebproxy "${s}" ${host} ${port}`);
+            execSync(`networksetup -setsecurewebproxy "${s}" ${host} ${port}`);
+            execSync(`networksetup -setsocksfirewallproxy "${s}" ${host} ${socksPort}`);
           } catch {
             // ignore
           }
@@ -3567,23 +3789,26 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       }
     } else if (process.platform === 'darwin') {
       try {
-        const { exec } = require('child_process');
-        const runCommand = (cmd: string) =>
-          new Promise((resolve, reject) => {
-            exec(cmd, (error: any) => {
-              if (error) reject(error);
-              else resolve(null);
-            });
-          });
+        const { execSync } = require('child_process');
+        // 动态获取所有服务并关闭代理
+        const servicesOutput = execSync('networksetup -listallnetworkservices').toString();
+        const services = servicesOutput
+          .split('\n')
+          .filter(
+            (s: string) =>
+              s &&
+              !s.includes('*') &&
+              s !== 'An asterisk (*) denotes that a network service is disabled.'
+          );
 
-        const services = ['Wi-Fi', 'Ethernet', 'Thunderbolt Bridge'];
         for (const service of services) {
           try {
-            await runCommand(`networksetup -setwebproxystate "${service}" off`);
-            await runCommand(`networksetup -setsecurewebproxystate "${service}" off`);
-            await runCommand(`networksetup -setsocksfirewallproxystate "${service}" off`);
+            const s = service.trim();
+            execSync(`networksetup -setwebproxystate "${s}" off`);
+            execSync(`networksetup -setsecurewebproxystate "${s}" off`);
+            execSync(`networksetup -setsocksfirewallproxystate "${s}" off`);
           } catch {
-            // Ignore
+            // ignore
           }
         }
         this.logToManager('info', 'macOS 系统代理已取消');

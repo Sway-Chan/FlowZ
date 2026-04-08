@@ -60,7 +60,7 @@ export function AppRulesCard() {
             try {
               const res = await fetch(url, { signal: AbortSignal.timeout(8000) });
               if (res.ok) return await res.json();
-            } catch (e) {
+            } catch {
               console.warn(`Failed to fetch from ${url}, trying next...`);
             }
           }
@@ -254,7 +254,6 @@ export function AppRulesCard() {
             const rule = getAppRule(preset.id);
             const isEnabled = rule?.enabled ?? false;
             const isCustom = preset.id.startsWith('custom-');
-            const isHeaderHidden = ['openai', 'anthropic', 'gemini'].includes(preset.id);
 
             return (
               <div key={preset.id} className="group relative">
@@ -268,11 +267,11 @@ export function AppRulesCard() {
                   onValueChange={(v) => handlePolicyChange(preset, v)}
                 >
                   <SelectTrigger
-                    className={`h-${viewMode === 'comfortable' ? '[110px]' : '[88px]'} w-full p-${viewMode === 'comfortable' ? '3.5' : '2.5'} flex flex-col items-start ${viewMode === 'comfortable' ? 'justify-between' : ''} rounded-${viewMode === 'comfortable' ? '2xl' : 'xl'} border border-muted-foreground/10 transition-all duration-300 shadow-none focus:ring-0 [&>svg]:hidden bg-muted/40 hover:bg-muted/60 relative overflow-hidden`}
+                    className={`h-${viewMode === 'comfortable' ? '[110px]' : '[88px]'} w-full p-${viewMode === 'comfortable' ? '3.5' : '2.5'} flex flex-col items-start rounded-xl border border-muted-foreground/10 transition-all duration-300 shadow-none focus:ring-0 [&>svg]:hidden bg-muted/40 hover:bg-muted/60 relative overflow-hidden`}
                   >
                     {/* 左上脚标：Surge 风格 */}
                     <div
-                      className={`text-[8px] text-muted-foreground/50 font-medium tracking-tight uppercase leading-none ${isHeaderHidden ? 'invisible' : ''}`}
+                      className={`text-[8px] text-muted-foreground/50 font-medium tracking-tight uppercase leading-none mt-0.5 mb-1 ${viewMode === 'comfortable' ? 'ml-1.5' : 'ml-2.5'}`}
                     >
                       {t('rules.appRulesManualSelection')}
                     </div>
@@ -280,12 +279,12 @@ export function AppRulesCard() {
                     <div
                       className={
                         viewMode === 'comfortable'
-                          ? 'flex items-center gap-2.5 w-full flex-1'
-                          : 'flex items-center gap-2 w-full mt-1.5'
+                          ? 'flex items-center gap-2.5 w-full flex-1 ml-1.5'
+                          : 'flex items-center gap-2 w-full mt-0.5 ml-2.5'
                       }
                     >
                       <div
-                        className={`${viewMode === 'comfortable' ? 'h-9 w-9' : 'h-6 w-6'} flex items-center justify-center bg-background/80 rounded-${viewMode === 'comfortable' ? 'xl' : 'lg'} shadow-sm border border-white/${viewMode === 'comfortable' ? '10' : '5'} p-${viewMode === 'comfortable' ? '1' : '0.5'} shrink-0 transition-transform group-hover:scale-105`}
+                        className={`${viewMode === 'comfortable' ? 'h-9 w-9' : 'h-6 w-6'} flex items-center justify-center bg-background/80 rounded-lg shadow-sm border border-white/${viewMode === 'comfortable' ? '10' : '5'} p-${viewMode === 'comfortable' ? '1' : '0.5'} shrink-0 transition-transform group-hover:scale-105`}
                       >
                         {preset.iconUrl ? (
                           <img
@@ -322,7 +321,7 @@ export function AppRulesCard() {
                     <div
                       className={
                         viewMode === 'comfortable'
-                          ? `absolute bottom-1.5 left-3.5 right-3.5 text-[9.5px] w-full text-left font-bold tracking-normal truncate ${
+                          ? `absolute bottom-1.5 left-2.5 right-3.5 text-[9.5px] w-full text-left font-bold tracking-normal truncate ${
                               !rule || !isEnabled
                                 ? 'text-muted-foreground/60'
                                 : rule.action === 'direct'
@@ -331,7 +330,7 @@ export function AppRulesCard() {
                                     ? 'text-red-600 dark:text-red-400'
                                     : 'text-primary'
                             }`
-                          : `text-[9px] w-full text-left font-bold tracking-normal truncate ${
+                          : `text-[9px] w-full text-left font-bold tracking-normal truncate ml-2 ${
                               !rule || !isEnabled
                                 ? 'text-muted-foreground/60'
                                 : rule.action === 'direct'
@@ -354,18 +353,20 @@ export function AppRulesCard() {
                                   : 'bg-primary'
                           }`}
                         />
-                        {(() => {
-                          if (!rule || !isEnabled) return 'Proxy';
-                          if (rule.action === 'direct') return 'DIRECT';
-                          if (rule.action === 'block') return 'BLOCK';
-                          if (rule.targetServerId) {
-                            const s = config.servers?.find(
-                              (server) => server.id === rule.targetServerId
-                            );
-                            return s ? s.name : 'Proxy';
-                          }
-                          return 'Proxy';
-                        })()}
+                        <span className="truncate">
+                          {(() => {
+                            if (!rule || !isEnabled) return 'Proxy';
+                            if (rule.action === 'direct') return 'DIRECT';
+                            if (rule.action === 'block') return 'BLOCK';
+                            if (rule.targetServerId) {
+                              const s = config.servers?.find(
+                                (server) => server.id === rule.targetServerId
+                              );
+                              return s ? s.name : 'Proxy';
+                            }
+                            return 'Proxy';
+                          })()}
+                        </span>
                       </div>
                     </div>
                   </SelectTrigger>
@@ -426,7 +427,7 @@ export function AppRulesCard() {
                   setShowIconGallery(false);
                   setIsAddDialogOpen(true);
                 }}
-                className={`${viewMode === 'comfortable' ? 'h-[110px]' : 'h-[88px]'} w-full flex flex-col items-center justify-center gap-2 rounded-${viewMode === 'comfortable' ? '2xl' : 'xl'} border-2 border-dashed border-muted-foreground/10 bg-transparent hover:bg-muted/30 hover:border-primary/30 transition-all duration-300 shadow-none`}
+                className={`${viewMode === 'comfortable' ? 'h-[110px]' : 'h-[88px]'} w-full flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed border-muted-foreground/10 bg-transparent hover:bg-muted/30 hover:border-primary/30 transition-all duration-300 shadow-none`}
               >
                 <div className="h-9 w-9 flex items-center justify-center bg-muted/40 rounded-full group-hover:bg-primary/10 group-hover:text-primary transition-colors">
                   <Plus className="h-6 w-6 text-muted-foreground/60 group-hover:text-primary" />

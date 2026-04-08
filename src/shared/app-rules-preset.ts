@@ -18,6 +18,8 @@ export interface AppPreset {
   geositeTags: string[];
   /** 对应的 geoip 标签数组（可能有多个，可选） */
   geoipTags?: string[];
+  /** 对应的进程名数组（用于 macOS/Windows/Linux 真·应用分流，可选） */
+  processNames?: string[];
   /** 分类 */
   category: 'video' | 'social' | 'ai' | 'tools' | 'game';
 }
@@ -31,8 +33,7 @@ export const APP_PRESETS: AppPreset[] = [
     labelKey: 'youtube',
     emoji: '▶️',
     iconUrl: `${QURE_BASE}/YouTube.png`,
-    geositeTags: ['youtube', 'googlevideo'],
-    geoipTags: ['youtube'],
+    geositeTags: ['youtube'],
     category: 'video',
   },
   {
@@ -41,7 +42,7 @@ export const APP_PRESETS: AppPreset[] = [
     emoji: '🎬',
     iconUrl: `${QURE_BASE}/Netflix.png`,
     geositeTags: ['netflix'],
-    geoipTags: ['netflix'],
+    processNames: ['Netflix', 'Netflix.exe'],
     category: 'video',
   },
   {
@@ -50,7 +51,7 @@ export const APP_PRESETS: AppPreset[] = [
     emoji: '🎵',
     iconUrl: `${QURE_BASE}/TikTok.png`,
     geositeTags: ['tiktok'],
-    geoipTags: ['tiktok'],
+    processNames: ['TikTok', 'TikTok.exe'],
     category: 'video',
   },
   {
@@ -59,6 +60,7 @@ export const APP_PRESETS: AppPreset[] = [
     emoji: '📺',
     iconUrl: `${QURE_BASE}/bilibili.png`,
     geositeTags: ['bilibili'],
+    processNames: ['BiliBili', 'bilibili', 'bilibili.exe'],
     category: 'video',
   },
   // ── 社交 ──────────────────────────────────────────
@@ -68,7 +70,7 @@ export const APP_PRESETS: AppPreset[] = [
     emoji: '✈️',
     iconUrl: `${QURE_BASE}/Telegram.png`,
     geositeTags: ['telegram'],
-    geoipTags: ['telegram'],
+    processNames: ['Telegram', 'Telegram.exe', 'Telegram Desktop'],
     category: 'social',
   },
   {
@@ -78,6 +80,7 @@ export const APP_PRESETS: AppPreset[] = [
     iconUrl: `${QURE_BASE}/X.png`,
     geositeTags: ['twitter'],
     geoipTags: ['twitter'],
+    processNames: ['Twitter', 'X', 'Twitter.exe'],
     category: 'social',
   },
   {
@@ -86,6 +89,7 @@ export const APP_PRESETS: AppPreset[] = [
     emoji: '📷',
     iconUrl: `${QURE_BASE}/Instagram.png`,
     geositeTags: ['instagram'],
+    processNames: ['Instagram', 'Instagram.exe'],
     category: 'social',
   },
   // ── AI ────────────────────────────────────────────
@@ -95,6 +99,7 @@ export const APP_PRESETS: AppPreset[] = [
     emoji: '🤖',
     iconUrl: `${QURE_BASE}/ChatGPT.png`,
     geositeTags: ['openai'],
+    processNames: ['ChatGPT', 'ChatGPT.exe'],
     category: 'ai',
   },
   {
@@ -104,6 +109,7 @@ export const APP_PRESETS: AppPreset[] = [
     iconUrl:
       'https://raw.githubusercontent.com/lige47/QuanX-icon-rule/main/icon/04ProxySoft/claude.png',
     geositeTags: ['anthropic'],
+    processNames: ['Claude', 'Claude.exe'],
     category: 'ai',
   },
   {
@@ -112,8 +118,7 @@ export const APP_PRESETS: AppPreset[] = [
     emoji: '✨',
     iconUrl:
       'https://raw.githubusercontent.com/lige47/QuanX-icon-rule/main/icon/04ProxySoft/gemini.png',
-    geositeTags: ['google-gemini', 'google-palm', 'google'],
-    geoipTags: ['google'],
+    geositeTags: ['google'],
     category: 'ai',
   },
   // ── 工具 ──────────────────────────────────────────
@@ -123,6 +128,7 @@ export const APP_PRESETS: AppPreset[] = [
     emoji: '🐙',
     iconUrl: `${QURE_BASE}/GitHub.png`,
     geositeTags: ['github'],
+    processNames: ['GitHub Desktop', 'GitHubDesktop.exe', 'git', 'git.exe', 'GitHub'],
     category: 'tools',
   },
   {
@@ -131,7 +137,6 @@ export const APP_PRESETS: AppPreset[] = [
     emoji: '🔍',
     iconUrl: `${QURE_BASE}/Google_Search.png`,
     geositeTags: ['google'],
-    geoipTags: ['google'],
     category: 'tools',
   },
   {
@@ -140,6 +145,7 @@ export const APP_PRESETS: AppPreset[] = [
     emoji: '🎧',
     iconUrl: `${QURE_BASE}/Spotify.png`,
     geositeTags: ['spotify'],
+    processNames: ['Spotify', 'Spotify.exe'],
     category: 'tools',
   },
   {
@@ -148,6 +154,7 @@ export const APP_PRESETS: AppPreset[] = [
     emoji: '🍎',
     iconUrl: `${QURE_BASE}/Apple.png`,
     geositeTags: ['apple'],
+    processNames: ['App Store', 'Software Update', 'cloudd', 'nsurlsessiond'],
     category: 'tools',
   },
   // ── 游戏 ──────────────────────────────────────────
@@ -157,6 +164,7 @@ export const APP_PRESETS: AppPreset[] = [
     emoji: '🎮',
     iconUrl: `${QURE_BASE}/Steam.png`,
     geositeTags: ['steam'],
+    processNames: ['Steam', 'steam.exe'],
     category: 'game',
   },
   {
@@ -165,6 +173,7 @@ export const APP_PRESETS: AppPreset[] = [
     emoji: '🏰',
     iconUrl: `${QURE_BASE}/Disney.png`,
     geositeTags: ['disney'],
+    processNames: ['Disney+'],
     category: 'video',
   },
 ];
