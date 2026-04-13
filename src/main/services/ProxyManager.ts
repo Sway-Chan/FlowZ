@@ -962,16 +962,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       }
     );
 
-    // 如果开启了局域网共享，额外监听 DNS 端口提供服务
-    // macOS 上 53 端口通常被占用，使用 5353 或其它非准入端口更稳健
-    if (config.allowLan) {
-      inbounds.push({
-        type: 'dns',
-        tag: 'dns-in',
-        listen: '::',
-        listen_port: process.platform === 'darwin' ? 5353 : 53,
-      } as any);
-    }
+
 
     // Mixed 端口（可选）：同时接受 HTTP 和 SOCKS5 请求
     if (config.mixedPort && config.mixedPort > 0) {
@@ -1797,6 +1788,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           routeConfig.rule_set = [];
         }
         routeConfig.rule_set.push(...customRuleSets);
+      }
+
+      // 排除进程规则：优先级最高，在应用分流之前插入，确保用户明确指定绕过的进程不被任何规则覆盖
+      if (config.bypassProcesses && config.bypassProcesses.length > 0) {
+        rules.push({
+          process_name: config.bypassProcesses,
+          action: 'route',
+          outbound: 'direct',
+        });
       }
 
       // 应用分流规则（真·应用分流，基于进程名）

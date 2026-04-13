@@ -414,6 +414,14 @@ export class ConfigManager implements IConfigManager {
       config.rememberWindowSize = false;
     }
 
+    // bypassProcesses 是可选字段，兼容旧配置
+    if (config.bypassProcesses === undefined) {
+      config.bypassProcesses = [];
+    }
+    if (!Array.isArray(config.bypassProcesses)) {
+      throw new Error('bypassProcesses must be an array');
+    }
+
     // 验证端口
     if (typeof config.socksPort !== 'number' || config.socksPort < 1 || config.socksPort > 65535) {
       throw new Error('socksPort must be a number between 1 and 65535');
