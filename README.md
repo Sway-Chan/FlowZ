@@ -19,6 +19,7 @@
 - ✅ 支持 NaïveProxy、VLESS、VMess、Trojan、Hysteria2、Shadowsocks、Anytls、TUIC、Shadows-tls协议。
 - ✅ 强大的路由规则系统（支持 geosite / geoip 规则集）
 - ✅ 多种代理模式（全局 / 智能 / 直连）
+- ✅ 应用分流策略组模块
 - ✅ 支持订阅链接
 - ✅ TUN 透明代理模式（支持 System / gVisor / Mixed 堆栈）
 - ✅ 系统级代理自动接管
@@ -30,6 +31,7 @@
 - ✅ 现代化 UI（基于 shadcn/ui）
 - ✅ 支持连接拓扑展示功能
 - ✅ 支持隐私保护模式
+- ✅ 支持排除进程代理模式
 - ✅ 跨平台支持（Windows / macOS / Linux（测试））
 - ✅ 支持中英文语言切换
 ---
