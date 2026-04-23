@@ -28,6 +28,19 @@ export function AdvancedSettings() {
   const configRef = useRef(config);
   const { t } = useTranslation();
 
+  // Synchronize local state when config loads or changes
+  useEffect(() => {
+    if (config) {
+      setSocksPort(config.socksPort?.toString() || '2081');
+      setHttpPort(config.httpPort?.toString() || '2080');
+      const hasMixed = (config.mixedPort ?? 0) > 0;
+      setMixedPortEnabled(hasMixed);
+      if (hasMixed) {
+        setMixedPort(config.mixedPort?.toString() || '7890');
+      }
+    }
+  }, [config]);
+
   useEffect(() => {
     configRef.current = config;
   }, [config]);
@@ -187,7 +200,13 @@ export function AdvancedSettings() {
   };
 
   if (!config) {
-    return null;
+    return (
+      <Card>
+        <CardContent className="p-6 flex items-center justify-center min-h-[200px]">
+          <div className="animate-pulse text-muted-foreground">{t('common.loading')}</div>
+        </CardContent>
+      </Card>
+    );
   }
 
   return (

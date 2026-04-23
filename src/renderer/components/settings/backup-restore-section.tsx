@@ -111,8 +111,11 @@ export function BackupRestoreSection() {
   };
 
   // ── Helpers ──────────────────────────────────────────────────────────────────
+  const manualCount = backupInfo?.manualServerCount ?? 0;
+  const subCount = backupInfo?.subscriptionCount ?? 0;
   const totalNodes = backupInfo?.serverCount ?? 0;
-  const hasData = totalNodes > 0 || (backupInfo?.subscriptionCount ?? 0) > 0;
+  const nodesFromSubs = Math.max(0, totalNodes - manualCount);
+  const hasData = totalNodes > 0 || subCount > 0;
 
   return (
     <div className="space-y-4 pt-4 border-t">
@@ -195,7 +198,7 @@ export function BackupRestoreSection() {
                 <span className="text-xs text-muted-foreground">
                   (
                   {t('settings.advanced.backup.subNodes', {
-                    count: totalNodes - (backupInfo?.manualServerCount ?? 0),
+                    count: nodesFromSubs,
                   })}
                   )
                 </span>
