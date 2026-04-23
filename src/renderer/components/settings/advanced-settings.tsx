@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState, type KeyboardEvent } from 'react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
@@ -20,7 +20,118 @@ export function AdvancedSettings() {
     config?.mixedPort && config.mixedPort > 0 ? config.mixedPort.toString() : '7890'
   );
   const [isLoading, setIsLoading] = useState(false);
+  const [updateMirrorInput, setUpdateMirrorInput] = useState(
+    config?.updateMirror ?? 'https://gh-proxy.org/'
+  );
+  const [mirrorSlashAutoAdded, setMirrorSlashAutoAdded] = useState(false);
+  const mirrorSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const configRef = useRef(config);
   const { t } = useTranslation();
+
+  useEffect(() => {
+    configRef.current = config;
+  }, [config]);
+
+  useEffect(() => {
+    const next = config?.updateMirror ?? 'https://gh-proxy.org/';
+    setUpdateMirrorInput(next);
+    setMirrorSlashAutoAdded(false);
+  }, [config?.updateMirror]);
+
+  useEffect(() => {
+    return () => {
+      if (mirrorSaveTimerRef.current) {
+        clearTimeout(mirrorSaveTimerRef.current);
+      }
+    };
+  }, []);
+
+  const normalizeUpdateMirror = (input: string): string => {
+    let normalized = input.trim();
+    if (!normalized) return '';
+    if (normalized.includes('{url}')) return normalized;
+
+    if (/^(https?):[^/]/i.test(normalized)) {
+      normalized = normalized.replace(/^(https?):/i, '$1://');
+    } else if (/^(https?):\/(?!\/)/i.test(normalized)) {
+      normalized = normalized.replace(/^(https?):\/(?!\/)/i, '$1://');
+    }
+
+    if (normalized.endsWith('/')) return normalized;
+
+    try {
+      const url = new URL(normalized);
+      const protocol = url.protocol.toLowerCase();
+      if (protocol !== 'http:' && protocol !== 'https:') {
+        return normalized;
+      }
+
+      const host = url.hostname.toLowerCase();
+      const isIp = /^(?:\d{1,3}\.){3}\d{1,3}$/.test(host);
+      const isLocalhost = host === 'localhost';
+      const hasDot = host.includes('.');
+      if (!isIp && !isLocalhost && !hasDot) {
+        return normalized;
+      }
+
+      return `${normalized}/`;
+    } catch {
+      return normalized;
+    }
+  };
+
+  const scheduleMirrorSave = (rawValue: string) => {
+    if (mirrorSaveTimerRef.current) {
+      clearTimeout(mirrorSaveTimerRef.current);
+    }
+
+    mirrorSaveTimerRef.current = setTimeout(async () => {
+      const current = configRef.current;
+      if (!current) return;
+
+      const normalized = normalizeUpdateMirror(rawValue);
+      const base = current.updateMirror ?? 'https://gh-proxy.org/';
+
+      if (normalized !== rawValue) {
+        setUpdateMirrorInput(normalized);
+        setMirrorSlashAutoAdded(normalized.endsWith('/'));
+      } else {
+        setMirrorSlashAutoAdded(false);
+      }
+
+      if (normalized !== base) {
+        await saveConfig({ ...current, updateMirror: normalized });
+      }
+    }, 600);
+  };
+
+  const handleUpdateMirrorChange = (value: string) => {
+    setMirrorSlashAutoAdded(false);
+    setUpdateMirrorInput(value);
+    scheduleMirrorSave(value);
+  };
+
+  const handleUpdateMirrorKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
+    if (!mirrorSlashAutoAdded || !updateMirrorInput.endsWith('/')) return;
+
+    const isPrintable = e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey;
+    if (isPrintable) {
+      e.preventDefault();
+      const next = updateMirrorInput.slice(0, -1) + e.key;
+      setMirrorSlashAutoAdded(false);
+      setUpdateMirrorInput(next);
+      scheduleMirrorSave(next);
+      return;
+    }
+
+    if (e.key === 'Backspace') {
+      e.preventDefault();
+      const next = updateMirrorInput.slice(0, -1);
+      setMirrorSlashAutoAdded(false);
+      setUpdateMirrorInput(next);
+      scheduleMirrorSave(next);
+    }
+  };
 
   const handleSavePorts = async () => {
     if (!config) return;
@@ -163,6 +274,21 @@ export function AdvancedSettings() {
             <p className="text-xs text-muted-foreground ml-6 mb-2">
               {t('settings.advanced.fakeIpDesc')}
             </p>
+
+            <div className="space-y-2 pt-2 border-t border-dashed">
+              <Label htmlFor="updateMirror">{t('settings.advanced.updateMirror')}</Label>
+              <Input
+                id="updateMirror"
+                value={updateMirrorInput}
+                onChange={(e) => handleUpdateMirrorChange(e.target.value)}
+                onKeyDown={handleUpdateMirrorKeyDown}
+                className="max-w-md"
+                placeholder={t('settings.advanced.updateMirrorPlaceholder')}
+              />
+              <p className="text-xs text-muted-foreground">
+                {t('settings.advanced.updateMirrorDesc')}
+              </p>
+            </div>
 
             <div className="flex items-center space-x-2 pt-3 border-t">
               <Checkbox

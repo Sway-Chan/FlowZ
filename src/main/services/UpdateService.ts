@@ -8,10 +8,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { LogManager } from './LogManager';
 import type { UpdateInfo, UpdateCheckResult, UpdateProgress } from '../../shared/types/update';
-import { getUserDataPath } from '../utils/paths';
+import type { UserConfig } from '../../shared/types';
+import { getConfigPath, getUserDataPath } from '../utils/paths';
 
 const GITHUB_OWNER = 'dododook';
 const GITHUB_REPO = 'FlowZ';
+const DEFAULT_UPDATE_MIRROR = 'https://gh-proxy.org/';
 
 export class UpdateService {
   private logManager: LogManager;
@@ -145,7 +147,8 @@ export class UpdateService {
         fs.unlinkSync(filePath);
       }
 
-      await this.downloadFile(updateInfo.downloadUrl, filePath, updateInfo.fileSize);
+      const { primaryUrl, fallbackUrl } = this.resolveDownloadUrls(updateInfo.downloadUrl);
+      await this.downloadFile(primaryUrl, filePath, updateInfo.fileSize, false, fallbackUrl);
 
       this.logManager.addLog('info', `更新下载完成: ${filePath}`, 'UpdateService');
       this.updateProgress({ status: 'downloaded', percentage: 100, message: '下载完成' });
@@ -495,6 +498,7 @@ open "${installerPath}"
 
       const downloadDir = app.getPath('temp');
       const filePath = path.join(downloadDir, updateInfo.fileName);
+      const { primaryUrl, fallbackUrl } = this.resolveDownloadUrls(updateInfo.downloadUrl);
 
       // 如果文件已存在，先删除
       if (fs.existsSync(filePath)) {
@@ -502,9 +506,11 @@ open "${installerPath}"
       }
 
       await this.downloadFileWithProgressWindow(
-        updateInfo.downloadUrl,
+        primaryUrl,
         filePath,
-        updateInfo.fileSize
+        updateInfo.fileSize,
+        false,
+        fallbackUrl
       );
 
       this.logManager.addLog('info', `更新下载完成: ${filePath}`, 'UpdateService');
@@ -614,7 +620,8 @@ open "${installerPath}"
     url: string,
     destPath: string,
     totalSize: number,
-    isRetry = false
+    isRetry = false,
+    fallbackUrl?: string
   ): Promise<void> {
     return new Promise((resolve, reject) => {
       const file = fs.createWriteStream(destPath);
@@ -624,19 +631,18 @@ open "${installerPath}"
         file.close();
         if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
 
-        if (!isRetry && url.includes('github.com')) {
+        if (!isRetry && fallbackUrl) {
           this.logManager.addLog(
             'warn',
             `下载出错，尝试使用加速镜像: ${err.message}`,
             'UpdateService'
           );
-          const mirrorUrl = `https://ghp.ci/${url}`;
           this.updateProgress({
             status: 'downloading',
             percentage: 0,
             message: '正在尝试通过镜像下载...',
           });
-          this.downloadFile(mirrorUrl, destPath, totalSize, true).then(resolve).catch(reject);
+          this.downloadFile(fallbackUrl, destPath, totalSize, true).then(resolve).catch(reject);
           return;
         }
         reject(err);
@@ -704,7 +710,8 @@ open "${installerPath}"
     url: string,
     destPath: string,
     totalSize: number,
-    isRetry = false
+    isRetry = false,
+    fallbackUrl?: string
   ): Promise<void> {
     return new Promise((resolve, reject) => {
       const file = fs.createWriteStream(destPath);
@@ -714,15 +721,14 @@ open "${installerPath}"
         file.close();
         if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
 
-        if (!isRetry && url.includes('github.com')) {
+        if (!isRetry && fallbackUrl) {
           this.logManager.addLog(
             'warn',
             `下载出错，尝试使用加速镜像: ${err.message}`,
             'UpdateService'
           );
-          const mirrorUrl = `https://ghp.ci/${url}`;
           this.updateProgressWindow(0, '正在尝试通过镜像下载...');
-          this.downloadFileWithProgressWindow(mirrorUrl, destPath, totalSize, true)
+          this.downloadFileWithProgressWindow(fallbackUrl, destPath, totalSize, true)
             .then(resolve)
             .catch(reject);
           return;
@@ -818,5 +824,51 @@ open "${installerPath}"
     } catch {
       // 忽略错误
     }
+  }
+
+  private resolveDownloadUrls(url: string): { primaryUrl: string; fallbackUrl?: string } {
+    if (!url.includes('github.com')) {
+      return { primaryUrl: url };
+    }
+
+    const mirrorUrl = this.buildMirrorUrl(url);
+    if (mirrorUrl && mirrorUrl !== url) {
+      // 配置了镜像时优先使用镜像，失败再回退到原始直连 URL
+      return { primaryUrl: mirrorUrl, fallbackUrl: url };
+    }
+
+    // 未配置镜像时保留历史行为：先直连，失败再尝试默认镜像
+    return { primaryUrl: url, fallbackUrl: `${DEFAULT_UPDATE_MIRROR}${url}` };
+  }
+
+  private buildMirrorUrl(url: string): string | null {
+    const mirror = this.getUpdateMirror();
+    if (!mirror) return null;
+
+    if (mirror.includes('{url}')) {
+      return mirror.replace('{url}', url);
+    }
+
+    const prefix = mirror.endsWith('/') ? mirror : `${mirror}/`;
+    return `${prefix}${url}`;
+  }
+
+  private getUpdateMirror(): string {
+    try {
+      const configPath = getConfigPath();
+      if (!fs.existsSync(configPath)) {
+        return DEFAULT_UPDATE_MIRROR;
+      }
+
+      const raw = fs.readFileSync(configPath, 'utf-8');
+      const config = JSON.parse(raw) as Partial<UserConfig>;
+      if (typeof config.updateMirror === 'string') {
+        return config.updateMirror.trim();
+      }
+    } catch {
+      // ignore and fallback
+    }
+
+    return DEFAULT_UPDATE_MIRROR;
   }
 }

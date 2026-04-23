@@ -10,6 +10,10 @@ import * as path from 'path';
 import { LogManager } from './LogManager';
 import { ProxyManager } from './ProxyManager';
 import { resourceManager } from './ResourceManager';
+import type { UserConfig } from '../../shared/types';
+import { getConfigPath } from '../utils/paths';
+
+const DEFAULT_UPDATE_MIRROR = 'https://gh-proxy.org/';
 
 export interface CoreUpdateCheckResult {
   hasUpdate: boolean;
@@ -115,7 +119,8 @@ export class CoreUpdateService {
     try {
       // 1. 下载文件
       this.logManager.addLog('info', '开始下载核心文件...', 'CoreUpdateService');
-      const tempPath = await this.downloadFile(downloadUrl);
+      const { primaryUrl, fallbackUrl } = this.resolveDownloadUrls(downloadUrl);
+      const tempPath = await this.downloadFile(primaryUrl, false, fallbackUrl);
 
       // 2. 解压文件 (如果需要)
       // Sing-box release 通常是 .tar.gz 或 .zip
@@ -614,7 +619,7 @@ export class CoreUpdateService {
     return filteredAssets[0];
   }
 
-  private async downloadFile(url: string, isRetry = false): Promise<string> {
+  private async downloadFile(url: string, isRetry = false, fallbackUrl?: string): Promise<string> {
     // 根据系统平台设置合理的默认扩展名
     let ext = process.platform === 'win32' ? '.zip' : '.tar.gz';
     try {
@@ -647,15 +652,14 @@ export class CoreUpdateService {
         file.close();
         fs.unlink(tempPath, () => {});
 
-        // 遇到网络错误，且是第一次尝试，并且是 github 链接，尝试使用加速镜像
-        if (!isRetry && url.includes('github.com')) {
+        // 遇到网络错误时尝试备用下载线路
+        if (!isRetry && fallbackUrl) {
           this.logManager.addLog(
             'warn',
             `下载出错，尝试使用加速镜像: ${err.message}`,
             'CoreUpdateService'
           );
-          const mirrorUrl = `https://ghp.ci/${url}`;
-          this.downloadFile(mirrorUrl, true).then(resolve).catch(reject);
+          this.downloadFile(fallbackUrl, true).then(resolve).catch(reject);
           return;
         }
 
@@ -690,6 +694,52 @@ export class CoreUpdateService {
 
       request.end();
     });
+  }
+
+  private resolveDownloadUrls(url: string): { primaryUrl: string; fallbackUrl?: string } {
+    if (!url.includes('github.com')) {
+      return { primaryUrl: url };
+    }
+
+    const mirrorUrl = this.buildMirrorUrl(url);
+    if (mirrorUrl && mirrorUrl !== url) {
+      // 配置了镜像时优先使用镜像，失败再回退到原始直连 URL
+      return { primaryUrl: mirrorUrl, fallbackUrl: url };
+    }
+
+    // 未配置镜像时保留历史行为：先直连，失败再尝试默认镜像
+    return { primaryUrl: url, fallbackUrl: `${DEFAULT_UPDATE_MIRROR}${url}` };
+  }
+
+  private buildMirrorUrl(url: string): string | null {
+    const mirror = this.getUpdateMirror();
+    if (!mirror) return null;
+
+    if (mirror.includes('{url}')) {
+      return mirror.replace('{url}', url);
+    }
+
+    const prefix = mirror.endsWith('/') ? mirror : `${mirror}/`;
+    return `${prefix}${url}`;
+  }
+
+  private getUpdateMirror(): string {
+    try {
+      const configPath = getConfigPath();
+      if (!fs.existsSync(configPath)) {
+        return DEFAULT_UPDATE_MIRROR;
+      }
+
+      const raw = fs.readFileSync(configPath, 'utf-8');
+      const config = JSON.parse(raw) as Partial<UserConfig>;
+      if (typeof config.updateMirror === 'string') {
+        return config.updateMirror.trim();
+      }
+    } catch {
+      // ignore and fallback
+    }
+
+    return DEFAULT_UPDATE_MIRROR;
   }
 
   private async extractCore(filePath: string): Promise<{ corePath: string; extractDir: string }> {

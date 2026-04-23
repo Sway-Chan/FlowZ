@@ -292,6 +292,7 @@ export interface UserConfig {
   autoConnect: boolean;
   minimizeToTray: boolean;
   autoCheckUpdate: boolean;
+  updateMirror?: string; // 更新下载镜像前缀，例如 https://ghp.ci/
   autoLightweightMode: boolean;
   autoUpdateSubscriptionOnStart: boolean; // 启动时自动更新订阅
   rememberWindowSize?: boolean; // 记忆调整后的窗口大小

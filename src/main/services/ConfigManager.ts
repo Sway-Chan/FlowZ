@@ -394,6 +394,17 @@ export class ConfigManager implements IConfigManager {
       config.autoCheckUpdate = true;
     }
 
+    // updateMirror 是可选字段，兼容旧配置
+    if (config.updateMirror !== undefined && typeof config.updateMirror !== 'string') {
+      throw new Error('updateMirror must be a string');
+    }
+    // 默认启用 GitHub 加速镜像；留空字符串可禁用镜像
+    if (config.updateMirror === undefined) {
+      config.updateMirror = 'https://gh-proxy.org/';
+    } else {
+      config.updateMirror = this.normalizeUpdateMirror(config.updateMirror);
+    }
+
     // autoLightweightMode 是可选字段，兼容旧配置
     if (
       config.autoLightweightMode !== undefined &&
@@ -458,6 +469,7 @@ export class ConfigManager implements IConfigManager {
       autoConnect: false,
       minimizeToTray: true,
       autoCheckUpdate: true, // 默认启用启动时自动检查更新
+      updateMirror: 'https://gh-proxy.org/', // 更新下载镜像前缀，留空可禁用
       autoLightweightMode: false, // 默认不启用自动轻量模式
       autoUpdateSubscriptionOnStart: false, // 默认不启用启动时更新订阅
       rememberWindowSize: false, // 默认不启用记忆窗口大小
@@ -480,5 +492,47 @@ export class ConfigManager implements IConfigManager {
       logLevel: 'info',
       uiTheme: 'system',
     };
+  }
+
+  /**
+   * 标准化更新镜像地址：
+   * - 留空 => 禁用镜像
+   * - 包含 {url} 模板 => 原样保留
+   * - 普通前缀地址 => 自动补齐末尾 /
+   */
+  private normalizeUpdateMirror(input: string): string {
+    let normalized = input.trim();
+    if (!normalized) return '';
+    if (normalized.includes('{url}')) return normalized;
+
+    // 容错：https:fsef.g 或 https:/fsef.g => https://fsef.g
+    if (/^(https?):[^/]/i.test(normalized)) {
+      normalized = normalized.replace(/^(https?):/i, '$1://');
+    } else if (/^(https?):\/(?!\/)/i.test(normalized)) {
+      normalized = normalized.replace(/^(https?):\/(?!\/)/i, '$1://');
+    }
+
+    if (normalized.endsWith('/')) return normalized;
+
+    // 只对“看起来已完成”的 URL 自动补 `/`，避免用户逐字输入时被打断
+    try {
+      const url = new URL(normalized);
+      const protocol = url.protocol.toLowerCase();
+      if (protocol !== 'http:' && protocol !== 'https:') {
+        return normalized;
+      }
+
+      const host = url.hostname.toLowerCase();
+      const isIp = /^(?:\d{1,3}\.){3}\d{1,3}$/.test(host);
+      const isLocalhost = host === 'localhost';
+      const hasDot = host.includes('.');
+      if (!isIp && !isLocalhost && !hasDot) {
+        return normalized;
+      }
+
+      return `${normalized}/`;
+    } catch {
+      return normalized;
+    }
   }
 }
