@@ -39,6 +39,8 @@ type SingboxOutbound = {
   plugin?: string;
   plugin_opts?: string;
   obfs?: { type?: string; password?: string };
+  server_ports?: string[] | string;
+  hop_interval?: string;
   tls?: SingboxTls;
   transport?: SingboxTransport;
 };
@@ -163,10 +165,22 @@ export class SubscriptionService {
             password: ob.password ?? '',
             security: 'tls',
           };
+          const hy2Settings: NonNullable<ServerConfig['hysteria2Settings']> = {};
+
           if (ob.obfs?.type === 'salamander' && ob.obfs.password) {
-            hy2.hysteria2Settings = {
-              obfs: { type: 'salamander', password: ob.obfs.password },
-            };
+            hy2Settings.obfs = { type: 'salamander', password: ob.obfs.password };
+          }
+          if (ob.server_ports) {
+            hy2Settings.serverPorts = Array.isArray(ob.server_ports)
+              ? ob.server_ports.join(',')
+              : ob.server_ports;
+          }
+          if (ob.hop_interval) {
+            hy2Settings.hopInterval = ob.hop_interval;
+          }
+
+          if (Object.keys(hy2Settings).length > 0) {
+            hy2.hysteria2Settings = hy2Settings;
           }
           servers.push(hy2);
         }

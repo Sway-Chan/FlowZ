@@ -184,6 +184,8 @@ interface SingBoxOutbound {
     password: string;
   };
   network?: string;
+  server_ports?: string[];
+  hop_interval?: string;
   // TUIC specific
   congestion_control?: string;
   udp_relay_mode?: string;
@@ -1337,6 +1339,29 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       // 网络类型 (tcp/udp)
       if (server.hysteria2Settings?.network) {
         outbound.network = server.hysteria2Settings.network;
+      }
+
+      if (server.hysteria2Settings?.serverPorts) {
+        const serverPorts = server.hysteria2Settings.serverPorts
+          .split(/[,，]/)
+          .map((port) => port.trim())
+          .filter((port) => port.length > 0)
+          .map((port) => {
+            const rangeMatch = port.match(/^(\d+)\s*-\s*(\d+)$/);
+            if (rangeMatch) {
+              return `${rangeMatch[1]}:${rangeMatch[2]}`;
+            }
+            return port;
+          });
+        if (serverPorts.length > 0) {
+          outbound.server_ports = serverPorts;
+          delete outbound.server_port;
+        }
+      }
+
+      if (server.hysteria2Settings?.hopInterval) {
+        const hopInterval = server.hysteria2Settings.hopInterval.trim();
+        outbound.hop_interval = /^\d+$/.test(hopInterval) ? `${hopInterval}s` : hopInterval;
       }
     }
 

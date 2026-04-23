@@ -312,6 +312,17 @@ export class ProtocolParser implements IProtocolParser {
       hysteria2Settings.network = network;
     }
 
+    const serverPorts = params.get('mport') || params.get('ports') || params.get('server_ports');
+    if (serverPorts) {
+      hysteria2Settings.serverPorts = serverPorts;
+    }
+
+    const hopInterval =
+      params.get('hop-interval') || params.get('hop_interval') || params.get('hopInterval');
+    if (hopInterval) {
+      hysteria2Settings.hopInterval = /^\d+$/.test(hopInterval) ? `${hopInterval}s` : hopInterval;
+    }
+
     // 只有在有设置时才添加
     if (Object.keys(hysteria2Settings).length > 0) {
       config.hysteria2Settings = hysteria2Settings;
@@ -1112,6 +1123,12 @@ export class ProtocolParser implements IProtocolParser {
       }
       if (config.hysteria2Settings.network) {
         params.set('network', config.hysteria2Settings.network);
+      }
+      if (config.hysteria2Settings.serverPorts) {
+        params.set('mport', config.hysteria2Settings.serverPorts);
+      }
+      if (config.hysteria2Settings.hopInterval) {
+        params.set('hop-interval', config.hysteria2Settings.hopInterval);
       }
     }
 

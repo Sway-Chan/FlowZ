@@ -26,6 +26,8 @@ const createHysteria2Schema = (t: any) =>
     // 带宽限制
     upMbps: z.number().optional(),
     downMbps: z.number().optional(),
+    serverPorts: z.string().optional(),
+    hopInterval: z.string().optional(),
     // 混淆设置
     obfsEnabled: z.boolean(),
     obfsPassword: z.string().optional(),
@@ -41,6 +43,12 @@ interface Hysteria2FormProps {
   onSubmit: (config: any) => Promise<void>;
 }
 
+const normalizeHopInterval = (value?: string): string | undefined => {
+  const input = value?.trim();
+  if (!input) return undefined;
+  return /^\d+$/.test(input) ? `${input}s` : input;
+};
+
 export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
   const { t } = useTranslation();
   const hysteria2FormSchema = createHysteria2Schema(t);
@@ -53,6 +61,8 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
       password: '',
       upMbps: undefined,
       downMbps: undefined,
+      serverPorts: '',
+      hopInterval: '',
       obfsEnabled: false,
       obfsPassword: '',
       tlsServerName: '',
@@ -69,6 +79,8 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
         password: serverConfig.password || '',
         upMbps: serverConfig.hysteria2Settings?.upMbps ?? undefined,
         downMbps: serverConfig.hysteria2Settings?.downMbps ?? undefined,
+        serverPorts: serverConfig.hysteria2Settings?.serverPorts || '',
+        hopInterval: serverConfig.hysteria2Settings?.hopInterval || '',
         obfsEnabled: !!serverConfig.hysteria2Settings?.obfs?.type,
         obfsPassword: serverConfig.hysteria2Settings?.obfs?.password || '',
         tlsServerName: serverConfig.tlsSettings?.serverName || '',
@@ -94,6 +106,8 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
       hysteria2Settings: {
         upMbps: values.upMbps || undefined,
         downMbps: values.downMbps || undefined,
+        serverPorts: values.serverPorts?.trim() || undefined,
+        hopInterval: normalizeHopInterval(values.hopInterval),
         obfs:
           values.obfsEnabled && values.obfsPassword
             ? {
@@ -108,6 +122,7 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
   };
 
   const isObfsEnabled = form.watch('obfsEnabled');
+  const hasServerPorts = !!form.watch('serverPorts')?.trim();
 
   return (
     <Form {...form}>
@@ -138,6 +153,7 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
                   type="number"
                   placeholder="443"
                   {...field}
+                  disabled={hasServerPorts}
                   onChange={(e) => field.onChange(parseInt(e.target.value) || 0)}
                 />
               </FormControl>
@@ -206,6 +222,38 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
                   />
                 </FormControl>
                 <FormDescription>{t('servers.bbrDesc')}</FormDescription>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+        </div>
+
+        <div className="grid grid-cols-2 gap-4">
+          <FormField
+            control={form.control}
+            name="serverPorts"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>{t('servers.serverPorts')}</FormLabel>
+                <FormControl>
+                  <Input placeholder="47000:48000,50000" {...field} />
+                </FormControl>
+                <FormDescription>{t('servers.serverPortsDesc')}</FormDescription>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+
+          <FormField
+            control={form.control}
+            name="hopInterval"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>{t('servers.hopInterval')}</FormLabel>
+                <FormControl>
+                  <Input placeholder="18" {...field} />
+                </FormControl>
+                <FormDescription>{t('servers.hopIntervalDesc')}</FormDescription>
                 <FormMessage />
               </FormItem>
             )}

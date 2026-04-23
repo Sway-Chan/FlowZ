@@ -74,6 +74,8 @@ export interface Hysteria2Settings {
   downMbps?: number;
   obfs?: Hysteria2ObfsSettings;
   network?: Hysteria2Network;
+  serverPorts?: string;
+  hopInterval?: string;
 }
 
 // TUIC 协议设置
