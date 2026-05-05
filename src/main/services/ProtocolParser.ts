@@ -749,9 +749,11 @@ export class ProtocolParser implements IProtocolParser {
     const address = this.stripIpv6Brackets(urlObj.hostname);
     const port = parseInt(urlObj.port) || 1080;
     const name = decodeURIComponent(urlObj.hash.slice(1)) || `${address}:${port}`;
-    
-    // Credentials 
-    const credentials = decodeURIComponent(urlObj.username + (urlObj.password ? ':' + urlObj.password : ''));
+
+    // Credentials
+    const credentials = decodeURIComponent(
+      urlObj.username + (urlObj.password ? ':' + urlObj.password : '')
+    );
     const username = urlObj.username ? credentials.split(':')[0] : undefined;
     const password = urlObj.password ? credentials.split(':').slice(1).join(':') : undefined;
 
@@ -779,9 +781,11 @@ export class ProtocolParser implements IProtocolParser {
     const defaultPort = urlObj.protocol.includes('https') ? 443 : 80;
     const port = parseInt(urlObj.port) || defaultPort;
     const name = decodeURIComponent(urlObj.hash.slice(1)) || `${address}:${port}`;
-    
-    // Credentials 
-    const credentials = decodeURIComponent(urlObj.username + (urlObj.password ? ':' + urlObj.password : ''));
+
+    // Credentials
+    const credentials = decodeURIComponent(
+      urlObj.username + (urlObj.password ? ':' + urlObj.password : '')
+    );
     const username = urlObj.username ? credentials.split(':')[0] : undefined;
     const password = urlObj.password ? credentials.split(':').slice(1).join(':') : undefined;
 
@@ -1040,8 +1044,6 @@ export class ProtocolParser implements IProtocolParser {
     const credentials = username || password ? `${username}:${password}@` : '';
     return `${protocolPrefix}${credentials}${config.address}:${config.port}#${name}`;
   }
-
-
 
   /**
    * 生成 VLESS URL

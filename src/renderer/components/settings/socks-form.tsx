@@ -120,7 +120,9 @@ export function SocksForm({ serverConfig, onSubmit }: SocksFormProps) {
           name="username"
           render={({ field }) => (
             <FormItem>
-              <FormLabel>{t('servers.username')} ({t('servers.optional', 'Optional')})</FormLabel>
+              <FormLabel>
+                {t('servers.username')} ({t('servers.optional', 'Optional')})
+              </FormLabel>
               <FormControl>
                 <Input placeholder={t('servers.usernamePlaceholder', 'Username')} {...field} />
               </FormControl>
@@ -134,9 +136,15 @@ export function SocksForm({ serverConfig, onSubmit }: SocksFormProps) {
           name="password"
           render={({ field }) => (
             <FormItem>
-              <FormLabel>{t('servers.password')} ({t('servers.optional', 'Optional')})</FormLabel>
+              <FormLabel>
+                {t('servers.password')} ({t('servers.optional', 'Optional')})
+              </FormLabel>
               <FormControl>
-                <Input type="password" placeholder={t('servers.passwordPlaceholder', 'Password')} {...field} />
+                <Input
+                  type="password"
+                  placeholder={t('servers.passwordPlaceholder', 'Password')}
+                  {...field}
+                />
               </FormControl>
               <FormMessage />
             </FormItem>

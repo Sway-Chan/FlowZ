@@ -232,7 +232,9 @@ export class WindowsSystemProxy extends SystemProxyBase {
       execSync('netsh advfirewall firewall delete rule name="FlowZ_Block_QUIC"', {
         stdio: 'ignore',
       });
-    } catch {}
+    } catch {
+      /* ignore */
+    }
 
     try {
       execSync(`reg add "${this.regPath}" /v ProxyEnable /t REG_DWORD /d 0 /f`, {
@@ -527,7 +529,9 @@ export class MacOSSystemProxy extends SystemProxyBase {
           execSync(`networksetup -setsocksfirewallproxystate "${service}" off`, {
             stdio: 'ignore',
           });
-        } catch {}
+        } catch {
+          /* ignore */
+        }
       }
     } catch (error) {
       console.error('同步禁用 macOS 系统代理失败:', error);
@@ -757,13 +761,17 @@ export class LinuxSystemProxy extends SystemProxyBase {
     try {
       // GNOME
       execSync('gsettings set org.gnome.system.proxy mode "none"', { stdio: 'ignore' });
-    } catch {}
+    } catch {
+      /* ignore */
+    }
     try {
       // KDE
       execSync('kwriteconfig5 --file kioslaverc --group "Proxy Settings" --key "ProxyType" 0', {
         stdio: 'ignore',
       });
-    } catch {}
+    } catch {
+      /* ignore */
+    }
   }
 }
 

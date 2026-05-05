@@ -430,7 +430,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
             if (address) {
               resolvedServerIps[serverId] = address;
             }
-          } catch (e) {}
+          } catch {
+            /* ignore */
+          }
         }
       });
       await Promise.all(resolvePromises);
@@ -4055,7 +4057,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         const refreshCmd = `powershell -NoProfile -Command "$sig = '[DllImport(\\"wininet.dll\\")] public static extern bool InternetSetOption(int hInternet, int dwOption, int lpBuffer, int dwBufferLength);'; $type = Add-Type -MemberDefinition $sig -Name 'WinInet' -Namespace 'Proxy' -PassThru; $type::InternetSetOption(0, 39, 0, 0); $type::InternetSetOption(0, 37, 0, 0);"`;
         try {
           await runCommand(refreshCmd);
-        } catch (e) {
+        } catch {
           // ignore
         }
 

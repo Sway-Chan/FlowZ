@@ -125,7 +125,7 @@ export function HttpForm({ serverConfig, onSubmit }: HttpFormProps) {
               <FormControl>
                 <Input
                   type="number"
-                  placeholder={isHttps ? "443" : "80"}
+                  placeholder={isHttps ? '443' : '80'}
                   {...field}
                   onChange={(e) => field.onChange(parseInt(e.target.value) || 0)}
                 />
@@ -140,7 +140,9 @@ export function HttpForm({ serverConfig, onSubmit }: HttpFormProps) {
           name="username"
           render={({ field }) => (
             <FormItem>
-              <FormLabel>{t('servers.username')} ({t('servers.optional', 'Optional')})</FormLabel>
+              <FormLabel>
+                {t('servers.username')} ({t('servers.optional', 'Optional')})
+              </FormLabel>
               <FormControl>
                 <Input placeholder={t('servers.usernamePlaceholder', 'Username')} {...field} />
               </FormControl>
@@ -154,9 +156,15 @@ export function HttpForm({ serverConfig, onSubmit }: HttpFormProps) {
           name="password"
           render={({ field }) => (
             <FormItem>
-              <FormLabel>{t('servers.password')} ({t('servers.optional', 'Optional')})</FormLabel>
+              <FormLabel>
+                {t('servers.password')} ({t('servers.optional', 'Optional')})
+              </FormLabel>
               <FormControl>
-                <Input type="password" placeholder={t('servers.passwordPlaceholder', 'Password')} {...field} />
+                <Input
+                  type="password"
+                  placeholder={t('servers.passwordPlaceholder', 'Password')}
+                  {...field}
+                />
               </FormControl>
               <FormMessage />
             </FormItem>
@@ -191,7 +199,10 @@ export function HttpForm({ serverConfig, onSubmit }: HttpFormProps) {
                     <Input placeholder="example.com" {...field} />
                   </FormControl>
                   <FormDescription>
-                    {t('servers.sniDesc', 'TLS Server Name Indication, leave blank to use server address')}
+                    {t(
+                      'servers.sniDesc',
+                      'TLS Server Name Indication, leave blank to use server address'
+                    )}
                   </FormDescription>
                   <FormMessage />
                 </FormItem>
@@ -208,7 +219,12 @@ export function HttpForm({ serverConfig, onSubmit }: HttpFormProps) {
                   </FormControl>
                   <div className="space-y-1 leading-none">
                     <FormLabel>{t('servers.allowInsecure', 'Allow Insecure')}</FormLabel>
-                    <FormDescription>{t('servers.allowInsecureDesc', 'Allow invalid certificates (not recommended)')}</FormDescription>
+                    <FormDescription>
+                      {t(
+                        'servers.allowInsecureDesc',
+                        'Allow invalid certificates (not recommended)'
+                      )}
+                    </FormDescription>
                   </div>
                 </FormItem>
               )}

@@ -67,10 +67,8 @@ export function BypassProcessSettings() {
             添加进程名后，该进程的所有流量将直连，不经过代理。
             <br />
             Windows 填写 <code className="bg-muted rounded px-1">.exe</code> 文件名，如{' '}
-            <code className="bg-muted rounded px-1">THS.exe</code>；
-            macOS 填写应用进程名，如{' '}
-            <code className="bg-muted rounded px-1">THS</code>。
-            需要重启代理后生效。
+            <code className="bg-muted rounded px-1">THS.exe</code>； macOS 填写应用进程名，如{' '}
+            <code className="bg-muted rounded px-1">THS</code>。 需要重启代理后生效。
           </span>
         </div>
 
@@ -83,7 +81,12 @@ export function BypassProcessSettings() {
             onKeyDown={handleKeyDown}
             className="h-9 text-sm"
           />
-          <Button onClick={handleAdd} size="sm" className="h-9 px-3 shrink-0" disabled={!inputValue.trim()}>
+          <Button
+            onClick={handleAdd}
+            size="sm"
+            className="h-9 px-3 shrink-0"
+            disabled={!inputValue.trim()}
+          >
             <Plus className="h-4 w-4 mr-1" />
             添加
           </Button>
@@ -109,9 +112,7 @@ export function BypassProcessSettings() {
             ))}
           </div>
         ) : (
-          <p className="text-xs text-muted-foreground text-center py-3">
-            暂未添加任何排除进程
-          </p>
+          <p className="text-xs text-muted-foreground text-center py-3">暂未添加任何排除进程</p>
         )}
       </CardContent>
     </Card>

@@ -646,7 +646,9 @@ app.whenReady().then(async () => {
       const { session } = require('electron');
       await session.defaultSession.setProxy({});
       logManager.addLog('info', '已恢复 Electron 主进程直连状态', 'Main');
-    } catch (err) {}
+    } catch {
+      /* ignore */
+    }
 
     // 正常停止时，重置错误状态
     updateTrayMenuState(false, false);
@@ -1170,7 +1172,9 @@ process.on('SIGTERM', async () => {
     const { createSystemProxyManager } = require('./services/SystemProxyManager');
     const sysProxy = createSystemProxyManager();
     sysProxy.disableProxySync();
-  } catch (e) {}
+  } catch {
+    /* ignore */
+  }
 });
 
 // 进程退出时的最后兜底（同步执行）
@@ -1179,5 +1183,7 @@ process.on('exit', () => {
     const { createSystemProxyManager } = require('./services/SystemProxyManager');
     const sysProxy = createSystemProxyManager();
     sysProxy.disableProxySync();
-  } catch (e) {}
+  } catch {
+    /* ignore */
+  }
 });

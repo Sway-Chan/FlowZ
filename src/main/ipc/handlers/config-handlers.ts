@@ -37,7 +37,9 @@ export function registerConfigHandlers(configManager: ConfigManager): void {
         const isDark = nativeTheme.shouldUseDarkColors;
         for (const win of BrowserWindow.getAllWindows()) {
           if (!win.isDestroyed()) {
-            win.setBackgroundColor(process.platform === 'darwin' ? '#00000000' : (isDark ? '#121217' : '#f1f5f9'));
+            win.setBackgroundColor(
+              process.platform === 'darwin' ? '#00000000' : isDark ? '#121217' : '#f1f5f9'
+            );
           }
         }
       }
@@ -84,7 +86,9 @@ export function registerConfigHandlers(configManager: ConfigManager): void {
         const isDark = nativeTheme.shouldUseDarkColors;
         for (const win of BrowserWindow.getAllWindows()) {
           if (!win.isDestroyed()) {
-            win.setBackgroundColor(process.platform === 'darwin' ? '#00000000' : (isDark ? '#121217' : '#f1f5f9'));
+            win.setBackgroundColor(
+              process.platform === 'darwin' ? '#00000000' : isDark ? '#121217' : '#f1f5f9'
+            );
           }
         }
       }
