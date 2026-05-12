@@ -52,6 +52,17 @@ try {
   // 部分环境不支持，忽略
 }
 
+// 单实例锁：防止开启多个软件实例
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  app.quit();
+} else {
+  app.on('second-instance', (_event, _commandLine, _workingDirectory) => {
+    // 当有人试图运行第二个实例时，聚焦并显示主窗口
+    showWindow();
+  });
+}
+
 let mainWindow: BrowserWindow | null = null;
 let trayManager: TrayManager | null = null;
 const isDevelopment = process.env.NODE_ENV === 'development';
@@ -508,466 +519,335 @@ async function updateTrayMenuState(isProxyRunning: boolean, hasError?: boolean):
   }
 }
 
-app.whenReady().then(async () => {
-  // 在导入任何使用路径的服务之前，初始化用户数据路径
-  // 这确保无论以何种权限运行，都使用正确的路径
-  initUserDataPath();
+if (gotTheLock) {
+  app.whenReady().then(async () => {
+    // 在导入任何使用路径的服务之前，初始化用户数据路径
+    // 这确保无论以何种权限运行，都使用正确的路径
+    initUserDataPath();
 
-  // 初始化服务
-  configManager = new ConfigManager();
-  protocolParser = new ProtocolParser();
-  logManager = new LogManager();
-  systemProxyManager = createSystemProxyManager();
-  updateService = new UpdateService(logManager);
-  coreUpdateService = new CoreUpdateService(logManager);
-  subscriptionService = new SubscriptionService(protocolParser, logManager);
-  speedTestService = new SpeedTestService(logManager);
-  // 记录应用启动日志
-  logManager.addLog('info', 'Application started', 'Main');
+    // 初始化服务
+    configManager = new ConfigManager();
+    protocolParser = new ProtocolParser();
+    logManager = new LogManager();
+    systemProxyManager = createSystemProxyManager();
+    updateService = new UpdateService(logManager);
+    coreUpdateService = new CoreUpdateService(logManager);
+    subscriptionService = new SubscriptionService(protocolParser, logManager);
+    speedTestService = new SpeedTestService(logManager);
+    // 记录应用启动日志
+    logManager.addLog('info', 'Application started', 'Main');
 
-  // macOS: 禁用 App Nap，防止系统认为应用"没有响应"
-  // 当应用在后台运行代理时，App Nap 会导致系统误判应用状态
-  if (process.platform === 'darwin') {
-    const { powerSaveBlocker } = require('electron');
-    powerSaveBlocker.start('prevent-app-suspension');
-  }
-
-  // 设置 macOS Dock 图标
-  if (process.platform === 'darwin' && app.dock) {
-    const iconPath = resourceManager.getAppIconPath();
-    const fs = require('fs');
-    if (fs.existsSync(iconPath)) {
-      const { nativeImage } = require('electron');
-      const icon = nativeImage.createFromPath(iconPath);
-      // 调整为标准 Dock 图标尺寸
-      const resizedIcon = icon.resize({ width: 128, height: 128 });
-      app.dock.setIcon(resizedIcon);
-    }
-  }
-
-  // 加载配置并处理错误
-  try {
-    const config = await configManager.loadConfig();
-    logManager.addLog('info', 'Configuration loaded successfully', 'Main');
-
-    // 检查配置是否为默认配置（可能是因为加载失败）
-    if (config.servers.length === 0 && config.selectedServerId === null) {
-      // 这可能是首次启动或配置文件损坏
-      logManager.addLog('warn', 'Using default configuration', 'Main');
-    }
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    logManager.addLog('error', `Failed to load configuration: ${errorMessage}`, 'Main');
-
-    // 显示错误对话框通知用户
-    dialog.showErrorBox(
-      '配置加载失败',
-      `无法加载配置文件，将使用默认配置。\n\n错误信息: ${errorMessage}`
-    );
-  }
-
-  await createWindow();
-
-  // 初始化 ProxyManager（需要在窗口创建后）
-  proxyManager = new ProxyManager(logManager, mainWindow || undefined);
-  coreUpdateService.setProxyManager(proxyManager);
-
-  // 初始化自动换节点服务
-  autoSwitchService = new AutoSwitchService(
-    configManager,
-    proxyManager,
-    logManager,
-    () => mainWindow
-  );
-  // 根据当前配置决定是否启用
-  {
-    const cfg = await configManager.loadConfig().catch(() => null);
-    if (cfg?.autoSwitchNode) {
-      autoSwitchService.enable();
-    }
-  }
-
-  // 监听代理管理器事件，更新托盘状态
-  proxyManager.on('error', async (error: Error) => {
-    logManager.addLog('error', `Proxy error: ${error.message}`, 'Main');
-    // 发生错误时，更新托盘显示为"连接异常"
-    updateTrayMenuState(false, true);
-
-    // 触发自动换节点（如果已启用）
-    if (autoSwitchService) {
-      autoSwitchService.onProxyError(error.message).catch((e) => {
-        logManager.addLog('warn', `自动换节点处理异常: ${e}`, 'Main');
-      });
+    // macOS: 禁用 App Nap，防止系统认为应用"没有响应"
+    // 当应用在后台运行代理时，App Nap 会导致系统误判应用状态
+    if (process.platform === 'darwin') {
+      const { powerSaveBlocker } = require('electron');
+      powerSaveBlocker.start('prevent-app-suspension');
     }
 
-    // 进程意外退出时，清理系统代理设置，避免网络不可用
-    try {
-      const proxyStatus = await systemProxyManager.getProxyStatus();
-      if (proxyStatus.enabled) {
-        logManager.addLog('info', 'Disabling system proxy due to proxy error...', 'Main');
-        await systemProxyManager.disableProxy();
-        logManager.addLog('info', 'System proxy disabled after error', 'Main');
+    // 设置 macOS Dock 图标
+    if (process.platform === 'darwin' && app.dock) {
+      const iconPath = resourceManager.getAppIconPath();
+      const fs = require('fs');
+      if (fs.existsSync(iconPath)) {
+        const { nativeImage } = require('electron');
+        const icon = nativeImage.createFromPath(iconPath);
+        // 调整为标准 Dock 图标尺寸
+        const resizedIcon = icon.resize({ width: 128, height: 128 });
+        app.dock.setIcon(resizedIcon);
       }
-    } catch (cleanupError) {
-      const errorMessage =
-        cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
-      logManager.addLog(
-        'warn',
-        `Failed to disable system proxy after error: ${errorMessage}`,
-        'Main'
-      );
-    }
-  });
-
-  proxyManager.on('started', async () => {
-    try {
-      await coreUpdateService.recordSuccessfulVersion();
-      logManager.addLog('info', '已记录当前运行的内核版本基线', 'Main');
-    } catch (e) {
-      logManager.addLog('warn', `记录内核基线版本失败: ${e}`, 'Main');
     }
 
+    // 加载配置并处理错误
     try {
       const config = await configManager.loadConfig();
-      const proxyUrl = `http://127.0.0.1:${config.httpPort || 2080}`;
-      const { session } = require('electron');
-      await session.defaultSession.setProxy({
-        proxyRules: proxyUrl,
-        proxyBypassRules: '127.0.0.1,localhost,::1',
-      });
-      logManager.addLog('info', `已强制 Electron 主进程(更新检查/测速)走代理: ${proxyUrl}`, 'Main');
-    } catch (err) {
-      logManager.addLog('warn', `设置 Electron 主进程代理失败: ${err}`, 'Main');
-    }
-  });
+      logManager.addLog('info', 'Configuration loaded successfully', 'Main');
 
-  proxyManager.on('stopped', async () => {
-    try {
-      const { session } = require('electron');
-      await session.defaultSession.setProxy({});
-      logManager.addLog('info', '已恢复 Electron 主进程直连状态', 'Main');
-    } catch {
-      /* ignore */
-    }
-
-    // 正常停止时，重置错误状态
-    updateTrayMenuState(false, false);
-
-    // 确保系统代理被清理
-    try {
-      const proxyStatus = await systemProxyManager.getProxyStatus();
-      if (proxyStatus.enabled) {
-        await systemProxyManager.disableProxy();
-        logManager.addLog('info', 'System proxy disabled on stop', 'Main');
-      }
-    } catch (cleanupError) {
-      const errorMessage =
-        cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
-      logManager.addLog('warn', `Failed to disable system proxy on stop: ${errorMessage}`, 'Main');
-    }
-  });
-
-  // 注册 IPC 处理器（需要在 ProxyManager 创建后）
-  registerConfigHandlers(configManager);
-  registerServerHandlers(protocolParser, configManager);
-  registerLogHandlers(logManager, proxyManager);
-  registerProxyHandlers(proxyManager, systemProxyManager);
-  registerVersionHandlers(coreUpdateService);
-  registerAdminHandlers();
-
-  registerRulesHandlers(configManager);
-
-  // 注册核心更新处理器
-  setCoreUpdateService(coreUpdateService, logManager);
-  registerCoreUpdateHandlers();
-
-  // 注册自启动处理器
-  registerAutoStartHandlers();
-
-  // 注册订阅处理器
-  registerSubscriptionHandlers(subscriptionService, configManager);
-
-  // 注册备份与恢复处理器
-  registerBackupHandlers(configManager);
-
-  // 同步自启动状态
-  const autoStartManager = createAutoStartManager();
-  const config = await configManager.loadConfig();
-  await autoStartManager.setAutoStart(config.autoStart ?? false);
-
-  // 注册更新处理器
-  setUpdateService(updateService);
-  updateService.setMainWindow(mainWindow);
-  // 设置更新前的清理回调，确保在安装更新前停止代理进程
-  updateService.setCleanupCallback(cleanupResources);
-  registerUpdateHandlers();
-
-  // 注册测速处理器
-  registerSpeedTestHandlers(configManager, speedTestService);
-
-  // 设置托盘状态更新回调
-  setTrayStateCallback((isRunning: boolean, hasError?: boolean) => {
-    updateTrayMenuState(isRunning, hasError);
-  });
-
-  // 监听渲染进程语言同步
-  const { ipcMain } = require('electron');
-  ipcMain.handle(IPC_CHANNELS.APP_SET_LANGUAGE, (_: any, lang: string) => {
-    if (trayManager) {
-      trayManager.setLanguage(lang);
-    }
-  });
-
-  // 创建托盘图标
-  trayManager = new TrayManager(mainWindow, logManager, {
-    onStartProxy: async () => {
-      try {
-        const config = await configManager.loadConfig();
-        if (proxyManager) {
-          await proxyManager.start(config);
-
-          // 系统代理模式：设置系统代理
-          const modeType = (config.proxyModeType || 'systemProxy').toLowerCase();
-          if (modeType === 'systemproxy') {
-            await systemProxyManager.enableProxy(
-              '127.0.0.1',
-              config.httpPort || 2080,
-              config.socksPort || 2081
-            );
-          }
-
-          logManager.addLog('info', 'Proxy started from tray', 'Main');
-          // 更新托盘菜单状态
-          updateTrayMenuState(true);
-        }
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        logManager.addLog('error', `Failed to start proxy: ${errorMessage}`, 'Main');
-      }
-    },
-    onStopProxy: async () => {
-      try {
-        // 先禁用系统代理（不管当前状态如何，都尝试禁用）
-        await systemProxyManager.disableProxy();
-
-        if (proxyManager) {
-          await proxyManager.stop();
-          logManager.addLog('info', 'Proxy stopped from tray', 'Main');
-          // 更新托盘菜单状态
-          updateTrayMenuState(false);
-        }
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        logManager.addLog('error', `Failed to stop proxy: ${errorMessage}`, 'Main');
-      }
-    },
-    onShowWindow: () => {
-      showWindow();
-    },
-    onQuit: async () => {
-      // 清理资源后退出
-      await cleanupResources();
-      app.exit(0);
-    },
-    onSelectServer: async (serverId: string) => {
-      try {
-        const config = await configManager.loadConfig();
-        config.selectedServerId = serverId;
-        await configManager.saveConfig(config);
-        logManager.addLog('info', `Server selected from tray: ${serverId}`, 'Main');
-
-        // 如果代理正在运行，重启以应用新服务器
-        if (proxyManager && proxyManager.getStatus().running) {
-          await proxyManager.stop();
-          await proxyManager.start(config);
-          logManager.addLog('info', 'Proxy restarted with new server', 'Main');
-        }
-
-        // 更新托盘菜单
-        updateTrayMenuState(proxyManager?.getStatus().running ?? false);
-
-        // 通知渲染进程配置已更新
-        ipcEventEmitter.sendToAll('event:configChanged', { newValue: config });
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        logManager.addLog('error', `Failed to select server: ${errorMessage}`, 'Main');
-      }
-    },
-    onChangeProxyMode: async (mode) => {
-      try {
-        const config = await configManager.loadConfig();
-        config.proxyMode = mode;
-        await configManager.saveConfig(config);
-        logManager.addLog('info', `Proxy mode changed from tray: ${mode}`, 'Main');
-
-        // 如果代理正在运行，重启以应用新模式
-        if (proxyManager && proxyManager.getStatus().running) {
-          await proxyManager.stop();
-          await proxyManager.start(config);
-          logManager.addLog('info', 'Proxy restarted with new mode', 'Main');
-        }
-
-        // 更新托盘菜单
-        updateTrayMenuState(proxyManager?.getStatus().running ?? false);
-
-        // 通知渲染进程配置已更新
-        ipcEventEmitter.sendToAll('event:configChanged', { newValue: config });
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        logManager.addLog('error', `Failed to change proxy mode: ${errorMessage}`, 'Main');
-      }
-    },
-    onOpenSettings: () => {
-      showWindow();
-      // 发送导航事件到渲染进程
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('navigate', '/settings');
-      }
-    },
-    onCheckUpdate: async () => {
-      // 检查更新并显示对话框
-      const result = await updateService.checkForUpdate();
-      if (result.hasUpdate && result.updateInfo) {
-        const action = await updateService.showUpdateDialog(result.updateInfo);
-        if (action === 'update') {
-          // 使用带进度窗口的下载方法
-          const filePath = await updateService.downloadUpdateWithProgress(result.updateInfo);
-          if (filePath) {
-            await updateService.installUpdate(filePath);
-          }
-        } else if (action === 'skip') {
-          updateService.skipVersion(result.updateInfo.version);
-        }
-      } else if (!result.error) {
-        // 没有更新，显示提示
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          const { dialog } = require('electron');
-          dialog.showMessageBox(mainWindow, {
-            type: 'info',
-            title: '检查更新',
-            message: '当前已是最新版本',
-            buttons: ['确定'],
-          });
-        }
-      }
-    },
-    onManageServers: () => {
-      showWindow();
-      // 发送导航事件到渲染进程
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('navigate', '/server');
-      }
-    },
-    onSpeedTest: async () => {
-      try {
-        const config = await configManager.loadConfig();
-        if (config.servers.length === 0) {
-          logManager.addLog('warn', 'No servers configured for speed test', 'Main');
-          return;
-        }
-
-        logManager.addLog(
-          'info',
-          `Starting speed test for ${config.servers.length} servers`,
-          'Main'
-        );
-
-        // 复用 SpeedTestService，自动处理 TCP 和 UDP 协议
-        const results = await speedTestService.testAllServers(config.servers);
-
-        logManager.addLog('info', 'Speed test completed for all servers', 'Main');
-
-        if (trayManager) {
-          trayManager.updateSpeedTestResults(results, config.servers);
-        }
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        logManager.addLog('error', `Speed test failed: ${errorMessage}`, 'Main');
-
-        if (trayManager) {
-          trayManager.updateSpeedTestResults(new Map(), []);
-        }
-      }
-    },
-    onEnterPrivacyMode: () => {
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('event:enterPrivacyMode');
-      }
-    },
-  });
-  trayManager.createTray();
-
-  // 初始化托盘菜单状态
-  updateTrayMenuState(false);
-
-  // 启动时自动连接（延迟 2 秒，等待窗口和服务初始化完成）
-  setTimeout(async () => {
-    try {
-      const config = await configManager.loadConfig();
-
-      // 检查 sing-box 内核版本是否发生变化（检测更新是否破坏配置兼容性）
-      try {
-        const lastKnownVersion = coreUpdateService.getLastKnownGoodVersion();
-        const currentVersion = await coreUpdateService.getCurrentVersion();
-        if (lastKnownVersion && currentVersion !== '未知' && lastKnownVersion !== currentVersion) {
-          logManager.addLog(
-            'warn',
-            `sing-box 内核版本已变更: ${lastKnownVersion} → ${currentVersion}，通知用户`,
-            'Main'
-          );
-          ipcEventEmitter.sendToAll(IPC_CHANNELS.EVENT_CORE_VERSION_CHANGED, {
-            previousVersion: lastKnownVersion,
-            currentVersion,
-            hasBackup: coreUpdateService.hasBackup(),
-          });
-        }
-      } catch (versionCheckError) {
-        logManager.addLog('warn', `版本检测失败: ${versionCheckError}`, 'Main');
-      }
-
-      // 检查是否启用了启动时自动连接
-      if (config.autoConnect && config.selectedServerId) {
-        logManager.addLog('info', '启动时自动连接已启用，正在连接...', 'Main');
-
-        if (proxyManager) {
-          await proxyManager.start(config);
-
-          // 系统代理模式：设置系统代理
-          const modeType = (config.proxyModeType || 'systemProxy').toLowerCase();
-          if (modeType === 'systemproxy') {
-            await systemProxyManager.enableProxy(
-              '127.0.0.1',
-              config.httpPort || 2080,
-              config.socksPort || 2081
-            );
-          }
-
-          logManager.addLog('info', '启动时自动连接成功', 'Main');
-          // 更新托盘菜单状态
-          updateTrayMenuState(true);
-        }
-      } else if (config.autoConnect && !config.selectedServerId) {
-        logManager.addLog('warn', '启动时自动连接已启用，但未选择服务器', 'Main');
+      // 检查配置是否为默认配置（可能是因为加载失败）
+      if (config.servers.length === 0 && config.selectedServerId === null) {
+        // 这可能是首次启动或配置文件损坏
+        logManager.addLog('warn', 'Using default configuration', 'Main');
       }
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
-      logManager.addLog('error', `启动时自动连接失败: ${errorMessage}`, 'Main');
-      // 连接失败时更新托盘状态
-      updateTrayMenuState(false, true);
-    }
-  }, 2000);
+      logManager.addLog('error', `Failed to load configuration: ${errorMessage}`, 'Main');
 
-  // 启动后自动检查更新（延迟 5 秒，避免影响启动体验）
-  setTimeout(async () => {
-    try {
-      const config = await configManager.loadConfig();
-      // 检查是否启用了自动检查更新
-      if (config.autoCheckUpdate !== false) {
-        logManager.addLog('info', '正在自动检查更新...', 'Main');
+      // 显示错误对话框通知用户
+      dialog.showErrorBox(
+        '配置加载失败',
+        `无法加载配置文件，将使用默认配置。\n\n错误信息: ${errorMessage}`
+      );
+    }
+
+    await createWindow();
+
+    // 初始化 ProxyManager（需要在窗口创建后）
+    proxyManager = new ProxyManager(logManager, mainWindow || undefined);
+    coreUpdateService.setProxyManager(proxyManager);
+
+    // 初始化自动换节点服务
+    autoSwitchService = new AutoSwitchService(
+      configManager,
+      proxyManager,
+      logManager,
+      () => mainWindow
+    );
+    // 根据当前配置决定是否启用
+    {
+      const cfg = await configManager.loadConfig().catch(() => null);
+      if (cfg?.autoSwitchNode) {
+        autoSwitchService.enable();
+      }
+    }
+
+    // 监听代理管理器事件，更新托盘状态
+    proxyManager.on('error', async (error: Error) => {
+      logManager.addLog('error', `Proxy error: ${error.message}`, 'Main');
+      // 发生错误时，更新托盘显示为"连接异常"
+      updateTrayMenuState(false, true);
+
+      // 触发自动换节点（如果已启用）
+      if (autoSwitchService) {
+        autoSwitchService.onProxyError(error.message).catch((e) => {
+          logManager.addLog('warn', `自动换节点处理异常: ${e}`, 'Main');
+        });
+      }
+
+      // 进程意外退出时，清理系统代理设置，避免网络不可用
+      try {
+        const proxyStatus = await systemProxyManager.getProxyStatus();
+        if (proxyStatus.enabled) {
+          logManager.addLog('info', 'Disabling system proxy due to proxy error...', 'Main');
+          await systemProxyManager.disableProxy();
+          logManager.addLog('info', 'System proxy disabled after error', 'Main');
+        }
+      } catch (cleanupError) {
+        const errorMessage =
+          cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+        logManager.addLog(
+          'warn',
+          `Failed to disable system proxy after error: ${errorMessage}`,
+          'Main'
+        );
+      }
+    });
+
+    proxyManager.on('started', async () => {
+      try {
+        await coreUpdateService.recordSuccessfulVersion();
+        logManager.addLog('info', '已记录当前运行的内核版本基线', 'Main');
+      } catch (e) {
+        logManager.addLog('warn', `记录内核基线版本失败: ${e}`, 'Main');
+      }
+
+      try {
+        const config = await configManager.loadConfig();
+        const proxyUrl = `http://127.0.0.1:${config.httpPort || 2080}`;
+        const { session } = require('electron');
+        await session.defaultSession.setProxy({
+          proxyRules: proxyUrl,
+          proxyBypassRules: '127.0.0.1,localhost,::1',
+        });
+        logManager.addLog(
+          'info',
+          `已强制 Electron 主进程(更新检查/测速)走代理: ${proxyUrl}`,
+          'Main'
+        );
+      } catch (err) {
+        logManager.addLog('warn', `设置 Electron 主进程代理失败: ${err}`, 'Main');
+      }
+    });
+
+    proxyManager.on('stopped', async () => {
+      try {
+        const { session } = require('electron');
+        await session.defaultSession.setProxy({});
+        logManager.addLog('info', '已恢复 Electron 主进程直连状态', 'Main');
+      } catch {
+        /* ignore */
+      }
+
+      // 正常停止时，重置错误状态
+      updateTrayMenuState(false, false);
+
+      // 确保系统代理被清理
+      try {
+        const proxyStatus = await systemProxyManager.getProxyStatus();
+        if (proxyStatus.enabled) {
+          await systemProxyManager.disableProxy();
+          logManager.addLog('info', 'System proxy disabled on stop', 'Main');
+        }
+      } catch (cleanupError) {
+        const errorMessage =
+          cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
+        logManager.addLog(
+          'warn',
+          `Failed to disable system proxy on stop: ${errorMessage}`,
+          'Main'
+        );
+      }
+    });
+
+    // 注册 IPC 处理器（需要在 ProxyManager 创建后）
+    registerConfigHandlers(configManager);
+    registerServerHandlers(protocolParser, configManager);
+    registerLogHandlers(logManager, proxyManager);
+    registerProxyHandlers(proxyManager, systemProxyManager);
+    registerVersionHandlers(coreUpdateService);
+    registerAdminHandlers();
+
+    registerRulesHandlers(configManager);
+
+    // 注册核心更新处理器
+    setCoreUpdateService(coreUpdateService, logManager);
+    registerCoreUpdateHandlers();
+
+    // 注册自启动处理器
+    registerAutoStartHandlers();
+
+    // 注册订阅处理器
+    registerSubscriptionHandlers(subscriptionService, configManager);
+
+    // 注册备份与恢复处理器
+    registerBackupHandlers(configManager);
+
+    // 同步自启动状态
+    const autoStartManager = createAutoStartManager();
+    const config = await configManager.loadConfig();
+    await autoStartManager.setAutoStart(config.autoStart ?? false);
+
+    // 注册更新处理器
+    setUpdateService(updateService);
+    updateService.setMainWindow(mainWindow);
+    // 设置更新前的清理回调，确保在安装更新前停止代理进程
+    updateService.setCleanupCallback(cleanupResources);
+    registerUpdateHandlers();
+
+    // 注册测速处理器
+    registerSpeedTestHandlers(configManager, speedTestService);
+
+    // 设置托盘状态更新回调
+    setTrayStateCallback((isRunning: boolean, hasError?: boolean) => {
+      updateTrayMenuState(isRunning, hasError);
+    });
+
+    // 监听渲染进程语言同步
+    const { ipcMain } = require('electron');
+    ipcMain.handle(IPC_CHANNELS.APP_SET_LANGUAGE, (_: any, lang: string) => {
+      if (trayManager) {
+        trayManager.setLanguage(lang);
+      }
+    });
+
+    // 创建托盘图标
+    trayManager = new TrayManager(mainWindow, logManager, {
+      onStartProxy: async () => {
+        try {
+          const config = await configManager.loadConfig();
+          if (proxyManager) {
+            await proxyManager.start(config);
+
+            // 系统代理模式：设置系统代理
+            const modeType = (config.proxyModeType || 'systemProxy').toLowerCase();
+            if (modeType === 'systemproxy') {
+              await systemProxyManager.enableProxy(
+                '127.0.0.1',
+                config.httpPort || 2080,
+                config.socksPort || 2081
+              );
+            }
+
+            logManager.addLog('info', 'Proxy started from tray', 'Main');
+            // 更新托盘菜单状态
+            updateTrayMenuState(true);
+          }
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          logManager.addLog('error', `Failed to start proxy: ${errorMessage}`, 'Main');
+        }
+      },
+      onStopProxy: async () => {
+        try {
+          // 先禁用系统代理（不管当前状态如何，都尝试禁用）
+          await systemProxyManager.disableProxy();
+
+          if (proxyManager) {
+            await proxyManager.stop();
+            logManager.addLog('info', 'Proxy stopped from tray', 'Main');
+            // 更新托盘菜单状态
+            updateTrayMenuState(false);
+          }
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          logManager.addLog('error', `Failed to stop proxy: ${errorMessage}`, 'Main');
+        }
+      },
+      onShowWindow: () => {
+        showWindow();
+      },
+      onQuit: async () => {
+        // 清理资源后退出
+        await cleanupResources();
+        app.exit(0);
+      },
+      onSelectServer: async (serverId: string) => {
+        try {
+          const config = await configManager.loadConfig();
+          config.selectedServerId = serverId;
+          await configManager.saveConfig(config);
+          logManager.addLog('info', `Server selected from tray: ${serverId}`, 'Main');
+
+          // 如果代理正在运行，重启以应用新服务器
+          if (proxyManager && proxyManager.getStatus().running) {
+            await proxyManager.stop();
+            await proxyManager.start(config);
+            logManager.addLog('info', 'Proxy restarted with new server', 'Main');
+          }
+
+          // 更新托盘菜单
+          updateTrayMenuState(proxyManager?.getStatus().running ?? false);
+
+          // 通知渲染进程配置已更新
+          ipcEventEmitter.sendToAll('event:configChanged', { newValue: config });
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          logManager.addLog('error', `Failed to select server: ${errorMessage}`, 'Main');
+        }
+      },
+      onChangeProxyMode: async (mode) => {
+        try {
+          const config = await configManager.loadConfig();
+          config.proxyMode = mode;
+          await configManager.saveConfig(config);
+          logManager.addLog('info', `Proxy mode changed from tray: ${mode}`, 'Main');
+
+          // 如果代理正在运行，重启以应用新模式
+          if (proxyManager && proxyManager.getStatus().running) {
+            await proxyManager.stop();
+            await proxyManager.start(config);
+            logManager.addLog('info', 'Proxy restarted with new mode', 'Main');
+          }
+
+          // 更新托盘菜单
+          updateTrayMenuState(proxyManager?.getStatus().running ?? false);
+
+          // 通知渲染进程配置已更新
+          ipcEventEmitter.sendToAll('event:configChanged', { newValue: config });
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          logManager.addLog('error', `Failed to change proxy mode: ${errorMessage}`, 'Main');
+        }
+      },
+      onOpenSettings: () => {
+        showWindow();
+        // 发送导航事件到渲染进程
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('navigate', '/settings');
+        }
+      },
+      onCheckUpdate: async () => {
+        // 检查更新并显示对话框
         const result = await updateService.checkForUpdate();
         if (result.hasUpdate && result.updateInfo) {
-          logManager.addLog('info', `发现新版本: ${result.updateInfo.version}`, 'Main');
-          // 显示更新对话框
           const action = await updateService.showUpdateDialog(result.updateInfo);
           if (action === 'update') {
             // 使用带进度窗口的下载方法
@@ -978,145 +858,297 @@ app.whenReady().then(async () => {
           } else if (action === 'skip') {
             updateService.skipVersion(result.updateInfo.version);
           }
-        } else if (result.error) {
-          logManager.addLog('warn', `自动检查更新失败: ${result.error}`, 'Main');
-        } else {
-          logManager.addLog('info', '当前已经是最新版本', 'Main');
-        }
-      }
-    } catch (error) {
-      logManager.addLog('error', `自动检查更新异常: ${error}`, 'Main');
-    }
-  }, 5000);
-
-  // 启动后自动更新订阅（延迟 8 秒，避免干扰启动）
-  setTimeout(async () => {
-    try {
-      const config = await configManager.loadConfig();
-      if (config.autoUpdateSubscriptionOnStart) {
-        logManager.addLog('info', '启动时自动更新订阅已启用，正在更新...', 'Main');
-
-        if (!config.subscriptions || config.subscriptions.length === 0) {
-          logManager.addLog('info', '没有可更新的订阅', 'Main');
-          return;
-        }
-
-        let updatedCount = 0;
-        let failedCount = 0;
-
-        for (const subscription of config.subscriptions) {
-          if (!subscription.autoUpdate) continue;
-          try {
-            const result = await subscriptionService.fetchSubscription(
-              subscription.url,
-              subscription.id
-            );
-            const fetchedServers = result.servers;
-
-            const oldServers = config.servers.filter((s) => s.subscriptionId === subscription.id);
-            const oldServersMap = new Map<string, (typeof config.servers)[0]>();
-            oldServers.forEach((s) => {
-              oldServersMap.set(`${s.name}-${s.protocol}-${s.address}-${s.port}`, s);
+        } else if (!result.error) {
+          // 没有更新，显示提示
+          if (mainWindow && !mainWindow.isDestroyed()) {
+            const { dialog } = require('electron');
+            dialog.showMessageBox(mainWindow, {
+              type: 'info',
+              title: '检查更新',
+              message: '当前已是最新版本',
+              buttons: ['确定'],
             });
-
-            const newServersToKeep = [];
-            for (const newServer of fetchedServers) {
-              const key = `${newServer.name}-${newServer.protocol}-${newServer.address}-${newServer.port}`;
-              if (oldServersMap.has(key)) {
-                const old = oldServersMap.get(key)!;
-                newServersToKeep.push({
-                  ...newServer,
-                  id: old.id,
-                  createdAt: old.createdAt,
-                  updatedAt: new Date().toISOString(),
-                });
-                oldServersMap.delete(key);
-              } else {
-                newServersToKeep.push(newServer);
-              }
-            }
-
-            const deletedIds = new Set(Array.from(oldServersMap.values()).map((s) => s.id));
-            if (config.selectedServerId && deletedIds.has(config.selectedServerId)) {
-              config.selectedServerId = null;
-            }
-
-            const otherServers = config.servers.filter((s) => s.subscriptionId !== subscription.id);
-            config.servers = [...otherServers, ...newServersToKeep];
-            subscription.lastUpdated = new Date().toISOString();
-            if (result.userInfo) subscription.userInfo = result.userInfo;
-
-            updatedCount++;
-          } catch (e: any) {
-            logManager.addLog('warn', `更新订阅 [${subscription.name}] 失败: ${e.message}`, 'Main');
-            failedCount++;
           }
         }
+      },
+      onManageServers: () => {
+        showWindow();
+        // 发送导航事件到渲染进程
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('navigate', '/server');
+        }
+      },
+      onSpeedTest: async () => {
+        try {
+          const config = await configManager.loadConfig();
+          if (config.servers.length === 0) {
+            logManager.addLog('warn', 'No servers configured for speed test', 'Main');
+            return;
+          }
 
-        await configManager.saveConfig(config);
-        logManager.addLog(
-          'info',
-          `启动时自动更新订阅完成。成功：${updatedCount}，失败：${failedCount}`,
-          'Main'
-        );
+          logManager.addLog(
+            'info',
+            `Starting speed test for ${config.servers.length} servers`,
+            'Main'
+          );
 
-        // 广播配置变更事件以更新 UI
-        ipcEventEmitter.sendToAll('event:configChanged', { newValue: config });
-      }
-    } catch (error) {
-      logManager.addLog('error', `启动时自动更新订阅异常: ${error}`, 'Main');
-    }
-  }, 8000);
+          // 复用 SpeedTestService，自动处理 TCP 和 UDP 协议
+          const results = await speedTestService.testAllServers(config.servers);
 
-  // 监听配置变更事件，更新托盘菜单并自动重启代理
-  mainEventEmitter.on(MAIN_EVENTS.CONFIG_CHANGED, async () => {
-    // 1. 更新托盘菜单
-    const isRunning = proxyManager?.getStatus().running ?? false;
-    updateTrayMenuState(isRunning);
+          logManager.addLog('info', 'Speed test completed for all servers', 'Main');
 
-    // 2. 如果代理正在运行，自动重启以应用新配置
-    if (isRunning && proxyManager) {
-      logManager.addLog('info', 'Configuration changed, restarting proxy...', 'Main');
+          if (trayManager) {
+            trayManager.updateSpeedTestResults(results, config.servers);
+          }
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          logManager.addLog('error', `Speed test failed: ${errorMessage}`, 'Main');
+
+          if (trayManager) {
+            trayManager.updateSpeedTestResults(new Map(), []);
+          }
+        }
+      },
+      onEnterPrivacyMode: () => {
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('event:enterPrivacyMode');
+        }
+      },
+    });
+    trayManager.createTray();
+
+    // 初始化托盘菜单状态
+    updateTrayMenuState(false);
+
+    // 启动时自动连接（延迟 2 秒，等待窗口和服务初始化完成）
+    setTimeout(async () => {
       try {
-        await proxyManager.stop();
-        // 重新加载配置以确保使用最新值
-        const latestConfig = await configManager.loadConfig();
-        await proxyManager.start(latestConfig);
-        logManager.addLog('info', 'Proxy restarted successfully with new configuration', 'Main');
+        const config = await configManager.loadConfig();
 
-        // 重启后再次更新托盘（以防状态有变）
-        updateTrayMenuState(true);
+        // 检查 sing-box 内核版本是否发生变化（检测更新是否破坏配置兼容性）
+        try {
+          const lastKnownVersion = coreUpdateService.getLastKnownGoodVersion();
+          const currentVersion = await coreUpdateService.getCurrentVersion();
+          if (
+            lastKnownVersion &&
+            currentVersion !== '未知' &&
+            lastKnownVersion !== currentVersion
+          ) {
+            logManager.addLog(
+              'warn',
+              `sing-box 内核版本已变更: ${lastKnownVersion} → ${currentVersion}，通知用户`,
+              'Main'
+            );
+            ipcEventEmitter.sendToAll(IPC_CHANNELS.EVENT_CORE_VERSION_CHANGED, {
+              previousVersion: lastKnownVersion,
+              currentVersion,
+              hasBackup: coreUpdateService.hasBackup(),
+            });
+          }
+        } catch (versionCheckError) {
+          logManager.addLog('warn', `版本检测失败: ${versionCheckError}`, 'Main');
+        }
+
+        // 检查是否启用了启动时自动连接
+        if (config.autoConnect && config.selectedServerId) {
+          logManager.addLog('info', '启动时自动连接已启用，正在连接...', 'Main');
+
+          if (proxyManager) {
+            await proxyManager.start(config);
+
+            // 系统代理模式：设置系统代理
+            const modeType = (config.proxyModeType || 'systemProxy').toLowerCase();
+            if (modeType === 'systemproxy') {
+              await systemProxyManager.enableProxy(
+                '127.0.0.1',
+                config.httpPort || 2080,
+                config.socksPort || 2081
+              );
+            }
+
+            logManager.addLog('info', '启动时自动连接成功', 'Main');
+            // 更新托盘菜单状态
+            updateTrayMenuState(true);
+          }
+        } else if (config.autoConnect && !config.selectedServerId) {
+          logManager.addLog('warn', '启动时自动连接已启用，但未选择服务器', 'Main');
+        }
       } catch (error) {
         const errorMessage = error instanceof Error ? error.message : String(error);
-        logManager.addLog(
-          'error',
-          `Failed to restart proxy after config change: ${errorMessage}`,
-          'Main'
-        );
-        // 重启失败，更新托盘状态为停止
+        logManager.addLog('error', `启动时自动连接失败: ${errorMessage}`, 'Main');
+        // 连接失败时更新托盘状态
         updateTrayMenuState(false, true);
       }
-    }
+    }, 2000);
 
-    // 3. 同步自动换节点服务状态
-    if (autoSwitchService) {
-      const latestCfg = await configManager.loadConfig().catch(() => null);
-      if (latestCfg?.autoSwitchNode) {
-        autoSwitchService.enable();
-      } else {
-        autoSwitchService.disable();
+    // 启动后自动检查更新（延迟 5 秒，避免影响启动体验）
+    setTimeout(async () => {
+      try {
+        const config = await configManager.loadConfig();
+        // 检查是否启用了自动检查更新
+        if (config.autoCheckUpdate !== false) {
+          logManager.addLog('info', '正在自动检查更新...', 'Main');
+          const result = await updateService.checkForUpdate();
+          if (result.hasUpdate && result.updateInfo) {
+            logManager.addLog('info', `发现新版本: ${result.updateInfo.version}`, 'Main');
+            // 显示更新对话框
+            const action = await updateService.showUpdateDialog(result.updateInfo);
+            if (action === 'update') {
+              // 使用带进度窗口的下载方法
+              const filePath = await updateService.downloadUpdateWithProgress(result.updateInfo);
+              if (filePath) {
+                await updateService.installUpdate(filePath);
+              }
+            } else if (action === 'skip') {
+              updateService.skipVersion(result.updateInfo.version);
+            }
+          } else if (result.error) {
+            logManager.addLog('warn', `自动检查更新失败: ${result.error}`, 'Main');
+          } else {
+            logManager.addLog('info', '当前已经是最新版本', 'Main');
+          }
+        }
+      } catch (error) {
+        logManager.addLog('error', `自动检查更新异常: ${error}`, 'Main');
       }
-    }
-  });
+    }, 5000);
 
-  app.on('activate', async () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      await createWindow();
-    }
+    // 启动后自动更新订阅（延迟 8 秒，避免干扰启动）
+    setTimeout(async () => {
+      try {
+        const config = await configManager.loadConfig();
+        if (config.autoUpdateSubscriptionOnStart) {
+          logManager.addLog('info', '启动时自动更新订阅已启用，正在更新...', 'Main');
+
+          if (!config.subscriptions || config.subscriptions.length === 0) {
+            logManager.addLog('info', '没有可更新的订阅', 'Main');
+            return;
+          }
+
+          let updatedCount = 0;
+          let failedCount = 0;
+
+          for (const subscription of config.subscriptions) {
+            if (!subscription.autoUpdate) continue;
+            try {
+              const result = await subscriptionService.fetchSubscription(
+                subscription.url,
+                subscription.id
+              );
+              const fetchedServers = result.servers;
+
+              const oldServers = config.servers.filter((s) => s.subscriptionId === subscription.id);
+              const oldServersMap = new Map<string, (typeof config.servers)[0]>();
+              oldServers.forEach((s) => {
+                oldServersMap.set(`${s.name}-${s.protocol}-${s.address}-${s.port}`, s);
+              });
+
+              const newServersToKeep = [];
+              for (const newServer of fetchedServers) {
+                const key = `${newServer.name}-${newServer.protocol}-${newServer.address}-${newServer.port}`;
+                if (oldServersMap.has(key)) {
+                  const old = oldServersMap.get(key)!;
+                  newServersToKeep.push({
+                    ...newServer,
+                    id: old.id,
+                    createdAt: old.createdAt,
+                    updatedAt: new Date().toISOString(),
+                  });
+                  oldServersMap.delete(key);
+                } else {
+                  newServersToKeep.push(newServer);
+                }
+              }
+
+              const deletedIds = new Set(Array.from(oldServersMap.values()).map((s) => s.id));
+              if (config.selectedServerId && deletedIds.has(config.selectedServerId)) {
+                config.selectedServerId = null;
+              }
+
+              const otherServers = config.servers.filter(
+                (s) => s.subscriptionId !== subscription.id
+              );
+              config.servers = [...otherServers, ...newServersToKeep];
+              subscription.lastUpdated = new Date().toISOString();
+              if (result.userInfo) subscription.userInfo = result.userInfo;
+
+              updatedCount++;
+            } catch (e: any) {
+              logManager.addLog(
+                'warn',
+                `更新订阅 [${subscription.name}] 失败: ${e.message}`,
+                'Main'
+              );
+              failedCount++;
+            }
+          }
+
+          await configManager.saveConfig(config);
+          logManager.addLog(
+            'info',
+            `启动时自动更新订阅完成。成功：${updatedCount}，失败：${failedCount}`,
+            'Main'
+          );
+
+          // 广播配置变更事件以更新 UI
+          ipcEventEmitter.sendToAll('event:configChanged', { newValue: config });
+        }
+      } catch (error) {
+        logManager.addLog('error', `启动时自动更新订阅异常: ${error}`, 'Main');
+      }
+    }, 8000);
+
+    // 监听配置变更事件，更新托盘菜单并自动重启代理
+    mainEventEmitter.on(MAIN_EVENTS.CONFIG_CHANGED, async () => {
+      // 1. 更新托盘菜单
+      const isRunning = proxyManager?.getStatus().running ?? false;
+      updateTrayMenuState(isRunning);
+
+      // 2. 如果代理正在运行，自动重启以应用新配置
+      if (isRunning && proxyManager) {
+        logManager.addLog('info', 'Configuration changed, restarting proxy...', 'Main');
+        try {
+          await proxyManager.stop();
+          // 重新加载配置以确保使用最新值
+          const latestConfig = await configManager.loadConfig();
+          await proxyManager.start(latestConfig);
+          logManager.addLog('info', 'Proxy restarted successfully with new configuration', 'Main');
+
+          // 重启后再次更新托盘（以防状态有变）
+          updateTrayMenuState(true);
+        } catch (error) {
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          logManager.addLog(
+            'error',
+            `Failed to restart proxy after config change: ${errorMessage}`,
+            'Main'
+          );
+          // 重启失败，更新托盘状态为停止
+          updateTrayMenuState(false, true);
+        }
+      }
+
+      // 3. 同步自动换节点服务状态
+      if (autoSwitchService) {
+        const latestCfg = await configManager.loadConfig().catch(() => null);
+        if (latestCfg?.autoSwitchNode) {
+          autoSwitchService.enable();
+        } else {
+          autoSwitchService.disable();
+        }
+      }
+    });
+
+    app.on('activate', async () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        await createWindow();
+      }
+    });
   });
-});
+}
 
 app.on('window-all-closed', () => {
+  if (!gotTheLock) return;
   // 在 macOS 上，即使所有窗口关闭，应用也应该继续运行（托盘模式）
   // 在其他平台上，如果启用了托盘，也应该继续运行
   if (process.platform !== 'darwin' && !trayManager) {
@@ -1126,6 +1158,7 @@ app.on('window-all-closed', () => {
 
 // 使用 will-quit 事件来清理资源
 app.on('will-quit', async (_event) => {
+  if (!gotTheLock) return;
   // 阻止默认退出，先清理资源
   _event.preventDefault();
 
@@ -1164,6 +1197,7 @@ process.on('SIGTERM', async () => {
 // 核心兜底修复：系统关机/注销时的同步清理
 // 解决 Windows 下系统代理在重启后依然残留的问题
 (app as any).on('session-end', () => {
+  if (!gotTheLock) return;
   console.log('Detected OS session-end, executing synchronous cleanup...');
   if (proxyManager) {
     proxyManager.stop().catch(() => {});
@@ -1179,6 +1213,7 @@ process.on('SIGTERM', async () => {
 
 // 进程退出时的最后兜底（同步执行）
 process.on('exit', () => {
+  if (!gotTheLock) return;
   try {
     const { createSystemProxyManager } = require('./services/SystemProxyManager');
     const sysProxy = createSystemProxyManager();

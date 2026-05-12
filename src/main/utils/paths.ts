@@ -5,11 +5,40 @@
 
 import { app } from 'electron';
 import * as path from 'path';
+import * as fs from 'fs';
 
 /**
  * 缓存的用户数据路径（在应用启动时以普通用户身份运行时确定）
  */
 let cachedUserDataPath: string | null = null;
+
+/**
+ * 检测便携模式下的数据路径
+ * 检查可执行文件同级目录（或 macOS .app 同级）是否存在 userdata 或 data 文件夹
+ */
+function getPortableDataPath(): string | null {
+  if (!app.isPackaged) return null;
+
+  try {
+    const exePath = app.getPath('exe');
+    let appDir = path.dirname(exePath);
+
+    // macOS 特殊处理：.app 包的同级目录
+    if (process.platform === 'darwin') {
+      // FlowZ.app/Contents/MacOS/FlowZ -> FlowZ.app/Contents/MacOS -> FlowZ.app/Contents -> FlowZ.app -> Parent
+      appDir = path.join(appDir, '../../..');
+    }
+
+    const portableData = path.join(appDir, 'data');
+    if (fs.existsSync(portableData)) return portableData;
+
+    const portableUserdata = path.join(appDir, 'userdata');
+    if (fs.existsSync(portableUserdata)) return portableUserdata;
+  } catch (e) {
+    // 忽略错误
+  }
+  return null;
+}
 
 /**
  * 获取正确的用户数据路径
@@ -66,9 +95,16 @@ export function getUserDataPath(): string {
  */
 export function initUserDataPath(): void {
   if (!cachedUserDataPath) {
-    // 在应用启动时（普通用户身份）缓存路径
-    cachedUserDataPath = app.getPath('userData');
-    console.log('[Paths] User data path initialized:', cachedUserDataPath);
+    // 优先尝试便携模式路径
+    const portablePath = getPortableDataPath();
+    if (portablePath) {
+      cachedUserDataPath = portablePath;
+      console.log('[Paths] Portable mode detected. Using data path:', cachedUserDataPath);
+    } else {
+      // 在应用启动时（普通用户身份）缓存路径
+      cachedUserDataPath = app.getPath('userData');
+      console.log('[Paths] User data path initialized:', cachedUserDataPath);
+    }
   }
 }
 
