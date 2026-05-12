@@ -133,7 +133,7 @@
     ],
     "category": "Network",
     "icon": "resources/app.png",
-    "artifactName": "${productName}-${version}-linux-${arch}-${target}.${ext}",
+    "artifactName": "${productName}-${version}-linux-${arch}.${ext}",
     "extraResources": [
       {
         "from": "resources/linux",
