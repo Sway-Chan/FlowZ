@@ -884,7 +884,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         domain: uniqueDomains,
         domain_suffix: uniqueDomains.flatMap((d) => [d, `.${d}`]),
         domain_keyword: uniqueDomains,
-        server: 'dns-bootstrap-udp',
+        server: 'dns-domestic', // 强制使用 DoH 解析节点域名，防止 UDP 53 被运营商劫持/丢包导致 TTL 过期后断网
       } as SingBoxDnsRule);
     }
 
@@ -1695,7 +1695,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       outbound: 'direct',
     });
 
-    // 智能分流规则
     const routeConfig: SingBoxRouteConfig = {
       rules,
       // 核心修复：macOS 下 default_domain_resolver 必须使用 IP-based 引导解析器 (dns-bootstrap-udp)
@@ -1705,11 +1704,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       // 如果模式是全局代理 (global/proxy)，则最终出口是所选节点
       final: proxyMode === 'direct' ? 'direct' : selectedServerTag,
     };
-
-    // 【QUIC 阻断规则已移至用户自定义规则和应用分流之后】
-    // 原先在此处全域拒绝 UDP 443 会导致问题：即使用户在应用分流中将游戏设为直连，
-    // 游戏的 UDP 443 流量在被应用分流规则匹配之前就已经被 reject 了。
-    // 移动到后面可以让用户的应用分流规则优先级更高。
 
     // 【DNS 引导与辅助直连】：
     // 确保以下公共 DNS IP 不会被后面的 block 规则拦截，从而保证 DoH 握手和初次域名解析。
@@ -1918,19 +1912,83 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // 【QUIC 阻断】：放在自定义规则和应用分流之后，确保用户的 direct/proxy 规则优先级更高
     // 这样游戏设为直连时，进程名匹配在前，游戏的 UDP 流量不会被误拒。
-    // 仅阻断未被上方规则匹配到的剩余浏览器 QUIC（UDP 443），迫使其回退到 TCP (TLS)。
+    // 仅阻断浏览器的 DoH over QUIC，迫使浏览器回退到系统 UDP 53 + hijack-dns 体系。
+    // 重要：不能全量 reject 所有 UDP 443，否则 Hysteria2/TUIC 等 QUIC 协议节点会被误伤。
     rules.push({
+      domain_keyword: [
+        'dns.google',
+        'cloudflare-dns.com',
+        'doh.opendns.com',
+        'dns.quad9.net',
+        'one.one.one.one',
+      ],
       network: ['udp'],
       port: [443],
       action: 'reject',
     } as any);
+
+    // 【DNS 死循环防范】：sing-box 本地 DNS 解析器的请求必须强制直连，否则在全局代理模式下会产生死循环
+    // 兼容 Windows 1.12.x 版本，不使用 DNS 配置里的 detour
+    rules.push({
+      protocol: 'dns',
+      action: 'route',
+      outbound: 'direct',
+    } as any);
+
+    rules.push({
+      ip_cidr: ['223.5.5.5/32'],
+      port: [53, 443],
+      action: 'route',
+      outbound: 'direct',
+    });
+
+    rules.push({
+      domain_suffix: ['doh.pub'],
+      action: 'route',
+      outbound: 'direct',
+    });
+
+    // 【通用修复：Chrome/Edge 心跳 beacon 域名强制直连 —— global 和 smart 模式均生效】
+    // gvt2.com / gvt1.com 是 Google CDN 心跳；clientservices / oauthaccountmanager /
+    // optimizationguide-pa 是 Chrome 账号同步、FCM Push 和优化引导的后台服务。
+    // 这些域名对代理节点出口通常限速或屏蔽（非浏览行为），一旦持续超时会耗尽连接池，
+    // 导致所有正常网页也超时 —— 即"过一会就断网"现象。
+    // 在 global 和 smart 两种模式下均强制直连，彻底消除对连接池的占用。
+    if (proxyMode !== 'direct') {
+      rules.push({
+        domain_suffix: [
+          // Google CDN 心跳
+          'gvt2.com',
+          'gvt1.com',
+          // Chrome 账号同步 / FCM Push 后台
+          'oauthaccountmanager.googleapis.com',
+          'clientservices.googleapis.com',
+          // Chrome 优化引导服务
+          'optimizationguide-pa.googleapis.com',
+          // Google FCM 推送 (port 5228)
+          'mtalk.google.com',
+          // Android 客户端服务
+          'android.clients.google.com',
+          // Chrome / GMS clients
+          'clients1.google.com',
+          'clients2.google.com',
+          'clients3.google.com',
+          'clients4.google.com',
+          'clients5.google.com',
+          'clients6.google.com',
+          // 自动更新检查
+          'update.googleapis.com',
+        ],
+        action: 'reject',
+      });
+    }
 
     // 智能分流规则（仅在智能分流模式下启用）
     if (proxyMode === 'smart') {
       // 已移除 ::/0 block，因为 block 是静默丢包，会导致 Chrome 等浏览器在发起 TCP SYN 包时陷入漫长的 21 秒重传等待（Happy Eyeballs 假死），
       // 从而让用户以为“所有的海外网站全都打不开了”。我们必须依靠浏览器的原生 fallback，或者直接让 Mac 本机关闭 IPv6 分配。
 
-      // 针对 Google 和 YouTube 的关键词兜底规则（仅在未专门设置应用分流时作为备份）
+      // 针对 Google 核心服务（搜索/YouTube/Gmail 等）的关键词兜底规则（仅在未专门设置应用分流时作为备份）
       // 注意：这些规则在 AppRules 之后，所以不会覆盖用户手动指定的节点
       rules.push({
         domain_keyword: ['google', 'gmail', 'youtube', 'gstatic', 'googleapis', 'googlevideo'],
@@ -3457,6 +3515,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     this.logFileWatcher = setInterval(async () => {
       try {
         const stats = await fs.stat(logFilePath);
+
+        // 如果文件大小变小了，说明文件被清空或截断了
+        if (stats.size < this.lastLogFileSize) {
+          this.lastLogFileSize = 0;
+        }
+
         if (stats.size > this.lastLogFileSize) {
           // 读取新增的内容
           const fd = await fs.open(logFilePath, 'r');
