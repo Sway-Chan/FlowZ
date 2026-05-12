@@ -28,7 +28,7 @@
       }
     ],
     "icon": "build/icon.ico",
-    "artifactName": "${productName}-${version}-win-${arch}-${target}.${ext}",
+    "artifactName": "${productName}-${version}-win-${arch}-setup.${ext}",
     "extraResources": [
       {
         "from": "resources",
@@ -66,6 +66,9 @@
     "installerHeaderIcon": "build/icon.ico",
     "deleteAppDataOnUninstall": false
   },
+  "portable": {
+    "artifactName": "${productName}-${version}-win-${arch}-portable.${ext}"
+  },
   "mac": {
     "target": [
       {
@@ -77,7 +80,7 @@
     ],
     "icon": "build/icon.icns",
     "category": "public.app-category.utilities",
-    "artifactName": "${productName}-${version}-mac-${arch}-${target}.${ext}",
+    "artifactName": "${productName}-${version}-mac-${arch}.${ext}",
     "identity": null,
     "gatekeeperAssess": false,
     "extraResources": [
