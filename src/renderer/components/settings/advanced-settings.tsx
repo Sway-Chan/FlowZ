@@ -191,11 +191,11 @@ export function AdvancedSettings() {
             <div className="flex gap-2">
               <Input
                 id="socksPort"
-                type="number"
-                min="1024"
-                max="65535"
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]*"
                 value={socksPort}
-                onChange={(e) => setSocksPort(e.target.value)}
+                onChange={(e) => setSocksPort(e.target.value.replace(/[^0-9]/g, ''))}
                 className="max-w-[200px]"
               />
             </div>
@@ -207,11 +207,11 @@ export function AdvancedSettings() {
             <div className="flex gap-2">
               <Input
                 id="httpPort"
-                type="number"
-                min="1024"
-                max="65535"
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]*"
                 value={httpPort}
-                onChange={(e) => setHttpPort(e.target.value)}
+                onChange={(e) => setHttpPort(e.target.value.replace(/[^0-9]/g, ''))}
                 className="max-w-[200px]"
               />
             </div>
@@ -237,11 +237,11 @@ export function AdvancedSettings() {
               <div className="ml-6 space-y-2">
                 <Input
                   id="mixedPort"
-                  type="number"
-                  min="1024"
-                  max="65535"
+                  type="text"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
                   value={mixedPort}
-                  onChange={(e) => setMixedPort(e.target.value)}
+                  onChange={(e) => setMixedPort(e.target.value.replace(/[^0-9]/g, ''))}
                   className="max-w-[200px]"
                 />
                 <p className="text-xs text-muted-foreground">

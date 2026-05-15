@@ -389,6 +389,7 @@
     "generateShareLinkFailed": "Failed to generate share link",
     "copyFailed": "Copy failed",
     "copyShareLink": "Copy share link",
+    "copyAndEdit": "Clone & fix via manual edit",
     "edit": "Edit",
     "delete": "Delete",
     "deleteServerConfig": "Delete Server",

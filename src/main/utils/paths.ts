@@ -14,9 +14,15 @@ let cachedUserDataPath: string | null = null;
 
 /**
  * 检测便携模式下的数据路径
- * 检查可执行文件同级目录（或 macOS .app 同级）是否存在 userdata 或 data 文件夹
+ * 检查环境变量或可执行文件同级目录是否存在 userdata 或 data 文件夹
  */
 function getPortableDataPath(): string | null {
+  // 1. 优先检查 electron-builder 设置的便携版环境变量
+  // PORTABLE_EXECUTABLE_DIR 是 Windows 便携版 EXE 所在的目录
+  if (process.env.PORTABLE_EXECUTABLE_DIR) {
+    return path.join(process.env.PORTABLE_EXECUTABLE_DIR, 'data');
+  }
+
   if (!app.isPackaged) return null;
 
   try {
@@ -90,8 +96,9 @@ export function getUserDataPath(): string {
 }
 
 /**
- * 设置用户数据路径（应在应用启动时以普通用户身份调用）
- * 这确保即使后来以 root 运行部分代码，也能使用正确的路径
+ * 设置用户数据路径（应在应用启动时尽早调用）
+ * 这确保即使后来以 root 运行部分代码，也能使用正确的路径，
+ * 并且在便携模式下，Electron 的内部数据也能正确重定向。
  */
 export function initUserDataPath(): void {
   if (!cachedUserDataPath) {
@@ -99,7 +106,24 @@ export function initUserDataPath(): void {
     const portablePath = getPortableDataPath();
     if (portablePath) {
       cachedUserDataPath = portablePath;
-      console.log('[Paths] Portable mode detected. Using data path:', cachedUserDataPath);
+
+      // 确保便携版数据目录存在
+      if (!fs.existsSync(cachedUserDataPath)) {
+        try {
+          fs.mkdirSync(cachedUserDataPath, { recursive: true });
+        } catch (e) {
+          console.error('[Paths] Failed to create portable data directory:', e);
+        }
+      }
+
+      // 核心：将 Electron 的 userData 路径重定向到便携目录
+      // 注意：这必须在 app.requestSingleInstanceLock() 之前调用
+      try {
+        app.setPath('userData', cachedUserDataPath);
+        console.log('[Paths] Portable mode detected. Redirected userData to:', cachedUserDataPath);
+      } catch (e) {
+        console.error('[Paths] Failed to set userData path:', e);
+      }
     } else {
       // 在应用启动时（普通用户身份）缓存路径
       cachedUserDataPath = app.getPath('userData');

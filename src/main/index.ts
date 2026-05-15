@@ -36,6 +36,10 @@ import { mainEventEmitter, MAIN_EVENTS } from './ipc/main-events';
 import { initUserDataPath } from './utils/paths';
 import { IPC_CHANNELS } from '../shared/ipc-channels';
 
+// 初始化用户数据路径（必须在 app.requestSingleInstanceLock() 之前调用）
+// 以确保便携模式下，锁文件和所有 Electron 数据都重定向到正确的目录
+initUserDataPath();
+
 // Windows LTSC / 精简版系统兼容处理
 // 如果用户是 LTSC 且黑屏，建议他们通过设置开启“禁用硬件加速”选项
 // 强制开启软件渲染会导致正常 Windows 用户出现严重白屏或掉帧，因此这里移除全局强制设定。
@@ -521,10 +525,6 @@ async function updateTrayMenuState(isProxyRunning: boolean, hasError?: boolean):
 
 if (gotTheLock) {
   app.whenReady().then(async () => {
-    // 在导入任何使用路径的服务之前，初始化用户数据路径
-    // 这确保无论以何种权限运行，都使用正确的路径
-    initUserDataPath();
-
     // 初始化服务
     configManager = new ConfigManager();
     protocolParser = new ProtocolParser();

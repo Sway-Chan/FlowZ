@@ -49,6 +49,7 @@ export class ProtocolParser implements IProtocolParser {
       url.startsWith('ss://') ||
       url.startsWith('anytls://') ||
       url.startsWith('tuic://') ||
+      url.startsWith('naive://') ||
       url.startsWith('http2://') ||
       url.startsWith('naive+https://') ||
       url.startsWith('vmess://') ||
@@ -120,7 +121,13 @@ export class ProtocolParser implements IProtocolParser {
       }
 
       // naive 是 http2 或者 naive+https 的内部别名
-      if (protocolStr === 'http2' || protocolStr === 'naive+https') {
+      // 同时兼容一些客户端使用的 https://...#naive 格式，以及标准的 naive://
+      if (
+        protocolStr === 'http2' ||
+        protocolStr === 'naive+https' ||
+        protocolStr === 'naive' ||
+        (protocolStr === 'https' && urlObj.hash.toLowerCase().includes('naive'))
+      ) {
         protocolStr = 'naive';
       }
 
@@ -318,25 +325,10 @@ export class ProtocolParser implements IProtocolParser {
     }
 
     // 解析 TLS 配置
-    const tlsSettings: TlsSettings = {};
-
-    const sni = params.get('sni') || params.get('peer');
-    if (sni) {
-      tlsSettings.serverName = sni;
-    }
-
-    const insecure = params.get('insecure') || params.get('allowInsecure');
-    if (insecure === '1' || insecure === 'true') {
-      tlsSettings.allowInsecure = true;
-    }
-
-    const alpn = params.get('alpn');
-    if (alpn) {
-      tlsSettings.alpn = alpn.split(',');
-    }
-
-    if (Object.keys(tlsSettings).length > 0) {
-      config.tlsSettings = tlsSettings;
+    config.tlsSettings = this.parseTlsSettings(params);
+    // Hysteria2 必须开启 TLS，如果 parseTlsSettings 没解析到 SNI，设置默认 SNI
+    if (!config.tlsSettings.serverName) {
+      config.tlsSettings.serverName = params.get('sni') || params.get('peer') || address;
     }
 
     return config;
@@ -370,11 +362,13 @@ export class ProtocolParser implements IProtocolParser {
       network: 'tcp', // sing-box tuic default network isn't strictly necessary but keeping for consistency
       security: 'tls',
       tuicSettings: {},
-      tlsSettings: {
-        serverName: params.get('sni') || url.hostname,
-        allowInsecure: params.get('allow_insecure') === '1' || params.get('insecure') === '1',
-      },
+      tlsSettings: this.parseTlsSettings(params),
     };
+
+    // 如果没解析到 SNI，设置默认
+    if (!config.tlsSettings!.serverName) {
+      config.tlsSettings!.serverName = params.get('sni') || url.hostname;
+    }
 
     // Alpn (typically 'h3' for TUIC v5)
     const alpnParam = params.get('alpn');
@@ -657,10 +651,10 @@ export class ProtocolParser implements IProtocolParser {
 
     // 设置默认 TLS
     config.security = 'tls';
-    config.tlsSettings = {
-      serverName: address,
-      allowInsecure: false,
-    };
+    config.tlsSettings = this.parseTlsSettings(params);
+    if (!config.tlsSettings.serverName) {
+      config.tlsSettings.serverName = address;
+    }
 
     return config;
   }
@@ -722,11 +716,15 @@ export class ProtocolParser implements IProtocolParser {
         config.security = 'tls';
         config.tlsSettings = {
           serverName: vmessData.sni || vmessData.host || address,
-          allowInsecure: false,
+          allowInsecure:
+            vmessData.insecure === true ||
+            vmessData.insecure === 1 ||
+            vmessData.allowInsecure === true,
           fingerprint: vmessData.fp || 'chrome',
         };
         if (vmessData.alpn) {
-          config.tlsSettings.alpn = vmessData.alpn.split(',');
+          config.tlsSettings.alpn =
+            typeof vmessData.alpn === 'string' ? vmessData.alpn.split(',') : vmessData.alpn;
         }
       } else {
         config.security = 'none';
@@ -804,10 +802,10 @@ export class ProtocolParser implements IProtocolParser {
     };
 
     if (isHttps) {
-      config.tlsSettings = {
-        serverName: address,
-        allowInsecure: false,
-      };
+      config.tlsSettings = this.parseTlsSettings(new URLSearchParams(urlObj.search));
+      if (!config.tlsSettings.serverName) {
+        config.tlsSettings.serverName = address;
+      }
     }
 
     return config;
@@ -918,13 +916,14 @@ export class ProtocolParser implements IProtocolParser {
     const settings: TlsSettings = {};
 
     // SNI / Server Name
-    const sni = params.get('sni') || params.get('host');
+    const sni = params.get('sni') || params.get('host') || params.get('peer');
     if (sni) {
       settings.serverName = sni;
     }
 
-    // Allow Insecure
-    const allowInsecure = params.get('allowInsecure');
+    // Allow Insecure (支持多种常见别名)
+    const allowInsecure =
+      params.get('allowInsecure') || params.get('insecure') || params.get('allow_insecure');
     if (allowInsecure !== null) {
       settings.allowInsecure = allowInsecure === '1' || allowInsecure === 'true';
     }
