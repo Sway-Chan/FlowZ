@@ -140,7 +140,7 @@ export class CoreUpdateService {
 
       // 5. 替换核心
       this.logManager.addLog('info', '正在替换核心文件...', 'CoreUpdateService');
-      const targetPath = resourceManager.getSingBoxPath();
+      const targetPath = resourceManager.getSingBoxUpdateTargetPath();
 
       // 确保目标目录存在
       const targetDir = path.dirname(targetPath);
@@ -363,7 +363,7 @@ export class CoreUpdateService {
       }
     }
 
-    const currentPath = resourceManager.getSingBoxPath();
+    const currentPath = resourceManager.getSingBoxUpdateTargetPath();
     const backupPath = this.getBackupPath();
 
     this.logManager.addLog(
@@ -442,7 +442,7 @@ export class CoreUpdateService {
     // 备份当前核心
     await this.backupCurrentCore();
 
-    const targetPath = resourceManager.getSingBoxPath();
+    const targetPath = resourceManager.getSingBoxUpdateTargetPath();
     const targetDir = path.dirname(targetPath);
 
     if (!fs.existsSync(targetDir)) {
@@ -781,7 +781,7 @@ export class CoreUpdateService {
   }
 
   private async restoreBackup(): Promise<void> {
-    const currentPath = resourceManager.getSingBoxPath();
+    const currentPath = resourceManager.getSingBoxUpdateTargetPath();
     const backupPath = this.getBackupPath();
 
     if (fs.existsSync(backupPath)) {

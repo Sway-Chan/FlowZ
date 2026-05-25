@@ -30,10 +30,35 @@ export class ResourceManager {
   getSingBoxPath(): string {
     // Windows 平台需要 .exe 扩展名
     const filename = this.platform === 'win32' ? 'sing-box.exe' : 'sing-box';
+
+    // Windows Portable 模式特殊处理：优先使用 userData 下的核心
+    if (this.platform === 'win32' && process.env.PORTABLE_EXECUTABLE_DIR) {
+      const fs = require('fs');
+      const portableCorePath = path.join(app.getPath('userData'), 'core_update', filename);
+      if (fs.existsSync(portableCorePath)) {
+        return portableCorePath;
+      }
+    }
+
     const platformDir = this.getPlatformResourceDir();
     const singboxPath = path.join(platformDir, filename);
 
     return singboxPath;
+  }
+
+  /**
+   * 获取核心更新时的目标写入路径
+   * 专为解决 Portable 版本每次启动清空临时目录导致更新失效的问题
+   */
+  getSingBoxUpdateTargetPath(): string {
+    const filename = this.platform === 'win32' ? 'sing-box.exe' : 'sing-box';
+
+    // Windows Portable 模式特殊处理：更新文件必须写入 userData 才能持久化
+    if (this.platform === 'win32' && process.env.PORTABLE_EXECUTABLE_DIR) {
+      return path.join(app.getPath('userData'), 'core_update', filename);
+    }
+
+    return this.getSingBoxPath();
   }
 
   /**

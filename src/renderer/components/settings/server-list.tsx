@@ -67,6 +67,7 @@ const ALL_PROTOCOLS = [
   'tuic',
   'naive',
   'socks',
+  'snell',
   'http',
 ] as const;
 
@@ -323,6 +324,7 @@ export function ServerList({
       tuic: 'bg-indigo-500/15 text-indigo-600 border-indigo-300/30',
       naive: 'bg-rose-500/15 text-rose-600 border-rose-300/30',
       socks: 'bg-slate-500/15 text-slate-600 border-slate-300/30',
+      snell: 'bg-amber-500/15 text-amber-600 border-amber-300/30',
       http: 'bg-sky-500/15 text-sky-600 border-sky-300/30',
     };
     return colors[protocol.toLowerCase()] || 'bg-muted text-muted-foreground';
@@ -731,7 +733,15 @@ export function ServerList({
                 </CardHeader>
                 <CardContent className="pt-0 pb-3">
                   <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-                    {server.protocol?.toLowerCase() === 'shadowsocks' ? (
+                    {server.protocol?.toLowerCase() === 'snell' ? (
+                      <>
+                        <span>PSK: ***</span>
+                        <span>
+                          {t('servers.snellVersion', 'Version')}:{' '}
+                          {server.snellSettings?.version || 4}
+                        </span>
+                      </>
+                    ) : server.protocol?.toLowerCase() === 'shadowsocks' ? (
                       <span>
                         {t('servers.encryption')}: {server.shadowsocksSettings?.method || 'N/A'}
                       </span>

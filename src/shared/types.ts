@@ -19,6 +19,7 @@ export type Protocol =
   | 'vmess'
   | 'naive'
   | 'socks'
+  | 'snell'
   | 'http';
 export type Network = 'tcp' | 'ws' | 'grpc' | 'http';
 export type Hysteria2Network = 'tcp' | 'udp';
@@ -90,6 +91,14 @@ export interface ShadowsocksSettings {
   password: string;
   plugin?: string;
   pluginOptions?: string;
+}
+
+// Snell 协议设置
+export interface SnellSettings {
+  psk: string;
+  version: number;
+  obfs?: 'none' | 'http' | 'tls';
+  obfsHost?: string;
 }
 
 // AnyTLS 协议设置
@@ -166,6 +175,9 @@ export interface ServerConfig {
 
   // Shadowsocks 特定
   shadowsocksSettings?: ShadowsocksSettings;
+
+  // Snell 特定
+  snellSettings?: SnellSettings;
 
   // Shadow-TLS 插件（可附加在任意协议上，常用于 SS2022）
   shadowTlsSettings?: ShadowTlsSettings;

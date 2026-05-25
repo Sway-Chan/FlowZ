@@ -58,7 +58,9 @@ export function ImportUrlDialog({ open, onOpenChange, onImportSuccess }: ImportU
       u.startsWith('socks://') ||
       u.startsWith('s5://') ||
       u.startsWith('http://') ||
-      u.startsWith('https://')
+      u.startsWith('https://') ||
+      u.startsWith('snell://') ||
+      /^\s*[^=]+\s*=\s*snell\s*,/i.test(u)
     );
   };
 

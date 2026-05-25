@@ -70,6 +70,10 @@ export function ProxyModeSelector() {
     } else if (protocol === 'socks' || protocol === 'http') {
       // SOCKS and HTTP can just have address and port, username/pass are optional
       return true;
+    } else if (protocol === 'snell') {
+      return !!(
+        selectedServer.snellSettings?.psk && selectedServer.snellSettings?.psk.trim() !== ''
+      );
     }
 
     return false;

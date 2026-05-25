@@ -202,11 +202,12 @@ export class ConfigManager implements IConfigManager {
           'tuic',
           'naive',
           'socks',
+          'snell',
           'http',
         ].includes(protocolLower)
       ) {
         throw new Error(
-          'Server protocol must be vless, vmess, trojan, hysteria2, shadowsocks, anytls, tuic, naive, socks, or http'
+          'Server protocol must be vless, vmess, trojan, hysteria2, shadowsocks, anytls, tuic, naive, socks, snell, or http'
         );
       }
       if (!server.address || typeof server.address !== 'string') {
@@ -285,6 +286,16 @@ export class ConfigManager implements IConfigManager {
           typeof server.shadowsocksSettings.password !== 'string'
         ) {
           throw new Error('Shadowsocks server requires password');
+        }
+      }
+
+      // Snell 特定验证
+      if (protocolLower === 'snell') {
+        if (!server.snellSettings) {
+          throw new Error('Snell server requires snellSettings');
+        }
+        if (!server.snellSettings.psk || typeof server.snellSettings.psk !== 'string') {
+          throw new Error('Snell server requires psk');
         }
       }
     }

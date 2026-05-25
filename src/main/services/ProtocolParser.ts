@@ -57,7 +57,9 @@ export class ProtocolParser implements IProtocolParser {
       url.startsWith('socks://') ||
       url.startsWith('s5://') ||
       url.startsWith('http://') ||
-      url.startsWith('https://')
+      url.startsWith('https://') ||
+      url.startsWith('snell://') ||
+      /^\s*[^=]+\s*=\s*snell\s*,/i.test(url)
     );
   }
 
@@ -107,6 +109,11 @@ export class ProtocolParser implements IProtocolParser {
         url = this.preprocessSsUrl(url);
       }
 
+      // Check for Surge Snell format: "Name = snell, IP, PORT, psk=..."
+      if (/^\s*[^=]+\s*=\s*snell\s*,/i.test(url)) {
+        return this.parseSnellSurge(url);
+      }
+
       const urlObj = new URL(url);
       let protocolStr = urlObj.protocol.replace(':', '');
 
@@ -153,6 +160,8 @@ export class ProtocolParser implements IProtocolParser {
         return this.parseSocks(urlObj);
       } else if (protocol === 'http' || protocolStr === 'https') {
         return this.parseHttp(urlObj);
+      } else if (protocol === 'snell') {
+        return this.parseSnellUrl(urlObj);
       }
 
       throw new Error(`不支持的协议: ${protocol}`);
@@ -799,13 +808,116 @@ export class ProtocolParser implements IProtocolParser {
       password,
       network: 'tcp',
       security: isHttps ? 'tls' : 'none',
+      tlsSettings: isHttps ? { serverName: address, allowInsecure: false } : undefined,
+    };
+    return config;
+  }
+
+  /**
+   * 解析 Surge 格式的 Snell 节点
+   * 格式: HK-Snell = snell, 1.2.3.4, 50370, psk=xxx, version=4, reuse=true, tfo=true, obfs=tls, obfs-host=bing.com
+   */
+  private parseSnellSurge(line: string): ServerConfig {
+    const parts = line.split('=');
+    const namePart = parts[0].trim();
+
+    // 把第一个 = 后面的内容重新拼起来（防止 psk 等字段带有 =）
+    const configStr = parts.slice(1).join('=');
+    const items = configStr.split(',').map((s) => s.trim());
+
+    // items[0] 是 'snell'
+    const address = this.stripIpv6Brackets(items[1]);
+    const port = parseInt(items[2], 10);
+
+    const config: ServerConfig = {
+      id: randomUUID(),
+      name: namePart || 'Snell Node',
+      protocol: 'snell',
+      address,
+      port,
+      snellSettings: {
+        psk: '',
+        version: 4,
+        obfs: 'none',
+      },
     };
 
-    if (isHttps) {
-      config.tlsSettings = this.parseTlsSettings(new URLSearchParams(urlObj.search));
-      if (!config.tlsSettings.serverName) {
-        config.tlsSettings.serverName = address;
+    // 解析键值对参数
+    for (let i = 3; i < items.length; i++) {
+      const param = items[i];
+      const eqIdx = param.indexOf('=');
+      if (eqIdx !== -1) {
+        const key = param.substring(0, eqIdx).trim().toLowerCase();
+        const value = param.substring(eqIdx + 1).trim();
+
+        if (key === 'psk') {
+          config.snellSettings!.psk = value;
+        } else if (key === 'version') {
+          config.snellSettings!.version = parseInt(value, 10);
+        } else if (key === 'obfs') {
+          const obfsLower = value.toLowerCase();
+          if (obfsLower === 'http' || obfsLower === 'tls') {
+            config.snellSettings!.obfs = obfsLower;
+          }
+        } else if (key === 'obfs-host') {
+          config.snellSettings!.obfsHost = value;
+        }
       }
+    }
+
+    if (!config.snellSettings!.psk) {
+      throw new Error('Snell 配置缺少 PSK');
+    }
+
+    return config;
+  }
+
+  /**
+   * 解析 snell:// URL 格式 (Clash/Shadowrocket 可能支持)
+   * 格式: snell://psk@host:port?version=4&obfs=tls&obfs-host=bing.com#name
+   */
+  private parseSnellUrl(urlObj: URL): ServerConfig {
+    const address = this.stripIpv6Brackets(urlObj.hostname);
+    const port = parseInt(urlObj.port) || 443;
+    const name = decodeURIComponent(urlObj.hash.slice(1)) || `${address}:${port}`;
+
+    // ps 放在 username 里（或者 username:password 合并）
+    const psk = decodeURIComponent(
+      urlObj.username + (urlObj.password ? ':' + urlObj.password : '')
+    );
+
+    const config: ServerConfig = {
+      id: randomUUID(),
+      name,
+      protocol: 'snell',
+      address,
+      port,
+      snellSettings: {
+        psk: psk,
+        version: 4,
+        obfs: 'none',
+      },
+    };
+
+    const params = new URLSearchParams(urlObj.search);
+
+    const versionStr = params.get('version');
+    if (versionStr) {
+      config.snellSettings!.version = parseInt(versionStr, 10);
+    }
+
+    const obfsStr = params.get('obfs')?.toLowerCase();
+    if (obfsStr === 'http' || obfsStr === 'tls') {
+      config.snellSettings!.obfs = obfsStr;
+    }
+
+    const obfsHost = params.get('obfs-host');
+    if (obfsHost) {
+      config.snellSettings!.obfsHost = obfsHost;
+    }
+
+    if (!config.snellSettings!.psk) {
+      throw new Error('Snell URL 缺少 PSK');
     }
 
     return config;

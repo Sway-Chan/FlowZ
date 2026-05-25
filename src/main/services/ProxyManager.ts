@@ -182,8 +182,10 @@ interface SingBoxOutbound {
   down_mbps?: number;
   obfs?: {
     type: string;
-    password: string;
+    password?: string;
+    host?: string;
   };
+  psk?: string;
   network?: string;
   // TUIC specific
   congestion_control?: string;
@@ -221,6 +223,8 @@ interface SingBoxOutbound {
   };
   // DNS resolver for outbound server domain
   domain_resolver?: string;
+  // IPv4/IPv6 preference: prefer_ipv4 | prefer_ipv6 | ipv4_only | ipv6_only
+  domain_strategy?: string;
   // UDP over TCP (UoT)
   udp_over_tcp?: {
     enabled: boolean;
@@ -1336,6 +1340,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     const protocolLower = protocol;
     const tlsProtocols = ['trojan', 'anytls', 'hysteria2', 'tuic'];
 
+    const isIPv6Address = (addr: string) => /^[0-9a-fA-F:]+$/.test(addr) && addr.includes(':');
+    const isDomainName = (addr: string) =>
+      !isIPv6Address(addr) && !/^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(addr);
+
     const outbound: SingBoxOutbound = {
       type: protocol,
       tag: idToTagMap.get(server.id) || `proxy-${server.id}`,
@@ -1343,6 +1351,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       server_port: server.port,
       // 代理服务器使用 IP-based 引导解析器，防止因 dns-local 死循环导致的连接挂起
       domain_resolver: 'dns-bootstrap-udp',
+      // 当节点地址是域名时，优先解析并使用 IPv4 (A 记录)，避免通过 IPv6 出站。
+      // 国内 ISP 的 IPv6 前缀约每 16 分钟刷新一次：刷新期间旧前缀的 TCP 会话被强制 RST，
+      // 新前缀生效前的窗口期内新建连接 i/o timeout，造成 TUN 模式约 10+ 分钟后断网。
+      // 对于纯 IPv6 IP 节点（如本次触发问题的 240e:... 地址），domain_strategy 无效，
+      // 需要在服务商侧将节点地址改为域名或 IPv4 地址才能根治。
+      domain_strategy: isDomainName(server.address) ? 'prefer_ipv4' : undefined,
     };
 
     // VLESS 特定配置
@@ -1419,6 +1433,22 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       if (server.shadowsocksSettings.plugin) {
         outbound.plugin = server.shadowsocksSettings.plugin;
         outbound.plugin_opts = server.shadowsocksSettings.pluginOptions;
+      }
+    }
+
+    // Snell 特定配置
+    if (protocol === 'snell') {
+      if (!server.snellSettings) {
+        throw new Error(`Snell server ${server.name} missing settings`);
+      }
+      outbound.psk = server.snellSettings.psk;
+      outbound.version = server.snellSettings.version || 4;
+
+      if (server.snellSettings.obfs && server.snellSettings.obfs !== 'none') {
+        outbound.obfs = {
+          type: server.snellSettings.obfs,
+          host: server.snellSettings.obfsHost || 'bing.com',
+        };
       }
     }
 
@@ -1836,6 +1866,40 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 第一条 QUIC reject 规则已在上方（生成 routeConfig 之前）添加，此处重复添加会造成规则冗余
     // reject 比 block 更合适（发 TCP RST 让浏览器立即回退到 TCP，而不是静默丢弃造成等待超时）
 
+    // 【关键修复：纯 CDN beacon/遥测域名必须在 appRules 之前 reject，防止 Chrome appRule 绕过此规则】
+    // 这些域名是浏览器后台遥测上报，在代理节点出口通常被限速或封锁，持续 5 秒 i/o timeout，
+    // 大量堆积会：
+    // 1. 耗尽 sing-box 连接池，导致正常请求也超时
+    // 2. 消耗 FakeIP 地址槽（198.18.0.0/15 共 65536 个），10 分钟后 FakeIP 耗尽导致 DNS 失败断网
+    // 必须放在 appRules 之前，否则 Chrome 应用分流规则会让这些域名绕过 reject 走代理。
+    //
+    // 注意：只 reject 纯 CDN beacon/遥测域名，不要 reject 有实际功能的服务：
+    //   - play.googleapis.com：Antigravity/VS Code 语言服务器在用，reject 会断功能
+    //   - mtalk.google.com：Telegram 等应用的 FCM 推送依赖，reject 会断通知
+    if (proxyMode !== 'direct') {
+      rules.push({
+        domain_suffix: [
+          // Google CDN beacon 心跳（纯遥测，无实际用户功能，日志里 gvt3.com 是之前遗漏的！）
+          'gvt1.com',
+          'gvt2.com',
+          'gvt3.com', // beacons5.gvt3.com 日志里大量 timeout，之前遗漏
+          // Chrome 后台遥测/优化服务（无用户感知功能，节点通常封锁）
+          'clientservices.googleapis.com',
+          'optimizationguide-pa.googleapis.com',
+          // Chrome / GMS 配置拉取（clients1~6，纯后台心跳，不影响正常使用）
+          'clients1.google.com',
+          'clients2.google.com',
+          'clients3.google.com',
+          'clients4.google.com',
+          'clients5.google.com',
+          'clients6.google.com',
+          // 自动更新静默检查（节点封锁大量更新流量导致 timeout）
+          'update.googleapis.com',
+        ],
+        action: 'reject',
+      });
+    }
+
     // 3. 自定义规则（优先级次之，允许用户覆盖后续默认行为）
     if (proxyMode !== 'direct') {
       const { rules: customRules, ruleSets: customRuleSets } = this.generateCustomRules(
@@ -1948,40 +2012,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       outbound: 'direct',
     });
 
-    // 【通用修复：Chrome/Edge 心跳 beacon 域名强制直连 —— global 和 smart 模式均生效】
-    // gvt2.com / gvt1.com 是 Google CDN 心跳；clientservices / oauthaccountmanager /
-    // optimizationguide-pa 是 Chrome 账号同步、FCM Push 和优化引导的后台服务。
-    // 这些域名对代理节点出口通常限速或屏蔽（非浏览行为），一旦持续超时会耗尽连接池，
-    // 导致所有正常网页也超时 —— 即"过一会就断网"现象。
-    // 在 global 和 smart 两种模式下均强制直连，彻底消除对连接池的占用。
-    if (proxyMode !== 'direct') {
-      rules.push({
-        domain_suffix: [
-          // Google CDN 心跳
-          'gvt2.com',
-          'gvt1.com',
-          // Chrome 账号同步 / FCM Push 后台
-          'oauthaccountmanager.googleapis.com',
-          'clientservices.googleapis.com',
-          // Chrome 优化引导服务
-          'optimizationguide-pa.googleapis.com',
-          // Google FCM 推送 (port 5228)
-          'mtalk.google.com',
-          // Android 客户端服务
-          'android.clients.google.com',
-          // Chrome / GMS clients
-          'clients1.google.com',
-          'clients2.google.com',
-          'clients3.google.com',
-          'clients4.google.com',
-          'clients5.google.com',
-          'clients6.google.com',
-          // 自动更新检查
-          'update.googleapis.com',
-        ],
-        action: 'reject',
-      });
-    }
+    // 【旧的心跳 reject 规则已移至 appRules 之前（见上方），此处保留注释说明原因】
+    // 原因：若放在 appRules 之后，Chrome 的应用分流规则（action: proxy）会覆盖这里的 reject，
+    // 导致 gvt3.com 等心跳域名仍然走代理并持续 timeout，引发连接池耗尽和 FakeIP 堆积。
 
     // 智能分流规则（仅在智能分流模式下启用）
     if (proxyMode === 'smart') {
@@ -3522,14 +3555,24 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         }
 
         if (stats.size > this.lastLogFileSize) {
+          // 【关键修复】限制单次最大读取量为 512KB，防止日志文件过大时
+          // Node.js 主线程被 IO 阻塞，导致健康检查定时器延迟触发、Electron IPC 卡顿。
+          // TUN 模式下 10 分钟产生大量日志，不限速会造成单次读取数 MB 数据。
+          const MAX_READ_SIZE = 512 * 1024; // 512KB
+          const bytesToRead = Math.min(stats.size - this.lastLogFileSize, MAX_READ_SIZE);
+          // 读取文件末尾的新内容（若超限则跳过中间部分，只读最新数据）
+          const readOffset = stats.size - bytesToRead;
+
           // 读取新增的内容
           const fd = await fs.open(logFilePath, 'r');
-          const buffer = Buffer.alloc(stats.size - this.lastLogFileSize);
-          await fd.read(buffer, 0, buffer.length, this.lastLogFileSize);
+          const buffer = Buffer.alloc(bytesToRead);
+          await fd.read(buffer, 0, buffer.length, readOffset);
           await fd.close();
 
-          const newContent = buffer.toString('utf-8');
+          // 更新位置指针到文件末尾（无论读了多少，都跳过中间积压部分）
           this.lastLogFileSize = stats.size;
+
+          const newContent = buffer.toString('utf-8');
 
           // 处理日志内容
           if (newContent.trim()) {

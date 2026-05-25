@@ -14,7 +14,7 @@ export type {
   SubscriptionConfig,
 } from '../../shared/types';
 export type ProxyMode = 'global' | 'smart' | 'direct';
-export type ProxyModeType = 'systemProxy' | 'tun';
+export type ProxyModeType = 'systemProxy' | 'tun' | 'manual';
 export type ProtocolType =
   | 'vless'
   | 'trojan'
@@ -23,7 +23,10 @@ export type ProtocolType =
   | 'anytls'
   | 'tuic'
   | 'vmess'
-  | 'naive';
+  | 'naive'
+  | 'socks'
+  | 'http'
+  | 'snell';
 
 // 兼容旧代码的类型别名
 export type ServerConfigWithId = import('../../shared/types').ServerConfig;
