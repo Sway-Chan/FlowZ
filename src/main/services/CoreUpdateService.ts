@@ -820,22 +820,23 @@ export class CoreUpdateService {
       // First try a direct copy (works if app has write access)
       fs.copyFileSync(src, dest);
     } catch (directErr: any) {
-      if (directErr.code !== 'EPERM' && directErr.code !== 'EACCES') {
+      if (directErr.code !== 'EPERM' && directErr.code !== 'EACCES' && directErr.code !== 'EBUSY') {
         throw directErr;
       }
 
       this.logManager.addLog(
         'info',
-        'Direct copy failed (EPERM), attempting elevated PowerShell copy...',
+        `Direct copy failed (${directErr.code}), attempting elevated PowerShell copy...`,
         'CoreUpdateService'
       );
 
       // Fall back: use PowerShell with -Verb RunAs to elevate.
       const scriptPath = path.join(app.getPath('temp'), `flowz-copy-${Date.now()}.ps1`);
       // 使用 $ErrorActionPreference = 'Stop' 确保出错时非 0 退出
+      // 增加 Stop-Process 防御，防止因为 TUN 模式的高权限占用导致无法覆盖
       fs.writeFileSync(
         scriptPath,
-        `$ErrorActionPreference = 'Stop'\nCopy-Item -Path '${escapedSrc}' -Destination '${escapedDest}' -Force\n`
+        `$ErrorActionPreference = 'Stop'\nStop-Process -Name "sing-box" -Force -ErrorAction SilentlyContinue\nStart-Sleep -Seconds 1\nCopy-Item -Path '${escapedSrc}' -Destination '${escapedDest}' -Force\n`
       );
 
       try {
