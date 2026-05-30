@@ -190,7 +190,7 @@ export function ServerPage() {
       <Tabs defaultValue="manual">
         {/* Tab 栏：自建节点 + 每个订阅 + 订阅管理 */}
         <div className="flex items-center justify-between gap-4">
-          <TabsList className="flex-shrink-0 overflow-x-auto">
+          <TabsList className="min-w-0 flex-1 justify-start overflow-x-auto overflow-y-hidden">
             {/* 自建节点 Tab */}
             <TabsTrigger value="manual" className="flex items-center gap-1.5">
               <Server className="h-3.5 w-3.5" />
