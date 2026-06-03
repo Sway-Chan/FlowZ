@@ -23,7 +23,10 @@ export type ProtocolType =
   | 'anytls'
   | 'tuic'
   | 'vmess'
-  | 'naive';
+  | 'naive'
+  | 'socks'
+  | 'http'
+  | 'ssh';
 
 // 兼容旧代码的类型别名
 export type ServerConfigWithId = import('../../shared/types').ServerConfig;

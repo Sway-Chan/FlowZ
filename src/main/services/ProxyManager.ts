@@ -228,6 +228,14 @@ interface SingBoxOutbound {
   };
   // Direct outbound: UDP fragmentation (also used to mark outbound as "non-empty" for sing-box 1.13+ validation)
   udp_fragment?: boolean;
+  // SSH specific
+  user?: string;
+  private_key?: string;
+  private_key_path?: string;
+  private_key_passphrase?: string;
+  host_key?: string[];
+  host_key_algorithms?: string[];
+  client_version?: string;
 }
 
 interface SingBoxRouteRule {
@@ -1485,6 +1493,23 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       }
     }
 
+    // SSH 特定配置
+    if (server.protocol === 'ssh') {
+      const ssh = server.sshSettings || {};
+      if (ssh.user) outbound.user = ssh.user;
+      if (ssh.password) outbound.password = ssh.password;
+      if (ssh.privateKey) outbound.private_key = ssh.privateKey;
+      if (ssh.privateKeyPath) outbound.private_key_path = ssh.privateKeyPath;
+      if (ssh.privateKeyPassphrase) outbound.private_key_passphrase = ssh.privateKeyPassphrase;
+      if (ssh.hostKey && ssh.hostKey.length > 0) outbound.host_key = ssh.hostKey;
+      if (ssh.hostKeyAlgorithms && ssh.hostKeyAlgorithms.length > 0)
+        outbound.host_key_algorithms = ssh.hostKeyAlgorithms;
+      if (ssh.clientVersion) outbound.client_version = ssh.clientVersion;
+
+      // SSH outbound 不需要 TLS 和传输层配置，直接返回
+      return outbound;
+    }
+
     // TLS 配置 (非 Naive 协议，因为 Naive 已在前一段处理了 tls 结构)
     if (
       server.protocol !== 'naive' &&
@@ -1631,6 +1656,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // C. 强制引导核心 DNS 直连（必须在 hijack-dns 之前！）
     // 把已知 bootstrap DNS IP 放在 hijack-dns 之前，无论哪个进程发包都走直连，彻底断环。
+    // 注意：这里只应该放国内的 DNS IP。如果放 8.8.8.8，会导致用户去 ping 8.8.8.8 时走直连被墙！
     rules.push({
       ip_cidr: [
         '223.5.5.5/32',
@@ -1638,8 +1664,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         '119.29.29.29/32',
         '119.28.28.28/32',
         '114.114.114.114/32',
-        '8.8.8.8/32',
-        '1.1.1.1/32',
       ],
       port: [53, 443],
       action: 'route',
@@ -1707,26 +1731,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // 【DNS 引导与辅助直连】：
     // 确保以下公共 DNS IP 不会被后面的 block 规则拦截，从而保证 DoH 握手和初次域名解析。
-    rules.push({
-      ip_cidr: [
-        '8.8.8.8/32',
-        '8.8.4.4/32',
-        '1.1.1.1/32',
-        '1.0.0.1/32',
-        '9.9.9.9/32',
-        '149.112.112.112/32',
-        '208.67.222.222/32',
-        '208.67.220.220/32',
-        // IPv6 Public DNS
-        '2001:4860:4860::8888/128',
-        '2001:4860:4860::8844/128',
-        '2606:4700:4700::1111/128',
-        '2606:4700:4700::1001/128',
-      ],
-      port: [53, 443, 853],
-      action: 'route',
-      outbound: 'direct',
-    });
+    // 海外 DNS 不应该强行直连（否则在国内会被黑洞）。移除原本强行直连 8.8.8.8 / 1.1.1.1 的设定。
 
     // 【终极绝杀隐私 DoH 泄漏】：
     // 现代浏览器会尝试通过常规 HTTPS 端口向特定域名发起 DoH 请求。
@@ -2091,6 +2096,21 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           url: `https://fastly.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-${category}.srs`,
           // 必须走直连下载，避免启动时循环依赖
           download_detour: 'direct',
+        } as any);
+      }
+    }
+
+    // 【UDP 黑洞防范兜底】：对于不支持 UDP 的代理协议（如 SSH, HTTP, AnyTLS），
+    // 凡是没有被上面的直连规则（如国内 IP/域名、局域网等）匹配的剩余 UDP 流量，
+    // 原本会分配给 final 出站。但由于这些代理协议在 sing-box 中不支持 UDP，
+    // 流量会穿透 final 跌落到系统 direct，导致被墙的 UDP 请求（如 QUIC）静默丢包假死 30 秒。
+    // 在这里统一 reject 剩余 UDP，促使浏览器立即 fallback 到 TCP 走代理。
+    if (proxyMode !== 'direct' && selectedServer) {
+      const tcpOnlyProtocols = ['ssh', 'http', 'anytls'];
+      if (tcpOnlyProtocols.includes(selectedServer.protocol.toLowerCase())) {
+        rules.push({
+          network: ['udp'],
+          action: 'reject',
         } as any);
       }
     }

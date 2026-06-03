@@ -630,7 +630,7 @@ open "${installerPath}"
             `下载出错，尝试使用加速镜像: ${err.message}`,
             'UpdateService'
           );
-          const mirrorUrl = `https://ghp.ci/${url}`;
+          const mirrorUrl = `https://mirror.ghproxy.com/${url}`;
           this.updateProgress({
             status: 'downloading',
             percentage: 0,
@@ -720,7 +720,7 @@ open "${installerPath}"
             `下载出错，尝试使用加速镜像: ${err.message}`,
             'UpdateService'
           );
-          const mirrorUrl = `https://ghp.ci/${url}`;
+          const mirrorUrl = `https://mirror.ghproxy.com/${url}`;
           this.updateProgressWindow(0, '正在尝试通过镜像下载...');
           this.downloadFileWithProgressWindow(mirrorUrl, destPath, totalSize, true)
             .then(resolve)

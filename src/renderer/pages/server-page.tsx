@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { toast } from 'sonner';
 import { useAppStore } from '@/store/app-store';
 import { ServerList } from '@/components/settings/server-list';
@@ -50,6 +50,25 @@ export function ServerPage() {
 
   // 手动添加的节点（无 subscriptionId）
   const manualServers = servers.filter((s) => !s.subscriptionId);
+
+  const scrollContainerRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const el = scrollContainerRef.current;
+    if (!el) return;
+
+    const onWheel = (e: WheelEvent) => {
+      // 如果垂直滚动幅度大于水平滚动幅度，则将其转换为水平滚动
+      if (Math.abs(e.deltaY) > Math.abs(e.deltaX)) {
+        e.preventDefault();
+        el.scrollLeft += e.deltaY;
+      }
+    };
+
+    // 使用 passive: false 以便可以调用 preventDefault 阻止页面垂直滚动
+    el.addEventListener('wheel', onWheel, { passive: false });
+    return () => el.removeEventListener('wheel', onWheel);
+  }, []);
 
   // ================= 服务器操作 =================
 
@@ -189,38 +208,56 @@ export function ServerPage() {
 
       <Tabs defaultValue="manual">
         {/* Tab 栏：自建节点 + 每个订阅 + 订阅管理 */}
-        <div className="flex items-center justify-between gap-4">
-          <TabsList className="min-w-0 flex-1 justify-start overflow-x-auto overflow-y-hidden">
-            {/* 自建节点 Tab */}
-            <TabsTrigger value="manual" className="flex items-center gap-1.5">
-              <Server className="h-3.5 w-3.5" />
-              {t('servers.manualNodes')}
-              {manualServers.length > 0 && (
-                <Badge variant="secondary" className="ml-1 h-4 px-1 text-[10px]">
-                  {manualServers.length}
-                </Badge>
-              )}
-            </TabsTrigger>
+        <div className="flex items-center gap-4">
+          {/* 可滚动的 Tab 区域，两侧渐变遮罩提示还有更多内容 */}
+          <div className="relative min-w-0 flex-1">
+            {/* 左侧渐变遮罩 */}
+            <div className="pointer-events-none absolute left-0 top-0 z-10 h-full w-8 bg-gradient-to-r from-background to-transparent" />
+            {/* 右侧渐变遮罩 */}
+            <div className="pointer-events-none absolute right-0 top-0 z-10 h-full w-8 bg-gradient-to-l from-background to-transparent" />
 
-            {/* 每个订阅一个 Tab */}
-            {subscriptions.map((sub) => {
-              const subServers = servers.filter((s) => s.subscriptionId === sub.id);
-              const isUpdating = updatingSubId === sub.id;
-              return (
-                <TabsTrigger key={sub.id} value={sub.id} className="flex items-center gap-1.5">
-                  <Rss className="h-3.5 w-3.5" />
-                  {sub.name}
-                  {subServers.length > 0 && (
+            <div
+              ref={scrollContainerRef}
+              className="overflow-x-auto overflow-y-hidden [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none] scroll-smooth"
+            >
+              <TabsList className="inline-flex w-max justify-start">
+                {/* 自建节点 Tab */}
+                <TabsTrigger value="manual" className="flex items-center gap-1.5 whitespace-nowrap">
+                  <Server className="h-3.5 w-3.5" />
+                  {t('servers.manualNodes')}
+                  {manualServers.length > 0 && (
                     <Badge variant="secondary" className="ml-1 h-4 px-1 text-[10px]">
-                      {isUpdating ? '…' : subServers.length}
+                      {manualServers.length}
                     </Badge>
                   )}
                 </TabsTrigger>
-              );
-            })}
-          </TabsList>
 
-          <div className="flex gap-2 flex-shrink-0">
+                {/* 每个订阅一个 Tab */}
+                {subscriptions.map((sub) => {
+                  const subServers = servers.filter((s) => s.subscriptionId === sub.id);
+                  const isUpdating = updatingSubId === sub.id;
+                  return (
+                    <TabsTrigger
+                      key={sub.id}
+                      value={sub.id}
+                      className="flex items-center gap-1.5 whitespace-nowrap"
+                    >
+                      <Rss className="h-3.5 w-3.5" />
+                      {sub.name}
+                      {subServers.length > 0 && (
+                        <Badge variant="secondary" className="ml-1 h-4 px-1 text-[10px]">
+                          {isUpdating ? '…' : subServers.length}
+                        </Badge>
+                      )}
+                    </TabsTrigger>
+                  );
+                })}
+              </TabsList>
+            </div>
+          </div>
+
+          {/* 添加订阅按钮固定在右侧，不参与滚动 */}
+          <div className="flex-shrink-0">
             <Button
               size="sm"
               variant="outline"

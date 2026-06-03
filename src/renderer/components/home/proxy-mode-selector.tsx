@@ -70,6 +70,9 @@ export function ProxyModeSelector() {
     } else if (protocol === 'socks' || protocol === 'http') {
       // SOCKS and HTTP can just have address and port, username/pass are optional
       return true;
+    } else if (protocol === 'ssh') {
+      // SSH 可以只配置地址和端口，或带有密码/私钥认证，这里基础校验只要地址和端口即可（上面已经校验过 address 和 port）
+      return true;
     }
 
     return false;

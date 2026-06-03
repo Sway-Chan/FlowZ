@@ -19,7 +19,8 @@ export type Protocol =
   | 'vmess'
   | 'naive'
   | 'socks'
-  | 'http';
+  | 'http'
+  | 'ssh';
 export type Network = 'tcp' | 'ws' | 'grpc' | 'http';
 export type Hysteria2Network = 'tcp' | 'udp';
 export type Security = 'none' | 'tls' | 'reality';
@@ -99,6 +100,18 @@ export interface AnyTlsSettings {
   minIdleSession?: number; // default 0
 }
 
+// SSH 协议设置
+export interface SshSettings {
+  user?: string; // SSH 用户名，默认 root
+  password?: string; // 密码认证
+  privateKey?: string; // 内联私钥内容
+  privateKeyPath?: string; // 私钥文件路径，如 $HOME/.ssh/id_rsa
+  privateKeyPassphrase?: string; // 私钥密码
+  hostKey?: string[]; // 主机公钥（留空接受所有）
+  hostKeyAlgorithms?: string[]; // 主机密钥算法
+  clientVersion?: string; // 客户端版本字符串
+}
+
 // Shadow-TLS 插件设置（套在 SS/其他协议外层，版本固定 v3）
 export interface ShadowTlsSettings {
   password: string; // Shadow-TLS v3 密码
@@ -166,6 +179,9 @@ export interface ServerConfig {
 
   // Shadowsocks 特定
   shadowsocksSettings?: ShadowsocksSettings;
+
+  // SSH 特定
+  sshSettings?: SshSettings;
 
   // Shadow-TLS 插件（可附加在任意协议上，常用于 SS2022）
   shadowTlsSettings?: ShadowTlsSettings;

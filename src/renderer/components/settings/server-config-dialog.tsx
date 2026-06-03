@@ -25,6 +25,7 @@ import { NaiveForm } from './naive-form';
 import { VmessForm } from './vmess-form';
 import { SocksForm } from './socks-form';
 import { HttpForm } from './http-form';
+import { SshForm } from './ssh-form';
 import type { ServerConfig, ProtocolType } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -145,6 +146,7 @@ export function ServerConfigDialog({
                 <SelectItem value="naive">NaiveProxy</SelectItem>
                 <SelectItem value="socks">SOCKS5</SelectItem>
                 <SelectItem value="http">HTTP(S)</SelectItem>
+                <SelectItem value="ssh">SSH</SelectItem>
               </SelectContent>
             </Select>
             <p className="text-sm text-muted-foreground">
@@ -287,6 +289,17 @@ export function ServerConfigDialog({
                 key={currentServerConfig?.id || 'new'}
                 serverConfig={
                   currentServerConfig?.protocol?.toLowerCase() === 'http'
+                    ? currentServerConfig
+                    : undefined
+                }
+                onSubmit={handleSave}
+              />
+            )}
+            {selectedProtocol === 'ssh' && (
+              <SshForm
+                key={currentServerConfig?.id || 'new'}
+                serverConfig={
+                  currentServerConfig?.protocol?.toLowerCase() === 'ssh'
                     ? currentServerConfig
                     : undefined
                 }

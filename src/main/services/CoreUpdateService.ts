@@ -654,7 +654,7 @@ export class CoreUpdateService {
             `下载出错，尝试使用加速镜像: ${err.message}`,
             'CoreUpdateService'
           );
-          const mirrorUrl = `https://ghp.ci/${url}`;
+          const mirrorUrl = `https://mirror.ghproxy.com/${url}`;
           this.downloadFile(mirrorUrl, true).then(resolve).catch(reject);
           return;
         }

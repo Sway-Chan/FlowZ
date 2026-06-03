@@ -43,7 +43,7 @@ import {
   CheckSquare,
   Square,
   Copy,
-  Activity,
+  Zap,
   Link,
 } from 'lucide-react';
 import { ImportUrlDialog } from './import-url-dialog';
@@ -68,6 +68,7 @@ const ALL_PROTOCOLS = [
   'naive',
   'socks',
   'http',
+  'ssh',
 ] as const;
 
 const getCountryCode = (name: string): string | null => {
@@ -122,10 +123,10 @@ export function ServerList({
   onSelectServer,
   onImportSuccess,
 }: ServerListProps) {
-  // 使用全局 store 存储延迟数据，切换页面不丢失
   const latencyMap = useAppStore((state) => state.latencyMap);
   const setLatencyMap = useAppStore((state) => state.setLatencyMap);
   const [isTestingSpeed, setIsTestingSpeed] = useState(false);
+  const [testingServerIds, setTestingServerIds] = useState<Set<string>>(new Set());
   const { t } = useTranslation();
 
   // 记住用户的视图偏好
@@ -165,6 +166,36 @@ export function ServerList({
       });
     } finally {
       setIsTestingSpeed(false);
+    }
+  };
+
+  const handleSingleSpeedTest = async (serverId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setTestingServerIds((prev) => {
+      const s = new Set(prev);
+      s.add(serverId);
+      return s;
+    });
+    try {
+      const results = await api.server.speedTest([serverId]);
+
+      // Update only this specific node's latency in the store
+      const newLatencyMap = { ...latencyMap, ...results };
+      setLatencyMap(newLatencyMap);
+
+      if (results[serverId] !== undefined) {
+        toast.success(t('servers.speedTestDone'));
+      }
+    } catch (error) {
+      toast.error(t('servers.speedTestFail'), {
+        description: error instanceof Error ? error.message : String(error),
+      });
+    } finally {
+      setTestingServerIds((prev) => {
+        const s = new Set(prev);
+        s.delete(serverId);
+        return s;
+      });
     }
   };
 
@@ -324,6 +355,7 @@ export function ServerList({
       naive: 'bg-rose-500/15 text-rose-600 border-rose-300/30',
       socks: 'bg-slate-500/15 text-slate-600 border-slate-300/30',
       http: 'bg-sky-500/15 text-sky-600 border-sky-300/30',
+      ssh: 'bg-amber-500/15 text-amber-600 border-amber-300/30',
     };
     return colors[protocol.toLowerCase()] || 'bg-muted text-muted-foreground';
   };
@@ -331,6 +363,22 @@ export function ServerList({
   // 操作按钮（卡片和列表模式共用）
   const renderActions = (server: ServerConfigWithId, stopPropagation = true) => (
     <div className="flex items-center gap-1 flex-shrink-0">
+      <Button
+        variant="ghost"
+        size="sm"
+        title={t('servers.speedTest')}
+        className="h-7 w-7 p-0 text-muted-foreground hover:text-primary"
+        disabled={testingServerIds.has(server.id) || isTestingSpeed}
+        onClick={(e) => {
+          if (stopPropagation) e.stopPropagation();
+          handleSingleSpeedTest(server.id, e);
+        }}
+      >
+        <Zap
+          className={`h-3.5 w-3.5 ${testingServerIds.has(server.id) ? 'animate-pulse text-primary fill-primary/20' : ''}`}
+        />
+      </Button>
+
       {latencyMap[server.id] !== undefined && (
         <span
           className={`text-xs font-medium mr-1 px-1.5 py-0.5 rounded ${getLatencyColor(latencyMap[server.id])} ${getLatencyBg(latencyMap[server.id])}`}
@@ -440,7 +488,7 @@ export function ServerList({
             onClick={handleSpeedTest}
             disabled={isTestingSpeed}
           >
-            <Activity className={`h-4 w-4 ${isTestingSpeed ? 'animate-pulse' : ''}`} />
+            <Zap className={`h-4 w-4 ${isTestingSpeed ? 'animate-pulse fill-current/20' : ''}`} />
             {isTestingSpeed ? t('servers.speedTesting') : t('servers.speedTest')}
           </Button>
 
