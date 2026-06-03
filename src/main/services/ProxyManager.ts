@@ -1637,19 +1637,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       } as any);
     }
 
-    // 1. 强制放行 FlowZ 及其核心进程：防止 DNS 回流死循环
-    // 必须放在最高优先级，确保核心组件的 DNS 请求能直连物理网卡
+    // 1. 强制放行 sing-box 核心进程：防止流量回流死循环
+    // 必须放在最高优先级，确保核心组件的请求能直连物理网卡
+    // 注意：不要把 FlowZ (主进程) 放在直连里，否则会干扰 FlowZ 自身的 GitHub 核心下载和测速。
     rules.push({
-      process_name: [
-        'sing-box',
-        'sing-box.exe',
-        'FlowZ',
-        'FlowZ.exe',
-        'FlowZ Helper',
-        'FlowZ Helper.exe',
-        'FlowZ Helper (Plugin)',
-        'FlowZ Helper (Plugin).exe',
-      ],
+      process_name: ['sing-box', 'sing-box.exe'],
       action: 'route',
       outbound: 'direct',
     });
