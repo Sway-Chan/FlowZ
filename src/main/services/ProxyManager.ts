@@ -541,6 +541,35 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     if (config.proxyModeType === 'systemProxy') {
       await this.setSystemProxy(config);
     }
+
+    // H3 修复：sing-box 的 cache_file 会持久化 selector 的 clash_api 选择，重启后缓存会覆盖 config
+    // 的 default。故启动后用 clash_api 把 selector 校正回 config.selectedServerId，让 FlowZ 配置成为
+    // 单一真值、压过缓存。best-effort（不阻塞启动成功）。
+    void this.reassertSelectorSelection(config);
+  }
+
+  /**
+   * 启动后把 selector 选择校正回 config.selectedServerId（压过 cache_file 持久化的旧选择，修 H3）。
+   * best-effort + 短重试，clash_api 刚起可能未就绪；失败不影响启动（cache/default 仍是有效节点）。
+   */
+  private async reassertSelectorSelection(config: UserConfig): Promise<void> {
+    const tag = this.currentIdToTagMap?.get(config.selectedServerId as string);
+    if (!tag) return;
+    for (let i = 0; i < 10; i++) {
+      if (!this.singboxProcess && !this.singboxPid) return; // 已停止则放弃
+      try {
+        const res = await fetch('http://127.0.0.1:9090/proxies/proxy-selector', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: tag }),
+          signal: AbortSignal.timeout(2000),
+        });
+        if (res.ok) return;
+      } catch {
+        // clash_api 未就绪/瞬时失败 → 短延迟后重试
+      }
+      await new Promise((r) => setTimeout(r, 300));
+    }
   }
 
   /**
@@ -558,6 +587,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     }
 
     await this.stopSingBoxProcess();
+    // 进程已停 → 清掉旧的 id→tag 映射，防止对一个已不存在的 selector 误发 clash_api 切换
+    this.currentIdToTagMap = null;
   }
 
   /**
@@ -613,8 +644,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     ) {
       return false;
     }
-    // 出站集合 / 路由相关项变化（hasModeChanged 未覆盖 servers 列表与 appRules）→ 需重生成
-    if (JSON.stringify(old.servers) !== JSON.stringify(newConfig.servers)) return false;
+    // 出站集合 / 路由相关项变化（hasModeChanged 未覆盖 servers 列表与 appRules）→ 需重生成。
+    // servers 按 id 归一化比较：订阅更新仅重排节点不应触发重启，节点出站配置真改了才重启。
+    const sortById = (servers: ServerConfig[]) =>
+      JSON.stringify([...servers].sort((a, b) => a.id.localeCompare(b.id)));
+    if (sortById(old.servers) !== sortById(newConfig.servers)) return false;
     if (JSON.stringify(old.appRules ?? []) !== JSON.stringify(newConfig.appRules ?? []))
       return false;
     // 其余 regen-affecting 项（proxyMode/type/ports/tun/customRules）：把 selectedServerId 对齐后，
@@ -635,6 +669,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: targetTag }),
+        signal: AbortSignal.timeout(2000),
       });
       if (!res.ok) {
         this.logToManager('warn', `clash_api 热切换返回 HTTP ${res.status}`);
@@ -1301,10 +1336,14 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         }
       }
 
-      // 全局 TLS 分片（PR-6）：开启后对所有已生成的 TLS 节点出站切分 ClientHello，抗 SNI-DPI。
+      // 全局 TLS 分片（PR-6）：开启后对所有已生成的 TCP-TLS 节点出站切分 ClientHello，抗 SNI-DPI。
+      // 跳过 hy2/tuic（QUIC 内 TLS、无 TCP ClientHello，死配置）与 naive（Cronet 自管 TLS，拒绝
+      // fragment 字段 → 启动 FATAL）。
       if (config.tlsFragment) {
         for (const ob of outbounds) {
-          if (ob.tls) ob.tls.fragment = true;
+          if (ob.tls && ob.type !== 'hysteria2' && ob.type !== 'tuic' && ob.type !== 'naive') {
+            ob.tls.fragment = true;
+          }
         }
       }
 
@@ -1669,20 +1708,28 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private applyAntiCensorshipOptions(outbound: SingBoxOutbound, server: ServerConfig): void {
     const protocolLower = server.protocol.toLowerCase();
 
+    // fragment 仅对「标准 sing-box TCP-TLS 栈」有意义，以下协议必须排除（否则死配置或直接启动 FATAL）：
+    //   · hy2/tuic：TLS 在 QUIC 内、无 TCP ClientHello（死配置）；
+    //   · naive：TLS 由 Cronet 自管，naive 出站直接拒绝 fragment 字段（实测
+    //     "fragment is not supported on naive outbound" → 启动 FATAL），无论 h2/h3。
+    // 注：ECH 不受此限——QUIC 与 naive(Cronet) 均原生支持 ECH。
+    const fragmentUnsupported =
+      protocolLower === 'hysteria2' || protocolLower === 'tuic' || protocolLower === 'naive';
+
     // ECH（隐藏 SNI）+ 每节点 TLS 分片（抗 SNI-DPI）：需已有 tls 块
     if (outbound.tls) {
       if (server.tlsSettings?.ech) outbound.tls.ech = { enabled: true };
-      if (server.tlsSettings?.fragment) outbound.tls.fragment = true;
+      if (server.tlsSettings?.fragment && !fragmentUnsupported) outbound.tls.fragment = true;
     }
 
-    // Multiplex（vless/trojan/vmess/shadowsocks）；reality+vision(xtls-rprx-vision) 与 mux 不兼容 → 跳过
+    // Multiplex（vless/trojan/vmess/shadowsocks）；vision flow(xtls-rprx-vision) 自带流分帧、与 mux
+    // 不兼容（与是否 reality 无关，普通 TLS+vision 同样不兼容）→ 跳过
     const mux = server.multiplexSettings;
-    const isRealityVision =
-      server.security === 'reality' && (server.flow || '').toLowerCase().includes('vision');
+    const hasVisionFlow = (server.flow || '').toLowerCase().includes('vision');
     if (
       mux?.enabled &&
       ['vless', 'trojan', 'vmess', 'shadowsocks'].includes(protocolLower) &&
-      !isRealityVision
+      !hasVisionFlow
     ) {
       outbound.multiplex = {
         enabled: true,
@@ -1752,8 +1799,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 主代理出站统一走 selector(proxy-selector)：clash_api 热切换即改 selector 指向、路由无需重生成。
     // 具体 targetServerId 的 app/custom 分流在各自逻辑里直指节点 tag，不经此变量。
     const selectedServerTag = 'proxy-selector';
-    // 获取当前选中的服务器（仅用于存在性判断，如 blockProxyQuic 的 !!selectedServer）
-    const selectedServer = config.servers.find((s) => s.id === config.selectedServerId);
 
     // blockQuic（节点无关）：开启时对"将走代理"的 QUIC(UDP443) 执行 reject，逼浏览器回退 TCP。
     // 「禁 QUIC」即禁 QUIC，与选中节点的协议/中继能力无关，对所有节点一视同仁。两点实测保证安全：
@@ -1763,7 +1808,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     //   · 不下发"全 UDP reject"——只禁 QUIC(443)。非 QUIC 的代理向 UDP 若节点不能中继(naive/ssh/http)，
     //     由 sing-box 出站层自动拒绝（实测日志 "UDP is not supported by outbound"，不漏 direct、不黑洞），
     //     无需路由层按节点固化。这也使路由配置与选中节点解耦 → 支持 selector 跨协议无缝热切换。
-    const blockProxyQuic = config.blockQuic === true && !!selectedServer;
+    // 节点无关：只要开了 blockQuic 且存在代理路径（非 direct 模式、有节点）就拦——不依赖 selectedServer
+    // 解析成功（避免 selectedServerId 失效但 selector default 仍出流量时 QUIC 漏过）。
+    const blockProxyQuic =
+      config.blockQuic === true && proxyMode !== 'direct' && config.servers.length > 0;
 
     // 给定域名匹配器，返回应配对的 udp443 reject 规则（smart 模式放在每条 →代理 规则之前），否则 null。
     const proxyUdpRejectFor = (matcher: Record<string, any>): SingBoxRouteRule | null =>
@@ -1909,8 +1957,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       if (domainSet.size > 0) {
         const domains = Array.from(domainSet);
         rules.push({
+          // domain(精确，= 节点 SNI) + domain_suffix(仅 .${d}，匹配子域)。不放裸 d 进 domain_suffix：
+          // 那是 raw 后缀匹配，会把共享 apex 下别的真实站点也沉降到直连。
           domain: domains,
-          domain_suffix: domains.flatMap((d) => [d, `.${d}`]),
+          domain_suffix: domains.map((d) => `.${d}`),
           action: 'route',
           outbound: 'direct',
         });
@@ -1985,7 +2035,28 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         idToTagMap,
         selectedServerTag
       );
-      rules.push(...customRules);
+      // 走代理的自定义规则同样要配对 udp443 reject（终止规则、在末尾兜底前命中）。逐条插入：
+      // 代理向规则前先放一条同匹配器的 udp443 reject；direct/block 规则不配对。
+      for (const cr of customRules) {
+        if (
+          cr.action === 'route' &&
+          cr.outbound &&
+          cr.outbound !== 'direct' &&
+          cr.outbound !== 'block'
+        ) {
+          const matcher: Record<string, any> = {};
+          if (cr.domain) matcher.domain = cr.domain;
+          if (cr.domain_suffix) matcher.domain_suffix = cr.domain_suffix;
+          if (cr.domain_keyword) matcher.domain_keyword = cr.domain_keyword;
+          if (cr.rule_set) matcher.rule_set = cr.rule_set;
+          if (cr.ip_cidr) matcher.ip_cidr = cr.ip_cidr;
+          if (Object.keys(matcher).length > 0) {
+            const r = proxyUdpRejectFor(matcher);
+            if (r) rules.push(r);
+          }
+        }
+        rules.push(cr);
+      }
 
       if (customRuleSets.length > 0) {
         if (!routeConfig.rule_set) {
@@ -2025,8 +2096,16 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           outbound = 'block';
         }
 
+        // 走代理的 app 分流也要配对 udp443 reject（这些是终止规则、在末尾兜底之前命中，否则 blockQuic
+        // 对该应用的 QUIC 失效）。direct/block 不配对。
+        const appOutIsProxy = outbound !== 'direct' && outbound !== 'block';
+
         // a. 基于进程名的规则（最精准，适用于 macOS/Windows TUN 模式）
         if (preset.processNames && preset.processNames.length > 0) {
+          if (appOutIsProxy) {
+            const r = proxyUdpRejectFor({ process_name: preset.processNames });
+            if (r) rules.push(r);
+          }
           rules.push({
             process_name: preset.processNames,
             action: 'route',
@@ -2041,6 +2120,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         ];
 
         if (ruleSets.length > 0) {
+          if (appOutIsProxy) {
+            const r = proxyUdpRejectFor({ rule_set: ruleSets });
+            if (r) rules.push(r);
+          }
           rules.push({
             rule_set: ruleSets,
             action: 'route',

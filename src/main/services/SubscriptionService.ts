@@ -103,14 +103,18 @@ export class SubscriptionService {
 
     for (const ob of outbounds) {
       if (!SUPPORTED.has(ob.type)) continue;
-      if (!ob.server || !ob.server_port) continue;
+      // 支持仅含 server_ports（端口跳跃、无 server_port）的 Hy2 节点：从首个范围的低位端口推导 port
+      const effectivePort =
+        ob.server_port ??
+        (ob.server_ports?.[0] ? parseInt(ob.server_ports[0].split(':')[0], 10) : undefined);
+      if (!ob.server || !effectivePort) continue;
 
       try {
         const base: Partial<ServerConfig> = {
           id: randomUUID(),
-          name: ob.tag || `${ob.server}:${ob.server_port}`,
+          name: ob.tag || `${ob.server}:${effectivePort}`,
           address: ob.server,
-          port: ob.server_port,
+          port: effectivePort,
           subscriptionId,
           createdAt: now,
           updatedAt: now,
