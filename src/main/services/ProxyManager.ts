@@ -13,7 +13,13 @@ import type { ILogManager } from './LogManager';
 import { IPC_CHANNELS } from '../../shared/ipc-channels';
 import { resourceManager } from './ResourceManager';
 import { retry } from '../utils/retry';
-import { getUserDataPath } from '../utils/paths';
+import {
+  getUserDataPath,
+  getSingBoxConfigPath,
+  getSingBoxLogPath,
+  getSingBoxPidPath,
+  getCachePath,
+} from '../utils/paths';
 import { getAppPreset } from '../../shared/app-rules-preset';
 
 /**
@@ -358,8 +364,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     if (configPath) {
       this.configPath = configPath;
     } else {
-      const userDataPath = getUserDataPath();
-      this.configPath = path.join(userDataPath, 'singbox_config.json');
+      this.configPath = getSingBoxConfigPath();
     }
 
     // sing-box 可执行文件路径
@@ -681,7 +686,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // 获取用户数据目录用于缓存文件
     const userDataPath = getUserDataPath();
-    const cachePath = path.join(userDataPath, 'cache.db');
+    const cachePath = getCachePath();
 
     // 关键优化：预先生成 ID 到 Tag 的唯一映射，使用服务器名称作为 Tag，确保拓扑和日志显示友好名称
     // 这样做之后内容拓扑（Clash API）和日志中显示的将是“香港 01”而不是“proxy-uuid”
@@ -767,8 +772,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 获取 sing-box 日志文件路径
    */
   private getLogFilePath(): string {
-    const userDataPath = getUserDataPath();
-    return path.join(userDataPath, 'singbox.log');
+    return getSingBoxLogPath();
   }
 
   /**
@@ -2341,9 +2345,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     const userDataPath = getUserDataPath();
     const filesToFix = [
-      path.join(userDataPath, 'cache.db'),
-      path.join(userDataPath, 'singbox.log'),
-      path.join(userDataPath, 'singbox.pid'),
+      getCachePath(),
+      getSingBoxLogPath(),
+      getSingBoxPidPath(),
       path.join(userDataPath, 'singbox_startup.log'),
     ];
 
@@ -2411,7 +2415,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           // 注意：路径中可能包含空格，需要使用转义引号
           // sing-box 配置中已经设置了 log.output，日志会写入文件
           // 使用 & 让进程在后台运行，并将 PID 写入文件
-          const pidFile = path.join(getUserDataPath(), 'singbox.pid');
+          const pidFile = getSingBoxPidPath();
           const startupLogFile = path.join(getUserDataPath(), 'singbox_startup.log');
           command = '/usr/bin/osascript';
 
@@ -2433,7 +2437,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         } else if (this.needsWindowsUAC()) {
           // Windows TUN 模式: 使用 PowerShell 请求 UAC 权限运行
           // 使用 Start-Process -Verb RunAs 来请求管理员权限
-          const pidFile = path.join(getUserDataPath(), 'singbox.pid');
+          const pidFile = getSingBoxPidPath();
           command = 'powershell.exe';
 
           // PowerShell 脚本：以管理员权限启动 sing-box 并记录 PID
@@ -3450,7 +3454,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 获取 PID 文件路径
    */
   private getPidFilePath(): string {
-    return path.join(getUserDataPath(), 'singbox.pid');
+    return getSingBoxPidPath();
   }
 
   /**
