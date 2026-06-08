@@ -1106,22 +1106,36 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           (process.platform === 'darwin' ? '172.19.0.1/30' : '172.19.0.1/16'),
       ];
       // macOS 默认分配 IPv6 以提高与本地网络服务的兼容性，与 3.3.18 保持一致
-      if (config.enableIPv6 && process.platform !== 'darwin') {
-        tunAddress.push(config.tunConfig?.inet6Address || 'fdfe:dcba:9876::1/126');
-      } else if (config.enableIPv6 && process.platform === 'darwin') {
+      // （此前 darwin / 非 darwin 两分支逻辑完全相同，已合并消重）
+      if (config.enableIPv6) {
         tunAddress.push(config.tunConfig?.inet6Address || 'fdfe:dcba:9876::1/126');
       }
+
+      // macOS (3.3.18) 最稳定 MTU 为 1400。Windows (3.4.0) 下 MTU=1350 最完美。
+      // 9000 为历史默认值（UI 不暴露 MTU 设置项），等同"未自定义"，必须回退到平台最优值，
+      // 否则巨型 MTU 会让上面精心调优的平台值成为永不生效的死代码。
+      const platformDefaultMtu = process.platform === 'darwin' ? 1400 : 1350;
+      const userMtu = config.tunConfig?.mtu;
+      const effectiveMtu = !userMtu || userMtu === 9000 ? platformDefaultMtu : userMtu;
+
+      // macOS 必须 gvisor 栈(3.3.18)；'system' 是历史默认值（UI 不暴露 stack 设置项），在 macOS 上
+      // 等同"未自定义"，必须回退到 gvisor，否则同 MTU 一样平台判定成永不生效的死代码。Win/Linux 保持 system。
+      const platformDefaultStack = process.platform === 'darwin' ? 'gvisor' : 'system';
+      const userStack = config.tunConfig?.stack;
+      const effectiveStack =
+        !userStack || (process.platform === 'darwin' && userStack === 'system')
+          ? platformDefaultStack
+          : userStack;
 
       const tunInbound: SingBoxInbound = {
         type: 'tun',
         tag: 'tun-in',
         address: tunAddress,
-        // macOS (3.3.18) 最稳定 MTU 为 1400。Windows (3.4.0) 下 MTU=1350 最完美。
-        mtu: config.tunConfig?.mtu || (process.platform === 'darwin' ? 1400 : 1350),
+        mtu: effectiveMtu,
         auto_route: config.tunConfig?.autoRoute ?? true,
         strict_route: config.tunConfig?.strictRoute ?? true,
         // macOS 必须使用 gvisor 栈(3.3.18)。Windows 下 system 栈配合 Wintun 性能最强且稳定(3.4.0)。
-        stack: config.tunConfig?.stack || (process.platform === 'darwin' ? 'gvisor' : 'system'),
+        stack: effectiveStack,
         route_exclude_address: excludeAddr,
       };
 
