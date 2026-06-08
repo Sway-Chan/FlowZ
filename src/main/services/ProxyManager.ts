@@ -1625,6 +1625,17 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 获取当前选中的服务器，用于排除代理服务器域名
     const selectedServer = config.servers.find((s) => s.id === config.selectedServerId);
 
+    // 是否对"将走代理"的 QUIC(UDP443) 执行 reject 以逼浏览器回退 TCP，消除节点 UDP relay
+    // 不通时的黑洞。按节点实际 server 拨号传输 guard：
+    //   - hysteria2/tuic 走 QUIC dial-server，reject 会经 strict_route 回流误杀其传输 → 跳过；
+    //   - 其余协议均 TCP dial-server（reject UDP 匹配不到其 TCP 传输）→ 安全启用。
+    //   注：sing-box 的 naive 可经 quic:true 走 h3(QUIC)，但 FlowZ 未启用该字段（默认 H2/TCP），
+    //       故 naive 归 TCP；若将来 FlowZ 暴露 naive-h3，需把这类节点也纳入跳过条件。
+    const blockProxyQuic =
+      config.blockQuic === true &&
+      !!selectedServer &&
+      !['hysteria2', 'tuic'].includes(selectedServer.protocol.toLowerCase());
+
     const versionArr = this.coreVersion.split('.');
     const versionNum = parseFloat(versionArr[0] + '.' + (versionArr[1] || '0'));
 
@@ -1981,13 +1992,33 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
       // 针对 Google 核心服务（搜索/YouTube/Gmail 等）的关键词兜底规则（仅在未专门设置应用分流时作为备份）
       // 注意：这些规则在 AppRules 之后，所以不会覆盖用户手动指定的节点
+      const googleKeywords = ['google', 'gmail', 'youtube', 'gstatic', 'googleapis', 'googlevideo'];
+
+      // blockQuic（smart）：在每条"→代理"规则之前配对一条 UDP443 reject，使代理向 QUIC 在被
+      // 路由到代理前就回退 TCP；下方 CN 直连规则不配对，故 CN/直连 QUIC 不受影响（兜底见末尾）。
+      if (blockProxyQuic) {
+        rules.push({
+          domain_keyword: googleKeywords,
+          network: ['udp'],
+          port: [443],
+          action: 'reject',
+        } as any);
+      }
       rules.push({
-        domain_keyword: ['google', 'gmail', 'youtube', 'gstatic', 'googleapis', 'googlevideo'],
+        domain_keyword: googleKeywords,
         action: 'route',
         outbound: selectedServerTag,
       });
 
       // 国外域名走代理
+      if (blockProxyQuic) {
+        rules.push({
+          rule_set: 'geosite-geolocation-!cn',
+          network: ['udp'],
+          port: [443],
+          action: 'reject',
+        } as any);
+      }
       rules.push({
         rule_set: 'geosite-geolocation-!cn',
         action: 'route',
@@ -2100,18 +2131,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         } as any);
       }
 
-      // T2-4: 用户开启"阻止 QUIC"时 reject 入站 UDP 443，让浏览器 QUIC 立即回退 TCP，
-      // 消除节点 UDP relay 不通时的 QUIC 黑洞（网页打开一会卡死）。协议三分类：
-      //   - ssh/http/anytls：上面已全量 reject UDP，此处对其为冗余 no-op；
-      //   - hysteria2/tuic：节点自身走 QUIC dial-server，会因 strict_route 回流被这条 reject
-      //     误杀，必须按协议 guard 跳过；
-      //   - vless/vmess/trojan/shadowsocks/naive/socks：本条真正生效对象（均 TCP dial-server；
-      //     naive 在 sing-box 是 H2/TLS/TCP、不支持 h3/QUIC，故安全；若将来支持 naive-h3 需更新此表）。
-      const udpTransportProtocols = ['hysteria2', 'tuic'];
-      if (
-        config.blockQuic === true &&
-        !udpTransportProtocols.includes(selectedServer.protocol.toLowerCase())
-      ) {
+      // blockQuic 兜底 reject：放在所有直连/分流规则之后，拦截"会落到 final(代理)"的剩余 UDP443
+      // （global 模式拦全部代理向 QUIC；smart 模式拦未被 google/!cn 配对 reject 命中的代理向 QUIC，
+      // CN 已在上方直连豁免）。配对与协议 guard 见上方 blockProxyQuic 定义。
+      if (blockProxyQuic) {
         rules.push({
           network: ['udp'],
           port: [443],
