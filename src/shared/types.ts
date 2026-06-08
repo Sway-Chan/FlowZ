@@ -360,6 +360,9 @@ export interface UserConfig {
   bypassLAN?: boolean; // 绕过局域网（将内网 IP 设置为直连）
   blockQuic?: boolean; // 阻止 QUIC（对代理向 UDP 443 执行 reject，逼浏览器回退 TCP）；默认关；节点无关，对所有协议一视同仁
   tlsFragment?: boolean; // 全局 TLS 分片：对所有 TLS 节点切分 ClientHello 抗 SNI-DPI；默认关
+  // 核心更新：仅在配置生成器已验证的 sing-box minor 版本带内自动更新（默认 true）。关闭后允许自动
+  // 更新跨越 minor（如 1.13→1.14），但跨 minor 的 schema 变更可能导致配置不兼容、需手动处理。
+  restrictCoreUpdateToCompatibleMinor?: boolean;
   bypassProcesses?: string[]; // 排除进程（指定进程直连，不走代理）
 
   // 日志设置

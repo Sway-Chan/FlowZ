@@ -370,6 +370,27 @@ export function AdvancedSettings() {
               {t('settings.advanced.autoSwitchNodeDesc' as any) ||
                 '当前节点断线或崩溃时，自动测速并切换到延迟最低的可用节点（每次切换冷却 60 秒）'}
             </p>
+
+            {/* 核心更新：仅在兼容版本带内自动更新 */}
+            <div className="flex items-center space-x-2 pt-2">
+              <Checkbox
+                id="restrictCoreUpdate"
+                checked={config.restrictCoreUpdateToCompatibleMinor !== false}
+                onCheckedChange={(checked) => {
+                  saveConfig({
+                    ...config,
+                    restrictCoreUpdateToCompatibleMinor: checked as boolean,
+                  });
+                }}
+              />
+              <Label htmlFor="restrictCoreUpdate" className="font-normal cursor-pointer">
+                {t('settings.advanced.restrictCoreUpdate' as any) || '仅在兼容版本带内自动更新内核'}
+              </Label>
+            </div>
+            <p className="text-xs text-muted-foreground ml-6 mb-2">
+              {t('settings.advanced.restrictCoreUpdateDesc' as any) ||
+                '仅自动更新到与当前配置生成器兼容的 sing-box 版本带（如 1.13.x）；跨版本带（如 1.14）不自动更新、转为提示随 App 升级，避免配置不兼容。手动更新不受此限制。'}
+            </p>
           </div>
         </div>
 

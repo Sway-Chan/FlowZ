@@ -238,6 +238,8 @@
       "interruptOnSwitchDesc": "默认优雅切换：切换节点不重启代理、现有连接保留至自然关闭，新连接走新节点。开启后切换时强制断开现有连接、立即在新节点重建。",
       "tlsFragment": "TLS 分片（抗 SNI 封锁）",
       "tlsFragmentDesc": "对所有 TLS 节点切分 ClientHello，使 SNI 跨多个 TCP 包、规避基于 SNI 关键词的 DPI 阻断。默认关；个别网络下可能轻微增加握手延迟。",
+      "restrictCoreUpdate": "仅在兼容版本带内自动更新内核",
+      "restrictCoreUpdateDesc": "仅自动更新到与当前配置生成器兼容的 sing-box 版本带（如 1.13.x）；跨版本带（如 1.14）不自动更新、转为提示随 App 升级，避免配置不兼容。手动更新不受此限制。",
       "terminalProxy": "终端代理设置",
       "terminalProxyDesc": "复制以下命令到终端中设置代理（需要先启动代理）",
       "gitProxy": "Git 代理设置",

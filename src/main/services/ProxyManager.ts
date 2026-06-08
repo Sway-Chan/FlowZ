@@ -341,6 +341,7 @@ export interface IProxyManager {
   on(event: 'started' | 'stopped' | 'error', listener: (...args: any[]) => void): void;
   off(event: 'started' | 'stopped' | 'error', listener: (...args: any[]) => void): void;
   getCoreVersion(): Promise<string>;
+  buildPreflightConfigJson(targetVersion: string): string | null;
 }
 
 export class ProxyManager extends EventEmitter implements IProxyManager {
@@ -369,6 +370,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
   // 自动重启相关
   private autoRestartEnabled: boolean = true;
+  // 核心更新"待验证窗口"内由 CoreUpdateService 置 true：抑制自动重启，让新核心首次异常退出立即
+  // 上报 'error' 触发回滚（而非在已知有问题的新核心上空转 MAX_RESTART_COUNT 次后才上报）。
+  private autoRestartSuppressed: boolean = false;
   private restartCount: number = 0;
   private lastRestartTime: number = 0;
   private static readonly MAX_RESTART_COUNT = 3; // 最大重启次数
@@ -740,6 +744,26 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     } catch (error) {
       this.logToManager('error', `获取核心版本失败: ${(error as any).message}`);
       return '1.13.0';
+    }
+  }
+
+  /**
+   * 为「核心更新预检」生成针对目标版本的配置 JSON：用当前活动配置 + 目标核心版本的生成风格
+   * （<1.13 走 inbound sniff，≥1.13 走 route action），供 sing-box check 校验新核心能否解析。
+   * 无活动配置（代理从未启动）时返回 null —— 调用方仅校验二进制可执行即可。
+   */
+  buildPreflightConfigJson(targetVersion: string): string | null {
+    if (!this.currentConfig) return null;
+    const savedVersion = this.coreVersion;
+    try {
+      this.coreVersion = targetVersion;
+      const cfg = this.generateSingBoxConfig(this.currentConfig);
+      return JSON.stringify(cfg, null, 2);
+    } catch (e) {
+      this.logToManager('warn', `预检配置生成失败: ${(e as any)?.message ?? e}`);
+      return null;
+    } finally {
+      this.coreVersion = savedVersion;
     }
   }
 
@@ -3496,6 +3520,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     if (!this.autoRestartEnabled || !this.currentConfig) {
       return false;
     }
+    // 核心更新待验证窗口：禁止自动重启，使新核心首次异常退出立即上报 error → 触发回滚
+    if (this.autoRestartSuppressed) {
+      return false;
+    }
 
     const now = Date.now();
 
@@ -3506,6 +3534,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // 检查是否超过最大重启次数
     return this.restartCount < ProxyManager.MAX_RESTART_COUNT;
+  }
+
+  /** 核心更新待验证窗口内由 CoreUpdateService 置 true：抑制自动重启，首次失败即上报触发回滚。 */
+  setAutoRestartSuppressed(suppressed: boolean): void {
+    this.autoRestartSuppressed = suppressed;
   }
 
   /**

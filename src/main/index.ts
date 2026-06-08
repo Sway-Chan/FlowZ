@@ -583,6 +583,7 @@ if (gotTheLock) {
     // 初始化 ProxyManager（需要在窗口创建后）
     proxyManager = new ProxyManager(logManager, mainWindow || undefined);
     coreUpdateService.setProxyManager(proxyManager);
+    coreUpdateService.setConfigProvider(() => configManager.loadConfig());
 
     // 初始化自动换节点服务
     autoSwitchService = new AutoSwitchService(
@@ -628,6 +629,18 @@ if (gotTheLock) {
           `Failed to disable system proxy after error: ${errorMessage}`,
           'Main'
         );
+      }
+
+      // 若是核心更新后新核心首次启动失败 → 自动回滚到旧核心并以旧核心重启代理
+      try {
+        const rolledBack = await coreUpdateService.autoRollbackIfPendingUpdate();
+        if (rolledBack) {
+          logManager.addLog('warn', '新核心启动失败，已自动回滚，正在以旧核心重启代理...', 'Main');
+          const cfg = await configManager.loadConfig();
+          await proxyManager?.start(cfg);
+        }
+      } catch (rollbackErr) {
+        logManager.addLog('error', `自动回滚重启失败: ${rollbackErr}`, 'Main');
       }
     });
 
