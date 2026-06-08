@@ -237,7 +237,7 @@ export function NaiveForm({ serverConfig, onSubmit }: NaiveFormProps) {
                     <FormDescription>{t('servers.naive.useHttp3Desc')}</FormDescription>
                   </div>
                   <FormControl>
-                    <Switch checked={field.value} onCheckedChange={field.onChange} />
+                    <Switch checked={field.value ?? false} onCheckedChange={field.onChange} />
                   </FormControl>
                 </FormItem>
               )}
