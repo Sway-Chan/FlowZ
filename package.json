@@ -27,9 +27,10 @@
     "lint": "eslint src --ext .ts,.tsx",
     "lint:fix": "eslint src --ext .ts,.tsx --fix",
     "format": "prettier --write \"src/**/*.{ts,tsx,json,css}\"",
+    "fetch:cronet": "node scripts/fetch-cronet.mjs",
     "release:tag": "node scripts/push-release.js",
     "release:tag:update": "node scripts/push-release.js -y -u",
-    "release:prepare": "npm run build && npm run package:all"
+    "release:prepare": "npm run fetch:cronet && npm run build && npm run package:all"
   },
   "keywords": [
     "electron",

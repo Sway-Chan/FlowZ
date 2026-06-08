@@ -240,9 +240,11 @@ export class ResourceManager {
     const userDataPath = app.getPath('userData');
     const updateDir = path.join(userDataPath, 'core_update');
     const targetPath = path.join(updateDir, 'sing-box');
-    
+
     // 检查是否已经有可写核心
     if (await this.fileExists(targetPath)) {
+      // 已有可写核心：仍需确保 libcronet 在旁（naive 出站靠 purego 同目录/系统库路径加载）
+      await this.ensureCronetBeside(updateDir);
       return targetPath;
     }
 
@@ -258,7 +260,52 @@ export class ResourceManager {
       await fs.chmod(targetPath, 0o755); // 赋予可执行权限
     }
 
+    // naive 节点需要 libcronet 与 sing-box 同目录（purego 加载），随核心一并放过去
+    await this.ensureCronetBeside(updateDir);
+
     return targetPath;
+  }
+
+  /** 各平台 NaiveProxy 核心库文件名（purego 期望的名字） */
+  getCronetLibFilename(): string {
+    if (this.platform === 'win32') return 'libcronet.dll';
+    if (this.platform === 'darwin') return 'libcronet.dylib';
+    return 'libcronet.so';
+  }
+
+  /** 内置的 libcronet 是否存在（用于 naive 可用性判断） */
+  hasCronetLib(): boolean {
+    try {
+      // macOS：cronet 由 sing-box 二进制静态编入（CGO，无 .dylib）。打包的 mac-arm64 与 mac-x64
+      // 核心（均 ≥1.13.13，with_naive_outbound）都含静态 cronet → naive 两 arch 皆可用、无需外部库。
+      if (this.platform === 'darwin') {
+        return true;
+      }
+      // linux/windows：cronet 走 dlopen 动态加载。检查 libcronet 是否在 sing-box 实际加载目录
+      // （purego 从二进制同目录加载）：Linux/便携=可写核心目录(已由 ensureCronetBeside 拷入)，
+      // 非便携 win=内置 resources 目录。不查内置兜底——否则 beside 拷贝失败仍误判"可用"→ FATAL。
+      const coreDir = path.dirname(this.getSingBoxPath());
+      return require('fs').existsSync(path.join(coreDir, this.getCronetLibFilename()));
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 把内置的 libcronet 复制到与（可写/已更新）核心同一目录，供 naive 出站(purego) 加载。
+   * 供 ensureWritableCore 与核心更新写盘后调用。内置无 libcronet 或已存在则跳过。
+   */
+  async ensureCronetBeside(coreDir: string): Promise<void> {
+    const name = this.getCronetLibFilename();
+    const src = path.join(this.getPlatformResourceDir(), name);
+    const dst = path.join(coreDir, name);
+    try {
+      if ((await this.fileExists(src)) && !(await this.fileExists(dst))) {
+        await fs.copyFile(src, dst);
+      }
+    } catch {
+      // 复制失败不应阻断启动；naive 不可用时 sing-box 会自报 cronet 错误
+    }
   }
 
   /**
