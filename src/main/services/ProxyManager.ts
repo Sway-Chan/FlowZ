@@ -1510,9 +1510,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       };
 
       // HTTP/3：naive 经 quic:true 走 h3(QUIC/UDP) 拨号传输，对应服务端 `--listen=quic://`。
-      // 注意这只改变"拨号传输"，naive 仍只过 TCP（HTTP CONNECT）、不能中继客户端 UDP（除非
-      // udp_over_tcp，FlowZ 不下发）；故路由层 naive 归入 TCP-only 集、恒 reject 代理向 UDP
-      // （见 generateRouteConfig isUdpRelayCapable）。该拨号本身受 fwmark 保护、不被 reject 误杀。
+      // 注意这只改变"拨号传输"：naive 仍只过 TCP（HTTP CONNECT）、不能中继客户端 UDP（除非
+      // udp_over_tcp，FlowZ 不下发）。客户端 QUIC 若走到 naive，由 blockQuic（udp443 reject 逼回退 TCP）
+      // 或 sing-box 出站层（"UDP is not supported by outbound"）处理；该拨号本身受 fwmark 保护、
+      // 绕过 route 规则，不被 reject 误杀（已实测）。
       if (server.naiveSettings?.useHttp3) {
         outbound.quic = true;
       }
@@ -1674,34 +1675,21 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 获取当前选中的服务器，用于排除代理服务器域名
     const selectedServer = config.servers.find((s) => s.id === config.selectedServerId);
 
-    // 代理向 UDP 的处理，按节点"能否中继客户端 UDP"分流（与"拨号传输"正交！）：
-    //   · 能中继(hy2/tuic 原生 UDP；vless/vmess/trojan/ss UoT；socks5 associate)：客户端 QUIC 可经
-    //     代理转发，是否拦由用户 blockQuic 开关决定。
-    //   · 不能中继(ssh/http/anytls 纯 TCP CONNECT/流；naive 仅在 udp_over_tcp 下可中继，而 FlowZ 不
-    //     下发该字段，故按 TCP-only 处理)：代理向 UDP 必黑洞 → 恒定 reject（逼 QUIC 回退 TCP、其余
-    //     UDP 快速失败而非穿透 final 跌到 direct 假死 30s）。
-    // 关键：对节点自身的 UDP 拨号(naive-h3/hy2/tuic dial server)无害——拨号是 sing-box 进程自有
-    //   socket，受 fwmark/auto_detect_interface 保护、绕过 route 规则。已用 netns TUN 抓包实测证伪
-    //   旧假设"reject 经 strict_route 回流误杀拨号"：带 reject udp443 时 hy2 拨号包仍正常逸出。
-    const TCP_ONLY_PROTOCOLS = ['ssh', 'http', 'anytls', 'naive'];
-    const isUdpRelayCapable = (s: ServerConfig): boolean =>
-      !TCP_ONLY_PROTOCOLS.includes(s.protocol.toLowerCase());
+    // blockQuic（节点无关）：开启时对"将走代理"的 QUIC(UDP443) 执行 reject，逼浏览器回退 TCP。
+    // 「禁 QUIC」即禁 QUIC，与选中节点的协议/中继能力无关，对所有节点一视同仁。两点实测保证安全：
+    //   · 节点自身的 UDP 拨号(naive-h3/hy2/tuic dial server)无害——拨号是 sing-box 进程自有 socket，
+    //     受 fwmark/auto_detect_interface 保护、绕过 route 规则；netns TUN 抓包实测：带 reject udp443
+    //     时 hy2 拨号包仍正常逸出（证伪旧假设"reject 经 strict_route 回流误杀拨号"）。
+    //   · 不下发"全 UDP reject"——只禁 QUIC(443)。非 QUIC 的代理向 UDP 若节点不能中继(naive/ssh/http)，
+    //     由 sing-box 出站层自动拒绝（实测日志 "UDP is not supported by outbound"，不漏 direct、不黑洞），
+    //     无需路由层按节点固化。这也使路由配置与选中节点解耦 → 支持 selector 跨协议无缝热切换。
+    const blockProxyQuic = config.blockQuic === true && !!selectedServer;
 
-    // 不能中继的节点：恒定 reject 全部代理向 UDP（强制兜底，与 blockQuic 开关无关）。
-    const rejectProxyUdpAll =
-      proxyMode !== 'direct' && !!selectedServer && !isUdpRelayCapable(selectedServer);
-    // 能中继的节点：仅当用户开 blockQuic 时 reject 代理向 QUIC(UDP443)，逼浏览器回退 TCP。
-    const blockProxyQuic =
-      config.blockQuic === true && !!selectedServer && isUdpRelayCapable(selectedServer);
-
-    // 给定域名匹配器，返回应配对的"代理向 UDP reject"规则（smart 模式放在每条 →代理 规则之前），
-    // 不需要则 null。二者互斥（节点要么能中继要么不能）：不能中继拦全部 UDP，能中继+blockQuic 拦 UDP443。
-    const proxyUdpRejectFor = (matcher: Record<string, any>): SingBoxRouteRule | null => {
-      if (rejectProxyUdpAll) return { ...matcher, network: ['udp'], action: 'reject' } as any;
-      if (blockProxyQuic)
-        return { ...matcher, network: ['udp'], port: [443], action: 'reject' } as any;
-      return null;
-    };
+    // 给定域名匹配器，返回应配对的 udp443 reject 规则（smart 模式放在每条 →代理 规则之前），否则 null。
+    const proxyUdpRejectFor = (matcher: Record<string, any>): SingBoxRouteRule | null =>
+      blockProxyQuic
+        ? ({ ...matcher, network: ['udp'], port: [443], action: 'reject' } as any)
+        : null;
 
     const versionArr = this.coreVersion.split('.');
     const versionNum = parseFloat(versionArr[0] + '.' + (versionArr[1] || '0'));
@@ -2176,14 +2164,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       }
     }
 
-    // 【代理向 UDP 黑洞兜底】：放在所有直连/分流规则之后，拦截"会落到 final(代理)"的剩余 UDP。
-    //   · 不能中继的节点(ssh/http/anytls/naive)：reject 全部剩余代理向 UDP（global 拦全部；smart 拦
-    //     未被上方 →代理 配对 reject 命中的；CN 已在上方直连豁免）——否则穿透 final 跌到 direct 假死 30s。
-    //   · 能中继+blockQuic：reject 代理向 QUIC(UDP443)，逼浏览器回退 TCP。
-    // 二者互斥；判定与"对节点自身 UDP 拨号无害"的实测论证见上方 isUdpRelayCapable 处。
-    if (rejectProxyUdpAll) {
-      rules.push({ network: ['udp'], action: 'reject' } as any);
-    } else if (blockProxyQuic) {
+    // 【代理向 QUIC 兜底】：放在所有直连/分流规则之后，拦截"会落到 final(代理)"的剩余 QUIC(udp443)。
+    // global 模式拦全部代理向 QUIC；smart 模式拦未被上方 →代理 配对 reject 命中的（CN 已直连豁免）。
+    // 只拦 QUIC——非 QUIC 的代理向 UDP 若节点不能中继，由 sing-box 出站层自动拒绝（见上方 blockProxyQuic）。
+    if (blockProxyQuic) {
       rules.push({ network: ['udp'], port: [443], action: 'reject' } as any);
     }
 
