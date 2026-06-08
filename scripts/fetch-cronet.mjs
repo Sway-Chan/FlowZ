@@ -5,9 +5,9 @@
  *
  * 用法：node scripts/fetch-cronet.mjs [--force]
  *
- * ⚠️ macOS：SagerNet/cronet-go 不分发预编译 libcronet.dylib（release 只有 linux/windows）。mac 下
- *   naive 需自行用 cronet-go 的 build-naive 从源码构建 libcronet.dylib 放进 resources/mac-{arch}/，
- *   否则运行时 hasCronetLib()=false、naive 节点会被优雅跳过（不影响其它协议节点）。
+ * ⚠️ macOS 不在此脚本范围：cronet 在 mac 上不走动态库。FlowZ 的 mac-arm64 sing-box 二进制已把 cronet
+ *   静态编入（CGO，实测二进制内含 cronet 符号、无 dlopen libcronet.dylib），naive 开箱即用、无需任何
+ *   外部库。mac-x64 二进制未编入 cronet → naive 暂不可用（需重编带 naive 的 x64 核心）。详见 README。
  *
  * ⚠️ 版本耦合：CRONET_VERSION 应与「随 app 打包的 sing-box 所用 cronet-go 版本」对应。cronet 走
  *   C API（Chromium 稳定 ABI），跨 sing-box 小版本一般兼容；若升级 sing-box 后 naive 报符号错，提高
@@ -24,7 +24,7 @@ const REPO = 'SagerNet/cronet-go';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const FORCE = process.argv.includes('--force');
 
-// 仅 linux/windows 有官方预编译资产；mac 见文件头说明（build-from-source）。
+// 仅 linux/windows 走动态库；mac 静态编入核心二进制，不需下载（见文件头）。
 // resources 目标目录 ← cronet-go 资产名 → 落地文件名(purego 期望)
 const TARGETS = [
   { dir: 'resources/linux', asset: 'libcronet-linux-amd64.so', out: 'libcronet.so' },
@@ -95,5 +95,5 @@ for (const t of TARGETS) {
   }
 }
 console.log(`\ncronet libs: ${ok} ready, ${failed} failed (version ${CRONET_VERSION}).`);
-console.log('macOS: 需自行从源码构建 libcronet.dylib（见脚本头注），否则 mac 下 naive 节点将被跳过。');
+console.log('macOS: cronet 静态编入 mac-arm64 核心，无需下载（见脚本头注）。');
 process.exit(failed > 0 ? 1 : 0);
