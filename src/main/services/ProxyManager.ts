@@ -370,6 +370,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
   // 自动重启相关
   private autoRestartEnabled: boolean = true;
+  // 核心更新"待验证窗口"内由 CoreUpdateService 置 true：抑制自动重启，让新核心首次异常退出立即
+  // 上报 'error' 触发回滚（而非在已知有问题的新核心上空转 MAX_RESTART_COUNT 次后才上报）。
+  private autoRestartSuppressed: boolean = false;
   private restartCount: number = 0;
   private lastRestartTime: number = 0;
   private static readonly MAX_RESTART_COUNT = 3; // 最大重启次数
@@ -3517,6 +3520,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     if (!this.autoRestartEnabled || !this.currentConfig) {
       return false;
     }
+    // 核心更新待验证窗口：禁止自动重启，使新核心首次异常退出立即上报 error → 触发回滚
+    if (this.autoRestartSuppressed) {
+      return false;
+    }
 
     const now = Date.now();
 
@@ -3527,6 +3534,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // 检查是否超过最大重启次数
     return this.restartCount < ProxyManager.MAX_RESTART_COUNT;
+  }
+
+  /** 核心更新待验证窗口内由 CoreUpdateService 置 true：抑制自动重启，首次失败即上报触发回滚。 */
+  setAutoRestartSuppressed(suppressed: boolean): void {
+    this.autoRestartSuppressed = suppressed;
   }
 
   /**
