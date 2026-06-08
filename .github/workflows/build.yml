@@ -30,6 +30,8 @@ jobs:
           cache: 'npm'
 
       - name: Install dependencies
+        env:
+          ELECTRON_MIRROR: "https://npmmirror.com/mirrors/electron/"
         run: npm ci
 
       - name: Lint code
@@ -43,10 +45,16 @@ jobs:
 
       - name: Package application (Windows)
         if: matrix.os == 'windows-latest'
+        env:
+          ELECTRON_MIRROR: "https://npmmirror.com/mirrors/electron/"
+          ELECTRON_BUILDER_BINARIES_MIRROR: "https://npmmirror.com/mirrors/electron-builder-binaries/"
         run: npm run package:win
 
       - name: Package application (macOS)
         if: matrix.os == 'macos-latest'
+        env:
+          ELECTRON_MIRROR: "https://npmmirror.com/mirrors/electron/"
+          ELECTRON_BUILDER_BINARIES_MIRROR: "https://npmmirror.com/mirrors/electron-builder-binaries/"
         run: npm run package:mac
 
       - name: Upload build artifacts

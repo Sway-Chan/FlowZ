@@ -41,6 +41,8 @@ jobs:
           sudo gem install --no-document fpm
 
       - name: Install dependencies
+        env:
+          ELECTRON_MIRROR: "https://npmmirror.com/mirrors/electron/"
         run: npm ci
 
       - name: Build application
@@ -50,6 +52,8 @@ jobs:
         run: npm run package:${{ matrix.platform }}
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: false
+          ELECTRON_MIRROR: "https://npmmirror.com/mirrors/electron/"
+          ELECTRON_BUILDER_BINARIES_MIRROR: "https://npmmirror.com/mirrors/electron-builder-binaries/"
 
       - name: Create DMG (macOS)
         if: matrix.platform == 'mac'
