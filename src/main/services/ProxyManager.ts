@@ -435,6 +435,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     await this.copyRuleSetsToUserData();
 
     // 3.5. 预解析所有节点的域名为 IP（仅针对 TUN 模式），防止 Windows 下回流死循环
+    // 【待真机验证 / CDN 风险】：对"域名节点"预解析得到的 IP 会进 route_exclude_address，若节点在
+    //   共享 CDN(如 Cloudflare) 后，等于把共享 IP 加直连 → 误伤同 IP 的被墙站点、且抗不住 IP 轮换。
+    //   现已在 generateRouteConfig 用"全节点域名 → direct"的纯域名规则(sniff SNI)做 CDN 安全豁免；
+    //   此处 Windows IP 预解析是否仍为断环所必需，需 Wintun 真机验证：若域名规则+sniff 足够 → 删除本块；
+    //   若 Windows 确需 IP 级兜底 → 应仅对 IP-literal 节点保留、域名节点不预解析。无 Windows 环境暂不擅改。
     const resolvedServerIps: Record<string, string> = {};
     if (isTunMode && process.platform === 'win32') {
       this.logToManager('info', '正在预解析节点域名以防止 TUN 回流...');
@@ -1809,40 +1814,43 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       action: 'reject',
     } as any);
 
-    // 排除代理服务器域名，确保代理服务器的连接走直连
-    // 这必须放在其他规则之前，否则可能被 geosite-cn 匹配导致死循环
-    if (selectedServer?.address) {
-      const proxyHosts = [selectedServer.address];
-      if (selectedServer.tlsSettings?.serverName) {
-        proxyHosts.push(selectedServer.tlsSettings.serverName);
-      }
-      const uniqueHosts = Array.from(new Set(proxyHosts));
-
-      const ips: string[] = [];
-      const domains: string[] = [];
-
+    // 排除全部代理节点的域名/IP，确保到任一节点的连接走直连（防回流死循环 + 兼容无缝切换/代理链）。
+    // CDN 安全：域名节点用纯域名规则(domain + domain_suffix，靠 sniff 出的 SNI 精确匹配节点域名)，
+    //   不预解析为共享 CDN IP（共享 IP 加直连会误伤同 IP 的被墙站点、且抗不住 IP 轮换）；
+    //   去掉过宽的 domain_keyword（会误匹配任意"含该域名串"的无关域名）。
+    // 仅用户显式填的 IP-literal 节点用 ip_cidr 排除（专用 IP、非共享，安全）。
+    // 扩展到全部节点(不止选中)：切节点 / detour 前置代理无需重生成配置即被豁免。
+    // 必须放在其他规则之前，否则可能被 geosite-cn 匹配导致死循环。
+    {
       const isIpv4 = (host: string) => /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(host);
       const isIpv6 = (host: string) => /^[0-9a-fA-F:]+$/.test(host) && host.includes(':');
 
-      uniqueHosts.forEach((host) => {
-        if (isIpv4(host)) ips.push(`${host}/32`);
-        else if (isIpv6(host)) ips.push(`${host}/128`);
-        else domains.push(host);
-      });
+      const ipSet = new Set<string>();
+      const domainSet = new Set<string>();
+      for (const s of config.servers) {
+        const hosts = [s.address, s.tlsSettings?.serverName].filter(
+          (h): h is string => !!h && h.length > 0
+        );
+        for (const host of hosts) {
+          if (isIpv4(host)) ipSet.add(`${host}/32`);
+          else if (isIpv6(host)) ipSet.add(`${host}/128`);
+          else domainSet.add(host);
+        }
+      }
 
-      if (domains.length > 0) {
+      if (domainSet.size > 0) {
+        const domains = Array.from(domainSet);
         rules.push({
           domain: domains,
           domain_suffix: domains.flatMap((d) => [d, `.${d}`]),
-          domain_keyword: domains,
           action: 'route',
           outbound: 'direct',
         });
       }
 
-      if (ips.length > 0) {
+      if (ipSet.size > 0) {
         rules.push({
-          ip_cidr: ips,
+          ip_cidr: Array.from(ipSet),
           action: 'route',
           outbound: 'direct',
         });
