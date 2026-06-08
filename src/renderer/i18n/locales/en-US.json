@@ -525,7 +525,7 @@
       "versionWarning": "⚠️ Naive protocol requires sing-box v1.13+ core. If you are using v1.12, please go to 'Settings -> About' to update your core.",
       "goUpdate": "Update Core",
       "useHttp3": "HTTP/3 (QUIC)",
-      "useHttp3Desc": "Transport over QUIC/UDP (server must listen on quic://). When enabled, this node is exempt from \"Block QUIC\"."
+      "useHttp3Desc": "This node dials over QUIC/UDP (server must listen on quic://, with HTTP/3 enabled). Its own QUIC dial is protected and not killed by \"Block QUIC\"; browser QUIC to this node is still handled per the \"Block QUIC\" setting."
     }
   },
   "rules": {

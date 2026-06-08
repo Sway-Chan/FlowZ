@@ -524,7 +524,7 @@
       "versionWarning": "⚠️ Naive 协议需要 sing-box v1.13+ 核心支持。如果您当前使用的是 v1.12 核心，请前往“设置 -> 关于”点击更新核心。",
       "goUpdate": "去更新核心",
       "useHttp3": "HTTP/3 (QUIC)",
-      "useHttp3Desc": "经 QUIC/UDP 传输，对应服务端 quic:// 监听；需服务端开启 HTTP/3。开启后该节点不受“阻止 QUIC”影响。"
+      "useHttp3Desc": "该节点用 QUIC/UDP 拨号（对应服务端 quic:// 监听，需服务端开启 HTTP/3）。其自身的 QUIC 拨号受保护、不被“阻止 QUIC”误杀；浏览器到该节点的 QUIC 仍按“阻止 QUIC”设置处理。"
     }
   },
   "rules": {

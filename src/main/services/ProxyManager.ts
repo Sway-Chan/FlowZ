@@ -553,10 +553,13 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * best-effort + 短重试，clash_api 刚起可能未就绪；失败不影响启动（cache/default 仍是有效节点）。
    */
   private async reassertSelectorSelection(config: UserConfig): Promise<void> {
-    const tag = this.currentIdToTagMap?.get(config.selectedServerId as string);
-    if (!tag) return;
     for (let i = 0; i < 10; i++) {
       if (!this.singboxProcess && !this.singboxPid) return; // 已停止则放弃
+      // 每轮读最新 currentConfig.selectedServerId：若启动窗口内用户已热切到别的节点，则用新节点、
+      // 不要把它 revert 回启动时的旧节点。
+      const targetId = this.currentConfig?.selectedServerId ?? config.selectedServerId;
+      const tag = this.currentIdToTagMap?.get(targetId as string);
+      if (!tag) return;
       try {
         const res = await fetch('http://127.0.0.1:9090/proxies/proxy-selector', {
           method: 'PUT',
@@ -635,26 +638,22 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 必须确实是切节点
     if (old.selectedServerId === newConfig.selectedServerId) return false;
     if (!newConfig.selectedServerId) return false;
-    // 目标节点必须已存在于运行中的 selector（= 启动时的 servers），否则 PUT 会指向不存在的成员
+    // 目标节点必须已存在于运行中的 selector（= 启动时的 servers），否则 PUT 指向不存在的成员
     if (!old.servers.some((s) => s.id === newConfig.selectedServerId)) return false;
-    // interrupt 开关是 selector 的配置项，改它必须重生成配置
-    if (
-      (old.interruptConnectionsOnSwitch ?? false) !==
-      (newConfig.interruptConnectionsOnSwitch ?? false)
-    ) {
-      return false;
-    }
-    // 出站集合 / 路由相关项变化（hasModeChanged 未覆盖 servers 列表与 appRules）→ 需重生成。
-    // servers 按 id 归一化比较：订阅更新仅重排节点不应触发重启，节点出站配置真改了才重启。
-    const sortById = (servers: ServerConfig[]) =>
-      JSON.stringify([...servers].sort((a, b) => a.id.localeCompare(b.id)));
-    if (sortById(old.servers) !== sortById(newConfig.servers)) return false;
-    if (JSON.stringify(old.appRules ?? []) !== JSON.stringify(newConfig.appRules ?? []))
-      return false;
-    // 其余 regen-affecting 项（proxyMode/type/ports/tun/customRules）：把 selectedServerId 对齐后，
-    // 若 hasModeChanged 仍判定无变化，则唯一变化就是切节点。
-    const probe: UserConfig = { ...newConfig, selectedServerId: old.selectedServerId };
-    return !this.hasModeChanged(probe);
+    // Windows TUN：route_exclude_address 在 start 时仅按「选中 + appRules」节点构建；热切到其它
+    // IP-literal 节点时其 server IP 不在排除集 → Wintun 会把 sing-box 自身出向包回捕进 TUN 成环。
+    // 配置不重生成无法补排除集，故 Windows TUN 一律退回重启（由重启重生成排除集）。
+    if (process.platform === 'win32' && newConfig.proxyModeType === 'tun') return false;
+    // 唯一允许变化的就是 selectedServerId：对齐它、servers 按 id 归一化后整体深比较——任何其它影响
+    // 配置生成的字段（blockQuic/tlsFragment/dnsConfig/各 TUN 子字段/appRules/customRules/端口/interrupt
+    // 开关 等）有差异都退回重启，避免「切节点 + 改某设置」同时发生时把那个设置静默丢掉。
+    const norm = (c: UserConfig) =>
+      JSON.stringify({
+        ...c,
+        selectedServerId: null,
+        servers: [...c.servers].sort((a, b) => a.id.localeCompare(b.id)),
+      });
+    return norm(old) === norm(newConfig);
   }
 
   /**
@@ -681,60 +680,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       this.logToManager('warn', `clash_api 热切换异常: ${e?.message ?? e}`);
       return false;
     }
-  }
-
-  /**
-   * 检查模式是否变化
-   */
-  private hasModeChanged(newConfig: UserConfig): boolean {
-    if (!this.currentConfig) {
-      return true;
-    }
-
-    // 检查代理模式
-    if (this.currentConfig.proxyMode !== newConfig.proxyMode) {
-      return true;
-    }
-
-    // 检查代理模式类型
-    if (this.currentConfig.proxyModeType !== newConfig.proxyModeType) {
-      return true;
-    }
-
-    // 检查选中的服务器
-    if (this.currentConfig.selectedServerId !== newConfig.selectedServerId) {
-      return true;
-    }
-
-    // 检查端口
-    if (
-      this.currentConfig.socksPort !== newConfig.socksPort ||
-      this.currentConfig.httpPort !== newConfig.httpPort
-    ) {
-      return true;
-    }
-
-    // 检查 TUN 配置（如果是 TUN 模式）
-    if (newConfig.proxyModeType === 'tun') {
-      const oldTun = this.currentConfig.tunConfig;
-      const newTun = newConfig.tunConfig;
-
-      if (
-        oldTun.mtu !== newTun.mtu ||
-        oldTun.stack !== newTun.stack ||
-        oldTun.autoRoute !== newTun.autoRoute ||
-        oldTun.strictRoute !== newTun.strictRoute
-      ) {
-        return true;
-      }
-    }
-
-    // 检查自定义规则
-    if (JSON.stringify(this.currentConfig.customRules) !== JSON.stringify(newConfig.customRules)) {
-      return true;
-    }
-
-    return false;
   }
 
   /**
@@ -822,7 +767,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 关键优化：预先生成 ID 到 Tag 的唯一映射，使用服务器名称作为 Tag，确保拓扑和日志显示友好名称
     // 这样做之后内容拓扑（Clash API）和日志中显示的将是“香港 01”而不是“proxy-uuid”
     const idToTagMap = new Map<string, string>();
-    const usedTags = new Set<string>();
+    // 预占内置出站 tag，防止用户把节点命名为 proxy-selector/direct/block 等导致 tag 撞车启动 FATAL
+    const usedTags = new Set<string>(['proxy-selector', 'direct', 'block', 'direct-loopback']);
 
     const getUniqueTag = (server: ServerConfig) => {
       let baseTag = server.name.trim() || '未命名节点';
@@ -1351,6 +1297,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       // 开关决定（默认 false=优雅切换，现有连接保留至自然关闭）。clash_api `PUT /proxies/proxy-selector`
       // 据此热切换、无需重启 sing-box（详见 switchMode）。路由的 final 与「→代理」规则统一指向本 selector。
       const nodeTags = outbounds.map((o) => o.tag).filter((t): t is string => !!t);
+      // 所有节点生成失败 → 空 selector 会让 sing-box 启动报含糊错误；这里提前给出清晰原因
+      if (nodeTags.length === 0) {
+        throw new Error('没有可用的代理节点出站（所有节点配置生成失败）');
+      }
       const selectedServerTag = idToTagMap.get(selectedServer.id) || 'proxy';
       outbounds.push({
         type: 'selector',
