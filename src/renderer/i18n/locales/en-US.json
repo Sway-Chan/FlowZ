@@ -234,7 +234,11 @@
       "bypassLAN": "Bypass LAN",
       "bypassLANDesc": "Force requests destined for the local network to bypass the proxy (disable to allow proxying for 192.168.x etc.)",
       "blockQuic": "Block QUIC (force TCP)",
-      "blockQuicDesc": "Reject QUIC (UDP 443) so browsers fall back to TCP. Fixes pages stalling when the node's UDP relay is unreliable. Off by default; not applicable to Hysteria2/TUIC nodes.",
+      "blockQuicDesc": "Reject proxy-bound QUIC (UDP 443) so browsers fall back to TCP. Fixes pages stalling when a node's UDP relay is unreliable. Off by default; applies to all nodes.",
+      "interruptOnSwitch": "Interrupt existing connections on switch",
+      "interruptOnSwitchDesc": "Default is graceful switching: switching nodes does not restart the proxy and existing connections persist until they close naturally; new connections use the new node. When enabled, switching forcibly drops existing connections and rebuilds them on the new node immediately.",
+      "tlsFragment": "TLS fragmentation (anti-SNI blocking)",
+      "tlsFragmentDesc": "Splits the TLS ClientHello across multiple TCP packets so the SNI is fragmented, evading SNI-keyword DPI blocking. Off by default; may slightly increase handshake latency on some networks.",
       "terminalProxy": "Terminal Proxy Settings",
       "terminalProxyDesc": "Copy the following commands to set proxy in terminal (proxy must be started first)",
       "gitProxy": "Git Proxy Settings",
@@ -519,7 +523,9 @@
     "alpnDesc": "Application-Layer Protocol Negotiation, e.g. h3",
     "naive": {
       "versionWarning": "⚠️ Naive protocol requires sing-box v1.13+ core. If you are using v1.12, please go to 'Settings -> About' to update your core.",
-      "goUpdate": "Update Core"
+      "goUpdate": "Update Core",
+      "useHttp3": "HTTP/3 (QUIC)",
+      "useHttp3Desc": "This node dials over QUIC/UDP (server must listen on quic://, with HTTP/3 enabled). Its own QUIC dial is protected and not killed by \"Block QUIC\"; browser QUIC to this node is still handled per the \"Block QUIC\" setting."
     }
   },
   "rules": {

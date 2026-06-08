@@ -796,11 +796,11 @@ if (gotTheLock) {
           await configManager.saveConfig(config);
           logManager.addLog('info', `Server selected from tray: ${serverId}`, 'Main');
 
-          // 如果代理正在运行，重启以应用新服务器
+          // 如果代理正在运行，应用新服务器：切节点走 switchMode（clash_api 热切换、不断流），
+          // 失败自动退回重启——与渲染端切换路径行为一致，避免托盘切节点硬重启断流。
           if (proxyManager && proxyManager.getStatus().running) {
-            await proxyManager.stop();
-            await proxyManager.start(config);
-            logManager.addLog('info', 'Proxy restarted with new server', 'Main');
+            await proxyManager.switchMode(config);
+            logManager.addLog('info', 'Applied server switch from tray', 'Main');
           }
 
           // 更新托盘菜单
@@ -1104,26 +1104,20 @@ if (gotTheLock) {
       const isRunning = proxyManager?.getStatus().running ?? false;
       updateTrayMenuState(isRunning);
 
-      // 2. 如果代理正在运行，自动重启以应用新配置
+      // 2. 如果代理正在运行，应用新配置：仅切节点走 clash_api 热切换（不断流），其余重启（见 switchMode）
       if (isRunning && proxyManager) {
-        logManager.addLog('info', 'Configuration changed, restarting proxy...', 'Main');
         try {
-          await proxyManager.stop();
           // 重新加载配置以确保使用最新值
           const latestConfig = await configManager.loadConfig();
-          await proxyManager.start(latestConfig);
-          logManager.addLog('info', 'Proxy restarted successfully with new configuration', 'Main');
+          await proxyManager.switchMode(latestConfig);
+          logManager.addLog('info', 'Applied configuration change', 'Main');
 
-          // 重启后再次更新托盘（以防状态有变）
-          updateTrayMenuState(true);
+          // 应用后再次更新托盘（以防状态有变）
+          updateTrayMenuState(proxyManager.getStatus().running);
         } catch (error) {
           const errorMessage = error instanceof Error ? error.message : String(error);
-          logManager.addLog(
-            'error',
-            `Failed to restart proxy after config change: ${errorMessage}`,
-            'Main'
-          );
-          // 重启失败，更新托盘状态为停止
+          logManager.addLog('error', `Failed to apply config change: ${errorMessage}`, 'Main');
+          // 应用失败，更新托盘状态为停止
           updateTrayMenuState(false, true);
         }
       }
