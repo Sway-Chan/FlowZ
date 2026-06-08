@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
@@ -23,10 +23,12 @@ export function AdvancedSettings() {
   const { t } = useTranslation();
 
   // 当前选中节点为 QUIC 协议(hy2/tuic)时，"阻止 QUIC"会误杀其传输，禁用该开关
-  const selectedProtocol = config?.servers
-    ?.find((s) => s.id === config?.selectedServerId)
-    ?.protocol?.toLowerCase();
-  const isQuicNode = selectedProtocol === 'hysteria2' || selectedProtocol === 'tuic';
+  const isQuicNode = useMemo(() => {
+    const selectedProtocol = config?.servers
+      ?.find((s) => s.id === config?.selectedServerId)
+      ?.protocol?.toLowerCase();
+    return selectedProtocol === 'hysteria2' || selectedProtocol === 'tuic';
+  }, [config?.selectedServerId, config?.servers]);
 
   const handleSavePorts = async () => {
     if (!config) return;
