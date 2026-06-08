@@ -1457,16 +1457,17 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       outbound.password = server.password;
 
       // NaiveProxy specific configuration
-      // 1. Force TLS enabled (NaiveProxy usually uses H2/TLS)
-      // 2. Default server_name to server address if not specified
+      // sing-box 的 naive outbound 由 Cronet 自管 TLS，仅支持 server_name / certificate /
+      // certificate_path / ech。下发 alpn 或 insecure:true 会让 sing-box 拒启：
+      //   FATAL: initialize outbound: alpn is not supported on naive outbound
+      //   FATAL: initialize outbound: insecure is not supported on naive outbound
+      // 故这里只下发 server_name（用户在节点上设置的 alpn / allowInsecure 对 naive 无效，忽略）。
+      // 参考：https://sing-box.sagernet.org/configuration/outbound/naive/ （TLS 字段限制）
+      //       SagerNet/sing-box protocol/naive/outbound.go (v1.13.x) ~L47 的 ALPN/insecure 校验
       outbound.tls = {
         enabled: true,
         server_name: server.tlsSettings?.serverName || server.address,
-        insecure: server.tlsSettings?.allowInsecure || false,
-        alpn: server.tlsSettings?.alpn || undefined,
       };
-
-      // 3. Naive handles its own fingerprint/transport, typically does not use uTLS settings
     }
 
     // SOCKS 特定配置
