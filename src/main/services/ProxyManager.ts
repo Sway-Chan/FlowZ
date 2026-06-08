@@ -814,7 +814,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // - 在 TUN 下，Windows 的系统 DNS (svchost) 发出的解析请求会被 TUN 劫持。如果该系统 DNS 配置为公共 IP，
     //   此时 type: 'local' (调用系统 getaddrinfo) 就会进入死循环。
     // - 为了彻底解决这个问题，同时避免 UDP 53 屏蔽（之前使用 223.5.5.5 UDP 的缺陷），
-    //   我们引入一个坚不可摧的 DoH IP Bootstrap：向 223.5.5.5(HTTP) 直接发包，并且 detour: 'direct' 强制绕过 TUN。
+    //   我们引入一个坚不可摧的 DoH IP Bootstrap (dns-bootstrap)：向 223.5.5.5:443 直接发 DoH 包。
+    //   它绕过 TUN 不是靠 DNS detour，而是靠 route 规则把 223.5.5.5:443 直连放行（见 generateRouteConfig）。
+    //   关键路径（节点域名 / doh.pub / default_domain_resolver）均以它为 resolver，免疫 UDP 53 限速/劫持/投毒。
     const dnsServers: SingBoxDnsServer[] = [
       {
         // 引导解析：专门用于解析代理节点的 IP 解析器（UDP，最稳健）
@@ -824,13 +826,13 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         server_port: 53,
       },
       {
-        // 引导解析（DoH）：作为 UDP 的备份
+        // 引导解析（DoH over IP）：关键路径的解析器。server 已是 IP，无需 domain_resolver。
+        // 相比 UDP 53，对运营商的 UDP 53 限速/劫持/投毒免疫，避免节点域名解析失败导致断流。
         tag: 'dns-bootstrap',
         type: 'https',
         server: '223.5.5.5',
         server_port: 443,
         path: '/dns-query',
-        domain_resolver: 'dns-bootstrap-udp',
       },
       {
         // 兼容性和兜底的系统 DNS
@@ -844,7 +846,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         server: 'doh.pub',
         server_port: 443,
         path: '/dns-query',
-        domain_resolver: 'dns-bootstrap-udp',
+        domain_resolver: 'dns-bootstrap',
       },
       {
         // 远程代理 DNS (推荐 DoH)
@@ -853,7 +855,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         server: 'dns.google',
         server_port: 443,
         path: '/dns-query',
-        domain_resolver: 'dns-bootstrap-udp',
+        domain_resolver: 'dns-bootstrap',
         // 关键核心：远程解析必须走代理，否则在境内直接发起会因 GFW 拦截/污染导致 FakeIP 映射失败或由于 TTL 极短产生大量无效解析。
         detour: selectedServerTag,
       },
@@ -1349,8 +1351,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       tag: idToTagMap.get(server.id) || `proxy-${server.id}`,
       server: server.address,
       server_port: server.port,
-      // 代理服务器使用 IP-based 引导解析器，防止因 dns-local 死循环导致的连接挂起
-      domain_resolver: 'dns-bootstrap-udp',
+      // 代理节点域名经 DoH-over-IP 引导解析（dns-bootstrap），免疫 UDP 53 限速/劫持，
+      // 避免节点解析失败导致全断流；同时防止 dns-local 死循环导致的连接挂起。
+      domain_resolver: 'dns-bootstrap',
     };
 
     // VLESS 特定配置
@@ -1707,9 +1710,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     const routeConfig: SingBoxRouteConfig = {
       rules,
-      // 核心修复：macOS 下 default_domain_resolver 必须使用 IP-based 引导解析器 (dns-bootstrap-udp)
-      // 避免解析 doh.pub 域名时产生的死循环。
-      default_domain_resolver: 'dns-bootstrap-udp',
+      // 核心修复：default_domain_resolver 使用 IP-based DoH 引导解析器 (dns-bootstrap)，
+      // 既避免解析 doh.pub 域名时的死循环，又免疫 UDP 53 限速/劫持（dns-bootstrap 同为 IP-based）。
+      default_domain_resolver: 'dns-bootstrap',
       auto_detect_interface: true,
       // 如果模式是全局代理 (global/proxy)，则最终出口是所选节点
       final: proxyMode === 'direct' ? 'direct' : selectedServerTag,
