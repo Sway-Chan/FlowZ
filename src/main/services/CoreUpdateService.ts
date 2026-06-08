@@ -172,6 +172,10 @@ export class CoreUpdateService {
         fs.chmodSync(targetPath, 0o755);
       }
 
+      // 核心单独更新后，确保 NaiveProxy 库 libcronet 与新核心同目录（官方 sing-box 包不含 libcronet，
+      // naive 仍依赖随 app 打包的那个；purego 从核心同目录加载）。
+      await resourceManager.ensureCronetBeside(targetDir);
+
       // macOS: 清除下载隔离标记并重新 ad-hoc 签名
       // 原因: macOS Gatekeeper 对新放入的未公证二进制会拦截执行 (SIGKILL)
       // xattr -cr 清除 quarantine 标记, codesign --force -s - 重新 ad-hoc 签名使其被系统接受

@@ -1248,9 +1248,20 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       // 生成【全部】节点的 Outbound：selector 需要列出所有可切换节点；detour 前置节点亦在 config.servers
       // 中，一并生成、通过 detour 字段链接。单个节点配置异常不应拖垮整体配置，逐节点 try/catch 跳过。
       // （app/custom 分流规则指向的固定节点 tag 不变，仍直接命中其节点出站，不经 selector。）
+      const cronetAvailable = resourceManager.hasCronetLib();
       for (const server of config.servers) {
         const tag = idToTagMap.get(server.id) || `proxy-${server.id}`;
         if (outbounds.some((o) => o.tag === tag)) continue; // 去重
+        // naive 出站需要 libcronet，且 sing-box 启动时会预初始化全部出站——缺库时若把 naive 节点
+        // 放进 selector，会让整个代理启动 FATAL（连非 naive 节点也用不了）。故缺库时跳过 naive 节点，
+        // 让用户仍能用其它协议节点。
+        if (server.protocol.toLowerCase() === 'naive' && !cronetAvailable) {
+          this.logToManager(
+            'warn',
+            `跳过 naive 节点「${server.name}」：未找到 NaiveProxy 核心库 libcronet`
+          );
+          continue;
+        }
         try {
           const ob = this.generateProxyOutbound(server, idToTagMap);
           ob.tag = tag;

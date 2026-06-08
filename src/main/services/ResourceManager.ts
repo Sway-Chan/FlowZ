@@ -240,9 +240,11 @@ export class ResourceManager {
     const userDataPath = app.getPath('userData');
     const updateDir = path.join(userDataPath, 'core_update');
     const targetPath = path.join(updateDir, 'sing-box');
-    
+
     // 检查是否已经有可写核心
     if (await this.fileExists(targetPath)) {
+      // 已有可写核心：仍需确保 libcronet 在旁（naive 出站靠 purego 同目录/系统库路径加载）
+      await this.ensureCronetBeside(updateDir);
       return targetPath;
     }
 
@@ -258,7 +260,45 @@ export class ResourceManager {
       await fs.chmod(targetPath, 0o755); // 赋予可执行权限
     }
 
+    // naive 节点需要 libcronet 与 sing-box 同目录（purego 加载），随核心一并放过去
+    await this.ensureCronetBeside(updateDir);
+
     return targetPath;
+  }
+
+  /** 各平台 NaiveProxy 核心库文件名（purego 期望的名字） */
+  getCronetLibFilename(): string {
+    if (this.platform === 'win32') return 'libcronet.dll';
+    if (this.platform === 'darwin') return 'libcronet.dylib';
+    return 'libcronet.so';
+  }
+
+  /** 内置的 libcronet 是否存在（用于 naive 可用性判断） */
+  hasCronetLib(): boolean {
+    try {
+      return require('fs').existsSync(
+        path.join(this.getPlatformResourceDir(), this.getCronetLibFilename())
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 把内置的 libcronet 复制到与（可写/已更新）核心同一目录，供 naive 出站(purego) 加载。
+   * 供 ensureWritableCore 与核心更新写盘后调用。内置无 libcronet 或已存在则跳过。
+   */
+  async ensureCronetBeside(coreDir: string): Promise<void> {
+    const name = this.getCronetLibFilename();
+    const src = path.join(this.getPlatformResourceDir(), name);
+    const dst = path.join(coreDir, name);
+    try {
+      if ((await this.fileExists(src)) && !(await this.fileExists(dst))) {
+        await fs.copyFile(src, dst);
+      }
+    } catch {
+      // 复制失败不应阻断启动；naive 不可用时 sing-box 会自报 cronet 错误
+    }
   }
 
   /**
