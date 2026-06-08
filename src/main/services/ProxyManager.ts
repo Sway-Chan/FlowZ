@@ -1504,8 +1504,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         server_name: server.tlsSettings?.serverName || server.address,
       };
 
-      // HTTP/3：naive 经 quic:true 走 h3(QUIC/UDP) 传输，对应服务端 `--listen=quic://`。
-      // 启用后该节点变为 UDP-transport，需被 blockQuic guard 跳过（见 generateRouteConfig）。
+      // HTTP/3：naive 经 quic:true 走 h3(QUIC/UDP) 拨号传输，对应服务端 `--listen=quic://`。
+      // 注意这只改变"拨号传输"，naive 仍只过 TCP（HTTP CONNECT）、不能中继客户端 UDP（除非
+      // udp_over_tcp，FlowZ 不下发）；故路由层 naive 归入 TCP-only 集、恒 reject 代理向 UDP
+      // （见 generateRouteConfig isUdpRelayCapable）。该拨号本身受 fwmark 保护、不被 reject 误杀。
       if (server.naiveSettings?.useHttp3) {
         outbound.quic = true;
       }
@@ -1667,20 +1669,34 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 获取当前选中的服务器，用于排除代理服务器域名
     const selectedServer = config.servers.find((s) => s.id === config.selectedServerId);
 
-    // 是否对"将走代理"的 QUIC(UDP443) 执行 reject 以逼浏览器回退 TCP，消除节点 UDP relay
-    // 不通时的黑洞。按节点实际 server 拨号传输 guard：
-    //   - UDP-transport 节点走 QUIC/UDP dial-server，reject 会经 strict_route 回流误杀其传输 → 跳过；
-    //     · hysteria2 / tuic：协议本身即 QUIC；
-    //     · naive 且 useHttp3：经 quic:true 走 h3(QUIC/UDP)；
-    //   - 其余协议均 TCP dial-server（reject UDP 匹配不到其 TCP 传输）→ 安全启用。
-    const isUdpTransportNode = (s: ServerConfig): boolean => {
-      const p = s.protocol.toLowerCase();
-      if (p === 'hysteria2' || p === 'tuic') return true;
-      if (p === 'naive' && s.naiveSettings?.useHttp3) return true;
-      return false;
-    };
+    // 代理向 UDP 的处理，按节点"能否中继客户端 UDP"分流（与"拨号传输"正交！）：
+    //   · 能中继(hy2/tuic 原生 UDP；vless/vmess/trojan/ss UoT；socks5 associate)：客户端 QUIC 可经
+    //     代理转发，是否拦由用户 blockQuic 开关决定。
+    //   · 不能中继(ssh/http/anytls 纯 TCP CONNECT/流；naive 仅在 udp_over_tcp 下可中继，而 FlowZ 不
+    //     下发该字段，故按 TCP-only 处理)：代理向 UDP 必黑洞 → 恒定 reject（逼 QUIC 回退 TCP、其余
+    //     UDP 快速失败而非穿透 final 跌到 direct 假死 30s）。
+    // 关键：对节点自身的 UDP 拨号(naive-h3/hy2/tuic dial server)无害——拨号是 sing-box 进程自有
+    //   socket，受 fwmark/auto_detect_interface 保护、绕过 route 规则。已用 netns TUN 抓包实测证伪
+    //   旧假设"reject 经 strict_route 回流误杀拨号"：带 reject udp443 时 hy2 拨号包仍正常逸出。
+    const TCP_ONLY_PROTOCOLS = ['ssh', 'http', 'anytls', 'naive'];
+    const isUdpRelayCapable = (s: ServerConfig): boolean =>
+      !TCP_ONLY_PROTOCOLS.includes(s.protocol.toLowerCase());
+
+    // 不能中继的节点：恒定 reject 全部代理向 UDP（强制兜底，与 blockQuic 开关无关）。
+    const rejectProxyUdpAll =
+      proxyMode !== 'direct' && !!selectedServer && !isUdpRelayCapable(selectedServer);
+    // 能中继的节点：仅当用户开 blockQuic 时 reject 代理向 QUIC(UDP443)，逼浏览器回退 TCP。
     const blockProxyQuic =
-      config.blockQuic === true && !!selectedServer && !isUdpTransportNode(selectedServer);
+      config.blockQuic === true && !!selectedServer && isUdpRelayCapable(selectedServer);
+
+    // 给定域名匹配器，返回应配对的"代理向 UDP reject"规则（smart 模式放在每条 →代理 规则之前），
+    // 不需要则 null。二者互斥（节点要么能中继要么不能）：不能中继拦全部 UDP，能中继+blockQuic 拦 UDP443。
+    const proxyUdpRejectFor = (matcher: Record<string, any>): SingBoxRouteRule | null => {
+      if (rejectProxyUdpAll) return { ...matcher, network: ['udp'], action: 'reject' } as any;
+      if (blockProxyQuic)
+        return { ...matcher, network: ['udp'], port: [443], action: 'reject' } as any;
+      return null;
+    };
 
     const versionArr = this.coreVersion.split('.');
     const versionNum = parseFloat(versionArr[0] + '.' + (versionArr[1] || '0'));
@@ -2040,16 +2056,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       // 注意：这些规则在 AppRules 之后，所以不会覆盖用户手动指定的节点
       const googleKeywords = ['google', 'gmail', 'youtube', 'gstatic', 'googleapis', 'googlevideo'];
 
-      // blockQuic（smart）：在每条"→代理"规则之前配对一条 UDP443 reject，使代理向 QUIC 在被
-      // 路由到代理前就回退 TCP；下方 CN 直连规则不配对，故 CN/直连 QUIC 不受影响（兜底见末尾）。
-      if (blockProxyQuic) {
-        rules.push({
-          domain_keyword: googleKeywords,
-          network: ['udp'],
-          port: [443],
-          action: 'reject',
-        } as any);
-      }
+      // 代理向 UDP（smart）：在每条"→代理"规则之前配对一条 reject，使该走代理的 UDP 在被路由到代理
+      // 前就 reject——不能中继的节点拦全部 UDP，能中继+blockQuic 仅拦 QUIC(UDP443)。下方 CN 直连规则
+      // 不配对，故 CN/直连 UDP 不受影响（兜底见 generateRouteConfig 末尾）。
+      const googleUdpReject = proxyUdpRejectFor({ domain_keyword: googleKeywords });
+      if (googleUdpReject) rules.push(googleUdpReject);
       rules.push({
         domain_keyword: googleKeywords,
         action: 'route',
@@ -2057,14 +2068,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       });
 
       // 国外域名走代理
-      if (blockProxyQuic) {
-        rules.push({
-          rule_set: 'geosite-geolocation-!cn',
-          network: ['udp'],
-          port: [443],
-          action: 'reject',
-        } as any);
-      }
+      const foreignUdpReject = proxyUdpRejectFor({ rule_set: 'geosite-geolocation-!cn' });
+      if (foreignUdpReject) rules.push(foreignUdpReject);
       rules.push({
         rule_set: 'geosite-geolocation-!cn',
         action: 'route',
@@ -2163,30 +2168,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       }
     }
 
-    // 【UDP 黑洞防范兜底】：对于不支持 UDP 的代理协议（如 SSH, HTTP, AnyTLS），
-    // 凡是没有被上面的直连规则（如国内 IP/域名、局域网等）匹配的剩余 UDP 流量，
-    // 原本会分配给 final 出站。但由于这些代理协议在 sing-box 中不支持 UDP，
-    // 流量会穿透 final 跌落到系统 direct，导致被墙的 UDP 请求（如 QUIC）静默丢包假死 30 秒。
-    // 在这里统一 reject 剩余 UDP，促使浏览器立即 fallback 到 TCP 走代理。
-    if (proxyMode !== 'direct' && selectedServer) {
-      const tcpOnlyProtocols = ['ssh', 'http', 'anytls'];
-      if (tcpOnlyProtocols.includes(selectedServer.protocol.toLowerCase())) {
-        rules.push({
-          network: ['udp'],
-          action: 'reject',
-        } as any);
-      }
-
-      // blockQuic 兜底 reject：放在所有直连/分流规则之后，拦截"会落到 final(代理)"的剩余 UDP443
-      // （global 模式拦全部代理向 QUIC；smart 模式拦未被 google/!cn 配对 reject 命中的代理向 QUIC，
-      // CN 已在上方直连豁免）。配对与协议 guard 见上方 blockProxyQuic 定义。
-      if (blockProxyQuic) {
-        rules.push({
-          network: ['udp'],
-          port: [443],
-          action: 'reject',
-        } as any);
-      }
+    // 【代理向 UDP 黑洞兜底】：放在所有直连/分流规则之后，拦截"会落到 final(代理)"的剩余 UDP。
+    //   · 不能中继的节点(ssh/http/anytls/naive)：reject 全部剩余代理向 UDP（global 拦全部；smart 拦
+    //     未被上方 →代理 配对 reject 命中的；CN 已在上方直连豁免）——否则穿透 final 跌到 direct 假死 30s。
+    //   · 能中继+blockQuic：reject 代理向 QUIC(UDP443)，逼浏览器回退 TCP。
+    // 二者互斥；判定与"对节点自身 UDP 拨号无害"的实测论证见上方 isUdpRelayCapable 处。
+    if (rejectProxyUdpAll) {
+      rules.push({ network: ['udp'], action: 'reject' } as any);
+    } else if (blockProxyQuic) {
+      rules.push({ network: ['udp'], port: [443], action: 'reject' } as any);
     }
 
     return routeConfig;
