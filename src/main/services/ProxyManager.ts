@@ -387,6 +387,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 先保存当前配置（needsRootPrivilege 等方法需要用到）
     this.currentConfig = config;
 
+    // Linux 下确保核心在用户目录且可执行，以便支持 setcap 和规避 AppImage EROFS
+    if (process.platform === 'linux') {
+      try {
+        this.singboxPath = await resourceManager.ensureWritableCore();
+      } catch (err) {
+        this.logToManager('error', `Linux 核心准备失败: ${(err as Error).message}`);
+      }
+    }
+
     // 仅在 TUN 模式下清理可能残留的 sing-box 进程
     // 系统代理模式不需要管理员权限，也不会有残留的 TUN 进程问题
     const isTunMode = config.proxyModeType === 'tun';
@@ -2397,6 +2406,24 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           this.logToManager('error', error.message);
           reject(error);
           return;
+        }
+
+        // Linux TUN 模式下的智能提权逻辑 (setcap)
+        if (process.platform === 'linux' && this.needsRootPrivilege()) {
+          try {
+            const { execSync } = require('child_process');
+            // 检查当前是否有 cap_net_admin
+            const caps = execSync(`getcap "${this.singboxPath}"`, { encoding: 'utf-8' });
+            if (!caps.includes('cap_net_admin')) {
+              this.logToManager('info', 'Linux 核心缺失网络权限，正在请求提权...');
+              // 使用 pkexec 调用 setcap 赋权
+              execSync(`pkexec setcap 'cap_net_admin,cap_net_bind_service,cap_net_raw=+ep' "${this.singboxPath}"`);
+              this.logToManager('info', 'Linux 核心提权成功');
+            }
+          } catch (err) {
+            this.logToManager('error', `Linux 核心提权失败: ${(err as Error).message}`);
+            // 不在此直接 reject，继续执行（用户可能通过其它方式提权或容错）
+          }
         }
 
         // 根据平台和模式选择启动方式：

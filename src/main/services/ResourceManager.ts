@@ -40,6 +40,15 @@ export class ResourceManager {
       }
     }
 
+    // Linux 模式特殊处理：优先使用 userData 下的核心，以便支持 setcap 和规避 AppImage EROFS
+    if (this.platform === 'linux') {
+      const fs = require('fs');
+      const linuxCorePath = path.join(app.getPath('userData'), 'core_update', filename);
+      if (fs.existsSync(linuxCorePath)) {
+        return linuxCorePath;
+      }
+    }
+
     const platformDir = this.getPlatformResourceDir();
     const singboxPath = path.join(platformDir, filename);
 
@@ -55,6 +64,11 @@ export class ResourceManager {
 
     // Windows Portable 模式特殊处理：更新文件必须写入 userData 才能持久化
     if (this.platform === 'win32' && process.env.PORTABLE_EXECUTABLE_DIR) {
+      return path.join(app.getPath('userData'), 'core_update', filename);
+    }
+
+    // Linux 下特殊处理：AppImage 是只读文件系统 (EROFS)，更新核心必须写入 userData
+    if (this.platform === 'linux') {
       return path.join(app.getPath('userData'), 'core_update', filename);
     }
 
@@ -213,6 +227,38 @@ export class ResourceManager {
     } catch {
       return false;
     }
+  }
+
+  /**
+   * 确保 Linux 下使用用户目录的可写核心，以解决 AppImage (EROFS) 的权限和更新问题
+   */
+  async ensureWritableCore(): Promise<string> {
+    if (this.platform !== 'linux') {
+      return this.getSingBoxPath();
+    }
+
+    const userDataPath = app.getPath('userData');
+    const updateDir = path.join(userDataPath, 'core_update');
+    const targetPath = path.join(updateDir, 'sing-box');
+    
+    // 检查是否已经有可写核心
+    if (await this.fileExists(targetPath)) {
+      return targetPath;
+    }
+
+    // 创建目录
+    await fs.mkdir(updateDir, { recursive: true });
+
+    // 从应用内置的包中复制
+    const platformDir = this.getPlatformResourceDir();
+    const sourcePath = path.join(platformDir, 'sing-box');
+
+    if (await this.fileExists(sourcePath)) {
+      await fs.copyFile(sourcePath, targetPath);
+      await fs.chmod(targetPath, 0o755); // 赋予可执行权限
+    }
+
+    return targetPath;
   }
 
   /**
