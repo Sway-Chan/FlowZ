@@ -22,6 +22,12 @@ export function AdvancedSettings() {
   const [isLoading, setIsLoading] = useState(false);
   const { t } = useTranslation();
 
+  // 当前选中节点为 QUIC 协议(hy2/tuic)时，"阻止 QUIC"会误杀其传输，禁用该开关
+  const selectedProtocol = config?.servers
+    ?.find((s) => s.id === config?.selectedServerId)
+    ?.protocol?.toLowerCase();
+  const isQuicNode = selectedProtocol === 'hysteria2' || selectedProtocol === 'tuic';
+
   const handleSavePorts = async () => {
     if (!config) return;
 
@@ -297,6 +303,24 @@ export function AdvancedSettings() {
             </div>
             <p className="text-xs text-muted-foreground ml-6 mb-2">
               {t('settings.advanced.bypassLANDesc')}
+            </p>
+
+            <div className="flex items-center space-x-2 pt-2">
+              <Checkbox
+                id="blockQuic"
+                checked={config.blockQuic === true}
+                disabled={isQuicNode}
+                onCheckedChange={(checked) => {
+                  const updatedConfig = { ...config, blockQuic: checked as boolean };
+                  saveConfig(updatedConfig);
+                }}
+              />
+              <Label htmlFor="blockQuic" className="font-normal cursor-pointer">
+                {t('settings.advanced.blockQuic')}
+              </Label>
+            </div>
+            <p className="text-xs text-muted-foreground ml-6 mb-2">
+              {t('settings.advanced.blockQuicDesc')}
             </p>
 
             {/* 自动换节点 */}
