@@ -2132,6 +2132,25 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           action: 'reject',
         } as any);
       }
+
+      // T2-4: 用户开启"阻止 QUIC"时 reject 入站 UDP 443，让浏览器 QUIC 立即回退 TCP，
+      // 消除节点 UDP relay 不通时的 QUIC 黑洞（网页打开一会卡死）。协议三分类：
+      //   - ssh/http/anytls：上面已全量 reject UDP，此处对其为冗余 no-op；
+      //   - hysteria2/tuic：节点自身走 QUIC dial-server，会因 strict_route 回流被这条 reject
+      //     误杀，必须按协议 guard 跳过；
+      //   - vless/vmess/trojan/shadowsocks/naive/socks：本条真正生效对象（均 TCP dial-server；
+      //     naive 在 sing-box 是 H2/TLS/TCP、不支持 h3/QUIC，故安全；若将来支持 naive-h3 需更新此表）。
+      const udpTransportProtocols = ['hysteria2', 'tuic'];
+      if (
+        config.blockQuic === true &&
+        !udpTransportProtocols.includes(selectedServer.protocol.toLowerCase())
+      ) {
+        rules.push({
+          network: ['udp'],
+          port: [443],
+          action: 'reject',
+        } as any);
+      }
     }
 
     return routeConfig;

@@ -233,6 +233,8 @@
       "allowLanGatewayTip": "When used as a gateway (other devices set this computer as Gateway/DNS), please ensure TUN mode is enabled. This will automatically enable system IP forwarding and listen on port 53 for DNS services.",
       "bypassLAN": "Bypass LAN",
       "bypassLANDesc": "Force requests destined for the local network to bypass the proxy (disable to allow proxying for 192.168.x etc.)",
+      "blockQuic": "Block QUIC (force TCP)",
+      "blockQuicDesc": "Reject QUIC (UDP 443) so browsers fall back to TCP. Fixes pages stalling when the node's UDP relay is unreliable. Off by default; not applicable to Hysteria2/TUIC nodes.",
       "terminalProxy": "Terminal Proxy Settings",
       "terminalProxyDesc": "Copy the following commands to set proxy in terminal (proxy must be started first)",
       "gitProxy": "Git Proxy Settings",

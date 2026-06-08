@@ -335,6 +335,7 @@ export interface UserConfig {
   mixedPort?: number; // 混合端口（可选，同时支持 HTTP 和 SOCKS5，0 或 undefined 表示禁用）
   allowLan?: boolean; // 局域网共享代理（允许其他设备连接）
   bypassLAN?: boolean; // 绕过局域网（将内网 IP 设置为直连）
+  blockQuic?: boolean; // 阻止 QUIC（reject 入站 UDP 443 强制浏览器回退 TCP）；默认关；hy2/tuic 节点自动跳过
   bypassProcesses?: string[]; // 排除进程（指定进程直连，不走代理）
 
   // 日志设置
