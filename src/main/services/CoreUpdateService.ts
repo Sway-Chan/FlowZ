@@ -11,6 +11,8 @@ import { LogManager } from './LogManager';
 import { ProxyManager } from './ProxyManager';
 import { resourceManager } from './ResourceManager';
 
+import type { UserConfig } from '../../shared/types';
+
 export interface CoreUpdateCheckResult {
   hasUpdate: boolean;
   currentVersion: string;
@@ -27,10 +29,20 @@ export interface CoreVersionInfo {
   lastKnownVersion: string | null;
 }
 
+/**
+ * FlowZ 配置生成器已验证适配的 sing-box minor 版本上限。跨越此 minor（如 1.14）可能因 sing-box
+ * 配置 schema 破坏性变更导致生成的配置无法解析；默认不自动跨 minor 更新（可在设置关闭）。
+ * sing-box 升级并验证配置生成兼容后，应调高此常量。
+ */
+const COMPATIBLE_MINOR_CEILING = 1.13;
+
 export class CoreUpdateService {
   private logManager: LogManager;
   private proxyManager: ProxyManager | null = null;
   private isUpdating: boolean = false;
+  // 更新后等待「首次成功运行」验证的新版本号；首启成功→清除并删备份，首启失败→自动回滚
+  private pendingUpdateVersion: string | null = null;
+  private configProvider: (() => Promise<UserConfig>) | null = null;
 
   constructor(logManager: LogManager) {
     this.logManager = logManager;
@@ -38,6 +50,11 @@ export class CoreUpdateService {
 
   setProxyManager(proxyManager: ProxyManager): void {
     this.proxyManager = proxyManager;
+  }
+
+  /** 注入配置读取器（用于读取"仅兼容版本带内更新"开关）。 */
+  setConfigProvider(provider: () => Promise<UserConfig>): void {
+    this.configProvider = provider;
   }
 
   /**
@@ -71,6 +88,39 @@ export class CoreUpdateService {
       );
 
       if (this.compareVersions(latestVersion, currentVersion) > 0) {
+        // 跳过曾预检/启动失败的问题版本（手动更新可绕过）
+        if (this.isKnownBad(latestVersion)) {
+          this.logManager.addLog(
+            'info',
+            `最新版本 ${latestVersion} 曾验证失败，已跳过自动更新`,
+            'CoreUpdateService'
+          );
+          return {
+            hasUpdate: false,
+            currentVersion,
+            latestVersion,
+            error: `版本 ${latestVersion} 与当前配置不兼容（已跳过）；如需仍可手动更新`,
+          };
+        }
+
+        // minor 带闸门：默认不自动跨越配置生成器已验证的 minor 上限（防 schema 破坏导致无法解析）
+        if (await this.isRestrictToCompatibleMinor()) {
+          const latestMinor = this.getMinor(latestVersion);
+          if (!isNaN(latestMinor) && latestMinor > COMPATIBLE_MINOR_CEILING) {
+            this.logManager.addLog(
+              'info',
+              `最新版本 ${latestVersion} 跨越兼容版本带(>${COMPATIBLE_MINOR_CEILING})，不自动更新`,
+              'CoreUpdateService'
+            );
+            return {
+              hasUpdate: false,
+              currentVersion,
+              latestVersion,
+              error: `新版本 ${latestVersion} 跨越兼容版本带，建议随 App 升级（可在设置关闭"仅兼容版本带内更新"以手动尝试）`,
+            };
+          }
+        }
+
         // 找到适合当前平台的资源
         const asset = this.findSuitableAsset(latestRelease.assets);
         if (asset) {
@@ -121,6 +171,21 @@ export class CoreUpdateService {
       // Sing-box release 通常是 .tar.gz 或 .zip
       this.logManager.addLog('info', '正在解压核心文件...', 'CoreUpdateService');
       const { corePath, extractDir: tempExtractDir } = await this.extractCore(tempPath);
+
+      // 2.5 预检：新核心可执行 + 可解析当前配置。不通过则不动现役核心（代理继续运行，永不 brick）。
+      const preflight = await this.preflightValidate(corePath);
+      if (!preflight.ok) {
+        if (preflight.version) this.markKnownBad(preflight.version);
+        try {
+          fs.unlinkSync(tempPath);
+          if (tempExtractDir && fs.existsSync(tempExtractDir)) {
+            fs.rmSync(tempExtractDir, { recursive: true, force: true });
+          }
+        } catch {
+          /* ignore */
+        }
+        throw new Error(`核心更新预检失败，已放弃（现役核心继续运行）：${preflight.reason}`);
+      }
 
       // 3. 停止代理
       let wasRunning = false;
@@ -195,6 +260,9 @@ export class CoreUpdateService {
       }
 
       this.logManager.addLog('info', '核心文件替换成功', 'CoreUpdateService');
+
+      // 标记"待首启验证"：首次成功运行→删备份（稳定即弃）；首启失败→自动回滚（见 index 'error' 钩子）
+      this.pendingUpdateVersion = preflight.version;
 
       // 6. 清理临时文件
       try {
@@ -294,6 +362,10 @@ export class CoreUpdateService {
       const data = { version, recordedAt: new Date().toISOString() };
       fs.writeFileSync(versionFilePath, JSON.stringify(data, null, 2), 'utf-8');
       this.logManager.addLog('info', `已记录成功版本: ${version}`, 'CoreUpdateService');
+
+      // 新核心已成功运行 → 清除待验证标记，并按"稳定即删备份"删除旧核心备份
+      this.pendingUpdateVersion = null;
+      this.pruneBackup();
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       this.logManager.addLog('warn', `记录版本失败: ${msg}`, 'CoreUpdateService');
@@ -511,6 +583,158 @@ export class CoreUpdateService {
     // 记录新版本
     await this.recordSuccessfulVersion();
     this.logManager.addLog('info', '手动替换核心成功', 'CoreUpdateService');
+  }
+
+  // === 核心更新健壮性：预检 / 问题版本跳过 / 备份生命周期 / 自动回滚 ===
+
+  /** 取任意 sing-box 二进制的版本号（执行 `<bin> version` 解析）；不可执行返回 null。 */
+  private async getBinaryVersion(binPath: string): Promise<string | null> {
+    try {
+      const { exec } = require('child_process');
+      const execAsync = require('util').promisify(exec);
+      const { stdout } = await execAsync(`"${binPath}" version`);
+      const m = String(stdout).match(/(?:version\s+|v)(\d+\.\d+(?:\.\d+)?)/i);
+      return m ? m[1] : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private getKnownBadPath(): string {
+    return path.join(app.getPath('userData'), 'core-known-bad.json');
+  }
+
+  private loadKnownBad(): string[] {
+    try {
+      const p = this.getKnownBadPath();
+      if (!fs.existsSync(p)) return [];
+      const d = JSON.parse(fs.readFileSync(p, 'utf-8'));
+      return Array.isArray(d?.versions) ? d.versions : [];
+    } catch {
+      return [];
+    }
+  }
+
+  /** 标记某版本为"问题版本"（预检/启动失败），自动更新将跳过；手动更新仍可强制安装。 */
+  private markKnownBad(version: string): void {
+    try {
+      const list = this.loadKnownBad();
+      if (!list.includes(version)) list.push(version);
+      fs.writeFileSync(
+        this.getKnownBadPath(),
+        JSON.stringify({ versions: list }, null, 2),
+        'utf-8'
+      );
+      this.logManager.addLog(
+        'warn',
+        `已标记问题版本 ${version}，自动更新将跳过`,
+        'CoreUpdateService'
+      );
+    } catch {
+      /* ignore */
+    }
+  }
+
+  isKnownBad(version: string): boolean {
+    return this.loadKnownBad().includes(version);
+  }
+
+  private getMinor(version: string): number {
+    const m = version.match(/^(\d+\.\d+)/);
+    return m ? parseFloat(m[1]) : NaN;
+  }
+
+  private async isRestrictToCompatibleMinor(): Promise<boolean> {
+    try {
+      if (!this.configProvider) return true;
+      const cfg = await this.configProvider();
+      return cfg?.restrictCoreUpdateToCompatibleMinor !== false; // 默认 true
+    } catch {
+      return true;
+    }
+  }
+
+  /**
+   * 核心更新预检：新核心二进制可执行 + 能解析"针对其版本生成的"当前配置（sing-box check）。
+   * 在替换现役核心之前调用 —— 不通过则现役核心不动、代理继续运行（永不 brick）。
+   */
+  private async preflightValidate(
+    newCorePath: string
+  ): Promise<{ ok: boolean; version: string | null; reason?: string }> {
+    const version = await this.getBinaryVersion(newCorePath);
+    if (!version) {
+      return { ok: false, version: null, reason: '新核心无法执行（架构不符或文件损坏）' };
+    }
+
+    const cfgJson = this.proxyManager ? this.proxyManager.buildPreflightConfigJson(version) : null;
+    if (!cfgJson) {
+      // 无活动配置（代理从未启动）→ 二进制可执行即视为通过
+      this.logManager.addLog(
+        'info',
+        `预检：新核心 ${version} 可执行（无活动配置，跳过 check）`,
+        'CoreUpdateService'
+      );
+      return { ok: true, version };
+    }
+
+    const tmpCfg = path.join(app.getPath('temp'), `flowz-preflight-${Date.now()}.json`);
+    try {
+      fs.writeFileSync(tmpCfg, cfgJson, 'utf-8');
+      const { exec } = require('child_process');
+      const execAsync = require('util').promisify(exec);
+      await execAsync(`"${newCorePath}" check -c "${tmpCfg}"`);
+      this.logManager.addLog(
+        'info',
+        `预检通过：新核心 ${version} 可解析当前配置`,
+        'CoreUpdateService'
+      );
+      return { ok: true, version };
+    } catch (e: any) {
+      const detail = String(e?.stderr || e?.message || e).split('\n')[0];
+      return { ok: false, version, reason: `新核心无法解析当前配置：${detail}` };
+    } finally {
+      try {
+        fs.unlinkSync(tmpCfg);
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  /** 删除旧核心备份（新核心已稳定运行后调用 —— 稳定即不再回滚，省磁盘）。 */
+  private pruneBackup(): void {
+    try {
+      const bak = this.getBackupPath();
+      if (fs.existsSync(bak)) {
+        fs.unlinkSync(bak);
+        this.logManager.addLog('info', '新核心已稳定运行，已删除旧核心备份', 'CoreUpdateService');
+      }
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /**
+   * 更新后新核心"首次启动失败"时调用（由上层在 proxy 'error' 事件中触发）：回滚到备份核心并标记
+   * 问题版本。返回 true 表示已回滚（调用方应以旧核心重启代理）。先清除待验证标记防重入/回滚循环。
+   */
+  async autoRollbackIfPendingUpdate(): Promise<boolean> {
+    const pending = this.pendingUpdateVersion;
+    this.pendingUpdateVersion = null;
+    if (!pending || !this.hasBackup()) return false;
+    this.logManager.addLog(
+      'error',
+      `新核心 ${pending} 启动失败，自动回滚到备份核心`,
+      'CoreUpdateService'
+    );
+    try {
+      await this.rollbackCore(); // 恢复 .bak → 现役（内部停代理 + 删备份 + 记录版本）
+      this.markKnownBad(pending);
+      return true;
+    } catch (e) {
+      this.logManager.addLog('error', `自动回滚失败: ${e}`, 'CoreUpdateService');
+      return false;
+    }
   }
 
   /**

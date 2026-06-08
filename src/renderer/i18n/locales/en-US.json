@@ -239,6 +239,8 @@
       "interruptOnSwitchDesc": "Default is graceful switching: switching nodes does not restart the proxy and existing connections persist until they close naturally; new connections use the new node. When enabled, switching forcibly drops existing connections and rebuilds them on the new node immediately.",
       "tlsFragment": "TLS fragmentation (anti-SNI blocking)",
       "tlsFragmentDesc": "Splits the TLS ClientHello across multiple TCP packets so the SNI is fragmented, evading SNI-keyword DPI blocking. Off by default; may slightly increase handshake latency on some networks.",
+      "restrictCoreUpdate": "Auto-update core only within compatible version band",
+      "restrictCoreUpdateDesc": "Only auto-update sing-box to versions compatible with the current config generator (e.g. 1.13.x). Updates crossing a version band (e.g. 1.14) are not applied automatically and prompt an app upgrade instead, avoiding config incompatibility. Manual updates are not restricted.",
       "terminalProxy": "Terminal Proxy Settings",
       "terminalProxyDesc": "Copy the following commands to set proxy in terminal (proxy must be started first)",
       "gitProxy": "Git Proxy Settings",
