@@ -518,7 +518,9 @@
     "alpnDesc": "应用层协议协商，例如 h3",
     "naive": {
       "versionWarning": "⚠️ Naive 协议需要 sing-box v1.13+ 核心支持。如果您当前使用的是 v1.12 核心，请前往“设置 -> 关于”点击更新核心。",
-      "goUpdate": "去更新核心"
+      "goUpdate": "去更新核心",
+      "useHttp3": "HTTP/3 (QUIC)",
+      "useHttp3Desc": "经 QUIC/UDP 传输，对应服务端 quic:// 监听；需服务端开启 HTTP/3。开启后该节点不受“阻止 QUIC”影响。"
     }
   },
   "rules": {

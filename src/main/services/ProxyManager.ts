@@ -191,6 +191,8 @@ interface SingBoxOutbound {
     password: string;
   };
   network?: string;
+  // naive specific: 走 HTTP/3 (QUIC) 传输
+  quic?: boolean;
   // TUIC specific
   congestion_control?: string;
   udp_relay_mode?: string;
@@ -1501,6 +1503,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         enabled: true,
         server_name: server.tlsSettings?.serverName || server.address,
       };
+
+      // HTTP/3：naive 经 quic:true 走 h3(QUIC/UDP) 传输，对应服务端 `--listen=quic://`。
+      // 启用后该节点变为 UDP-transport，需被 blockQuic guard 跳过（见 generateRouteConfig）。
+      if (server.naiveSettings?.useHttp3) {
+        outbound.quic = true;
+      }
     }
 
     // SOCKS 特定配置
@@ -1661,14 +1669,18 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // 是否对"将走代理"的 QUIC(UDP443) 执行 reject 以逼浏览器回退 TCP，消除节点 UDP relay
     // 不通时的黑洞。按节点实际 server 拨号传输 guard：
-    //   - hysteria2/tuic 走 QUIC dial-server，reject 会经 strict_route 回流误杀其传输 → 跳过；
+    //   - UDP-transport 节点走 QUIC/UDP dial-server，reject 会经 strict_route 回流误杀其传输 → 跳过；
+    //     · hysteria2 / tuic：协议本身即 QUIC；
+    //     · naive 且 useHttp3：经 quic:true 走 h3(QUIC/UDP)；
     //   - 其余协议均 TCP dial-server（reject UDP 匹配不到其 TCP 传输）→ 安全启用。
-    //   注：sing-box 的 naive 可经 quic:true 走 h3(QUIC)，但当前 FlowZ 未启用该字段（默认 H2/TCP），
-    //       故 naive 归 TCP；若将来 FlowZ 暴露 naive-h3，需把这类节点也纳入跳过条件。
+    const isUdpTransportNode = (s: ServerConfig): boolean => {
+      const p = s.protocol.toLowerCase();
+      if (p === 'hysteria2' || p === 'tuic') return true;
+      if (p === 'naive' && s.naiveSettings?.useHttp3) return true;
+      return false;
+    };
     const blockProxyQuic =
-      config.blockQuic === true &&
-      !!selectedServer &&
-      !['hysteria2', 'tuic'].includes(selectedServer.protocol.toLowerCase());
+      config.blockQuic === true && !!selectedServer && !isUdpTransportNode(selectedServer);
 
     const versionArr = this.coreVersion.split('.');
     const versionNum = parseFloat(versionArr[0] + '.' + (versionArr[1] || '0'));

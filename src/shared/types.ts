@@ -85,6 +85,11 @@ export interface TuicSettings {
   heartbeat?: string;
 }
 
+// Naive 协议设置
+export interface NaiveSettings {
+  useHttp3?: boolean; // 使用 HTTP/3 (QUIC) 传输；sing-box naive outbound 的 quic 字段
+}
+
 // Shadowsocks 协议设置
 export interface ShadowsocksSettings {
   method: string;
@@ -163,6 +168,7 @@ export interface ServerConfig {
 
   // Naive 特定
   username?: string;
+  naiveSettings?: NaiveSettings;
 
   // VMess 特定
   alterId?: number;

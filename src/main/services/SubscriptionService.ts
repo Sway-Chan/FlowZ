@@ -35,11 +35,14 @@ type SingboxOutbound = {
   server_port?: number;
   uuid?: string;
   flow?: string;
+  username?: string;
   password?: string;
   method?: string;
   plugin?: string;
   plugin_opts?: string;
   obfs?: { type?: string; password?: string };
+  // naive：是否启用 HTTP/3 (QUIC) 传输
+  quic?: boolean;
   tls?: SingboxTls;
   transport?: SingboxTransport;
 };
@@ -81,7 +84,7 @@ export class SubscriptionService {
     outbounds: SingboxOutbound[],
     subscriptionId: string
   ): ServerConfig[] {
-    const SUPPORTED = new Set(['shadowsocks', 'vless', 'trojan', 'hysteria2']);
+    const SUPPORTED = new Set(['shadowsocks', 'vless', 'trojan', 'hysteria2', 'naive']);
     const servers: ServerConfig[] = [];
     const now = new Date().toISOString();
 
@@ -170,6 +173,15 @@ export class SubscriptionService {
             };
           }
           servers.push(hy2);
+        } else if (ob.type === 'naive') {
+          // sing-box naive 的 quic:true 表示走 HTTP/3 (QUIC) 传输（h3 节点）
+          servers.push({
+            ...(base as ServerConfig),
+            protocol: 'naive',
+            username: ob.username ?? '',
+            password: ob.password ?? '',
+            naiveSettings: ob.quic ? { useHttp3: true } : undefined,
+          });
         }
       } catch (e: any) {
         this.logManager.addLog(
