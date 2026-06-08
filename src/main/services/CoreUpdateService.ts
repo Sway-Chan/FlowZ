@@ -30,11 +30,12 @@ export interface CoreVersionInfo {
 }
 
 /**
- * FlowZ 配置生成器已验证适配的 sing-box minor 版本上限。跨越此 minor（如 1.14）可能因 sing-box
- * 配置 schema 破坏性变更导致生成的配置无法解析；默认不自动跨 minor 更新（可在设置关闭）。
- * sing-box 升级并验证配置生成兼容后，应调高此常量。
+ * FlowZ 配置生成器已验证适配的 sing-box 版本带上限，编码为 major*1000+minor（1013 = 1.13）。
+ * 跨越此版本带（如 1.14）可能因 sing-box 配置 schema 破坏性变更导致生成的配置无法解析；默认不
+ * 自动跨带更新（可在设置关闭）。用整数编码比较，避免 parseFloat 把 "1.20" 误判为 1.2 < 1.13 而
+ * 漏放跨带更新。sing-box 升级并验证配置生成兼容后，应调高此常量。
  */
-const COMPATIBLE_MINOR_CEILING = 1.13;
+const COMPATIBLE_CEILING = 1013;
 
 export class CoreUpdateService {
   private logManager: LogManager;
@@ -42,7 +43,14 @@ export class CoreUpdateService {
   private isUpdating: boolean = false;
   // 更新后等待「首次成功运行」验证的新版本号；首启成功→清除并删备份，首启失败→自动回滚
   private pendingUpdateVersion: string | null = null;
+  private pendingUpdateAt: number = 0; // 更新落盘时间戳，用于"待验证"过期保护（防陈旧 pending 误回滚）
+  private stabilityTimer: ReturnType<typeof setTimeout> | null = null;
   private configProvider: (() => Promise<UserConfig>) | null = null;
+  // 新核心首启成功后需"稳定运行"此时长（无 error）才删旧备份——防 'started'(仅1s存活) 假成功删掉回滚网。
+  // 不变量：必须 > ProxyManager 健康检查间隔(10s)，否则 TUN 模式下崩溃在轮询检测到之前就被判稳定、误删备份。
+  private static readonly STABILITY_DWELL_MS = 30000;
+  // "待验证"最长有效期：超过则后续 error 视为与本次更新无关，不再触发回滚（防陈旧 pending 误回滚）
+  private static readonly PENDING_MAX_AGE_MS = 5 * 60 * 1000;
 
   constructor(logManager: LogManager) {
     this.logManager = logManager;
@@ -103,13 +111,13 @@ export class CoreUpdateService {
           };
         }
 
-        // minor 带闸门：默认不自动跨越配置生成器已验证的 minor 上限（防 schema 破坏导致无法解析）
+        // 版本带闸门：默认不自动跨越配置生成器已验证的版本带上限（防 schema 破坏导致无法解析）
         if (await this.isRestrictToCompatibleMinor()) {
-          const latestMinor = this.getMinor(latestVersion);
-          if (!isNaN(latestMinor) && latestMinor > COMPATIBLE_MINOR_CEILING) {
+          const latest = this.encodeMajorMinor(latestVersion);
+          if (!isNaN(latest) && latest > COMPATIBLE_CEILING) {
             this.logManager.addLog(
               'info',
-              `最新版本 ${latestVersion} 跨越兼容版本带(>${COMPATIBLE_MINOR_CEILING})，不自动更新`,
+              `最新版本 ${latestVersion} 跨越兼容版本带(>1.13)，不自动更新`,
               'CoreUpdateService'
             );
             return {
@@ -161,6 +169,7 @@ export class CoreUpdateService {
     }
 
     this.isUpdating = true;
+    let backupMade = false;
 
     try {
       // 1. 下载文件
@@ -202,6 +211,7 @@ export class CoreUpdateService {
 
       // 4. 备份旧核心
       await this.backupCurrentCore();
+      backupMade = true;
 
       // 5. 替换核心
       this.logManager.addLog('info', '正在替换核心文件...', 'CoreUpdateService');
@@ -261,8 +271,11 @@ export class CoreUpdateService {
 
       this.logManager.addLog('info', '核心文件替换成功', 'CoreUpdateService');
 
-      // 标记"待首启验证"：首次成功运行→删备份（稳定即弃）；首启失败→自动回滚（见 index 'error' 钩子）
+      // 标记"待首启验证"：稳定运行→删备份（稳定即弃）；首启失败→自动回滚（见 index 'error' 钩子）。
+      // 同时抑制 ProxyManager 自动重启——让新核心首次异常退出立即上报，而非在坏核心上空转重试。
       this.pendingUpdateVersion = preflight.version;
+      this.pendingUpdateAt = Date.now();
+      this.proxyManager?.setAutoRestartSuppressed(true);
 
       // 6. 清理临时文件
       try {
@@ -293,8 +306,8 @@ export class CoreUpdateService {
       const msg = error instanceof Error ? error.message : String(error);
       this.logManager.addLog('error', `更新核心失败: ${msg}`, 'CoreUpdateService');
 
-      // 尝试恢复备份
-      await this.restoreBackup();
+      // 尝试恢复备份（仅当本次确已备份；预检阶段失败时尚无新备份，避免误恢复陈旧 .bak 致降级）
+      if (backupMade) await this.restoreBackup();
 
       throw error;
     } finally {
@@ -363,9 +376,14 @@ export class CoreUpdateService {
       fs.writeFileSync(versionFilePath, JSON.stringify(data, null, 2), 'utf-8');
       this.logManager.addLog('info', `已记录成功版本: ${version}`, 'CoreUpdateService');
 
-      // 新核心已成功运行 → 清除待验证标记，并按"稳定即删备份"删除旧核心备份
-      this.pendingUpdateVersion = null;
-      this.pruneBackup();
+      // 该版本成功运行 → 从问题版本名单移除（曾因瞬时原因误标记的版本恢复自动更新资格）
+      this.clearKnownBad(version);
+
+      // 若处于"更新后待验证"窗口：'started' 仅代表存活 1s、可能假成功，不立即删备份；改启动稳定
+      // 观察期，期内无 error 才判稳定→删备份（详见 startStabilityWatch / 修 review #3 假成功删备份）
+      if (this.pendingUpdateVersion) {
+        this.startStabilityWatch();
+      }
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       this.logManager.addLog('warn', `记录版本失败: ${msg}`, 'CoreUpdateService');
@@ -590,9 +608,8 @@ export class CoreUpdateService {
   /** 取任意 sing-box 二进制的版本号（执行 `<bin> version` 解析）；不可执行返回 null。 */
   private async getBinaryVersion(binPath: string): Promise<string | null> {
     try {
-      const { exec } = require('child_process');
-      const execAsync = require('util').promisify(exec);
-      const { stdout } = await execAsync(`"${binPath}" version`);
+      const execFileAsync = require('util').promisify(require('child_process').execFile);
+      const { stdout } = await execFileAsync(binPath, ['version']);
       const m = String(stdout).match(/(?:version\s+|v)(\d+\.\d+(?:\.\d+)?)/i);
       return m ? m[1] : null;
     } catch {
@@ -639,9 +656,26 @@ export class CoreUpdateService {
     return this.loadKnownBad().includes(version);
   }
 
-  private getMinor(version: string): number {
-    const m = version.match(/^(\d+\.\d+)/);
-    return m ? parseFloat(m[1]) : NaN;
+  /** 从问题版本名单移除某版本（该版本成功运行后调用，使误标记可恢复）。 */
+  private clearKnownBad(version: string): void {
+    try {
+      const list = this.loadKnownBad();
+      if (!list.includes(version)) return;
+      const next = list.filter((v) => v !== version);
+      fs.writeFileSync(
+        this.getKnownBadPath(),
+        JSON.stringify({ versions: next }, null, 2),
+        'utf-8'
+      );
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** 把版本编码为可比较整数 major*1000+minor（"1.20.3"→1020），用于版本带比较；无法解析返回 NaN。 */
+  private encodeMajorMinor(version: string): number {
+    const m = version.match(/^(\d+)\.(\d+)/);
+    return m ? parseInt(m[1], 10) * 1000 + parseInt(m[2], 10) : NaN;
   }
 
   private async isRestrictToCompatibleMinor(): Promise<boolean> {
@@ -680,9 +714,8 @@ export class CoreUpdateService {
     const tmpCfg = path.join(app.getPath('temp'), `flowz-preflight-${Date.now()}.json`);
     try {
       fs.writeFileSync(tmpCfg, cfgJson, 'utf-8');
-      const { exec } = require('child_process');
-      const execAsync = require('util').promisify(exec);
-      await execAsync(`"${newCorePath}" check -c "${tmpCfg}"`);
+      const execFileAsync = require('util').promisify(require('child_process').execFile);
+      await execFileAsync(newCorePath, ['check', '-c', tmpCfg]);
       this.logManager.addLog(
         'info',
         `预检通过：新核心 ${version} 可解析当前配置`,
@@ -715,13 +748,50 @@ export class CoreUpdateService {
   }
 
   /**
+   * 新核心首启成功后启动"稳定观察期"：STABILITY_DWELL_MS 内无 'error' 才判定稳定 → 删旧备份、清待
+   * 验证标记、恢复自动重启。期内若 'error' 触发 autoRollback 会先取消本计时器（备份仍在，可回滚）。
+   */
+  private startStabilityWatch(): void {
+    if (this.stabilityTimer) clearTimeout(this.stabilityTimer);
+    const watching = this.pendingUpdateVersion;
+    this.stabilityTimer = setTimeout(() => {
+      this.stabilityTimer = null;
+      if (this.pendingUpdateVersion !== watching) return; // 已被回滚/其它路径清除
+      this.logManager.addLog(
+        'info',
+        `新核心 ${watching} 已稳定运行 ${CoreUpdateService.STABILITY_DWELL_MS / 1000}s，删除旧核心备份`,
+        'CoreUpdateService'
+      );
+      this.pruneBackup();
+      this.pendingUpdateVersion = null;
+      this.proxyManager?.setAutoRestartSuppressed(false);
+    }, CoreUpdateService.STABILITY_DWELL_MS);
+  }
+
+  /**
    * 更新后新核心"首次启动失败"时调用（由上层在 proxy 'error' 事件中触发）：回滚到备份核心并标记
    * 问题版本。返回 true 表示已回滚（调用方应以旧核心重启代理）。先清除待验证标记防重入/回滚循环。
    */
   async autoRollbackIfPendingUpdate(): Promise<boolean> {
+    if (this.stabilityTimer) {
+      clearTimeout(this.stabilityTimer);
+      this.stabilityTimer = null;
+    }
     const pending = this.pendingUpdateVersion;
+    const pendingAge = Date.now() - this.pendingUpdateAt;
     this.pendingUpdateVersion = null;
-    if (!pending || !this.hasBackup()) return false;
+    this.proxyManager?.setAutoRestartSuppressed(false); // 回滚后旧核心恢复正常自动重启
+    if (!pending) return false;
+    // 过期保护：距本次更新过久仍未成功运行，此刻的 error 多半与核心更新无关（如用户改了配置）→ 不回滚
+    if (pendingAge > CoreUpdateService.PENDING_MAX_AGE_MS) {
+      this.logManager.addLog(
+        'info',
+        `待验证版本 ${pending} 距更新已超 ${CoreUpdateService.PENDING_MAX_AGE_MS / 60000} 分钟仍未成功运行，本次错误不触发回滚`,
+        'CoreUpdateService'
+      );
+      return false;
+    }
+    if (!this.hasBackup()) return false;
     this.logManager.addLog(
       'error',
       `新核心 ${pending} 启动失败，自动回滚到备份核心`,
