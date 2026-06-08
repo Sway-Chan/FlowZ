@@ -244,6 +244,10 @@ interface SingBoxOutbound {
   host_key?: string[];
   host_key_algorithms?: string[];
   client_version?: string;
+  // selector specific（用于 clash_api 热切换节点：default=当前选中，interrupt_exist_connections=切换时是否中断现有连接）
+  outbounds?: string[];
+  default?: string;
+  interrupt_exist_connections?: boolean;
 }
 
 interface SingBoxRouteRule {
@@ -317,6 +321,7 @@ export interface IProxyManager {
   start(config: UserConfig): Promise<void>;
   stop(): Promise<void>;
   restart(config: UserConfig): Promise<void>;
+  switchMode(config: UserConfig): Promise<void>;
   getStatus(): ProxyStatus;
   generateSingBoxConfig(config: UserConfig, resolvedIps?: Record<string, string>): SingBoxConfig;
   on(event: 'started' | 'stopped' | 'error', listener: (...args: any[]) => void): void;
@@ -330,6 +335,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private pid: number | null = null;
   private singboxPid: number | null = null; // macOS TUN 模式下实际的 sing-box PID
   private currentConfig: UserConfig | null = null;
+  // 启动时生成的「节点 id → selector 成员 tag」映射，用于 clash_api 热切换时定位目标 tag
+  private currentIdToTagMap: Map<string, string> | null = null;
   private configPath: string;
   private singboxPath: string;
   private logManager: ILogManager | null = null;
@@ -552,22 +559,78 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 检测模式变化，如果代理正在运行则重启
    */
   async switchMode(newConfig: UserConfig): Promise<void> {
-    // 检查是否有模式变化
-    const modeChanged = this.hasModeChanged(newConfig);
-
-    if (!modeChanged) {
-      // 模式没有变化，只更新配置
+    // 代理未运行：只更新配置（下次 start 时按新配置生成）
+    if (!this.singboxProcess && !this.singboxPid) {
       this.currentConfig = newConfig;
       return;
     }
 
-    // 如果代理正在运行，需要重启
-    if (this.singboxProcess) {
-      this.logToManager('info', '代理模式已更改，正在重启代理...');
-      await this.restart(newConfig);
-    } else {
-      // 代理未运行，只更新配置
-      this.currentConfig = newConfig;
+    // 唯一变化是「切节点」→ clash_api 热切换 selector，不重启 sing-box（优雅切换，连接保留与否由
+    // selector.interrupt_exist_connections 开关决定）。失败则退回重启式切换，保证一定能应用。
+    if (this.canHotSwitch(newConfig)) {
+      if (await this.hotSwitchNode(newConfig)) {
+        this.currentConfig = newConfig;
+        return;
+      }
+      this.logToManager('warn', '热切换失败，退回重启式切换');
+    }
+
+    // 其余变化（模式/端口/TUN/规则/节点集合/interrupt 开关 等需重生成配置的项）→ 重启应用。
+    this.logToManager('info', '配置已更改，正在重启代理以应用...');
+    await this.restart(newConfig);
+  }
+
+  /**
+   * 是否可走 clash_api 热切换：当且仅当唯一变化是「切到一个已在运行中 selector 里的节点」，
+   * 其余影响配置生成的项（模式/端口/TUN/customRules/servers 集合/appRules/interrupt 开关）都未变。
+   */
+  private canHotSwitch(newConfig: UserConfig): boolean {
+    const old = this.currentConfig;
+    if (!old) return false;
+    // 必须确实是切节点
+    if (old.selectedServerId === newConfig.selectedServerId) return false;
+    if (!newConfig.selectedServerId) return false;
+    // 目标节点必须已存在于运行中的 selector（= 启动时的 servers），否则 PUT 会指向不存在的成员
+    if (!old.servers.some((s) => s.id === newConfig.selectedServerId)) return false;
+    // interrupt 开关是 selector 的配置项，改它必须重生成配置
+    if (
+      (old.interruptConnectionsOnSwitch ?? false) !==
+      (newConfig.interruptConnectionsOnSwitch ?? false)
+    ) {
+      return false;
+    }
+    // 出站集合 / 路由相关项变化（hasModeChanged 未覆盖 servers 列表与 appRules）→ 需重生成
+    if (JSON.stringify(old.servers) !== JSON.stringify(newConfig.servers)) return false;
+    if (JSON.stringify(old.appRules ?? []) !== JSON.stringify(newConfig.appRules ?? []))
+      return false;
+    // 其余 regen-affecting 项（proxyMode/type/ports/tun/customRules）：把 selectedServerId 对齐后，
+    // 若 hasModeChanged 仍判定无变化，则唯一变化就是切节点。
+    const probe: UserConfig = { ...newConfig, selectedServerId: old.selectedServerId };
+    return !this.hasModeChanged(probe);
+  }
+
+  /**
+   * 通过 clash_api `PUT /proxies/proxy-selector` 把 selector 切到目标节点（无需重启）。
+   * 成功返回 true；任何异常/非 2xx 返回 false（调用方退回重启）。
+   */
+  private async hotSwitchNode(newConfig: UserConfig): Promise<boolean> {
+    const targetTag = this.currentIdToTagMap?.get(newConfig.selectedServerId as string);
+    if (!targetTag) return false;
+    try {
+      const res = await fetch('http://127.0.0.1:9090/proxies/proxy-selector', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: targetTag }),
+      });
+      if (!res.ok) {
+        this.logToManager('warn', `clash_api 热切换返回 HTTP ${res.status}`);
+        return false;
+      }
+      this.logToManager('info', `已热切换节点 → ${targetTag}（clash_api，无重启）`);
+      return true;
+    } catch (e: any) {
+      this.logToManager('warn', `clash_api 热切换异常: ${e?.message ?? e}`);
+      return false;
     }
   }
 
@@ -728,13 +791,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     for (const s of config.servers) {
       idToTagMap.set(s.id, getUniqueTag(s));
     }
+    // 记录本次生成的 id→tag 映射，供 clash_api 热切换定位 selector 成员 tag（见 hotSwitchNode）
+    this.currentIdToTagMap = idToTagMap;
 
     const singboxConfig: SingBoxConfig = {
       log: this.generateLogConfig(config),
-      dns: this.generateDnsConfig(
-        config,
-        idToTagMap.get(config.selectedServerId as string) || 'proxy'
-      ),
+      dns: this.generateDnsConfig(config, 'proxy-selector'),
       inbounds: this.generateInbounds(config, resolvedIps),
       outbounds: this.generateOutbounds(selectedServer, config, idToTagMap),
       route: this.generateRouteConfig(config, idToTagMap),
@@ -1180,37 +1242,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     return inbounds;
   }
 
-  /**
-   * 递归获取代理链中的所有前置节点
-   */
-  private getDetourChain(server: ServerConfig, allServers: ServerConfig[]): ServerConfig[] {
-    const chain: ServerConfig[] = [];
-    const visitedIds = new Set<string>();
-    visitedIds.add(server.id);
-
-    let currentServer = server;
-    while (currentServer.detour) {
-      if (visitedIds.has(currentServer.detour)) {
-        console.warn(
-          `[ProxyManager] Detected proxy chain loop: ${currentServer.name} -> ${currentServer.detour}`
-        );
-        break;
-      }
-
-      const detourServer = allServers.find((s) => s.id === currentServer.detour);
-      if (!detourServer) {
-        console.warn(`[ProxyManager] Detour server not found: ${currentServer.detour}`);
-        break;
-      }
-
-      chain.push(detourServer);
-      visitedIds.add(detourServer.id);
-      currentServer = detourServer;
-    }
-
-    return chain;
-  }
-
   private generateOutbounds(
     selectedServer: ServerConfig,
     config: UserConfig,
@@ -1219,84 +1250,55 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     const outbounds: SingBoxOutbound[] = [];
 
     if (config) {
-      // 1. 生成主选节点的 Outbound 及其前置节点
-      const mainChain = this.getDetourChain(selectedServer, config.servers);
-
-      // 添加前置节点
-      for (const detourServer of mainChain.reverse()) {
-        const detourOutbound = this.generateProxyOutbound(detourServer, idToTagMap);
-        detourOutbound.tag = idToTagMap.get(detourServer.id) || `proxy-${detourServer.id}`;
-        // 避免重复添加
-        if (!outbounds.some((o) => o.tag === detourOutbound.tag)) {
-          outbounds.push(detourOutbound);
+      // 生成【全部】节点的 Outbound：selector 需要列出所有可切换节点；detour 前置节点亦在 config.servers
+      // 中，一并生成、通过 detour 字段链接。单个节点配置异常不应拖垮整体配置，逐节点 try/catch 跳过。
+      // （app/custom 分流规则指向的固定节点 tag 不变，仍直接命中其节点出站，不经 selector。）
+      for (const server of config.servers) {
+        const tag = idToTagMap.get(server.id) || `proxy-${server.id}`;
+        if (outbounds.some((o) => o.tag === tag)) continue; // 去重
+        try {
+          const ob = this.generateProxyOutbound(server, idToTagMap);
+          ob.tag = tag;
+          if (server.detour && config.servers.some((s) => s.id === server.detour)) {
+            // 环检测：沿 detour 链行进，若回到本节点即成环 → 不设 detour，避免 sing-box 报循环引用启动失败
+            const seen = new Set<string>([server.id]);
+            let cur: string | undefined = server.detour;
+            let looped = false;
+            while (cur) {
+              if (seen.has(cur)) {
+                looped = true;
+                break;
+              }
+              seen.add(cur);
+              cur = config.servers.find((s) => s.id === cur)?.detour;
+            }
+            if (looped) {
+              this.logToManager('warn', `检测到代理链成环，已跳过 detour: ${server.name}`);
+            } else {
+              ob.detour = idToTagMap.get(server.detour);
+            }
+          }
+          outbounds.push(ob);
+        } catch (e: any) {
+          this.logToManager(
+            'warn',
+            `生成节点出站失败，已跳过: ${server.name} (${e?.message ?? e})`
+          );
         }
       }
 
-      // 添加主节点
-      const mainOutbound = this.generateProxyOutbound(selectedServer, idToTagMap);
-      // 主节点默认使用 'proxy' tag，为了兼容老的路由规则
-      // 但对于拓扑显示，我们希望看到名称，所以这里我们保留一个名为 'proxy' 的 outbound
-      // 并在最后将其 tag 设为服务器名称（或者通过 detour 链处理）
-      // 这里的策略是：主选节点 tag 设为人类可读名称，并同步给路由规则使用。
+      // selector：列出已生成的全部节点 tag，default 指向当前选中节点；interrupt_exist_connections 由用户
+      // 开关决定（默认 false=优雅切换，现有连接保留至自然关闭）。clash_api `PUT /proxies/proxy-selector`
+      // 据此热切换、无需重启 sing-box（详见 switchMode）。路由的 final 与「→代理」规则统一指向本 selector。
+      const nodeTags = outbounds.map((o) => o.tag).filter((t): t is string => !!t);
       const selectedServerTag = idToTagMap.get(selectedServer.id) || 'proxy';
-      mainOutbound.tag = selectedServerTag;
-
-      if (selectedServer.detour && config.servers.some((s) => s.id === selectedServer.detour)) {
-        mainOutbound.detour = idToTagMap.get(selectedServer.detour);
-      }
-      outbounds.push(mainOutbound);
-
-      // 2. 生成自定义规则中指定的目标节点的 Outbound
-      // 遍历所有启用且指定了 targetServerId 的规则（包括 customRules 和 appRules）
-      const targetServerIds = new Set<string>();
-      if (config.customRules) {
-        for (const rule of config.customRules) {
-          if (rule.enabled && rule.action === 'proxy' && rule.targetServerId) {
-            targetServerIds.add(rule.targetServerId);
-          }
-        }
-      }
-      if (config.appRules) {
-        for (const rule of config.appRules) {
-          if (rule.enabled && rule.action === 'proxy' && rule.targetServerId) {
-            targetServerIds.add(rule.targetServerId);
-          }
-        }
-      }
-
-      for (const targetId of Array.from(targetServerIds)) {
-        // 如果目标节点就是主节点，不需要额外添加（主节点已有 'proxy' tag）
-        if (targetId === selectedServer.id) continue;
-
-        // 查找目标服务器配置
-        const targetServer = config.servers.find((s) => s.id === targetId);
-        if (!targetServer) continue;
-
-        // 获取目标节点的前置链
-        const targetChain = this.getDetourChain(targetServer, config.servers);
-
-        // 添加目标节点的前置节点
-        for (const detourServer of targetChain.reverse()) {
-          const detourOutbound = this.generateProxyOutbound(detourServer, idToTagMap);
-          detourOutbound.tag = idToTagMap.get(detourServer.id) || `proxy-${detourServer.id}`;
-          // 避免重复添加
-          if (!outbounds.some((o) => o.tag === detourOutbound.tag)) {
-            outbounds.push(detourOutbound);
-          }
-        }
-
-        // 添加目标节点本身
-        const targetOutbound = this.generateProxyOutbound(targetServer, idToTagMap);
-        targetOutbound.tag = idToTagMap.get(targetServer.id) || `proxy-${targetServer.id}`; // 使用节点名称作为 Tag
-        if (targetServer.detour && config.servers.some((s) => s.id === targetServer.detour)) {
-          targetOutbound.detour = idToTagMap.get(targetServer.detour);
-        }
-
-        // 避免重复添加
-        if (!outbounds.some((o) => o.tag === targetOutbound.tag)) {
-          outbounds.push(targetOutbound);
-        }
-      }
+      outbounds.push({
+        type: 'selector',
+        tag: 'proxy-selector',
+        outbounds: nodeTags,
+        default: nodeTags.includes(selectedServerTag) ? selectedServerTag : nodeTags[0],
+        interrupt_exist_connections: config.interruptConnectionsOnSwitch === true,
+      });
     } else {
       // Fallback if config is missing (shouldn't happen)
       outbounds.push(this.generateProxyOutbound(selectedServer, idToTagMap));
@@ -1331,11 +1333,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 为每个使用 Shadow-TLS 的节点插入内层 SS outbound
     const stlsOutbounds: SingBoxOutbound[] = [];
     for (const ob of outbounds) {
-      // 根据 tag 找到对应的 ServerConfig
-      const srv =
-        ob.tag === 'proxy'
-          ? selectedServer
-          : config?.servers.find((s) => `proxy-${s.id}` === ob.tag);
+      // 根据 tag（节点名称）反查对应的 ServerConfig；selector/direct/block 等非节点出站匹配不到 → 跳过
+      const srv = config?.servers.find((s) => idToTagMap.get(s.id) === ob.tag);
       if (srv?.shadowTlsSettings) {
         // 创建独立的外层 ShadowTLS outbound
         const stlsTag = `stls-out-${srv.id}`;
@@ -1671,8 +1670,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     const rules: SingBoxRouteRule[] = [];
     const proxyMode = (config.proxyMode || 'smart').toLowerCase();
 
-    const selectedServerTag = idToTagMap.get(config.selectedServerId as string) || 'proxy';
-    // 获取当前选中的服务器，用于排除代理服务器域名
+    // 主代理出站统一走 selector(proxy-selector)：clash_api 热切换即改 selector 指向、路由无需重生成。
+    // 具体 targetServerId 的 app/custom 分流在各自逻辑里直指节点 tag，不经此变量。
+    const selectedServerTag = 'proxy-selector';
+    // 获取当前选中的服务器（仅用于存在性判断，如 blockProxyQuic 的 !!selectedServer）
     const selectedServer = config.servers.find((s) => s.id === config.selectedServerId);
 
     // blockQuic（节点无关）：开启时对"将走代理"的 QUIC(UDP443) 执行 reject，逼浏览器回退 TCP。

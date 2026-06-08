@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState } from 'react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
@@ -21,14 +21,6 @@ export function AdvancedSettings() {
   );
   const [isLoading, setIsLoading] = useState(false);
   const { t } = useTranslation();
-
-  // 当前选中节点为 QUIC 协议(hy2/tuic)时，"阻止 QUIC"会误杀其传输，禁用该开关
-  const isQuicNode = useMemo(() => {
-    const selectedProtocol = config?.servers
-      ?.find((s) => s.id === config?.selectedServerId)
-      ?.protocol?.toLowerCase();
-    return selectedProtocol === 'hysteria2' || selectedProtocol === 'tuic';
-  }, [config?.selectedServerId, config?.servers]);
 
   const handleSavePorts = async () => {
     if (!config) return;
@@ -311,7 +303,6 @@ export function AdvancedSettings() {
               <Checkbox
                 id="blockQuic"
                 checked={config.blockQuic === true}
-                disabled={isQuicNode}
                 onCheckedChange={(checked) => {
                   const updatedConfig = { ...config, blockQuic: checked as boolean };
                   saveConfig(updatedConfig);
@@ -323,6 +314,26 @@ export function AdvancedSettings() {
             </div>
             <p className="text-xs text-muted-foreground ml-6 mb-2">
               {t('settings.advanced.blockQuicDesc')}
+            </p>
+
+            <div className="flex items-center space-x-2 pt-2">
+              <Checkbox
+                id="interruptOnSwitch"
+                checked={config.interruptConnectionsOnSwitch === true}
+                onCheckedChange={(checked) => {
+                  const updatedConfig = {
+                    ...config,
+                    interruptConnectionsOnSwitch: checked as boolean,
+                  };
+                  saveConfig(updatedConfig);
+                }}
+              />
+              <Label htmlFor="interruptOnSwitch" className="font-normal cursor-pointer">
+                {t('settings.advanced.interruptOnSwitch')}
+              </Label>
+            </div>
+            <p className="text-xs text-muted-foreground ml-6 mb-2">
+              {t('settings.advanced.interruptOnSwitchDesc')}
             </p>
 
             {/* 自动换节点 */}

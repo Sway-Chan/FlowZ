@@ -319,6 +319,7 @@ export interface UserConfig {
   autoPrivacyMode?: boolean; // 自动进入隐私模式
   privacyPassword?: string; // 隐私模式解锁密码
   autoSwitchNode?: boolean; // 节点故障时自动切换到可用节点
+  interruptConnectionsOnSwitch?: boolean; // 切换节点时中断现有连接、强制在新节点重建（默认 false=优雅切换，现有连接保留至自然关闭）
 
   // 窗口尺寸（仅在 rememberWindowSize 启用时使用）
   windowBounds?: { width: number; height: number };
@@ -341,7 +342,7 @@ export interface UserConfig {
   mixedPort?: number; // 混合端口（可选，同时支持 HTTP 和 SOCKS5，0 或 undefined 表示禁用）
   allowLan?: boolean; // 局域网共享代理（允许其他设备连接）
   bypassLAN?: boolean; // 绕过局域网（将内网 IP 设置为直连）
-  blockQuic?: boolean; // 阻止 QUIC（reject 入站 UDP 443 强制浏览器回退 TCP）；默认关；hy2/tuic 节点自动跳过
+  blockQuic?: boolean; // 阻止 QUIC（对代理向 UDP 443 执行 reject，逼浏览器回退 TCP）；默认关；节点无关，对所有协议一视同仁
   bypassProcesses?: string[]; // 排除进程（指定进程直连，不走代理）
 
   // 日志设置
