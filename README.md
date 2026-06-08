@@ -71,7 +71,7 @@
 打开 `.dmg` 并拖入 Applications
 
 ### macOS (Intel)
-需要从源码构建
+打开 `.dmg` 并拖入 Applications（已提供 Intel / x64 预构建包）
 
 若 macOS 提示“软件已损坏”：
 
@@ -94,11 +94,7 @@ npm run package:win
 npm run package:mac
 ```
 
-macOS Intel 用户需要修改 `electron-builder.json`：
-
-```json
-"arch": ["x64"]
-```
+`package:mac` 默认构建 **arm64 + x64** 两个架构（见 `electron-builder.json` 的 `mac.target.arch`）。
 
 ---
 
@@ -146,8 +142,7 @@ macOS Intel 用户需要修改 `electron-builder.json`：
 naive 出站底层走 **Chromium 的 Cronet 网络库** 以获得与浏览器一致的指纹。各平台链接方式不同：
 
 - **Linux / Windows**：cronet 走**动态库**（`libcronet.so` / `libcronet.dll`），需与核心同目录。打包时由 `npm run fetch:cronet` 从 [SagerNet/cronet-go](https://github.com/SagerNet/cronet-go/releases) 拉取并随安装包打入（体积大，不入库、CI/打包时拉取）。
-- **macOS（Apple Silicon / arm64）**：cronet **静态编入** sing-box 核心二进制，naive **开箱即用、无需任何外部库**。
-- **macOS（Intel / x64）**：当前打包的 x64 核心**未编入 cronet** → naive 暂不可用（需重新构建带 naive 支持的 x64 核心）。
+- **macOS（arm64 与 x64）**：cronet 由 sing-box 核心二进制**静态编入**（CGO），naive **开箱即用、无需任何外部库**；两个架构均随安装包发布（核心统一 sing-box 1.13.13）。
 
 > 在缺少 cronet 的平台/架构上，naive 节点会被**自动跳过**（不影响其它协议节点；若选中的正是 naive 节点会给出明确提示）。
 
