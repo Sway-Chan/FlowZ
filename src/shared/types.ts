@@ -21,7 +21,7 @@ export type Protocol =
   | 'socks'
   | 'http'
   | 'ssh';
-export type Network = 'tcp' | 'ws' | 'grpc' | 'http';
+export type Network = 'tcp' | 'ws' | 'grpc' | 'http' | 'httpupgrade';
 export type Hysteria2Network = 'tcp' | 'udp';
 export type Security = 'none' | 'tls' | 'reality';
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'fatal';
@@ -37,6 +37,8 @@ export interface TlsSettings {
   allowInsecure?: boolean;
   alpn?: string[];
   fingerprint?: string;
+  ech?: boolean; // Encrypted Client Hello（隐藏 SNI）；sing-box tls.ech.enabled
+  fragment?: boolean; // TLS ClientHello 分片，抗 SNI-DPI；sing-box tls.fragment
 }
 
 export interface RealitySettings {
@@ -75,6 +77,17 @@ export interface Hysteria2Settings {
   downMbps?: number;
   obfs?: Hysteria2ObfsSettings;
   network?: Hysteria2Network;
+  serverPorts?: string; // 端口跳跃范围，如 "20000:30000"；sing-box server_ports
+  hopInterval?: string; // 端口跳跃间隔，如 "30s"；sing-box hop_interval
+}
+
+// Multiplex 多路复用设置（vless/trojan/vmess/shadowsocks）；注意 reality+vision(xtls-rprx-vision) 不兼容
+export interface MultiplexSettings {
+  enabled?: boolean;
+  protocol?: 'smux' | 'yamux' | 'h2mux'; // 默认 h2mux
+  maxConnections?: number;
+  minStreams?: number;
+  padding?: boolean; // 流量填充，增强抗特征
 }
 
 // TUIC 协议设置
@@ -182,6 +195,9 @@ export interface ServerConfig {
 
   // AnyTLS 特定
   anyTlsSettings?: AnyTlsSettings;
+
+  // Multiplex 多路复用（vless/trojan/vmess/ss；reality+vision 不兼容，生成侧 guard）
+  multiplexSettings?: MultiplexSettings;
 
   // Shadowsocks 特定
   shadowsocksSettings?: ShadowsocksSettings;
@@ -343,6 +359,7 @@ export interface UserConfig {
   allowLan?: boolean; // 局域网共享代理（允许其他设备连接）
   bypassLAN?: boolean; // 绕过局域网（将内网 IP 设置为直连）
   blockQuic?: boolean; // 阻止 QUIC（对代理向 UDP 443 执行 reject，逼浏览器回退 TCP）；默认关；节点无关，对所有协议一视同仁
+  tlsFragment?: boolean; // 全局 TLS 分片：对所有 TLS 节点切分 ClientHello 抗 SNI-DPI；默认关
   bypassProcesses?: string[]; // 排除进程（指定进程直连，不走代理）
 
   // 日志设置

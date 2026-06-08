@@ -21,18 +21,30 @@ type SingboxTls = {
   alpn?: string[];
   utls?: { enabled?: boolean; fingerprint?: string };
   reality?: { enabled?: boolean; public_key?: string; short_id?: string };
+  ech?: { enabled?: boolean };
+  fragment?: boolean;
 };
 type SingboxTransport = {
   type?: string;
   path?: string;
+  host?: string;
   headers?: Record<string, string>;
   service_name?: string;
+};
+type SingboxMultiplex = {
+  enabled?: boolean;
+  protocol?: string;
+  max_connections?: number;
+  min_streams?: number;
+  padding?: boolean;
 };
 type SingboxOutbound = {
   type: string;
   tag: string;
   server?: string;
   server_port?: number;
+  server_ports?: string[];
+  hop_interval?: string;
   uuid?: string;
   flow?: string;
   username?: string;
@@ -45,6 +57,7 @@ type SingboxOutbound = {
   quic?: boolean;
   tls?: SingboxTls;
   transport?: SingboxTransport;
+  multiplex?: SingboxMultiplex;
 };
 
 export class SubscriptionService {
@@ -112,6 +125,8 @@ export class SubscriptionService {
             allowInsecure: ob.tls.insecure ?? false,
             alpn: ob.tls.alpn,
             fingerprint: ob.tls.utls?.fingerprint,
+            ech: ob.tls.ech?.enabled === true ? true : undefined,
+            fragment: ob.tls.fragment === true ? true : undefined,
           };
           if (hasReality && ob.tls.reality) {
             base.realitySettings = {
@@ -124,7 +139,7 @@ export class SubscriptionService {
         // Transport
         if (ob.transport?.type) {
           const t = ob.transport;
-          const netType = t.type as 'ws' | 'grpc' | 'http' | 'tcp';
+          const netType = t.type as 'ws' | 'grpc' | 'http' | 'httpupgrade' | 'tcp';
           base.network = netType;
           if (netType === 'ws') {
             base.wsSettings = { path: t.path, headers: t.headers };
@@ -132,7 +147,21 @@ export class SubscriptionService {
             base.grpcSettings = { serviceName: t.service_name };
           } else if (netType === 'http') {
             base.httpSettings = { path: t.path };
+          } else if (netType === 'httpupgrade') {
+            // httpupgrade 复用 ws 设置承载 path/Host
+            base.wsSettings = { path: t.path, headers: t.host ? { Host: t.host } : t.headers };
           }
+        }
+
+        // Multiplex（vless/trojan/vmess/ss）
+        if (ob.multiplex?.enabled) {
+          base.multiplexSettings = {
+            enabled: true,
+            protocol: (ob.multiplex.protocol as 'smux' | 'yamux' | 'h2mux') || 'h2mux',
+            maxConnections: ob.multiplex.max_connections,
+            minStreams: ob.multiplex.min_streams,
+            padding: ob.multiplex.padding,
+          };
         }
 
         // Protocol-specific
@@ -167,10 +196,17 @@ export class SubscriptionService {
             password: ob.password ?? '',
             security: 'tls',
           };
+          const hy2Settings: NonNullable<ServerConfig['hysteria2Settings']> = {};
           if (ob.obfs?.type === 'salamander' && ob.obfs.password) {
-            hy2.hysteria2Settings = {
-              obfs: { type: 'salamander', password: ob.obfs.password },
-            };
+            hy2Settings.obfs = { type: 'salamander', password: ob.obfs.password };
+          }
+          // 端口跳跃：server_ports 形如 ["20000:30000"]，存为逗号分隔字符串
+          if (ob.server_ports && ob.server_ports.length > 0) {
+            hy2Settings.serverPorts = ob.server_ports.join(',');
+            if (ob.hop_interval) hy2Settings.hopInterval = ob.hop_interval;
+          }
+          if (Object.keys(hy2Settings).length > 0) {
+            hy2.hysteria2Settings = hy2Settings;
           }
           servers.push(hy2);
         } else if (ob.type === 'naive') {

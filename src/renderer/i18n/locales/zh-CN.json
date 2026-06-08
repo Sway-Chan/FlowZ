@@ -236,6 +236,8 @@
       "blockQuicDesc": "reject 代理向 QUIC（UDP 443），让浏览器回退 TCP，解决节点 UDP relay 不通导致的网页卡顿/断流。默认关；对所有节点生效。",
       "interruptOnSwitch": "切换节点时断开现有连接",
       "interruptOnSwitchDesc": "默认优雅切换：切换节点不重启代理、现有连接保留至自然关闭，新连接走新节点。开启后切换时强制断开现有连接、立即在新节点重建。",
+      "tlsFragment": "TLS 分片（抗 SNI 封锁）",
+      "tlsFragmentDesc": "对所有 TLS 节点切分 ClientHello，使 SNI 跨多个 TCP 包、规避基于 SNI 关键词的 DPI 阻断。默认关；个别网络下可能轻微增加握手延迟。",
       "terminalProxy": "终端代理设置",
       "terminalProxyDesc": "复制以下命令到终端中设置代理（需要先启动代理）",
       "gitProxy": "Git 代理设置",

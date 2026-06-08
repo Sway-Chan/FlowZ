@@ -336,6 +336,23 @@ export function AdvancedSettings() {
               {t('settings.advanced.interruptOnSwitchDesc')}
             </p>
 
+            <div className="flex items-center space-x-2 pt-2">
+              <Checkbox
+                id="tlsFragment"
+                checked={config.tlsFragment === true}
+                onCheckedChange={(checked) => {
+                  const updatedConfig = { ...config, tlsFragment: checked as boolean };
+                  saveConfig(updatedConfig);
+                }}
+              />
+              <Label htmlFor="tlsFragment" className="font-normal cursor-pointer">
+                {t('settings.advanced.tlsFragment')}
+              </Label>
+            </div>
+            <p className="text-xs text-muted-foreground ml-6 mb-2">
+              {t('settings.advanced.tlsFragmentDesc')}
+            </p>
+
             {/* 自动换节点 */}
             <div className="flex items-center space-x-2 pt-2">
               <Checkbox

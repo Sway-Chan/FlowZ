@@ -219,14 +219,28 @@ interface SingBoxOutbound {
       public_key: string;
       short_id: string;
     };
+    ech?: { enabled: boolean };
+    fragment?: boolean;
   };
   // Transport
   transport?: {
     type: string;
     path?: string;
+    host?: string;
     headers?: Record<string, string | string[]>;
     service_name?: string;
   };
+  // Multiplex 多路复用
+  multiplex?: {
+    enabled: boolean;
+    protocol?: string;
+    max_connections?: number;
+    min_streams?: number;
+    padding?: boolean;
+  };
+  // Hysteria2 端口跳跃
+  server_ports?: string[];
+  hop_interval?: string;
   // DNS resolver for outbound server domain
   domain_resolver?: string;
   // UDP over TCP (UoT)
@@ -1287,6 +1301,13 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         }
       }
 
+      // 全局 TLS 分片（PR-6）：开启后对所有已生成的 TLS 节点出站切分 ClientHello，抗 SNI-DPI。
+      if (config.tlsFragment) {
+        for (const ob of outbounds) {
+          if (ob.tls) ob.tls.fragment = true;
+        }
+      }
+
       // selector：列出已生成的全部节点 tag，default 指向当前选中节点；interrupt_exist_connections 由用户
       // 开关决定（默认 false=优雅切换，现有连接保留至自然关闭）。clash_api `PUT /proxies/proxy-selector`
       // 据此热切换、无需重启 sing-box（详见 switchMode）。路由的 final 与「→代理」规则统一指向本 selector。
@@ -1635,7 +1656,56 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       outbound.transport = this.generateTransportConfig(server);
     }
 
+    // PR-6 抗封增强（ECH / TLS 分片 / Multiplex / Hy2 端口跳跃）统一后处理
+    this.applyAntiCensorshipOptions(outbound, server);
+
     return outbound;
+  }
+
+  /**
+   * PR-6 抗封增强统一后处理：ECH、每节点 TLS 分片、Multiplex(reality+vision 跳过)、Hy2 端口跳跃。
+   * 放在 outbound 构建完成后统一处理，避免散落到各协议的 tls/transport 构建点。
+   */
+  private applyAntiCensorshipOptions(outbound: SingBoxOutbound, server: ServerConfig): void {
+    const protocolLower = server.protocol.toLowerCase();
+
+    // ECH（隐藏 SNI）+ 每节点 TLS 分片（抗 SNI-DPI）：需已有 tls 块
+    if (outbound.tls) {
+      if (server.tlsSettings?.ech) outbound.tls.ech = { enabled: true };
+      if (server.tlsSettings?.fragment) outbound.tls.fragment = true;
+    }
+
+    // Multiplex（vless/trojan/vmess/shadowsocks）；reality+vision(xtls-rprx-vision) 与 mux 不兼容 → 跳过
+    const mux = server.multiplexSettings;
+    const isRealityVision =
+      server.security === 'reality' && (server.flow || '').toLowerCase().includes('vision');
+    if (
+      mux?.enabled &&
+      ['vless', 'trojan', 'vmess', 'shadowsocks'].includes(protocolLower) &&
+      !isRealityVision
+    ) {
+      outbound.multiplex = {
+        enabled: true,
+        protocol: mux.protocol || 'h2mux',
+        ...(mux.maxConnections ? { max_connections: mux.maxConnections } : {}),
+        ...(mux.minStreams ? { min_streams: mux.minStreams } : {}),
+        ...(mux.padding ? { padding: true } : {}),
+      };
+    }
+
+    // Hysteria2 端口跳跃（serverPorts 为逗号分隔的范围串，如 "20000:30000"，支持多段）
+    if (protocolLower === 'hysteria2' && server.hysteria2Settings?.serverPorts) {
+      const ports = server.hysteria2Settings.serverPorts
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (ports.length > 0) {
+        outbound.server_ports = ports;
+        if (server.hysteria2Settings.hopInterval) {
+          outbound.hop_interval = server.hysteria2Settings.hopInterval;
+        }
+      }
+    }
   }
 
   /**
@@ -1654,6 +1724,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       return {
         type: 'grpc',
         service_name: server.grpcSettings.serviceName || '',
+      };
+    }
+
+    // httpupgrade：较 ws 更隐蔽的 HTTP Upgrade 传输（复用 ws 的 path / Host）
+    if (server.network === 'httpupgrade') {
+      return {
+        type: 'httpupgrade',
+        path: server.wsSettings?.path || '/',
+        host: server.wsSettings?.headers?.['Host'] || server.tlsSettings?.serverName,
       };
     }
 
