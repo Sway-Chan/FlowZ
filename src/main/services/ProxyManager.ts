@@ -341,6 +341,7 @@ export interface IProxyManager {
   on(event: 'started' | 'stopped' | 'error', listener: (...args: any[]) => void): void;
   off(event: 'started' | 'stopped' | 'error', listener: (...args: any[]) => void): void;
   getCoreVersion(): Promise<string>;
+  buildPreflightConfigJson(targetVersion: string): string | null;
 }
 
 export class ProxyManager extends EventEmitter implements IProxyManager {
@@ -740,6 +741,26 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     } catch (error) {
       this.logToManager('error', `获取核心版本失败: ${(error as any).message}`);
       return '1.13.0';
+    }
+  }
+
+  /**
+   * 为「核心更新预检」生成针对目标版本的配置 JSON：用当前活动配置 + 目标核心版本的生成风格
+   * （<1.13 走 inbound sniff，≥1.13 走 route action），供 sing-box check 校验新核心能否解析。
+   * 无活动配置（代理从未启动）时返回 null —— 调用方仅校验二进制可执行即可。
+   */
+  buildPreflightConfigJson(targetVersion: string): string | null {
+    if (!this.currentConfig) return null;
+    const savedVersion = this.coreVersion;
+    try {
+      this.coreVersion = targetVersion;
+      const cfg = this.generateSingBoxConfig(this.currentConfig);
+      return JSON.stringify(cfg, null, 2);
+    } catch (e) {
+      this.logToManager('warn', `预检配置生成失败: ${(e as any)?.message ?? e}`);
+      return null;
+    } finally {
+      this.coreVersion = savedVersion;
     }
   }
 
