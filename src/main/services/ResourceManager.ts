@@ -276,11 +276,10 @@ export class ResourceManager {
   /** 内置的 libcronet 是否存在（用于 naive 可用性判断） */
   hasCronetLib(): boolean {
     try {
-      // macOS：cronet 不以动态库分发，由 sing-box 二进制静态编入（CGO）。FlowZ 当前 mac-arm64 核心
-      // 含静态 cronet → naive 可用；mac-x64 核心未含 cronet（需重编带 naive 的 x64 核心）→ 不可用。
-      // 故 mac 不查 .dylib（不存在也不需要），按 arch 判定。
+      // macOS：cronet 由 sing-box 二进制静态编入（CGO，无 .dylib）。打包的 mac-arm64 与 mac-x64
+      // 核心（均 ≥1.13.13，with_naive_outbound）都含静态 cronet → naive 两 arch 皆可用、无需外部库。
       if (this.platform === 'darwin') {
-        return this.arch === 'arm64';
+        return true;
       }
       // linux/windows：cronet 走 dlopen 动态加载。检查 libcronet 是否在 sing-box 实际加载目录
       // （purego 从二进制同目录加载）：Linux/便携=可写核心目录(已由 ensureCronetBeside 拷入)，

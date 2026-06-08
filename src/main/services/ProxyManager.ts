@@ -1255,7 +1255,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         route_exclude_address: excludeAddr,
       };
 
-      // 兼容 sing-box 1.12.x 版本 (即 Windows 上的 1.12.13)，必须在 inbound 定义 sniff 否则无法域名分流。
+      // 兼容 sing-box 1.12.x 版本（打包核心现已全部 ≥1.13.13，此分支仅为向后兼容旧 userData 核心保留），必须在 inbound 定义 sniff 否则无法域名分流。
       // 对于 1.13.0+，嗅探逻辑已经统一由后方 route.rules 承担，但在入站开启会报错，因此需精准版本判断。
       const inboundVersionMatch = this.coreVersion.match(/^(\d+\.\d+)/);
       const inboundVersionNum = inboundVersionMatch ? parseFloat(inboundVersionMatch[1]) : 1.13;
