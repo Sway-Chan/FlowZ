@@ -332,6 +332,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private lastErrorOutput: string = '';
   private logFileWatcher: ReturnType<typeof setInterval> | null = null;
   private lastLogFileSize: number = 0;
+  // 长会话 debug 日志无限增长会撑满磁盘，超过此上限即截断 singbox.log
+  // （sing-box 以 O_APPEND 模式写，截断后从 offset 0 续写，不产生 sparse 空洞）
+  private static readonly MAX_LOG_FILE_SIZE = 20 * 1024 * 1024; // 20MB
   private healthCheckTimer: ReturnType<typeof setInterval> | null = null;
   private static readonly HEALTH_CHECK_INTERVAL = 10000; // 10秒检查一次
 
@@ -1721,8 +1724,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // 【终极绝杀隐私 DoH 泄漏】：
     // 现代浏览器会尝试通过常规 HTTPS 端口向特定域名发起 DoH 请求。
-    // 我们在这里将这些特定的 DoH 域名强制阻断（Block），从而迫使浏览器退回到系统标准的 UDP 53。
-    // 这样流量就能重新被 hijack-dns 捕获并进入我们的 DNS 分流/FakeIP 体系。
+    // 这里 reject 这些 DoH 域名（发 RST，让浏览器立即回退，而非 block 静默丢包等 21s 重传超时），
+    // 迫使浏览器退回系统标准 UDP 53，重新被 hijack-dns 捕获进入 DNS 分流/FakeIP 体系。
+    // 与下方同组 DoH 域名的 QUIC/UDP-443 reject 规则保持行为一致。
     rules.push({
       domain_keyword: [
         'dns.google',
@@ -1732,9 +1736,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         'one.one.one.one',
       ],
       port: [443, 853],
-      action: 'route',
-      outbound: 'block',
-    });
+      action: 'reject',
+    } as any);
 
     // 排除代理服务器域名，确保代理服务器的连接走直连
     // 这必须放在其他规则之前，否则可能被 geosite-cn 匹配导致死循环
@@ -3521,6 +3524,13 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     this.logFileWatcher = setInterval(async () => {
       try {
         const stats = await fs.stat(logFilePath);
+
+        // 防止长会话日志无限增长撑满磁盘：超过上限即截断（sing-box O_APPEND 写，截断后从 0 续写）
+        if (stats.size > ProxyManager.MAX_LOG_FILE_SIZE) {
+          await fs.truncate(logFilePath, 0);
+          this.lastLogFileSize = 0;
+          return;
+        }
 
         // 如果文件大小变小了，说明文件被清空或截断了
         if (stats.size < this.lastLogFileSize) {
