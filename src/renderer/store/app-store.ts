@@ -230,8 +230,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       // 确保有默认的TUN配置
       if (!config.tunConfig) {
         config.tunConfig = {
-          mtu: 9000,
-          stack: 'system',
+          mtu: window.electron?.platform === 'darwin' ? 1400 : 1350,
+          stack: window.electron?.platform === 'darwin' ? 'gvisor' : 'system',
           autoRoute: true,
           strictRoute: true,
         };

@@ -448,8 +448,8 @@ export class ConfigManager implements IConfigManager {
       proxyMode: 'global',
       proxyModeType: 'systemProxy', // 默认使用系统代理模式，不需要管理员权限
       tunConfig: {
-        mtu: 9000,
-        stack: 'system',
+        mtu: process.platform === 'darwin' ? 1400 : 1350,
+        stack: process.platform === 'darwin' ? 'gvisor' : 'system',
         autoRoute: true,
         strictRoute: true,
       },
