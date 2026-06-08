@@ -751,6 +751,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     if (!selectedServer) {
       throw new Error('Selected server not found');
     }
+    // 选中节点不可用（naive 缺 libcronet）→ 明确报错，不静默切到别的节点（修 review M1）
+    if (!this.isNodeUsable(selectedServer)) {
+      throw new Error(
+        `选中的节点「${selectedServer.name}」是 NaiveProxy，但未找到 libcronet 核心库（macOS 暂无官方预编译库）。请选择其它协议的节点。`
+      );
+    }
 
     // 调试日志
     console.log('[ProxyManager] Generating config with:', {
@@ -810,6 +816,19 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         },
       },
     };
+
+    // 路由规则若指向「已被跳过/不存在的出站」（如缺 libcronet 被跳过的 naive 节点），sing-box 会以
+    // "outbound not found" 启动失败。统一把这类死引用修正为 selector（修 review H2：app/custom 分流
+    // 指向被跳过 naive 节点的情况）。
+    const validTags = new Set(
+      singboxConfig.outbounds.map((o) => o.tag).filter((t): t is string => !!t)
+    );
+    for (const rule of singboxConfig.route?.rules ?? []) {
+      const r = rule as { action?: string; outbound?: string };
+      if (r.action === 'route' && r.outbound && !validTags.has(r.outbound)) {
+        r.outbound = 'proxy-selector';
+      }
+    }
 
     // 调试日志
     console.log('[ProxyManager] Generated inbounds count:', singboxConfig.inbounds.length);
@@ -1237,6 +1256,14 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     return inbounds;
   }
 
+  /** 节点是否可用：naive 需要 libcronet 核心库，缺库时不可用（会被跳过、分流/选中回退到 selector）。 */
+  private isNodeUsable(server: ServerConfig): boolean {
+    if (server.protocol.toLowerCase() === 'naive' && !resourceManager.hasCronetLib()) {
+      return false;
+    }
+    return true;
+  }
+
   private generateOutbounds(
     selectedServer: ServerConfig,
     config: UserConfig,
@@ -1248,17 +1275,16 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       // 生成【全部】节点的 Outbound：selector 需要列出所有可切换节点；detour 前置节点亦在 config.servers
       // 中，一并生成、通过 detour 字段链接。单个节点配置异常不应拖垮整体配置，逐节点 try/catch 跳过。
       // （app/custom 分流规则指向的固定节点 tag 不变，仍直接命中其节点出站，不经 selector。）
-      const cronetAvailable = resourceManager.hasCronetLib();
       for (const server of config.servers) {
         const tag = idToTagMap.get(server.id) || `proxy-${server.id}`;
         if (outbounds.some((o) => o.tag === tag)) continue; // 去重
-        // naive 出站需要 libcronet，且 sing-box 启动时会预初始化全部出站——缺库时若把 naive 节点
-        // 放进 selector，会让整个代理启动 FATAL（连非 naive 节点也用不了）。故缺库时跳过 naive 节点，
-        // 让用户仍能用其它协议节点。
-        if (server.protocol.toLowerCase() === 'naive' && !cronetAvailable) {
+        // 不可用节点跳过：naive 缺 libcronet 时，sing-box 启动会预初始化全部出站、缺库的 naive 会让
+        // 整个代理启动 FATAL（连非 naive 节点也用不了）。跳过后，路由层对该节点 tag 的死引用会在
+        // generateSingBoxConfig 末尾被统一修正为 selector（见 H2 修复）。
+        if (!this.isNodeUsable(server)) {
           this.logToManager(
             'warn',
-            `跳过 naive 节点「${server.name}」：未找到 NaiveProxy 核心库 libcronet`
+            `跳过不可用节点「${server.name}」：NaiveProxy 缺少 libcronet 核心库`
           );
           continue;
         }

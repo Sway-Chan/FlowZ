@@ -276,9 +276,11 @@ export class ResourceManager {
   /** 内置的 libcronet 是否存在（用于 naive 可用性判断） */
   hasCronetLib(): boolean {
     try {
-      return require('fs').existsSync(
-        path.join(this.getPlatformResourceDir(), this.getCronetLibFilename())
-      );
+      // 检查 sing-box 实际加载的目录（purego 从二进制同目录加载）：Linux/便携=可写核心目录(已由
+      // ensureCronetBeside 拷入)，mac/win 非便携=内置 resources 目录。不查内置兜底——否则 beside 拷贝
+      // 失败时仍误判"可用"，导致 naive 不被跳过、sing-box 找不到库而启动 FATAL（修 review M3）。
+      const coreDir = path.dirname(this.getSingBoxPath());
+      return require('fs').existsSync(path.join(coreDir, this.getCronetLibFilename()));
     } catch {
       return false;
     }

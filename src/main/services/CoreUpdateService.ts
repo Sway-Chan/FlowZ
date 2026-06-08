@@ -466,6 +466,10 @@ export class CoreUpdateService {
       fs.chmodSync(targetPath, 0o755);
     }
 
+    // 手动替换核心后，确保 libcronet 与新核心同目录（naive 依赖随 app 打包的库；修 review M4，
+    // 与自动核心更新路径一致）
+    await resourceManager.ensureCronetBeside(targetDir);
+
     // macOS: 清除隔离标记并重新签名
     if (process.platform === 'darwin') {
       try {

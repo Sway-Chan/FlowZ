@@ -5,11 +5,15 @@
  *
  * 用法：node scripts/fetch-cronet.mjs [--force]
  *
- * ⚠️ 版本耦合：CRONET_VERSION 应与「随 app 打包的 sing-box 所用 cronet-go 版本」对应。
- *   cronet 走 C API（Chromium 稳定 ABI），跨 sing-box 小版本一般兼容；若升级 sing-box 后 naive 报
- *   符号错，提高此处版本并重打包。来源：https://github.com/SagerNet/cronet-go/releases
+ * ⚠️ macOS：SagerNet/cronet-go 不分发预编译 libcronet.dylib（release 只有 linux/windows）。mac 下
+ *   naive 需自行用 cronet-go 的 build-naive 从源码构建 libcronet.dylib 放进 resources/mac-{arch}/，
+ *   否则运行时 hasCronetLib()=false、naive 节点会被优雅跳过（不影响其它协议节点）。
+ *
+ * ⚠️ 版本耦合：CRONET_VERSION 应与「随 app 打包的 sing-box 所用 cronet-go 版本」对应。cronet 走
+ *   C API（Chromium 稳定 ABI），跨 sing-box 小版本一般兼容；若升级 sing-box 后 naive 报符号错，提高
+ *   此处版本并重打包。来源：https://github.com/SagerNet/cronet-go/releases
  */
-import { createWriteStream, existsSync, mkdirSync } from 'fs';
+import { createWriteStream, existsSync, mkdirSync, renameSync, unlinkSync } from 'fs';
 import { get } from 'https';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
@@ -20,12 +24,11 @@ const REPO = 'SagerNet/cronet-go';
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const FORCE = process.argv.includes('--force');
 
+// 仅 linux/windows 有官方预编译资产；mac 见文件头说明（build-from-source）。
 // resources 目标目录 ← cronet-go 资产名 → 落地文件名(purego 期望)
 const TARGETS = [
   { dir: 'resources/linux', asset: 'libcronet-linux-amd64.so', out: 'libcronet.so' },
   { dir: 'resources/win', asset: 'libcronet-windows-amd64.dll', out: 'libcronet.dll' },
-  { dir: 'resources/mac-arm64', asset: 'libcronet-darwin-arm64.dylib', out: 'libcronet.dylib' },
-  { dir: 'resources/mac-x64', asset: 'libcronet-darwin-amd64.dylib', out: 'libcronet.dylib' },
 ];
 
 function download(url, dest, redirects = 0) {
@@ -40,10 +43,31 @@ function download(url, dest, redirects = 0) {
         res.resume();
         return reject(new Error(`HTTP ${res.statusCode} for ${url}`));
       }
-      const file = createWriteStream(dest);
+      // 原子写：先写 .tmp，完成再 rename；失败/中断则删 .tmp，避免把截断文件当成"已存在"误用
+      const tmp = `${dest}.tmp`;
+      const file = createWriteStream(tmp);
+      const fail = (e) => {
+        try {
+          unlinkSync(tmp);
+        } catch {
+          /* ignore */
+        }
+        reject(e);
+      };
+      res.on('error', fail);
+      file.on('error', fail);
       res.pipe(file);
-      file.on('finish', () => file.close(() => resolve()));
-      file.on('error', reject);
+      file.on('finish', () =>
+        file.close((err) => {
+          if (err) return fail(err);
+          try {
+            renameSync(tmp, dest);
+            resolve();
+          } catch (e) {
+            fail(e);
+          }
+        })
+      );
     }).on('error', reject);
   });
 }
@@ -71,4 +95,5 @@ for (const t of TARGETS) {
   }
 }
 console.log(`\ncronet libs: ${ok} ready, ${failed} failed (version ${CRONET_VERSION}).`);
+console.log('macOS: 需自行从源码构建 libcronet.dylib（见脚本头注），否则 mac 下 naive 节点将被跳过。');
 process.exit(failed > 0 ? 1 : 0);
