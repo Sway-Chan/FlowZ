@@ -70,3 +70,6 @@ subscription-cache/
 # Any local override configs
 local.config.*
 *.local.json
+
+# NaiveProxy 核心库（由 npm run fetch:cronet 下载，打包时随 resources 打入；体积大不入库）
+resources/*/libcronet.*

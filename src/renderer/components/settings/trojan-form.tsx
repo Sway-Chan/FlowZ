@@ -20,8 +20,25 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { Checkbox } from '@/components/ui/checkbox';
 import { Loader2 } from 'lucide-react';
+import { EchField, MultiplexFields } from './shared/anti-censor-fields';
+import { AddressField, PortField } from './shared/basic-fields';
+import {
+  TlsServerNameField,
+  FingerprintField,
+  AllowInsecureField,
+  AlpnField,
+} from './shared/tls-fields';
+import { WsPathField, WsHostField } from './shared/transport-fields';
+import {
+  echSchemaShape,
+  multiplexSchemaShape,
+  echDefaults,
+  multiplexDefaults,
+  readEchDefault,
+  readMultiplexDefaults,
+  buildMultiplexSettings,
+} from './shared/field-schemas';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -30,12 +47,16 @@ const createTrojanSchema = (t: any) =>
     address: z.string().min(1, t('servers.addressRequired')),
     port: z.number().min(1).max(65535),
     password: z.string().min(1, t('servers.passwordRequired')),
-    network: z.enum(['tcp', 'ws', 'h2']),
+    network: z.enum(['tcp', 'ws', 'h2', 'httpupgrade']),
     security: z.enum(['none', 'tls']),
     tlsServerName: z.string().optional(),
     tlsAllowInsecure: z.boolean(),
     tlsFingerprint: z.string().optional(),
     alpn: z.string().optional(),
+    wsPath: z.string().optional(),
+    wsHost: z.string().optional(),
+    ...echSchemaShape,
+    ...multiplexSchemaShape,
   });
 
 type TrojanFormValues = z.infer<ReturnType<typeof createTrojanSchema>>;
@@ -61,16 +82,20 @@ export function TrojanForm({ serverConfig, onSubmit }: TrojanFormProps) {
       tlsAllowInsecure: false,
       tlsFingerprint: 'none',
       alpn: '',
+      wsPath: '',
+      wsHost: '',
+      ...echDefaults,
+      ...multiplexDefaults,
     },
   });
 
   useEffect(() => {
-    console.log('[TrojanForm] Server config changed:', serverConfig);
     if (serverConfig && serverConfig.protocol?.toLowerCase() === 'trojan') {
       // 标准化 network 和 security 值（转为全小写以匹配 schema）
-      const normalizeNetwork = (n: string | undefined): 'tcp' | 'ws' | 'h2' => {
+      const normalizeNetwork = (n: string | undefined): 'tcp' | 'ws' | 'h2' | 'httpupgrade' => {
         const lower = (n || 'tcp').toLowerCase();
         if (lower === 'ws' || lower === 'websocket') return 'ws';
+        if (lower === 'httpupgrade') return 'httpupgrade';
         if (lower === 'h2' || lower === 'http2') return 'h2';
         return 'tcp';
       };
@@ -89,14 +114,16 @@ export function TrojanForm({ serverConfig, onSubmit }: TrojanFormProps) {
         tlsAllowInsecure: serverConfig.tlsSettings?.allowInsecure || false,
         tlsFingerprint: serverConfig.tlsSettings?.fingerprint || 'none',
         alpn: serverConfig.tlsSettings?.alpn?.join(',') || '',
+        wsPath: serverConfig.wsSettings?.path || '',
+        wsHost: serverConfig.wsSettings?.headers?.['Host'] || '',
+        ...readEchDefault(serverConfig),
+        ...readMultiplexDefaults(serverConfig),
       };
-      console.log('[TrojanForm] Resetting form with:', formData);
       form.reset(formData);
     }
   }, [serverConfig, form]);
 
   const handleSubmit = async (values: TrojanFormValues) => {
-    console.log('[TrojanForm] Submitting values:', values);
     const config = {
       protocol: 'trojan',
       address: values.address,
@@ -111,8 +138,17 @@ export function TrojanForm({ serverConfig, onSubmit }: TrojanFormProps) {
               allowInsecure: values.tlsAllowInsecure,
               fingerprint: values.tlsFingerprint || 'none',
               alpn: values.alpn ? values.alpn.split(',').map((s) => s.trim()) : undefined,
+              ech: values.ech ? true : undefined,
             }
           : null,
+      wsSettings:
+        values.network === 'ws' || values.network === 'httpupgrade'
+          ? {
+              path: values.wsPath || '/',
+              headers: values.wsHost ? { Host: values.wsHost } : undefined,
+            }
+          : null,
+      multiplexSettings: buildMultiplexSettings(values),
     };
 
     try {
@@ -123,44 +159,15 @@ export function TrojanForm({ serverConfig, onSubmit }: TrojanFormProps) {
   };
 
   const isTlsEnabled = form.watch('security') === 'tls';
+  const isWebSocketEnabled =
+    form.watch('network') === 'ws' || form.watch('network') === 'httpupgrade';
 
   return (
     <Form {...form}>
       <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
-        <FormField
-          control={form.control}
-          name="address"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('servers.serverAddress')}</FormLabel>
-              <FormControl>
-                <Input placeholder="example.com" {...field} />
-              </FormControl>
-              <FormDescription>{t('servers.serverAddressDesc')}</FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+        <AddressField control={form.control} t={t} />
 
-        <FormField
-          control={form.control}
-          name="port"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('servers.port')}</FormLabel>
-              <FormControl>
-                <Input
-                  type="number"
-                  placeholder="443"
-                  {...field}
-                  onChange={(e) => field.onChange(parseInt(e.target.value) || 0)}
-                />
-              </FormControl>
-              <FormDescription>{t('servers.portDesc')}</FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+        <PortField control={form.control} t={t} placeholder="443" />
 
         <FormField
           control={form.control}
@@ -192,6 +199,7 @@ export function TrojanForm({ serverConfig, onSubmit }: TrojanFormProps) {
                 <SelectContent>
                   <SelectItem value="tcp">TCP</SelectItem>
                   <SelectItem value="ws">WebSocket</SelectItem>
+                  <SelectItem value="httpupgrade">HTTPUpgrade</SelectItem>
                   <SelectItem value="h2">HTTP/2</SelectItem>
                 </SelectContent>
               </Select>
@@ -227,85 +235,28 @@ export function TrojanForm({ serverConfig, onSubmit }: TrojanFormProps) {
         {isTlsEnabled && (
           <>
             <div className="grid grid-cols-2 gap-4">
-              <FormField
-                control={form.control}
-                name="tlsServerName"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>{t('servers.tlsServerName')}</FormLabel>
-                    <FormControl>
-                      <Input placeholder="example.com" {...field} />
-                    </FormControl>
-                    <FormDescription>{t('servers.tlsServerNameDesc')}</FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
+              <TlsServerNameField control={form.control} t={t} />
 
-              <FormField
-                control={form.control}
-                name="alpn"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>{t('servers.alpn')}</FormLabel>
-                    <FormControl>
-                      <Input placeholder="http/1.1" {...field} />
-                    </FormControl>
-                    <FormDescription>{t('servers.alpnDesc')}</FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
+              <AlpnField control={form.control} t={t} placeholder="http/1.1" />
             </div>
 
-            <FormField
-              control={form.control}
-              name="tlsFingerprint"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>{t('servers.fingerprint')}</FormLabel>
-                  <Select onValueChange={field.onChange} value={field.value}>
-                    <FormControl>
-                      <SelectTrigger>
-                        <SelectValue
-                          placeholder={t('servers.selectFingerprint', 'Select TLS Fingerprint')}
-                        />
-                      </SelectTrigger>
-                    </FormControl>
-                    <SelectContent>
-                      <SelectItem value="none">{t('servers.none', 'None')}</SelectItem>
-                      <SelectItem value="chrome">Chrome</SelectItem>
-                      <SelectItem value="firefox">Firefox</SelectItem>
-                      <SelectItem value="safari">Safari</SelectItem>
-                      <SelectItem value="edge">Edge</SelectItem>
-                      <SelectItem value="ios">iOS</SelectItem>
-                      <SelectItem value="android">Android</SelectItem>
-                      <SelectItem value="random">{t('servers.random')}</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <FormDescription>{t('servers.fingerprintDesc')}</FormDescription>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
+            <FingerprintField control={form.control} t={t} />
 
-            <FormField
-              control={form.control}
-              name="tlsAllowInsecure"
-              render={({ field }) => (
-                <FormItem className="flex flex-row items-start space-x-3 space-y-0">
-                  <FormControl>
-                    <Checkbox checked={field.value} onCheckedChange={field.onChange} />
-                  </FormControl>
-                  <div className="space-y-1 leading-none">
-                    <FormLabel>{t('servers.allowInsecure')}</FormLabel>
-                    <FormDescription>{t('servers.allowInsecureDesc')}</FormDescription>
-                  </div>
-                </FormItem>
-              )}
-            />
+            <AllowInsecureField control={form.control} t={t} />
+
+            <EchField control={form.control} t={t} />
           </>
         )}
+
+        {isWebSocketEnabled && (
+          <>
+            <WsPathField control={form.control} t={t} />
+
+            <WsHostField control={form.control} t={t} />
+          </>
+        )}
+
+        <MultiplexFields control={form.control} t={t} disabled={false} />
 
         <div className="flex gap-4">
           <Button type="submit" disabled={form.formState.isSubmitting}>

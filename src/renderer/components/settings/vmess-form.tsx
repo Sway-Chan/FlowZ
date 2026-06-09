@@ -19,30 +19,48 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { Checkbox } from '@/components/ui/checkbox';
 import { Loader2 } from 'lucide-react';
+import { EchField, MultiplexFields } from './shared/anti-censor-fields';
+import { AddressField, PortField } from './shared/basic-fields';
+import { TlsServerNameField, FingerprintField, AllowInsecureField } from './shared/tls-fields';
+import { WsPathField, WsHostField } from './shared/transport-fields';
+import {
+  echSchemaShape,
+  multiplexSchemaShape,
+  echDefaults,
+  multiplexDefaults,
+  readEchDefault,
+  readMultiplexDefaults,
+  buildMultiplexSettings,
+} from './shared/field-schemas';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
-const vmessFormSchema = z.object({
-  address: z.string().min(1, 'Address is required'),
-  port: z.number().min(1).max(65535),
-  uuid: z
-    .string()
-    .min(1, 'UUID is required')
-    .regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i, 'Invalid UUID'),
-  alterId: z.number().default(0),
-  vmessSecurity: z.string().default('auto'),
-  network: z.enum(['Tcp', 'Ws', 'H2']),
-  security: z.enum(['None', 'Tls']),
-  tlsServerName: z.string().optional().or(z.literal('')),
-  tlsAllowInsecure: z.boolean(),
-  tlsFingerprint: z.string().optional().or(z.literal('')),
-  wsPath: z.string().optional().or(z.literal('')),
-  wsHost: z.string().optional().or(z.literal('')),
-});
+const createVmessSchema = (t: any) =>
+  z.object({
+    address: z.string().min(1, t('servers.addressRequired')),
+    port: z.number().min(1).max(65535),
+    uuid: z
+      .string()
+      .min(1, t('servers.uuidRequired'))
+      .regex(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+        t('servers.uuidInvalid')
+      ),
+    alterId: z.number().default(0),
+    vmessSecurity: z.string().default('auto'),
+    network: z.enum(['Tcp', 'Ws', 'H2', 'HttpUpgrade']),
+    security: z.enum(['None', 'Tls']),
+    tlsServerName: z.string().optional().or(z.literal('')),
+    tlsAllowInsecure: z.boolean(),
+    tlsFingerprint: z.string().optional().or(z.literal('')),
+    wsPath: z.string().optional().or(z.literal('')),
+    wsHost: z.string().optional().or(z.literal('')),
+    ...echSchemaShape,
+    ...multiplexSchemaShape,
+  });
 
-type VmessFormValues = z.infer<typeof vmessFormSchema>;
+type VmessFormValues = z.infer<ReturnType<typeof createVmessSchema>>;
 
 interface VmessFormProps {
   serverConfig?: ServerConfig;
@@ -51,10 +69,12 @@ interface VmessFormProps {
 
 export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
   const { t } = useTranslation();
+  const vmessFormSchema = createVmessSchema(t);
 
-  const normalizeNetwork = (n: string | undefined): 'Tcp' | 'Ws' | 'H2' => {
+  const normalizeNetwork = (n: string | undefined): 'Tcp' | 'Ws' | 'H2' | 'HttpUpgrade' => {
     const lower = (n || 'tcp').toLowerCase();
     if (lower === 'ws' || lower === 'websocket') return 'Ws';
+    if (lower === 'httpupgrade') return 'HttpUpgrade';
     if (lower === 'h2' || lower === 'http2') return 'H2';
     return 'Tcp';
   };
@@ -80,6 +100,8 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
         tlsFingerprint: serverConfig.tlsSettings?.fingerprint || 'chrome',
         wsPath: serverConfig.wsSettings?.path || '',
         wsHost: serverConfig.wsSettings?.headers?.['Host'] || '',
+        ...readEchDefault(serverConfig),
+        ...readMultiplexDefaults(serverConfig),
       };
     }
     return {
@@ -95,6 +117,8 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
       tlsFingerprint: 'chrome',
       wsPath: '',
       wsHost: '',
+      ...echDefaults,
+      ...multiplexDefaults,
     };
   };
 
@@ -104,7 +128,7 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
   });
 
   const handleSubmit = async (values: VmessFormValues) => {
-    const network = values.network.toLowerCase() as 'tcp' | 'ws' | 'h2';
+    const network = values.network.toLowerCase() as 'tcp' | 'ws' | 'h2' | 'httpupgrade';
     const security = values.security.toLowerCase() as 'none' | 'tls';
 
     const serverConfig = {
@@ -122,60 +146,32 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
               serverName: values.tlsServerName?.trim() || null,
               allowInsecure: values.tlsAllowInsecure,
               fingerprint: values.tlsFingerprint || 'chrome',
+              ech: values.ech ? true : undefined,
             }
           : null,
       wsSettings:
-        network === 'ws'
+        network === 'ws' || network === 'httpupgrade'
           ? {
               path: values.wsPath || '/',
-              host: values.wsHost || null,
+              headers: values.wsHost ? { Host: values.wsHost } : undefined,
             }
           : null,
+      multiplexSettings: buildMultiplexSettings(values),
     };
 
     await onSubmit(serverConfig);
   };
 
   const isTlsEnabled = form.watch('security') === 'Tls';
-  const isWebSocketEnabled = form.watch('network') === 'Ws';
+  const isWebSocketEnabled =
+    form.watch('network') === 'Ws' || form.watch('network') === 'HttpUpgrade';
 
   return (
     <Form {...form}>
       <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
-        <FormField
-          control={form.control}
-          name="address"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('servers.serverAddress')}</FormLabel>
-              <FormControl>
-                <Input placeholder="example.com" {...field} />
-              </FormControl>
-              <FormDescription>{t('servers.serverAddressDesc')}</FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+        <AddressField control={form.control} t={t} />
 
-        <FormField
-          control={form.control}
-          name="port"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('servers.port')}</FormLabel>
-              <FormControl>
-                <Input
-                  type="number"
-                  placeholder="443"
-                  {...field}
-                  onChange={(e) => field.onChange(parseInt(e.target.value) || 0)}
-                />
-              </FormControl>
-              <FormDescription>{t('servers.portDesc')}</FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+        <PortField control={form.control} t={t} placeholder="443" />
 
         <FormField
           control={form.control}
@@ -255,6 +251,7 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
                 <SelectContent>
                   <SelectItem value="Tcp">TCP</SelectItem>
                   <SelectItem value="Ws">WebSocket</SelectItem>
+                  <SelectItem value="HttpUpgrade">HTTPUpgrade</SelectItem>
                   <SelectItem value="H2">HTTP/2</SelectItem>
                 </SelectContent>
               </Select>
@@ -289,102 +286,25 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
 
         {isTlsEnabled && (
           <>
-            <FormField
-              control={form.control}
-              name="tlsServerName"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>{t('servers.tlsServerName')}</FormLabel>
-                  <FormControl>
-                    <Input placeholder="example.com" {...field} />
-                  </FormControl>
-                  <FormDescription>{t('servers.tlsServerNameDesc')}</FormDescription>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
+            <TlsServerNameField control={form.control} t={t} />
 
-            <FormField
-              control={form.control}
-              name="tlsFingerprint"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>{t('servers.fingerprint')}</FormLabel>
-                  <Select onValueChange={field.onChange} value={field.value}>
-                    <FormControl>
-                      <SelectTrigger>
-                        <SelectValue
-                          placeholder={t('servers.selectFingerprint', 'Select TLS Fingerprint')}
-                        />
-                      </SelectTrigger>
-                    </FormControl>
-                    <SelectContent>
-                      <SelectItem value="chrome">Chrome</SelectItem>
-                      <SelectItem value="firefox">Firefox</SelectItem>
-                      <SelectItem value="safari">Safari</SelectItem>
-                      <SelectItem value="edge">Edge</SelectItem>
-                      <SelectItem value="ios">iOS</SelectItem>
-                      <SelectItem value="android">Android</SelectItem>
-                      <SelectItem value="random">{t('servers.random')}</SelectItem>
-                    </SelectContent>
-                  </Select>
-                  <FormDescription>{t('servers.fingerprintDesc')}</FormDescription>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
+            <FingerprintField control={form.control} t={t} />
 
-            <FormField
-              control={form.control}
-              name="tlsAllowInsecure"
-              render={({ field }) => (
-                <FormItem className="flex flex-row items-start space-x-3 space-y-0">
-                  <FormControl>
-                    <Checkbox checked={field.value} onCheckedChange={field.onChange} />
-                  </FormControl>
-                  <div className="space-y-1 leading-none">
-                    <FormLabel>{t('servers.allowInsecure')}</FormLabel>
-                    <FormDescription>{t('servers.allowInsecureDesc')}</FormDescription>
-                  </div>
-                </FormItem>
-              )}
-            />
+            <AllowInsecureField control={form.control} t={t} />
+
+            <EchField control={form.control} t={t} />
           </>
         )}
 
         {isWebSocketEnabled && (
           <>
-            <FormField
-              control={form.control}
-              name="wsPath"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>{t('servers.wsPath')}</FormLabel>
-                  <FormControl>
-                    <Input placeholder="" {...field} />
-                  </FormControl>
-                  <FormDescription>{t('servers.wsPathDesc')}</FormDescription>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
+            <WsPathField control={form.control} t={t} />
 
-            <FormField
-              control={form.control}
-              name="wsHost"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>{t('servers.wsHost')}</FormLabel>
-                  <FormControl>
-                    <Input placeholder="example.com" {...field} />
-                  </FormControl>
-                  <FormDescription>{t('servers.wsHostDesc')}</FormDescription>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
+            <WsHostField control={form.control} t={t} />
           </>
         )}
+
+        <MultiplexFields control={form.control} t={t} disabled={false} />
 
         <div className="flex gap-4">
           <Button type="submit" disabled={form.formState.isSubmitting}>

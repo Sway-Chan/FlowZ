@@ -21,7 +21,7 @@ export type Protocol =
   | 'socks'
   | 'http'
   | 'ssh';
-export type Network = 'tcp' | 'ws' | 'grpc' | 'http';
+export type Network = 'tcp' | 'ws' | 'grpc' | 'http' | 'httpupgrade';
 export type Hysteria2Network = 'tcp' | 'udp';
 export type Security = 'none' | 'tls' | 'reality';
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error' | 'fatal';
@@ -37,6 +37,8 @@ export interface TlsSettings {
   allowInsecure?: boolean;
   alpn?: string[];
   fingerprint?: string;
+  ech?: boolean; // Encrypted Client Hello（隐藏 SNI）；sing-box tls.ech.enabled
+  fragment?: boolean; // TLS ClientHello 分片，抗 SNI-DPI；sing-box tls.fragment
 }
 
 export interface RealitySettings {
@@ -75,6 +77,17 @@ export interface Hysteria2Settings {
   downMbps?: number;
   obfs?: Hysteria2ObfsSettings;
   network?: Hysteria2Network;
+  serverPorts?: string; // 端口跳跃范围，如 "20000:30000"；sing-box server_ports
+  hopInterval?: string; // 端口跳跃间隔，如 "30s"；sing-box hop_interval
+}
+
+// Multiplex 多路复用设置（vless/trojan/vmess/shadowsocks）；注意 reality+vision(xtls-rprx-vision) 不兼容
+export interface MultiplexSettings {
+  enabled?: boolean;
+  protocol?: 'smux' | 'yamux' | 'h2mux'; // 默认 h2mux
+  maxConnections?: number;
+  minStreams?: number;
+  padding?: boolean; // 流量填充，增强抗特征
 }
 
 // TUIC 协议设置
@@ -83,6 +96,11 @@ export interface TuicSettings {
   udpRelayMode?: 'native' | 'quic';
   zeroRttHandshake?: boolean;
   heartbeat?: string;
+}
+
+// Naive 协议设置
+export interface NaiveSettings {
+  useHttp3?: boolean; // 使用 HTTP/3 (QUIC) 传输；sing-box naive outbound 的 quic 字段
 }
 
 // Shadowsocks 协议设置
@@ -158,11 +176,15 @@ export interface ServerConfig {
   encryption?: string;
   flow?: string;
 
+  // vless/vmess UDP 封装，默认 xudp，可设 '' 或 'packetaddr' 等
+  packetEncoding?: string;
+
   // Trojan 和 Hysteria2 通用
   password?: string;
 
   // Naive 特定
   username?: string;
+  naiveSettings?: NaiveSettings;
 
   // VMess 特定
   alterId?: number;
@@ -176,6 +198,9 @@ export interface ServerConfig {
 
   // AnyTLS 特定
   anyTlsSettings?: AnyTlsSettings;
+
+  // Multiplex 多路复用（vless/trojan/vmess/ss；reality+vision 不兼容，生成侧 guard）
+  multiplexSettings?: MultiplexSettings;
 
   // Shadowsocks 特定
   shadowsocksSettings?: ShadowsocksSettings;
@@ -313,6 +338,7 @@ export interface UserConfig {
   autoPrivacyMode?: boolean; // 自动进入隐私模式
   privacyPassword?: string; // 隐私模式解锁密码
   autoSwitchNode?: boolean; // 节点故障时自动切换到可用节点
+  interruptConnectionsOnSwitch?: boolean; // 切换节点时中断现有连接、强制在新节点重建（默认 false=优雅切换，现有连接保留至自然关闭）
 
   // 窗口尺寸（仅在 rememberWindowSize 启用时使用）
   windowBounds?: { width: number; height: number };
@@ -335,7 +361,11 @@ export interface UserConfig {
   mixedPort?: number; // 混合端口（可选，同时支持 HTTP 和 SOCKS5，0 或 undefined 表示禁用）
   allowLan?: boolean; // 局域网共享代理（允许其他设备连接）
   bypassLAN?: boolean; // 绕过局域网（将内网 IP 设置为直连）
-  blockQuic?: boolean; // 阻止 QUIC（reject 入站 UDP 443 强制浏览器回退 TCP）；默认关；hy2/tuic 节点自动跳过
+  blockQuic?: boolean; // 阻止 QUIC（对代理向 UDP 443 执行 reject，逼浏览器回退 TCP）；默认关；节点无关，对所有协议一视同仁
+  tlsFragment?: boolean; // 全局 TLS 分片：对所有 TLS 节点切分 ClientHello 抗 SNI-DPI；默认关
+  // 核心更新：仅在配置生成器已验证的 sing-box minor 版本带内自动更新（默认 true）。关闭后允许自动
+  // 更新跨越 minor（如 1.13→1.14），但跨 minor 的 schema 变更可能导致配置不兼容、需手动处理。
+  restrictCoreUpdateToCompatibleMinor?: boolean;
   bypassProcesses?: string[]; // 排除进程（指定进程直连，不走代理）
 
   // 日志设置

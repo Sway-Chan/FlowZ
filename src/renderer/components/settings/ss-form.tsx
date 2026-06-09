@@ -21,6 +21,14 @@ import {
 } from '@/components/ui/select';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Loader2, Shield } from 'lucide-react';
+import { MultiplexFields } from './shared/anti-censor-fields';
+import { AddressField, PortField } from './shared/basic-fields';
+import {
+  multiplexSchemaShape,
+  multiplexDefaults,
+  readMultiplexDefaults,
+  buildMultiplexSettings,
+} from './shared/field-schemas';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -39,6 +47,7 @@ const createSsSchema = (t: any) =>
     shadowTlsSni: z.string().optional(),
     shadowTlsFingerprint: z.string().optional(),
     shadowTlsPort: z.number().optional(),
+    ...multiplexSchemaShape,
   });
 
 type SsFormValues = z.infer<ReturnType<typeof createSsSchema>>;
@@ -104,6 +113,7 @@ export function SsForm({ serverConfig, onSubmit }: SsFormProps) {
       shadowTlsPort: hasShadowTls
         ? (serverConfig?.shadowTlsSettings?.port ?? undefined)
         : undefined,
+      ...(isSs && serverConfig ? readMultiplexDefaults(serverConfig) : multiplexDefaults),
     },
   });
 
@@ -121,6 +131,7 @@ export function SsForm({ serverConfig, onSubmit }: SsFormProps) {
         plugin: values.plugin || undefined,
         pluginOptions: values.pluginOptions || undefined,
       },
+      multiplexSettings: buildMultiplexSettings(values),
     };
 
     if (values.enableShadowTls && values.shadowTlsPassword && values.shadowTlsSni) {
@@ -153,40 +164,9 @@ export function SsForm({ serverConfig, onSubmit }: SsFormProps) {
           )}
         />
 
-        <FormField
-          control={form.control}
-          name="address"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('servers.serverAddress')}</FormLabel>
-              <FormControl>
-                <Input placeholder="example.com" {...field} />
-              </FormControl>
-              <FormDescription>{t('servers.serverAddressDesc')}</FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+        <AddressField control={form.control} t={t} />
 
-        <FormField
-          control={form.control}
-          name="port"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('servers.port')}</FormLabel>
-              <FormControl>
-                <Input
-                  type="number"
-                  placeholder="8388"
-                  {...field}
-                  onChange={(e) => field.onChange(parseInt(e.target.value) || 0)}
-                />
-              </FormControl>
-              <FormDescription>{t('servers.portDesc')}</FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+        <PortField control={form.control} t={t} placeholder="8388" />
 
         <FormField
           control={form.control}
@@ -390,6 +370,8 @@ export function SsForm({ serverConfig, onSubmit }: SsFormProps) {
             </div>
           )}
         </div>
+
+        <MultiplexFields control={form.control} t={t} disabled={false} />
 
         <div className="flex gap-4">
           <Button type="submit" disabled={form.formState.isSubmitting}>

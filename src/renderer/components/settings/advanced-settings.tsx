@@ -1,4 +1,4 @@
-import { useState, useMemo } from 'react';
+import { useState } from 'react';
 import { Card, CardContent } from '@/components/ui/card';
 import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
@@ -21,14 +21,6 @@ export function AdvancedSettings() {
   );
   const [isLoading, setIsLoading] = useState(false);
   const { t } = useTranslation();
-
-  // 当前选中节点为 QUIC 协议(hy2/tuic)时，"阻止 QUIC"会误杀其传输，禁用该开关
-  const isQuicNode = useMemo(() => {
-    const selectedProtocol = config?.servers
-      ?.find((s) => s.id === config?.selectedServerId)
-      ?.protocol?.toLowerCase();
-    return selectedProtocol === 'hysteria2' || selectedProtocol === 'tuic';
-  }, [config?.selectedServerId, config?.servers]);
 
   const handleSavePorts = async () => {
     if (!config) return;
@@ -311,7 +303,6 @@ export function AdvancedSettings() {
               <Checkbox
                 id="blockQuic"
                 checked={config.blockQuic === true}
-                disabled={isQuicNode}
                 onCheckedChange={(checked) => {
                   const updatedConfig = { ...config, blockQuic: checked as boolean };
                   saveConfig(updatedConfig);
@@ -323,6 +314,43 @@ export function AdvancedSettings() {
             </div>
             <p className="text-xs text-muted-foreground ml-6 mb-2">
               {t('settings.advanced.blockQuicDesc')}
+            </p>
+
+            <div className="flex items-center space-x-2 pt-2">
+              <Checkbox
+                id="interruptOnSwitch"
+                checked={config.interruptConnectionsOnSwitch === true}
+                onCheckedChange={(checked) => {
+                  const updatedConfig = {
+                    ...config,
+                    interruptConnectionsOnSwitch: checked as boolean,
+                  };
+                  saveConfig(updatedConfig);
+                }}
+              />
+              <Label htmlFor="interruptOnSwitch" className="font-normal cursor-pointer">
+                {t('settings.advanced.interruptOnSwitch')}
+              </Label>
+            </div>
+            <p className="text-xs text-muted-foreground ml-6 mb-2">
+              {t('settings.advanced.interruptOnSwitchDesc')}
+            </p>
+
+            <div className="flex items-center space-x-2 pt-2">
+              <Checkbox
+                id="tlsFragment"
+                checked={config.tlsFragment === true}
+                onCheckedChange={(checked) => {
+                  const updatedConfig = { ...config, tlsFragment: checked as boolean };
+                  saveConfig(updatedConfig);
+                }}
+              />
+              <Label htmlFor="tlsFragment" className="font-normal cursor-pointer">
+                {t('settings.advanced.tlsFragment')}
+              </Label>
+            </div>
+            <p className="text-xs text-muted-foreground ml-6 mb-2">
+              {t('settings.advanced.tlsFragmentDesc')}
             </p>
 
             {/* 自动换节点 */}
@@ -341,6 +369,27 @@ export function AdvancedSettings() {
             <p className="text-xs text-muted-foreground ml-6 mb-2">
               {t('settings.advanced.autoSwitchNodeDesc' as any) ||
                 '当前节点断线或崩溃时，自动测速并切换到延迟最低的可用节点（每次切换冷却 60 秒）'}
+            </p>
+
+            {/* 核心更新：仅在兼容版本带内自动更新 */}
+            <div className="flex items-center space-x-2 pt-2">
+              <Checkbox
+                id="restrictCoreUpdate"
+                checked={config.restrictCoreUpdateToCompatibleMinor !== false}
+                onCheckedChange={(checked) => {
+                  saveConfig({
+                    ...config,
+                    restrictCoreUpdateToCompatibleMinor: checked as boolean,
+                  });
+                }}
+              />
+              <Label htmlFor="restrictCoreUpdate" className="font-normal cursor-pointer">
+                {t('settings.advanced.restrictCoreUpdate' as any) || '仅在兼容版本带内自动更新内核'}
+              </Label>
+            </div>
+            <p className="text-xs text-muted-foreground ml-6 mb-2">
+              {t('settings.advanced.restrictCoreUpdateDesc' as any) ||
+                '仅自动更新到与当前配置生成器兼容的 sing-box 版本带（如 1.13.x）；跨版本带（如 1.14）不自动更新、转为提示随 App 升级，避免配置不兼容。手动更新不受此限制。'}
             </p>
           </div>
         </div>

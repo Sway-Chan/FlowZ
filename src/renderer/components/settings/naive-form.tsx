@@ -14,6 +14,7 @@ import {
   FormDescription,
 } from '@/components/ui/form';
 import { Input } from '@/components/ui/input';
+import { Switch } from '@/components/ui/switch';
 import {
   Select,
   SelectContent,
@@ -32,6 +33,7 @@ const createNaiveSchema = (t: any) =>
     password: z.string().min(1, t('servers.passwordRequired')),
     tlsServerName: z.string().optional(),
     tlsFingerprint: z.string().optional(),
+    useHttp3: z.boolean().optional(),
   });
 
 type NaiveFormValues = z.infer<ReturnType<typeof createNaiveSchema>>;
@@ -54,6 +56,7 @@ export function NaiveForm({ serverConfig, onSubmit }: NaiveFormProps) {
         password: serverConfig.password || '',
         tlsServerName: serverConfig.tlsSettings?.serverName || '',
         tlsFingerprint: serverConfig.tlsSettings?.fingerprint || 'none',
+        useHttp3: serverConfig.naiveSettings?.useHttp3 ?? false,
       };
     }
     return {
@@ -63,6 +66,7 @@ export function NaiveForm({ serverConfig, onSubmit }: NaiveFormProps) {
       password: '',
       tlsServerName: '',
       tlsFingerprint: 'none',
+      useHttp3: false,
     };
   };
 
@@ -85,6 +89,7 @@ export function NaiveForm({ serverConfig, onSubmit }: NaiveFormProps) {
         allowInsecure: false,
         fingerprint: values.tlsFingerprint || 'none',
       },
+      naiveSettings: values.useHttp3 ? { useHttp3: true } : undefined,
     };
     await onSubmit(config);
   };
@@ -216,6 +221,24 @@ export function NaiveForm({ serverConfig, onSubmit }: NaiveFormProps) {
                   </Select>
                   <FormDescription>{t('servers.fingerprintDesc')}</FormDescription>
                   <FormMessage />
+                </FormItem>
+              )}
+            />
+
+            <FormField
+              control={form.control}
+              name="useHttp3"
+              render={({ field }) => (
+                <FormItem className="flex flex-row items-center justify-between rounded-lg border p-3">
+                  <div className="space-y-0.5">
+                    <FormLabel className="text-foreground">
+                      {t('servers.naive.useHttp3', 'HTTP/3 (QUIC)')}
+                    </FormLabel>
+                    <FormDescription>{t('servers.naive.useHttp3Desc')}</FormDescription>
+                  </div>
+                  <FormControl>
+                    <Switch checked={field.value} onCheckedChange={field.onChange} />
+                  </FormControl>
                 </FormItem>
               )}
             />

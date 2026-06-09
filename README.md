@@ -34,6 +34,9 @@
 - ✅ 支持排除进程代理模式
 - ✅ 跨平台支持（Windows / macOS / Linux（测试））
 - ✅ 支持中英文语言切换
+- ✅ 无缝切换节点（selector + clash_api 热切换，默认优雅不断流；可选「切换时中断现有连接」）
+- ✅ Block QUIC（节点无关：reject 代理向 QUIC/UDP 443、逼浏览器回退 TCP，解决节点 UDP relay 不通导致的网页卡顿）
+- ✅ 抗封增强：TLS Fragment（全局）/ ECH / Multiplex / httpupgrade / Hysteria2 端口跳跃（订阅自动识别，部分提供手动开关）
 ---
 
 ## 🖼 界面预览
@@ -68,7 +71,7 @@
 打开 `.dmg` 并拖入 Applications
 
 ### macOS (Intel)
-需要从源码构建
+打开 `.dmg` 并拖入 Applications（已提供 Intel / x64 预构建包）
 
 若 macOS 提示“软件已损坏”：
 
@@ -91,11 +94,7 @@ npm run package:win
 npm run package:mac
 ```
 
-macOS Intel 用户需要修改 `electron-builder.json`：
-
-```json
-"arch": ["x64"]
-```
+`package:mac` 默认构建 **arm64 + x64** 两个架构（见 `electron-builder.json` 的 `mac.target.arch`）。
 
 ---
 
@@ -124,6 +123,28 @@ macOS Intel 用户需要修改 `electron-builder.json`：
 - 直连模式：不使用代理
 
 如不希望使用 TUN，可在设置中切换为“系统代理模式”。
+
+---
+
+## 🛡 抗封 / 切换 / NaiveProxy 说明
+
+### 无缝切换节点
+默认采用 **selector + clash_api 热切换**：切换节点不重启核心、现有连接保留至自然关闭，新连接走新节点（优雅不断流）。高级设置中的「**切换时中断现有连接**」开关（默认关）开启后，切换会强制断开现有连接、立即在新节点重建。跨模式/端口/TUN/规则等改动仍会重启以应用。
+
+### Block QUIC（高级设置）
+开启后对**代理向的 QUIC（UDP 443）**执行 reject、逼浏览器回退 TCP，解决「节点 UDP relay 不通导致网页卡顿/断流」。**节点无关**，对所有协议一视同仁；hysteria2/tuic/naive 等以 QUIC 拨号的节点其**自身拨号不受影响**（受 fwmark 保护）。默认关。
+
+### 抗封增强
+- **TLS Fragment**（高级设置全局开关）：切分 TLS ClientHello，规避基于 SNI 关键词的 DPI 阻断。对所有 TCP-TLS 节点生效；hysteria2/tuic/naive 自动排除（其 TLS 不在 TCP 层）。
+- **ECH / Multiplex / httpupgrade / Hysteria2 端口跳跃**：从 **sing-box JSON 订阅自动识别并生效**（Multiplex 对 reality+vision 节点自动跳过；端口跳跃支持多段范围）。
+
+### ⚠️ NaiveProxy（naive）核心库说明
+naive 出站底层走 **Chromium 的 Cronet 网络库** 以获得与浏览器一致的指纹。各平台链接方式不同：
+
+- **Linux / Windows**：cronet 走**动态库**（`libcronet.so` / `libcronet.dll`），需与核心同目录。打包时由 `npm run fetch:cronet` 从 [SagerNet/cronet-go](https://github.com/SagerNet/cronet-go/releases) 拉取并随安装包打入（体积大，不入库、CI/打包时拉取）。
+- **macOS（arm64 与 x64）**：cronet 由 sing-box 核心二进制**静态编入**（CGO），naive **开箱即用、无需任何外部库**；两个架构均随安装包发布（核心统一 sing-box 1.13.13）。
+
+> 在缺少 cronet 的平台/架构上，naive 节点会被**自动跳过**（不影响其它协议节点；若选中的正是 naive 节点会给出明确提示）。
 
 ---
 
