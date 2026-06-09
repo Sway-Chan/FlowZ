@@ -22,6 +22,7 @@ import {
   getCachePath,
 } from '../utils/paths';
 import { getAppPreset } from '../../shared/app-rules-preset';
+import coreManifest from '../../shared/core-manifest.json';
 
 /**
  * 私有 IP 地址段（CIDR 格式）
@@ -305,6 +306,35 @@ interface SingBoxRouteConfig {
   auto_detect_interface?: boolean;
   final?: string;
 }
+
+/**
+ * 浏览器隐私 DoH 泄漏域名（DoH-over-HTTPS / DoH-over-QUIC）。route reject 与 DNS 拦截须用同一份清单，
+ * 避免某处漏掉某域名导致 DoH 绕过 hijack-dns / FakeIP 体系。改这一处即两处同步。
+ */
+const DOH_LEAK_DOMAIN_KEYWORDS = [
+  'dns.google',
+  'cloudflare-dns.com',
+  'doh.opendns.com',
+  'dns.quad9.net',
+  'one.one.one.one',
+];
+
+/** 主机字符串是否为 IPv4 字面量（与 DNS/route 生成各处保持同一判定，避免分类不一致）。 */
+const isIpv4Host = (host: string): boolean => /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(host);
+
+/** 主机字符串是否为 IPv6 字面量。 */
+const isIpv6Host = (host: string): boolean => /^[0-9a-fA-F:]+$/.test(host) && host.includes(':');
+
+/**
+ * QUIC(UDP/443) reject 规则工厂：可选叠加域名/进程等匹配器。route 与各处 blockQuic 共用，
+ * 保证 network/port/action 字面量始终一致（避免某处漏写 network 导致行为漂移）。
+ */
+const udp443RejectRule = (matcher: Record<string, unknown> = {}): SingBoxRouteRule => ({
+  ...matcher,
+  network: ['udp'],
+  port: [443],
+  action: 'reject',
+});
 
 interface SingBoxExperimental {
   cache_file?: {
@@ -762,10 +792,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
       // 备选方案：尝试直接取第一组连续的数字版本号
       const secondMatch = stdout.match(/(\d+\.\d+\.\d+)/);
-      return secondMatch ? secondMatch[1] : '1.13.0';
+      return secondMatch ? secondMatch[1] : coreManifest.bundledCoreVersion;
     } catch (error) {
       this.logToManager('error', `获取核心版本失败: ${(error as any).message}`);
-      return '1.13.0';
+      return coreManifest.bundledCoreVersion;
     }
   }
 
@@ -799,9 +829,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     }
     // 选中节点不可用（naive 缺 libcronet）→ 明确报错，不静默切到别的节点（修 review M1）
     if (!this.isNodeUsable(selectedServer)) {
-      throw new Error(
-        `选中的节点「${selectedServer.name}」是 NaiveProxy，但未找到 libcronet 核心库（macOS 暂无官方预编译库）。请选择其它协议的节点。`
-      );
+      throw new Error(this.naiveUnavailableReason(selectedServer));
     }
 
     // 调试日志
@@ -1187,9 +1215,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // TUN 模式额外添加 TUN inbound
     if (modeType === 'tun') {
-      const isIpv4 = (host: string) => /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(host);
-      const isIpv6 = (host: string) => /^[0-9a-fA-F:]+$/.test(host) && host.includes(':');
-
       const shouldBypassLAN = config.bypassLAN !== false; // 默认为 true
       // 恢复 3.3.18 能完美工作的排除列表。
       // 注意：macOS 下绝对不能在底层排除物理局域网段，否则 macOS NetworkExtension 的路由逆向拦截机制会导致从 TUN (172.19.0.1) 发回 192.168.x.x 的 TCP 回执包被当作非法源 IP 丢弃，导致网页无限 HANG。
@@ -1224,14 +1249,14 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         if (!serverId) continue;
         const server = config.servers.find((s) => s.id === serverId);
         if (server?.address) {
-          if (isIpv4(server.address)) {
+          if (isIpv4Host(server.address)) {
             excludeAddr.push(`${server.address}/32`);
-          } else if (isIpv6(server.address)) {
+          } else if (isIpv6Host(server.address)) {
             excludeAddr.push(`${server.address}/128`);
           } else if (resolvedIps && resolvedIps[serverId]) {
             // 使用预解析的 IP
             const addr = resolvedIps[serverId];
-            excludeAddr.push(isIpv6(addr) ? `${addr}/128` : `${addr}/32`);
+            excludeAddr.push(isIpv6Host(addr) ? `${addr}/128` : `${addr}/32`);
           }
         }
       }
@@ -1304,6 +1329,23 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       return false;
     }
     return true;
+  }
+
+  /**
+   * naive 节点因缺 libcronet 不可用时的用户可读原因，按平台/真因区分文案：
+   * - copy-failed：内置库存在但拷贝到核心目录失败（权限/磁盘/AV），提示重启或修权限，而非误报"无预编译库"
+   * - macOS no-lib：mac-x64 等未静态编入 cronet 的核心
+   * - 其它 no-lib：linux/win 未随包提供 libcronet（如未跑 fetch-cronet）
+   */
+  private naiveUnavailableReason(server: ServerConfig): string {
+    const status = resourceManager.getCronetLibStatus();
+    if (status === 'copy-failed') {
+      return `选中的节点「${server.name}」是 NaiveProxy：libcronet 核心库已内置，但拷贝到核心目录失败（可能是权限/磁盘空间/杀软占用）。请重启应用重试或检查目录权限；如仍失败，请改用其它协议的节点。`;
+    }
+    if (process.platform === 'darwin') {
+      return `选中的节点「${server.name}」是 NaiveProxy，但当前 macOS 核心未内置 cronet（暂无官方预编译库）。请选择其它协议的节点。`;
+    }
+    return `选中的节点「${server.name}」是 NaiveProxy，但未找到 libcronet 核心库。请选择其它协议的节点。`;
   }
 
   private generateOutbounds(
@@ -1479,13 +1521,19 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       domain_resolver: 'dns-bootstrap',
     };
 
+    // vless/vmess UDP 封装：默认 xudp；可经 server.packetEncoding 覆盖（兼容拒收 xudp 的旧核心/服务端，
+    // 否则 UDP 断流且无从调整）。显式设为空串则省略该字段（不下发 packet_encoding，由核心用其默认）。
+    const packetEncoding = server.packetEncoding ?? 'xudp';
+
     // VLESS 特定配置
     if (protocol === 'vless') {
       outbound.uuid = server.uuid;
       if (server.flow) {
         outbound.flow = server.flow;
       }
-      outbound.packet_encoding = 'xudp';
+      if (packetEncoding) {
+        outbound.packet_encoding = packetEncoding;
+      }
     }
 
     // VMess 特定配置
@@ -1493,7 +1541,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       outbound.uuid = server.uuid;
       outbound.security = server.vmessSecurity || 'auto';
       outbound.alter_id = server.alterId || 0;
-      outbound.packet_encoding = 'xudp';
+      if (packetEncoding) {
+        outbound.packet_encoding = packetEncoding;
+      }
     }
 
     // Trojan 特定配置
@@ -1844,10 +1894,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       config.blockQuic === true && proxyMode !== 'direct' && config.servers.length > 0;
 
     // 给定域名匹配器，返回应配对的 udp443 reject 规则（smart 模式放在每条 →代理 规则之前），否则 null。
-    const proxyUdpRejectFor = (matcher: Record<string, any>): SingBoxRouteRule | null =>
-      blockProxyQuic
-        ? ({ ...matcher, network: ['udp'], port: [443], action: 'reject' } as any)
-        : null;
+    const proxyUdpRejectFor = (matcher: Record<string, unknown>): SingBoxRouteRule | null =>
+      blockProxyQuic ? udp443RejectRule(matcher) : null;
 
     // A. 嗅探规则（必须在前，用于识别域名）
     // 1.13+ 必须在路由层开启 sniff，替代已移除的 inbound 级别 sniff 字段
@@ -1855,7 +1903,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     if (coreVersionAtLeast(this.coreVersion, 1, 13)) {
       rules.push({
         action: 'sniff',
-      } as any);
+      });
     }
 
     // 1. 强制放行 sing-box 核心进程：防止流量回流死循环
@@ -1895,7 +1943,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     rules.push({
       protocol: 'icmp',
       action: 'reject',
-    } as any);
+    });
 
     rules.push({
       process_name: [
@@ -1946,16 +1994,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 迫使浏览器退回系统标准 UDP 53，重新被 hijack-dns 捕获进入 DNS 分流/FakeIP 体系。
     // 与下方同组 DoH 域名的 QUIC/UDP-443 reject 规则保持行为一致。
     rules.push({
-      domain_keyword: [
-        'dns.google',
-        'cloudflare-dns.com',
-        'doh.opendns.com',
-        'dns.quad9.net',
-        'one.one.one.one',
-      ],
+      domain_keyword: DOH_LEAK_DOMAIN_KEYWORDS,
       port: [443, 853],
       action: 'reject',
-    } as any);
+    });
 
     // 排除全部代理节点的域名/IP，确保到任一节点的连接走直连（防回流死循环 + 兼容无缝切换/代理链）。
     // CDN 安全：域名节点用纯域名规则(domain + domain_suffix，靠 sniff 出的 SNI 精确匹配节点域名)，
@@ -1965,9 +2007,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 扩展到全部节点(不止选中)：切节点 / detour 前置代理无需重生成配置即被豁免。
     // 必须放在其他规则之前，否则可能被 geosite-cn 匹配导致死循环。
     {
-      const isIpv4 = (host: string) => /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(host);
-      const isIpv6 = (host: string) => /^[0-9a-fA-F:]+$/.test(host) && host.includes(':');
-
       const ipSet = new Set<string>();
       const domainSet = new Set<string>();
       for (const s of config.servers) {
@@ -1975,8 +2014,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           (h): h is string => !!h && h.length > 0
         );
         for (const host of hosts) {
-          if (isIpv4(host)) ipSet.add(`${host}/32`);
-          else if (isIpv6(host)) ipSet.add(`${host}/128`);
+          if (isIpv4Host(host)) ipSet.add(`${host}/32`);
+          else if (isIpv6Host(host)) ipSet.add(`${host}/128`);
           else domainSet.add(host);
         }
       }
@@ -2164,18 +2203,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 这样游戏设为直连时，进程名匹配在前，游戏的 UDP 流量不会被误拒。
     // 仅阻断浏览器的 DoH over QUIC，迫使浏览器回退到系统 UDP 53 + hijack-dns 体系。
     // 重要：不能全量 reject 所有 UDP 443，否则 Hysteria2/TUIC 等 QUIC 协议节点会被误伤。
-    rules.push({
-      domain_keyword: [
-        'dns.google',
-        'cloudflare-dns.com',
-        'doh.opendns.com',
-        'dns.quad9.net',
-        'one.one.one.one',
-      ],
-      network: ['udp'],
-      port: [443],
-      action: 'reject',
-    } as any);
+    rules.push(udp443RejectRule({ domain_keyword: DOH_LEAK_DOMAIN_KEYWORDS }));
 
     // 【DNS 死循环防范】：sing-box 本地 DNS 解析器的请求必须强制直连，否则在全局代理模式下会产生死循环
     // 兼容 Windows 1.12.x 版本，不使用 DNS 配置里的 detour
@@ -2183,7 +2211,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       protocol: 'dns',
       action: 'route',
       outbound: 'direct',
-    } as any);
+    });
 
     rules.push({
       ip_cidr: ['223.5.5.5/32'],
@@ -2358,7 +2386,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // global 模式拦全部代理向 QUIC；smart 模式拦未被上方 →代理 配对 reject 命中的（CN 已直连豁免）。
     // 只拦 QUIC——非 QUIC 的代理向 UDP 若节点不能中继，由 sing-box 出站层自动拒绝（见上方 blockProxyQuic）。
     if (blockProxyQuic) {
-      rules.push({ network: ['udp'], port: [443], action: 'reject' } as any);
+      rules.push(udp443RejectRule());
     }
 
     return routeConfig;

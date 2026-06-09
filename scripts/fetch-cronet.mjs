@@ -9,19 +9,24 @@
  *   静态编入（CGO，实测二进制内含 cronet 符号、无 dlopen libcronet.dylib），naive 开箱即用、无需任何
  *   外部库。mac-x64 二进制未编入 cronet → naive 暂不可用（需重编带 naive 的 x64 核心）。详见 README。
  *
- * ⚠️ 版本耦合：CRONET_VERSION 应与「随 app 打包的 sing-box 所用 cronet-go 版本」对应。cronet 走
- *   C API（Chromium 稳定 ABI），跨 sing-box 小版本一般兼容；若升级 sing-box 后 naive 报符号错，提高
- *   此处版本并重打包。来源：https://github.com/SagerNet/cronet-go/releases
+ * ⚠️ 版本耦合：cronetVersion（src/shared/core-manifest.json）应与「随 app 打包的 sing-box 所用
+ *   cronet-go 版本」对应。cronet 走 C API（Chromium 稳定 ABI），跨 sing-box 小版本一般兼容；若升级
+ *   sing-box 后 naive 报符号错，提高 manifest 中的版本并重打包。该 manifest 同时被 TS 主进程读取，
+ *   是核心/cronet 版本耦合的唯一真源。来源：https://github.com/SagerNet/cronet-go/releases
  */
-import { createWriteStream, existsSync, mkdirSync, renameSync, unlinkSync } from 'fs';
+import { createWriteStream, existsSync, mkdirSync, readFileSync, renameSync, unlinkSync } from 'fs';
 import { get } from 'https';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
 
-const CRONET_VERSION = 'v148.0.7778.96-1'; // ← 与打包 sing-box 的 cronet-go 版本对齐
-const REPO = 'SagerNet/cronet-go';
-
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
+
+// 版本耦合的唯一真源：与 TS 主进程共享同一份 manifest，升级核心只需改 core-manifest.json。
+const coreManifest = JSON.parse(
+  readFileSync(join(ROOT, 'src/shared/core-manifest.json'), 'utf-8')
+);
+const CRONET_VERSION = coreManifest.cronetVersion; // ← 与打包 sing-box 的 cronet-go 版本对齐
+const REPO = 'SagerNet/cronet-go';
 const FORCE = process.argv.includes('--force');
 
 // 仅 linux/windows 走动态库；mac 静态编入核心二进制，不需下载（见文件头）。

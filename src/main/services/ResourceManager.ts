@@ -273,22 +273,41 @@ export class ResourceManager {
     return 'libcronet.so';
   }
 
-  /** 内置的 libcronet 是否存在（用于 naive 可用性判断） */
-  hasCronetLib(): boolean {
+  /**
+   * libcronet（naive 出站依赖库）的可用性状态：
+   * - 'available'：可加载（macOS 静态编入，或 linux/win 核心同目录已有库）→ naive 可用
+   * - 'copy-failed'：linux/win 内置了库、但核心同目录缺库（ensureCronetBeside 拷贝失败：EACCES/磁盘满/
+   *   AV 锁等瞬时原因）→ 非永久"无库"，应提示拷贝/权限问题而非"无预编译库"
+   * - 'no-lib'：内置就没有该平台的库（如 mac-x64 未编入、或未跑 fetch-cronet）→ 真·不可用
+   */
+  getCronetLibStatus(): 'available' | 'copy-failed' | 'no-lib' {
     try {
       // macOS：cronet 由 sing-box 二进制静态编入（CGO，无 .dylib）。打包的 mac-arm64 与 mac-x64
       // 核心（均 ≥1.13.13，with_naive_outbound）都含静态 cronet → naive 两 arch 皆可用、无需外部库。
       if (this.platform === 'darwin') {
-        return true;
+        return 'available';
       }
+      const fsSync = require('fs');
+      const libName = this.getCronetLibFilename();
       // linux/windows：cronet 走 dlopen 动态加载。检查 libcronet 是否在 sing-box 实际加载目录
       // （purego 从二进制同目录加载）：Linux/便携=可写核心目录(已由 ensureCronetBeside 拷入)，
-      // 非便携 win=内置 resources 目录。不查内置兜底——否则 beside 拷贝失败仍误判"可用"→ FATAL。
+      // 非便携 win=内置 resources 目录。不以"内置存在"直接判可用——否则 beside 拷贝失败仍误判"可用"→ FATAL。
       const coreDir = path.dirname(this.getSingBoxPath());
-      return require('fs').existsSync(path.join(coreDir, this.getCronetLibFilename()));
+      if (fsSync.existsSync(path.join(coreDir, libName))) {
+        return 'available';
+      }
+      // 加载目录缺库：区分"内置压根没有"（真·无库）与"内置有但 ensureCronetBeside 拷贝失败"（瞬时故障）。
+      // 后者不应永久按"无库/macOS 无预编译库"拒用 naive，应提示拷贝/权限问题，可通过重试/修权限恢复。
+      const bundledLib = path.join(this.getPlatformResourceDir(), libName);
+      return fsSync.existsSync(bundledLib) ? 'copy-failed' : 'no-lib';
     } catch {
-      return false;
+      return 'no-lib';
     }
+  }
+
+  /** 内置的 libcronet 是否可用（用于 naive 可用性判断）。copy-failed 也视为当前不可用（库未就位）。 */
+  hasCronetLib(): boolean {
+    return this.getCronetLibStatus() === 'available';
   }
 
   /**
@@ -303,8 +322,13 @@ export class ResourceManager {
       if ((await this.fileExists(src)) && !(await this.fileExists(dst))) {
         await fs.copyFile(src, dst);
       }
-    } catch {
-      // 复制失败不应阻断启动；naive 不可用时 sing-box 会自报 cronet 错误
+    } catch (error) {
+      // 复制失败不阻断启动（naive 不可用时 sing-box 会自报 cronet 错误），但必须告警而非静默吞掉：
+      // 否则 dst 缺库会被 getCronetLibStatus 判为 'copy-failed'，需要这条日志定位 EACCES/磁盘满/AV 锁等真因。
+      const msg = error instanceof Error ? error.message : String(error);
+      console.warn(
+        `[ResourceManager] libcronet 拷贝失败（naive 暂不可用）：${src} → ${dst}：${msg}`
+      );
     }
   }
 

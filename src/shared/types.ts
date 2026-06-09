@@ -176,6 +176,9 @@ export interface ServerConfig {
   encryption?: string;
   flow?: string;
 
+  // vless/vmess UDP 封装，默认 xudp，可设 '' 或 'packetaddr' 等
+  packetEncoding?: string;
+
   // Trojan 和 Hysteria2 通用
   password?: string;
 

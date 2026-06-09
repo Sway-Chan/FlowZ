@@ -47,6 +47,7 @@ type SingboxOutbound = {
   hop_interval?: string;
   uuid?: string;
   flow?: string;
+  packet_encoding?: string;
   username?: string;
   password?: string;
   method?: string;
@@ -119,6 +120,11 @@ export class SubscriptionService {
           createdAt: now,
           updatedAt: now,
         };
+
+        // vless/vmess UDP 封装：JSON 订阅显式携带时透传（缺省时不写，由 ProxyManager 默认 xudp）
+        if (ob.packet_encoding !== undefined) {
+          base.packetEncoding = ob.packet_encoding;
+        }
 
         // TLS / Reality
         if (ob.tls && ob.tls.enabled !== false) {

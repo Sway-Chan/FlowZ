@@ -13,6 +13,7 @@ import { resourceManager } from './ResourceManager';
 
 import type { UserConfig } from '../../shared/types';
 import { encodeMajorMinor } from '../utils/version';
+import coreManifest from '../../shared/core-manifest.json';
 
 export interface CoreUpdateCheckResult {
   hasUpdate: boolean;
@@ -34,9 +35,9 @@ export interface CoreVersionInfo {
  * FlowZ 配置生成器已验证适配的 sing-box 版本带上限，编码为 major*1000+minor（1013 = 1.13）。
  * 跨越此版本带（如 1.14）可能因 sing-box 配置 schema 破坏性变更导致生成的配置无法解析；默认不
  * 自动跨带更新（可在设置关闭）。用整数编码比较，避免 parseFloat 把 "1.20" 误判为 1.2 < 1.13 而
- * 漏放跨带更新。sing-box 升级并验证配置生成兼容后，应调高此常量。
+ * 漏放跨带更新。sing-box 升级并验证配置生成兼容后，应调高此值（统一在 core-manifest.json 维护）。
  */
-const COMPATIBLE_CEILING = 1013;
+const COMPATIBLE_CEILING = coreManifest.compatibleCeiling;
 
 export class CoreUpdateService {
   private logManager: LogManager;
