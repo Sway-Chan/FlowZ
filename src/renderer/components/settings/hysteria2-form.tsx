@@ -16,6 +16,8 @@ import { Input } from '@/components/ui/input';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Loader2 } from 'lucide-react';
 import { EchField } from './shared/anti-censor-fields';
+import { AddressField, PortField } from './shared/basic-fields';
+import { TlsServerNameField, AllowInsecureField } from './shared/tls-fields';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -127,40 +129,9 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
   return (
     <Form {...form}>
       <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
-        <FormField
-          control={form.control}
-          name="address"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('servers.serverAddress')}</FormLabel>
-              <FormControl>
-                <Input placeholder="example.com" {...field} />
-              </FormControl>
-              <FormDescription>{t('servers.serverAddressDesc')}</FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+        <AddressField control={form.control} t={t} />
 
-        <FormField
-          control={form.control}
-          name="port"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('servers.port')}</FormLabel>
-              <FormControl>
-                <Input
-                  type="number"
-                  placeholder="443"
-                  {...field}
-                  onChange={(e) => field.onChange(parseInt(e.target.value) || 0)}
-                />
-              </FormControl>
-              <FormDescription>{t('servers.portDesc')}</FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+        <PortField control={form.control} t={t} placeholder="443" />
 
         <FormField
           control={form.control}
@@ -264,36 +235,9 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
           />
         )}
 
-        <FormField
-          control={form.control}
-          name="tlsServerName"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('servers.tlsServerName')}</FormLabel>
-              <FormControl>
-                <Input placeholder="example.com" {...field} />
-              </FormControl>
-              <FormDescription>{t('servers.tlsServerNameDesc')}</FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+        <TlsServerNameField control={form.control} t={t} />
 
-        <FormField
-          control={form.control}
-          name="tlsAllowInsecure"
-          render={({ field }) => (
-            <FormItem className="flex flex-row items-start space-x-3 space-y-0">
-              <FormControl>
-                <Checkbox checked={field.value} onCheckedChange={field.onChange} />
-              </FormControl>
-              <div className="space-y-1 leading-none">
-                <FormLabel>{t('servers.allowInsecure')}</FormLabel>
-                <FormDescription>{t('servers.allowInsecureDesc')}</FormDescription>
-              </div>
-            </FormItem>
-          )}
-        />
+        <AllowInsecureField control={form.control} t={t} />
 
         <EchField control={form.control} t={t} />
 
