@@ -47,13 +47,8 @@ export function EchField({ control, t }: { control: AnyControl; t: TFn }) {
             <Checkbox checked={field.value === true} onCheckedChange={field.onChange} />
           </FormControl>
           <div className="space-y-1 leading-none">
-            <FormLabel>{t('servers.ech', 'ECH（加密 ClientHello）')}</FormLabel>
-            <FormDescription>
-              {t(
-                'servers.echDesc',
-                '加密 ClientHello、隐藏 SNI，规避基于 SNI 的阻断。需服务端/DNS 支持 ECH。'
-              )}
-            </FormDescription>
+            <FormLabel>{t('servers.ech')}</FormLabel>
+            <FormDescription>{t('servers.echDesc')}</FormDescription>
           </div>
         </FormItem>
       )}
@@ -94,12 +89,11 @@ export function MultiplexFields({
               />
             </FormControl>
             <div className="space-y-1 leading-none">
-              <FormLabel>{t('servers.multiplex', 'Multiplex 多路复用')}</FormLabel>
+              <FormLabel>{t('servers.multiplex')}</FormLabel>
               <FormDescription>
                 {disabled
-                  ? disabledReason ||
-                    t('servers.multiplexDisabled', 'Multiplex 与当前配置不兼容，已禁用。')
-                  : t('servers.multiplexDesc', '多连接复用单一隧道，降低握手开销、抗连接特征。')}
+                  ? disabledReason || t('servers.multiplexDisabled')
+                  : t('servers.multiplexDesc')}
               </FormDescription>
             </div>
           </FormItem>
@@ -113,7 +107,7 @@ export function MultiplexFields({
             name="muxProtocol"
             render={({ field }) => (
               <FormItem>
-                <FormLabel>{t('servers.multiplexProtocol', '协议')}</FormLabel>
+                <FormLabel>{t('servers.multiplexProtocol')}</FormLabel>
                 <Select onValueChange={field.onChange} value={field.value || 'h2mux'}>
                   <FormControl>
                     <SelectTrigger>
@@ -137,11 +131,11 @@ export function MultiplexFields({
               name="muxMaxConnections"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>{t('servers.multiplexMaxConn', '最大连接数')}</FormLabel>
+                  <FormLabel>{t('servers.multiplexMaxConn')}</FormLabel>
                   <FormControl>
                     <Input
                       type="number"
-                      placeholder={t('servers.optional', '可选')}
+                      placeholder={t('servers.optional')}
                       {...field}
                       value={field.value ?? ''}
                       onChange={(e) =>
@@ -158,11 +152,11 @@ export function MultiplexFields({
               name="muxMinStreams"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>{t('servers.multiplexMinStreams', '最小流数')}</FormLabel>
+                  <FormLabel>{t('servers.multiplexMinStreams')}</FormLabel>
                   <FormControl>
                     <Input
                       type="number"
-                      placeholder={t('servers.optional', '可选')}
+                      placeholder={t('servers.optional')}
                       {...field}
                       value={field.value ?? ''}
                       onChange={(e) =>
@@ -185,10 +179,8 @@ export function MultiplexFields({
                   <Checkbox checked={field.value === true} onCheckedChange={field.onChange} />
                 </FormControl>
                 <div className="space-y-1 leading-none">
-                  <FormLabel>{t('servers.multiplexPadding', '流量填充')}</FormLabel>
-                  <FormDescription>
-                    {t('servers.multiplexPaddingDesc', '填充随机流量，增强抗特征（略增开销）。')}
-                  </FormDescription>
+                  <FormLabel>{t('servers.multiplexPadding')}</FormLabel>
+                  <FormDescription>{t('servers.multiplexPaddingDesc')}</FormDescription>
                 </div>
               </FormItem>
             )}

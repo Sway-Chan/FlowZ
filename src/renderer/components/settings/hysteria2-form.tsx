@@ -18,6 +18,7 @@ import { Loader2 } from 'lucide-react';
 import { EchField } from './shared/anti-censor-fields';
 import { AddressField, PortField } from './shared/basic-fields';
 import { TlsServerNameField, AllowInsecureField } from './shared/tls-fields';
+import { echSchemaShape, echDefaults, readEchDefault } from './shared/field-schemas';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -36,7 +37,7 @@ const createHysteria2Schema = (t: any) =>
     tlsServerName: z.string().optional(),
     tlsAllowInsecure: z.boolean(),
     // ECH
-    ech: z.boolean().optional(),
+    ...echSchemaShape,
     // 端口跳跃
     serverPorts: z.string().optional(),
     hopInterval: z.string().optional(),
@@ -65,14 +66,13 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
       obfsPassword: '',
       tlsServerName: '',
       tlsAllowInsecure: false,
-      ech: false,
+      ...echDefaults,
       serverPorts: '',
       hopInterval: '',
     },
   });
 
   useEffect(() => {
-    console.log('[Hysteria2Form] Server config changed:', serverConfig);
     if (serverConfig && serverConfig.protocol?.toLowerCase() === 'hysteria2') {
       const formData = {
         address: serverConfig.address || '',
@@ -84,11 +84,10 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
         obfsPassword: serverConfig.hysteria2Settings?.obfs?.password || '',
         tlsServerName: serverConfig.tlsSettings?.serverName || '',
         tlsAllowInsecure: serverConfig.tlsSettings?.allowInsecure || false,
-        ech: serverConfig.tlsSettings?.ech === true,
+        ...readEchDefault(serverConfig),
         serverPorts: serverConfig.hysteria2Settings?.serverPorts || '',
         hopInterval: serverConfig.hysteria2Settings?.hopInterval || '',
       };
-      console.log('[Hysteria2Form] Resetting form with:', formData);
       form.reset(formData);
     }
   }, [serverConfig, form]);

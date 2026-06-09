@@ -23,6 +23,12 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { Loader2, Shield } from 'lucide-react';
 import { MultiplexFields } from './shared/anti-censor-fields';
 import { AddressField, PortField } from './shared/basic-fields';
+import {
+  multiplexSchemaShape,
+  multiplexDefaults,
+  readMultiplexDefaults,
+  buildMultiplexSettings,
+} from './shared/field-schemas';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -41,11 +47,7 @@ const createSsSchema = (t: any) =>
     shadowTlsSni: z.string().optional(),
     shadowTlsFingerprint: z.string().optional(),
     shadowTlsPort: z.number().optional(),
-    muxEnabled: z.boolean().optional(),
-    muxProtocol: z.enum(['h2mux', 'smux', 'yamux']).optional(),
-    muxMaxConnections: z.number().optional(),
-    muxMinStreams: z.number().optional(),
-    muxPadding: z.boolean().optional(),
+    ...multiplexSchemaShape,
   });
 
 type SsFormValues = z.infer<ReturnType<typeof createSsSchema>>;
@@ -111,13 +113,7 @@ export function SsForm({ serverConfig, onSubmit }: SsFormProps) {
       shadowTlsPort: hasShadowTls
         ? (serverConfig?.shadowTlsSettings?.port ?? undefined)
         : undefined,
-      muxEnabled: isSs ? serverConfig?.multiplexSettings?.enabled === true : false,
-      muxProtocol: isSs
-        ? (serverConfig?.multiplexSettings?.protocol as 'h2mux' | 'smux' | 'yamux') || 'h2mux'
-        : 'h2mux',
-      muxMaxConnections: isSs ? serverConfig?.multiplexSettings?.maxConnections : undefined,
-      muxMinStreams: isSs ? serverConfig?.multiplexSettings?.minStreams : undefined,
-      muxPadding: isSs ? serverConfig?.multiplexSettings?.padding === true : false,
+      ...(isSs && serverConfig ? readMultiplexDefaults(serverConfig) : multiplexDefaults),
     },
   });
 
@@ -135,15 +131,7 @@ export function SsForm({ serverConfig, onSubmit }: SsFormProps) {
         plugin: values.plugin || undefined,
         pluginOptions: values.pluginOptions || undefined,
       },
-      multiplexSettings: values.muxEnabled
-        ? {
-            enabled: true,
-            protocol: values.muxProtocol || 'h2mux',
-            maxConnections: values.muxMaxConnections,
-            minStreams: values.muxMinStreams,
-            padding: values.muxPadding === true,
-          }
-        : undefined,
+      multiplexSettings: buildMultiplexSettings(values),
     };
 
     if (values.enableShadowTls && values.shadowTlsPassword && values.shadowTlsSni) {

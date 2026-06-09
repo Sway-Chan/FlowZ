@@ -30,6 +30,15 @@ import {
   AlpnField,
 } from './shared/tls-fields';
 import { WsPathField, WsHostField } from './shared/transport-fields';
+import {
+  echSchemaShape,
+  multiplexSchemaShape,
+  echDefaults,
+  multiplexDefaults,
+  readEchDefault,
+  readMultiplexDefaults,
+  buildMultiplexSettings,
+} from './shared/field-schemas';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -46,12 +55,8 @@ const createTrojanSchema = (t: any) =>
     alpn: z.string().optional(),
     wsPath: z.string().optional(),
     wsHost: z.string().optional(),
-    ech: z.boolean().optional(),
-    muxEnabled: z.boolean().optional(),
-    muxProtocol: z.enum(['h2mux', 'smux', 'yamux']).optional(),
-    muxMaxConnections: z.number().optional(),
-    muxMinStreams: z.number().optional(),
-    muxPadding: z.boolean().optional(),
+    ...echSchemaShape,
+    ...multiplexSchemaShape,
   });
 
 type TrojanFormValues = z.infer<ReturnType<typeof createTrojanSchema>>;
@@ -79,17 +84,12 @@ export function TrojanForm({ serverConfig, onSubmit }: TrojanFormProps) {
       alpn: '',
       wsPath: '',
       wsHost: '',
-      ech: false,
-      muxEnabled: false,
-      muxProtocol: 'h2mux',
-      muxMaxConnections: undefined,
-      muxMinStreams: undefined,
-      muxPadding: false,
+      ...echDefaults,
+      ...multiplexDefaults,
     },
   });
 
   useEffect(() => {
-    console.log('[TrojanForm] Server config changed:', serverConfig);
     if (serverConfig && serverConfig.protocol?.toLowerCase() === 'trojan') {
       // 标准化 network 和 security 值（转为全小写以匹配 schema）
       const normalizeNetwork = (n: string | undefined): 'tcp' | 'ws' | 'h2' | 'httpupgrade' => {
@@ -116,21 +116,14 @@ export function TrojanForm({ serverConfig, onSubmit }: TrojanFormProps) {
         alpn: serverConfig.tlsSettings?.alpn?.join(',') || '',
         wsPath: serverConfig.wsSettings?.path || '',
         wsHost: serverConfig.wsSettings?.headers?.['Host'] || '',
-        ech: serverConfig.tlsSettings?.ech === true,
-        muxEnabled: serverConfig.multiplexSettings?.enabled === true,
-        muxProtocol:
-          (serverConfig.multiplexSettings?.protocol as 'h2mux' | 'smux' | 'yamux') || 'h2mux',
-        muxMaxConnections: serverConfig.multiplexSettings?.maxConnections,
-        muxMinStreams: serverConfig.multiplexSettings?.minStreams,
-        muxPadding: serverConfig.multiplexSettings?.padding === true,
+        ...readEchDefault(serverConfig),
+        ...readMultiplexDefaults(serverConfig),
       };
-      console.log('[TrojanForm] Resetting form with:', formData);
       form.reset(formData);
     }
   }, [serverConfig, form]);
 
   const handleSubmit = async (values: TrojanFormValues) => {
-    console.log('[TrojanForm] Submitting values:', values);
     const config = {
       protocol: 'trojan',
       address: values.address,
@@ -155,15 +148,7 @@ export function TrojanForm({ serverConfig, onSubmit }: TrojanFormProps) {
               headers: values.wsHost ? { Host: values.wsHost } : undefined,
             }
           : null,
-      multiplexSettings: values.muxEnabled
-        ? {
-            enabled: true,
-            protocol: values.muxProtocol || 'h2mux',
-            maxConnections: values.muxMaxConnections,
-            minStreams: values.muxMinStreams,
-            padding: values.muxPadding === true,
-          }
-        : undefined,
+      multiplexSettings: buildMultiplexSettings(values),
     };
 
     try {

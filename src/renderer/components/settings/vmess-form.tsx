@@ -24,34 +24,43 @@ import { EchField, MultiplexFields } from './shared/anti-censor-fields';
 import { AddressField, PortField } from './shared/basic-fields';
 import { TlsServerNameField, FingerprintField, AllowInsecureField } from './shared/tls-fields';
 import { WsPathField, WsHostField } from './shared/transport-fields';
+import {
+  echSchemaShape,
+  multiplexSchemaShape,
+  echDefaults,
+  multiplexDefaults,
+  readEchDefault,
+  readMultiplexDefaults,
+  buildMultiplexSettings,
+} from './shared/field-schemas';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
-const vmessFormSchema = z.object({
-  address: z.string().min(1, 'Address is required'),
-  port: z.number().min(1).max(65535),
-  uuid: z
-    .string()
-    .min(1, 'UUID is required')
-    .regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i, 'Invalid UUID'),
-  alterId: z.number().default(0),
-  vmessSecurity: z.string().default('auto'),
-  network: z.enum(['Tcp', 'Ws', 'H2', 'HttpUpgrade']),
-  security: z.enum(['None', 'Tls']),
-  tlsServerName: z.string().optional().or(z.literal('')),
-  tlsAllowInsecure: z.boolean(),
-  tlsFingerprint: z.string().optional().or(z.literal('')),
-  wsPath: z.string().optional().or(z.literal('')),
-  wsHost: z.string().optional().or(z.literal('')),
-  ech: z.boolean().optional(),
-  muxEnabled: z.boolean().optional(),
-  muxProtocol: z.enum(['h2mux', 'smux', 'yamux']).optional(),
-  muxMaxConnections: z.number().optional(),
-  muxMinStreams: z.number().optional(),
-  muxPadding: z.boolean().optional(),
-});
+const createVmessSchema = (t: any) =>
+  z.object({
+    address: z.string().min(1, t('servers.addressRequired')),
+    port: z.number().min(1).max(65535),
+    uuid: z
+      .string()
+      .min(1, t('servers.uuidRequired'))
+      .regex(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+        t('servers.uuidInvalid')
+      ),
+    alterId: z.number().default(0),
+    vmessSecurity: z.string().default('auto'),
+    network: z.enum(['Tcp', 'Ws', 'H2', 'HttpUpgrade']),
+    security: z.enum(['None', 'Tls']),
+    tlsServerName: z.string().optional().or(z.literal('')),
+    tlsAllowInsecure: z.boolean(),
+    tlsFingerprint: z.string().optional().or(z.literal('')),
+    wsPath: z.string().optional().or(z.literal('')),
+    wsHost: z.string().optional().or(z.literal('')),
+    ...echSchemaShape,
+    ...multiplexSchemaShape,
+  });
 
-type VmessFormValues = z.infer<typeof vmessFormSchema>;
+type VmessFormValues = z.infer<ReturnType<typeof createVmessSchema>>;
 
 interface VmessFormProps {
   serverConfig?: ServerConfig;
@@ -60,6 +69,7 @@ interface VmessFormProps {
 
 export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
   const { t } = useTranslation();
+  const vmessFormSchema = createVmessSchema(t);
 
   const normalizeNetwork = (n: string | undefined): 'Tcp' | 'Ws' | 'H2' | 'HttpUpgrade' => {
     const lower = (n || 'tcp').toLowerCase();
@@ -90,13 +100,8 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
         tlsFingerprint: serverConfig.tlsSettings?.fingerprint || 'chrome',
         wsPath: serverConfig.wsSettings?.path || '',
         wsHost: serverConfig.wsSettings?.headers?.['Host'] || '',
-        ech: serverConfig.tlsSettings?.ech === true,
-        muxEnabled: serverConfig.multiplexSettings?.enabled === true,
-        muxProtocol:
-          (serverConfig.multiplexSettings?.protocol as 'h2mux' | 'smux' | 'yamux') || 'h2mux',
-        muxMaxConnections: serverConfig.multiplexSettings?.maxConnections,
-        muxMinStreams: serverConfig.multiplexSettings?.minStreams,
-        muxPadding: serverConfig.multiplexSettings?.padding === true,
+        ...readEchDefault(serverConfig),
+        ...readMultiplexDefaults(serverConfig),
       };
     }
     return {
@@ -112,12 +117,8 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
       tlsFingerprint: 'chrome',
       wsPath: '',
       wsHost: '',
-      ech: false,
-      muxEnabled: false,
-      muxProtocol: 'h2mux',
-      muxMaxConnections: undefined,
-      muxMinStreams: undefined,
-      muxPadding: false,
+      ...echDefaults,
+      ...multiplexDefaults,
     };
   };
 
@@ -155,15 +156,7 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
               headers: values.wsHost ? { Host: values.wsHost } : undefined,
             }
           : null,
-      multiplexSettings: values.muxEnabled
-        ? {
-            enabled: true,
-            protocol: values.muxProtocol || 'h2mux',
-            maxConnections: values.muxMaxConnections,
-            minStreams: values.muxMinStreams,
-            padding: values.muxPadding === true,
-          }
-        : undefined,
+      multiplexSettings: buildMultiplexSettings(values),
     };
 
     await onSubmit(serverConfig);

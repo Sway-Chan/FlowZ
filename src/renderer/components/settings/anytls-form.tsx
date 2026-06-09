@@ -25,6 +25,7 @@ import { EchField } from './shared/anti-censor-fields';
 import { AddressField, PortField } from './shared/basic-fields';
 import { TlsServerNameField, FingerprintField, AllowInsecureField } from './shared/tls-fields';
 import { RealityPublicKeyField, RealityShortIdField } from './shared/reality-fields';
+import { echSchemaShape, echDefaults, readEchDefault } from './shared/field-schemas';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -45,7 +46,7 @@ const createAnyTlsSchema = (t: any) =>
     tlsAllowInsecure: z.boolean(),
     realityPublicKey: z.string().optional(),
     realityShortId: z.string().optional(),
-    ech: z.boolean().optional(),
+    ...echSchemaShape,
   });
 
 type AnyTlsFormValues = z.infer<ReturnType<typeof createAnyTlsSchema>>;
@@ -71,7 +72,7 @@ export function AnyTlsForm({ serverConfig, onSubmit }: AnyTlsFormProps) {
         tlsAllowInsecure: serverConfig.tlsSettings?.allowInsecure || false,
         realityPublicKey: serverConfig.realitySettings?.publicKey || '',
         realityShortId: serverConfig.realitySettings?.shortId || '',
-        ech: serverConfig.tlsSettings?.ech === true,
+        ...readEchDefault(serverConfig),
       };
     }
     return {
@@ -84,7 +85,7 @@ export function AnyTlsForm({ serverConfig, onSubmit }: AnyTlsFormProps) {
       tlsAllowInsecure: false,
       realityPublicKey: '',
       realityShortId: '',
-      ech: false,
+      ...echDefaults,
     };
   };
 

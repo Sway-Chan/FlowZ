@@ -23,6 +23,7 @@ import {
 import { EchField } from './shared/anti-censor-fields';
 import { AddressField, PortField } from './shared/basic-fields';
 import { TlsServerNameField, AllowInsecureField, AlpnField } from './shared/tls-fields';
+import { echSchemaShape, echDefaults, readEchDefault } from './shared/field-schemas';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -37,7 +38,7 @@ const createTuicSchema = (t: any) =>
     tlsServerName: z.string().optional(),
     tlsAllowInsecure: z.boolean(),
     alpn: z.string().optional(),
-    ech: z.boolean().optional(),
+    ...echSchemaShape,
   });
 
 type TuicFormValues = z.infer<ReturnType<typeof createTuicSchema>>;
@@ -63,7 +64,7 @@ export function TuicForm({ serverConfig, onSubmit }: TuicFormProps) {
       tlsServerName: '',
       tlsAllowInsecure: false,
       alpn: 'h3',
-      ech: false,
+      ...echDefaults,
     },
   });
 
@@ -79,7 +80,7 @@ export function TuicForm({ serverConfig, onSubmit }: TuicFormProps) {
         tlsServerName: serverConfig.tlsSettings?.serverName || '',
         tlsAllowInsecure: serverConfig.tlsSettings?.allowInsecure || false,
         alpn: serverConfig.tlsSettings?.alpn?.join(',') || 'h3',
-        ech: serverConfig.tlsSettings?.ech === true,
+        ...readEchDefault(serverConfig),
       };
       form.reset(formData);
     }

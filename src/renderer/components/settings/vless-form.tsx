@@ -25,6 +25,15 @@ import { AddressField, PortField } from './shared/basic-fields';
 import { TlsServerNameField, FingerprintField, AllowInsecureField } from './shared/tls-fields';
 import { WsPathField, WsHostField } from './shared/transport-fields';
 import { RealityPublicKeyField, RealityShortIdField } from './shared/reality-fields';
+import {
+  echSchemaShape,
+  multiplexSchemaShape,
+  echDefaults,
+  multiplexDefaults,
+  readEchDefault,
+  readMultiplexDefaults,
+  buildMultiplexSettings,
+} from './shared/field-schemas';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -50,12 +59,8 @@ const createVlessSchema = (t: any) =>
     realityShortId: z.string().optional(),
     wsPath: z.string().optional(),
     wsHost: z.string().optional(),
-    ech: z.boolean().optional(),
-    muxEnabled: z.boolean().optional(),
-    muxProtocol: z.enum(['h2mux', 'smux', 'yamux']).optional(),
-    muxMaxConnections: z.number().optional(),
-    muxMinStreams: z.number().optional(),
-    muxPadding: z.boolean().optional(),
+    ...echSchemaShape,
+    ...multiplexSchemaShape,
   });
 
 type VlessFormValues = z.infer<ReturnType<typeof createVlessSchema>>;
@@ -101,13 +106,8 @@ export function VlessForm({ serverConfig, onSubmit }: VlessFormProps) {
         realityShortId: serverConfig.realitySettings?.shortId || '',
         wsPath: serverConfig.wsSettings?.path || '',
         wsHost: serverConfig.wsSettings?.headers?.['Host'] || '',
-        ech: serverConfig.tlsSettings?.ech === true,
-        muxEnabled: serverConfig.multiplexSettings?.enabled === true,
-        muxProtocol:
-          (serverConfig.multiplexSettings?.protocol as 'h2mux' | 'smux' | 'yamux') || 'h2mux',
-        muxMaxConnections: serverConfig.multiplexSettings?.maxConnections,
-        muxMinStreams: serverConfig.multiplexSettings?.minStreams,
-        muxPadding: serverConfig.multiplexSettings?.padding === true,
+        ...readEchDefault(serverConfig),
+        ...readMultiplexDefaults(serverConfig),
       };
     }
     return {
@@ -125,12 +125,8 @@ export function VlessForm({ serverConfig, onSubmit }: VlessFormProps) {
       realityShortId: '',
       wsPath: '',
       wsHost: '',
-      ech: false,
-      muxEnabled: false,
-      muxProtocol: 'h2mux',
-      muxMaxConnections: undefined,
-      muxMinStreams: undefined,
-      muxPadding: false,
+      ...echDefaults,
+      ...multiplexDefaults,
     };
   };
 
@@ -175,16 +171,7 @@ export function VlessForm({ serverConfig, onSubmit }: VlessFormProps) {
               headers: values.wsHost ? { Host: values.wsHost } : undefined,
             }
           : null,
-      multiplexSettings:
-        values.muxEnabled && values.flow !== 'xtls-rprx-vision'
-          ? {
-              enabled: true,
-              protocol: values.muxProtocol || 'h2mux',
-              maxConnections: values.muxMaxConnections,
-              minStreams: values.muxMinStreams,
-              padding: values.muxPadding === true,
-            }
-          : undefined,
+      multiplexSettings: buildMultiplexSettings(values, { skipVisionFlow: true }),
     };
 
     await onSubmit(serverConfig);

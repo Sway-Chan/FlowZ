@@ -65,7 +65,11 @@ export function PortField({
               type="number"
               placeholder={placeholder}
               {...field}
-              onChange={(e) => field.onChange(parseInt(e.target.value) || 0)}
+              onChange={(e) =>
+                field.onChange(
+                  e.target.value === '' ? undefined : parseInt(e.target.value, 10) || 0
+                )
+              }
             />
           </FormControl>
           <FormDescription>{t('servers.portDesc')}</FormDescription>
