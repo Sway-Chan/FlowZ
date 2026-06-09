@@ -12,6 +12,7 @@ import { ProxyManager } from './ProxyManager';
 import { resourceManager } from './ResourceManager';
 
 import type { UserConfig } from '../../shared/types';
+import { encodeMajorMinor } from '../utils/version';
 
 export interface CoreUpdateCheckResult {
   hasUpdate: boolean;
@@ -113,7 +114,7 @@ export class CoreUpdateService {
 
         // 版本带闸门：默认不自动跨越配置生成器已验证的版本带上限（防 schema 破坏导致无法解析）
         if (await this.isRestrictToCompatibleMinor()) {
-          const latest = this.encodeMajorMinor(latestVersion);
+          const latest = encodeMajorMinor(latestVersion);
           if (!isNaN(latest) && latest > COMPATIBLE_CEILING) {
             this.logManager.addLog(
               'info',
@@ -270,6 +271,16 @@ export class CoreUpdateService {
       }
 
       this.logManager.addLog('info', '核心文件替换成功', 'CoreUpdateService');
+
+      // naive 依赖随 app 打包的 libcronet（匹配出厂核心的 cronet-go 版本）。单独更新核心——尤其跨版本——
+      // 可能与打包库 ABI 漂移；该漂移在 dlopen 前不可见，sing-box check 预检无法发现。有 naive 节点则提示。
+      if (this.proxyManager?.hasNaiveNodes()) {
+        this.logManager.addLog(
+          'warn',
+          'naive 节点依赖随 app 打包的 libcronet；本次核心更新后如遇 naive 不可用，请回滚核心或等待 app 整体更新',
+          'CoreUpdateService'
+        );
+      }
 
       // 标记"待首启验证"：稳定运行→删备份（稳定即弃）；首启失败→自动回滚（见 index 'error' 钩子）。
       // 同时抑制 ProxyManager 自动重启——让新核心首次异常退出立即上报，而非在坏核心上空转重试。
@@ -672,12 +683,6 @@ export class CoreUpdateService {
     }
   }
 
-  /** 把版本编码为可比较整数 major*1000+minor（"1.20.3"→1020），用于版本带比较；无法解析返回 NaN。 */
-  private encodeMajorMinor(version: string): number {
-    const m = version.match(/^(\d+)\.(\d+)/);
-    return m ? parseInt(m[1], 10) * 1000 + parseInt(m[2], 10) : NaN;
-  }
-
   private async isRestrictToCompatibleMinor(): Promise<boolean> {
     try {
       if (!this.configProvider) return true;
@@ -975,12 +980,30 @@ export class CoreUpdateService {
           return;
         }
 
+        // 完整性校验：累计字节与 Content-Length 比对，拦截被截断/中断的下载流入解压
+        const lenHeader = response.headers['content-length'];
+        const expectedBytes = parseInt(
+          (Array.isArray(lenHeader) ? lenHeader[0] : lenHeader) as string,
+          10
+        );
+        let receivedBytes = 0;
+
         response.on('data', (chunk) => {
+          receivedBytes += chunk.length;
           file.write(chunk);
         });
 
         response.on('end', () => {
           file.close(() => {
+            if (!isNaN(expectedBytes) && receivedBytes !== expectedBytes) {
+              // 截断的 GitHub 下载会经 handleError 自动换镜像重试一次
+              handleError(
+                new Error(
+                  `下载不完整：收到 ${receivedBytes} 字节，期望 ${expectedBytes}（可能被截断）`
+                )
+              );
+              return;
+            }
             resolve(tempPath);
           });
         });
