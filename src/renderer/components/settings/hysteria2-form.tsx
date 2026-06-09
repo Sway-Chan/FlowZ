@@ -15,6 +15,7 @@ import {
 import { Input } from '@/components/ui/input';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Loader2 } from 'lucide-react';
+import { EchField } from './shared/anti-censor-fields';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -32,6 +33,11 @@ const createHysteria2Schema = (t: any) =>
     // TLS 设置
     tlsServerName: z.string().optional(),
     tlsAllowInsecure: z.boolean(),
+    // ECH
+    ech: z.boolean().optional(),
+    // 端口跳跃
+    serverPorts: z.string().optional(),
+    hopInterval: z.string().optional(),
   });
 
 type Hysteria2FormValues = z.infer<ReturnType<typeof createHysteria2Schema>>;
@@ -57,6 +63,9 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
       obfsPassword: '',
       tlsServerName: '',
       tlsAllowInsecure: false,
+      ech: false,
+      serverPorts: '',
+      hopInterval: '',
     },
   });
 
@@ -73,6 +82,9 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
         obfsPassword: serverConfig.hysteria2Settings?.obfs?.password || '',
         tlsServerName: serverConfig.tlsSettings?.serverName || '',
         tlsAllowInsecure: serverConfig.tlsSettings?.allowInsecure || false,
+        ech: serverConfig.tlsSettings?.ech === true,
+        serverPorts: serverConfig.hysteria2Settings?.serverPorts || '',
+        hopInterval: serverConfig.hysteria2Settings?.hopInterval || '',
       };
       console.log('[Hysteria2Form] Resetting form with:', formData);
       form.reset(formData);
@@ -90,6 +102,7 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
       tlsSettings: {
         serverName: values.tlsServerName || undefined,
         allowInsecure: values.tlsAllowInsecure,
+        ech: values.ech ? true : undefined,
       },
       hysteria2Settings: {
         upMbps: values.upMbps || undefined,
@@ -101,6 +114,8 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
                 password: values.obfsPassword,
               }
             : undefined,
+        serverPorts: values.serverPorts?.trim() || undefined,
+        hopInterval: values.hopInterval?.trim() || undefined,
       },
     };
 
@@ -279,6 +294,47 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
             </FormItem>
           )}
         />
+
+        <EchField control={form.control} t={t} />
+
+        <div className="grid grid-cols-2 gap-4">
+          <FormField
+            control={form.control}
+            name="serverPorts"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>{t('servers.hopPorts', '端口跳跃范围')}</FormLabel>
+                <FormControl>
+                  <Input placeholder="20000:30000,40000:50000" {...field} />
+                </FormControl>
+                <FormDescription>
+                  {t(
+                    'servers.hopPortsDesc',
+                    '逗号分隔的端口范围，如 20000:30000,40000:50000。留空则不启用。'
+                  )}
+                </FormDescription>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+
+          <FormField
+            control={form.control}
+            name="hopInterval"
+            render={({ field }) => (
+              <FormItem>
+                <FormLabel>{t('servers.hopInterval', '跳跃间隔')}</FormLabel>
+                <FormControl>
+                  <Input placeholder="30s" {...field} />
+                </FormControl>
+                <FormDescription>
+                  {t('servers.hopIntervalDesc', '端口跳跃的时间间隔，如 30s。留空使用默认值。')}
+                </FormDescription>
+                <FormMessage />
+              </FormItem>
+            )}
+          />
+        </div>
 
         <div className="flex gap-4">
           <Button type="submit" disabled={form.formState.isSubmitting}>

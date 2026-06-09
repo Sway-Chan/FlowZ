@@ -22,6 +22,7 @@ import {
 } from '@/components/ui/select';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Loader2 } from 'lucide-react';
+import { EchField } from './shared/anti-censor-fields';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -42,6 +43,7 @@ const createAnyTlsSchema = (t: any) =>
     tlsAllowInsecure: z.boolean(),
     realityPublicKey: z.string().optional(),
     realityShortId: z.string().optional(),
+    ech: z.boolean().optional(),
   });
 
 type AnyTlsFormValues = z.infer<ReturnType<typeof createAnyTlsSchema>>;
@@ -67,6 +69,7 @@ export function AnyTlsForm({ serverConfig, onSubmit }: AnyTlsFormProps) {
         tlsAllowInsecure: serverConfig.tlsSettings?.allowInsecure || false,
         realityPublicKey: serverConfig.realitySettings?.publicKey || '',
         realityShortId: serverConfig.realitySettings?.shortId || '',
+        ech: serverConfig.tlsSettings?.ech === true,
       };
     }
     return {
@@ -79,6 +82,7 @@ export function AnyTlsForm({ serverConfig, onSubmit }: AnyTlsFormProps) {
       tlsAllowInsecure: false,
       realityPublicKey: '',
       realityShortId: '',
+      ech: false,
     };
   };
 
@@ -104,6 +108,7 @@ export function AnyTlsForm({ serverConfig, onSubmit }: AnyTlsFormProps) {
         serverName: values.tlsServerName?.trim() || undefined,
         fingerprint: values.tlsFingerprint || 'chrome',
         allowInsecure: values.security === 'tls' ? values.tlsAllowInsecure : false,
+        ech: values.ech ? true : undefined,
       },
     };
 
@@ -260,6 +265,8 @@ export function AnyTlsForm({ serverConfig, onSubmit }: AnyTlsFormProps) {
                 </FormItem>
               )}
             />
+
+            <EchField control={form.control} t={t} />
           </>
         )}
 

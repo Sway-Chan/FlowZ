@@ -21,6 +21,7 @@ import {
 } from '@/components/ui/select';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Loader2 } from 'lucide-react';
+import { EchField, MultiplexFields } from './shared/anti-censor-fields';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -33,13 +34,19 @@ const vmessFormSchema = z.object({
     .regex(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i, 'Invalid UUID'),
   alterId: z.number().default(0),
   vmessSecurity: z.string().default('auto'),
-  network: z.enum(['Tcp', 'Ws', 'H2']),
+  network: z.enum(['Tcp', 'Ws', 'H2', 'HttpUpgrade']),
   security: z.enum(['None', 'Tls']),
   tlsServerName: z.string().optional().or(z.literal('')),
   tlsAllowInsecure: z.boolean(),
   tlsFingerprint: z.string().optional().or(z.literal('')),
   wsPath: z.string().optional().or(z.literal('')),
   wsHost: z.string().optional().or(z.literal('')),
+  ech: z.boolean().optional(),
+  muxEnabled: z.boolean().optional(),
+  muxProtocol: z.enum(['h2mux', 'smux', 'yamux']).optional(),
+  muxMaxConnections: z.number().optional(),
+  muxMinStreams: z.number().optional(),
+  muxPadding: z.boolean().optional(),
 });
 
 type VmessFormValues = z.infer<typeof vmessFormSchema>;
@@ -52,9 +59,10 @@ interface VmessFormProps {
 export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
   const { t } = useTranslation();
 
-  const normalizeNetwork = (n: string | undefined): 'Tcp' | 'Ws' | 'H2' => {
+  const normalizeNetwork = (n: string | undefined): 'Tcp' | 'Ws' | 'H2' | 'HttpUpgrade' => {
     const lower = (n || 'tcp').toLowerCase();
     if (lower === 'ws' || lower === 'websocket') return 'Ws';
+    if (lower === 'httpupgrade') return 'HttpUpgrade';
     if (lower === 'h2' || lower === 'http2') return 'H2';
     return 'Tcp';
   };
@@ -80,6 +88,13 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
         tlsFingerprint: serverConfig.tlsSettings?.fingerprint || 'chrome',
         wsPath: serverConfig.wsSettings?.path || '',
         wsHost: serverConfig.wsSettings?.headers?.['Host'] || '',
+        ech: serverConfig.tlsSettings?.ech === true,
+        muxEnabled: serverConfig.multiplexSettings?.enabled === true,
+        muxProtocol:
+          (serverConfig.multiplexSettings?.protocol as 'h2mux' | 'smux' | 'yamux') || 'h2mux',
+        muxMaxConnections: serverConfig.multiplexSettings?.maxConnections,
+        muxMinStreams: serverConfig.multiplexSettings?.minStreams,
+        muxPadding: serverConfig.multiplexSettings?.padding === true,
       };
     }
     return {
@@ -95,6 +110,12 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
       tlsFingerprint: 'chrome',
       wsPath: '',
       wsHost: '',
+      ech: false,
+      muxEnabled: false,
+      muxProtocol: 'h2mux',
+      muxMaxConnections: undefined,
+      muxMinStreams: undefined,
+      muxPadding: false,
     };
   };
 
@@ -104,7 +125,7 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
   });
 
   const handleSubmit = async (values: VmessFormValues) => {
-    const network = values.network.toLowerCase() as 'tcp' | 'ws' | 'h2';
+    const network = values.network.toLowerCase() as 'tcp' | 'ws' | 'h2' | 'httpupgrade';
     const security = values.security.toLowerCase() as 'none' | 'tls';
 
     const serverConfig = {
@@ -122,22 +143,33 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
               serverName: values.tlsServerName?.trim() || null,
               allowInsecure: values.tlsAllowInsecure,
               fingerprint: values.tlsFingerprint || 'chrome',
+              ech: values.ech ? true : undefined,
             }
           : null,
       wsSettings:
-        network === 'ws'
+        network === 'ws' || network === 'httpupgrade'
           ? {
               path: values.wsPath || '/',
-              host: values.wsHost || null,
+              headers: values.wsHost ? { Host: values.wsHost } : undefined,
             }
           : null,
+      multiplexSettings: values.muxEnabled
+        ? {
+            enabled: true,
+            protocol: values.muxProtocol || 'h2mux',
+            maxConnections: values.muxMaxConnections,
+            minStreams: values.muxMinStreams,
+            padding: values.muxPadding === true,
+          }
+        : undefined,
     };
 
     await onSubmit(serverConfig);
   };
 
   const isTlsEnabled = form.watch('security') === 'Tls';
-  const isWebSocketEnabled = form.watch('network') === 'Ws';
+  const isWebSocketEnabled =
+    form.watch('network') === 'Ws' || form.watch('network') === 'HttpUpgrade';
 
   return (
     <Form {...form}>
@@ -255,6 +287,7 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
                 <SelectContent>
                   <SelectItem value="Tcp">TCP</SelectItem>
                   <SelectItem value="Ws">WebSocket</SelectItem>
+                  <SelectItem value="HttpUpgrade">HTTPUpgrade</SelectItem>
                   <SelectItem value="H2">HTTP/2</SelectItem>
                 </SelectContent>
               </Select>
@@ -349,6 +382,8 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
                 </FormItem>
               )}
             />
+
+            <EchField control={form.control} t={t} />
           </>
         )}
 
@@ -385,6 +420,8 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
             />
           </>
         )}
+
+        <MultiplexFields control={form.control} t={t} disabled={false} />
 
         <div className="flex gap-4">
           <Button type="submit" disabled={form.formState.isSubmitting}>

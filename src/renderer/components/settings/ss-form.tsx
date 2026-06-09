@@ -21,6 +21,7 @@ import {
 } from '@/components/ui/select';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Loader2, Shield } from 'lucide-react';
+import { MultiplexFields } from './shared/anti-censor-fields';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -39,6 +40,11 @@ const createSsSchema = (t: any) =>
     shadowTlsSni: z.string().optional(),
     shadowTlsFingerprint: z.string().optional(),
     shadowTlsPort: z.number().optional(),
+    muxEnabled: z.boolean().optional(),
+    muxProtocol: z.enum(['h2mux', 'smux', 'yamux']).optional(),
+    muxMaxConnections: z.number().optional(),
+    muxMinStreams: z.number().optional(),
+    muxPadding: z.boolean().optional(),
   });
 
 type SsFormValues = z.infer<ReturnType<typeof createSsSchema>>;
@@ -104,6 +110,13 @@ export function SsForm({ serverConfig, onSubmit }: SsFormProps) {
       shadowTlsPort: hasShadowTls
         ? (serverConfig?.shadowTlsSettings?.port ?? undefined)
         : undefined,
+      muxEnabled: isSs ? serverConfig?.multiplexSettings?.enabled === true : false,
+      muxProtocol: isSs
+        ? (serverConfig?.multiplexSettings?.protocol as 'h2mux' | 'smux' | 'yamux') || 'h2mux'
+        : 'h2mux',
+      muxMaxConnections: isSs ? serverConfig?.multiplexSettings?.maxConnections : undefined,
+      muxMinStreams: isSs ? serverConfig?.multiplexSettings?.minStreams : undefined,
+      muxPadding: isSs ? serverConfig?.multiplexSettings?.padding === true : false,
     },
   });
 
@@ -121,6 +134,15 @@ export function SsForm({ serverConfig, onSubmit }: SsFormProps) {
         plugin: values.plugin || undefined,
         pluginOptions: values.pluginOptions || undefined,
       },
+      multiplexSettings: values.muxEnabled
+        ? {
+            enabled: true,
+            protocol: values.muxProtocol || 'h2mux',
+            maxConnections: values.muxMaxConnections,
+            minStreams: values.muxMinStreams,
+            padding: values.muxPadding === true,
+          }
+        : undefined,
     };
 
     if (values.enableShadowTls && values.shadowTlsPassword && values.shadowTlsSni) {
@@ -390,6 +412,8 @@ export function SsForm({ serverConfig, onSubmit }: SsFormProps) {
             </div>
           )}
         </div>
+
+        <MultiplexFields control={form.control} t={t} disabled={false} />
 
         <div className="flex gap-4">
           <Button type="submit" disabled={form.formState.isSubmitting}>
