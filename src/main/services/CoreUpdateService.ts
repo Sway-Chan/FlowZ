@@ -46,6 +46,9 @@ export class CoreUpdateService {
   private pendingUpdateVersion: string | null = null;
   private pendingUpdateAt: number = 0; // 更新落盘时间戳，用于"待验证"过期保护（防陈旧 pending 误回滚）
   private stabilityTimer: ReturnType<typeof setTimeout> | null = null;
+  // 兜底计时器：更新后若迟迟无 'started'/'error' 事件来解决待验证态（如更新时代理未运行、用户不重启），
+  // 到期解除自动重启抑制，避免抑制闩永久挂起。
+  private pendingFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private configProvider: (() => Promise<UserConfig>) | null = null;
   // 新核心首启成功后需"稳定运行"此时长（无 error）才删旧备份——防 'started'(仅1s存活) 假成功删掉回滚网。
   // 不变量：必须 > ProxyManager 健康检查间隔(10s)，否则 TUN 模式下崩溃在轮询检测到之前就被判稳定、误删备份。
@@ -287,6 +290,20 @@ export class CoreUpdateService {
       this.pendingUpdateVersion = preflight.version;
       this.pendingUpdateAt = Date.now();
       this.proxyManager?.setAutoRestartSuppressed(true);
+      // 兜底：到期仍未被 'started'/'error' 解决，则清待验证态并解除抑制（避免抑制闩永久挂起）。
+      if (this.pendingFallbackTimer) clearTimeout(this.pendingFallbackTimer);
+      this.pendingFallbackTimer = setTimeout(() => {
+        this.pendingFallbackTimer = null;
+        if (this.pendingUpdateVersion) {
+          this.logManager.addLog(
+            'info',
+            '核心更新待验证窗口超时未见首启事件，解除自动重启抑制',
+            'CoreUpdateService'
+          );
+          this.pendingUpdateVersion = null;
+          this.proxyManager?.setAutoRestartSuppressed(false);
+        }
+      }, CoreUpdateService.PENDING_MAX_AGE_MS);
 
       // 6. 清理临时文件
       try {
@@ -768,6 +785,8 @@ export class CoreUpdateService {
         'CoreUpdateService'
       );
       this.pruneBackup();
+      if (this.pendingFallbackTimer) clearTimeout(this.pendingFallbackTimer);
+      this.pendingFallbackTimer = null;
       this.pendingUpdateVersion = null;
       this.proxyManager?.setAutoRestartSuppressed(false);
     }, CoreUpdateService.STABILITY_DWELL_MS);
@@ -781,6 +800,10 @@ export class CoreUpdateService {
     if (this.stabilityTimer) {
       clearTimeout(this.stabilityTimer);
       this.stabilityTimer = null;
+    }
+    if (this.pendingFallbackTimer) {
+      clearTimeout(this.pendingFallbackTimer);
+      this.pendingFallbackTimer = null;
     }
     const pending = this.pendingUpdateVersion;
     const pendingAge = Date.now() - this.pendingUpdateAt;
@@ -854,8 +877,16 @@ export class CoreUpdateService {
   }
 
   private compareVersions(v1: string, v2: string): number {
-    const p1 = v1.split('.').map(Number);
-    const p2 = v2.split('.').map(Number);
+    // 容忍前导 v 与 prerelease/build 后缀（"v1.13.13"、"1.13.13-beta"、"1.13.13+naive"），
+    // 每段 NaN→0，避免 "1.13.13-beta" 这类标签把某段算成 NaN 而误判为相等。
+    const norm = (v: string) =>
+      v
+        .replace(/^v/i, '')
+        .split(/[-+]/)[0]
+        .split('.')
+        .map((p) => parseInt(p, 10) || 0);
+    const p1 = norm(v1);
+    const p2 = norm(v2);
     for (let i = 0; i < Math.max(p1.length, p2.length); i++) {
       const n1 = p1[i] || 0;
       const n2 = p2[i] || 0;
