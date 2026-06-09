@@ -65,6 +65,7 @@ export function PortField({
               type="number"
               placeholder={placeholder}
               {...field}
+              value={field.value ?? ''}
               onChange={(e) =>
                 field.onChange(
                   e.target.value === '' ? undefined : parseInt(e.target.value, 10) || 0
