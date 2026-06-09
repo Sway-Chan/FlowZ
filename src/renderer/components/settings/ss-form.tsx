@@ -22,6 +22,7 @@ import {
 import { Checkbox } from '@/components/ui/checkbox';
 import { Loader2, Shield } from 'lucide-react';
 import { MultiplexFields } from './shared/anti-censor-fields';
+import { AddressField, PortField } from './shared/basic-fields';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -175,40 +176,9 @@ export function SsForm({ serverConfig, onSubmit }: SsFormProps) {
           )}
         />
 
-        <FormField
-          control={form.control}
-          name="address"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('servers.serverAddress')}</FormLabel>
-              <FormControl>
-                <Input placeholder="example.com" {...field} />
-              </FormControl>
-              <FormDescription>{t('servers.serverAddressDesc')}</FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+        <AddressField control={form.control} t={t} />
 
-        <FormField
-          control={form.control}
-          name="port"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('servers.port')}</FormLabel>
-              <FormControl>
-                <Input
-                  type="number"
-                  placeholder="8388"
-                  {...field}
-                  onChange={(e) => field.onChange(parseInt(e.target.value) || 0)}
-                />
-              </FormControl>
-              <FormDescription>{t('servers.portDesc')}</FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+        <PortField control={form.control} t={t} placeholder="8388" />
 
         <FormField
           control={form.control}

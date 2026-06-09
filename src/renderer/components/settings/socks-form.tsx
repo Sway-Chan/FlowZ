@@ -6,7 +6,6 @@ import { Button } from '@/components/ui/button';
 import {
   Form,
   FormControl,
-  FormDescription,
   FormField,
   FormItem,
   FormLabel,
@@ -14,6 +13,7 @@ import {
 } from '@/components/ui/form';
 import { Input } from '@/components/ui/input';
 import { Loader2 } from 'lucide-react';
+import { AddressField, PortField } from './shared/basic-fields';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -81,39 +81,9 @@ export function SocksForm({ serverConfig, onSubmit }: SocksFormProps) {
   return (
     <Form {...form}>
       <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
-        <FormField
-          control={form.control}
-          name="address"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('servers.serverAddress')}</FormLabel>
-              <FormControl>
-                <Input placeholder="example.com" {...field} />
-              </FormControl>
-              <FormDescription>{t('servers.serverAddressDesc')}</FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+        <AddressField control={form.control} t={t} />
 
-        <FormField
-          control={form.control}
-          name="port"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('servers.port')}</FormLabel>
-              <FormControl>
-                <Input
-                  type="number"
-                  placeholder="1080"
-                  {...field}
-                  onChange={(e) => field.onChange(parseInt(e.target.value) || 0)}
-                />
-              </FormControl>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+        <PortField control={form.control} t={t} placeholder="1080" />
 
         <FormField
           control={form.control}

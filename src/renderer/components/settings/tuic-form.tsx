@@ -13,7 +13,6 @@ import {
   FormMessage,
 } from '@/components/ui/form';
 import { Input } from '@/components/ui/input';
-import { Checkbox } from '@/components/ui/checkbox';
 import {
   Select,
   SelectContent,
@@ -22,6 +21,8 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { EchField } from './shared/anti-censor-fields';
+import { AddressField, PortField } from './shared/basic-fields';
+import { TlsServerNameField, AllowInsecureField, AlpnField } from './shared/tls-fields';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -110,40 +111,9 @@ export function TuicForm({ serverConfig, onSubmit }: TuicFormProps) {
   return (
     <Form {...form}>
       <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
-        <FormField
-          control={form.control}
-          name="address"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('servers.serverAddress')}</FormLabel>
-              <FormControl>
-                <Input placeholder="example.com" {...field} />
-              </FormControl>
-              <FormDescription>{t('servers.serverAddressDesc')}</FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+        <AddressField control={form.control} t={t} />
 
-        <FormField
-          control={form.control}
-          name="port"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('servers.port')}</FormLabel>
-              <FormControl>
-                <Input
-                  type="number"
-                  placeholder="443"
-                  {...field}
-                  onChange={(e) => field.onChange(parseInt(e.target.value) || 0)}
-                />
-              </FormControl>
-              <FormDescription>{t('servers.portDesc')}</FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
+        <PortField control={form.control} t={t} placeholder="443" />
 
         <FormField
           control={form.control}
@@ -223,52 +193,12 @@ export function TuicForm({ serverConfig, onSubmit }: TuicFormProps) {
         </div>
 
         <div className="grid grid-cols-2 gap-4">
-          <FormField
-            control={form.control}
-            name="tlsServerName"
-            render={({ field }) => (
-              <FormItem>
-                <FormLabel>{t('servers.tlsServerName')}</FormLabel>
-                <FormControl>
-                  <Input placeholder="example.com" {...field} />
-                </FormControl>
-                <FormDescription>{t('servers.tlsServerNameDesc')}</FormDescription>
-                <FormMessage />
-              </FormItem>
-            )}
-          />
+          <TlsServerNameField control={form.control} t={t} />
 
-          <FormField
-            control={form.control}
-            name="alpn"
-            render={({ field }) => (
-              <FormItem>
-                <FormLabel>{t('servers.alpn')}</FormLabel>
-                <FormControl>
-                  <Input placeholder="h3" {...field} />
-                </FormControl>
-                <FormDescription>{t('servers.alpnDesc')}</FormDescription>
-                <FormMessage />
-              </FormItem>
-            )}
-          />
+          <AlpnField control={form.control} t={t} placeholder="h3" />
         </div>
 
-        <FormField
-          control={form.control}
-          name="tlsAllowInsecure"
-          render={({ field }) => (
-            <FormItem className="flex flex-row items-start space-x-3 space-y-0">
-              <FormControl>
-                <Checkbox checked={field.value} onCheckedChange={field.onChange} />
-              </FormControl>
-              <div className="space-y-1 leading-none">
-                <FormLabel>{t('servers.allowInsecure')}</FormLabel>
-                <FormDescription>{t('servers.allowInsecureDesc')}</FormDescription>
-              </div>
-            </FormItem>
-          )}
-        />
+        <AllowInsecureField control={form.control} t={t} />
 
         <EchField control={form.control} t={t} />
 
