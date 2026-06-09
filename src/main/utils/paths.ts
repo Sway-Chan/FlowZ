@@ -40,7 +40,7 @@ function getPortableDataPath(): string | null {
 
     const portableUserdata = path.join(appDir, 'userdata');
     if (fs.existsSync(portableUserdata)) return portableUserdata;
-  } catch (e) {
+  } catch {
     // 忽略错误
   }
   return null;
