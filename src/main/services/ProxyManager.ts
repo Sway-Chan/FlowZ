@@ -13,6 +13,7 @@ import type { ILogManager } from './LogManager';
 import { IPC_CHANNELS } from '../../shared/ipc-channels';
 import { resourceManager } from './ResourceManager';
 import { retry } from '../utils/retry';
+import { coreVersionAtLeast } from '../utils/version';
 import {
   getUserDataPath,
   getSingBoxConfigPath,
@@ -229,6 +230,8 @@ interface SingBoxOutbound {
     host?: string;
     headers?: Record<string, string | string[]>;
     service_name?: string;
+    max_early_data?: number;
+    early_data_header_name?: string;
   };
   // Multiplex 多路复用
   multiplex?: {
@@ -1124,9 +1127,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 版本兼容：
     //   1.12.x → sniff/sniff_override_destination 是 inbound 级别字段
     //   1.13.x → 这些字段已移除，改由路由层 action: 'sniff' + override_destination: true 实现
-    const inboundVer = this.coreVersion.match(/^(\d+\.\d+)/);
-    const inboundVerNum = inboundVer ? parseFloat(inboundVer[1]) : 1.13;
-    const useLegacySniff = !isNaN(inboundVerNum) && inboundVerNum < 1.13;
+    const useLegacySniff = !coreVersionAtLeast(this.coreVersion, 1, 13);
 
     const httpInbound: SingBoxInbound = {
       type: 'http',
@@ -1257,9 +1258,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
       // 兼容 sing-box 1.12.x 版本（打包核心现已全部 ≥1.13.13，此分支仅为向后兼容旧 userData 核心保留），必须在 inbound 定义 sniff 否则无法域名分流。
       // 对于 1.13.0+，嗅探逻辑已经统一由后方 route.rules 承担，但在入站开启会报错，因此需精准版本判断。
-      const inboundVersionMatch = this.coreVersion.match(/^(\d+\.\d+)/);
-      const inboundVersionNum = inboundVersionMatch ? parseFloat(inboundVersionMatch[1]) : 1.13;
-      if (!isNaN(inboundVersionNum) && inboundVersionNum < 1.13) {
+      if (!coreVersionAtLeast(this.coreVersion, 1, 13)) {
         (tunInbound as any).sniff = true;
       }
 
@@ -1384,9 +1383,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 版本条件：sing-box 1.12.x 需要在 outbound 层面做 override_address
     // 因为 1.12 的路由规则不支持 override_address 字段（会被静默忽略）。
     // 1.13+ 已将此功能迁移到路由规则，不需要额外的 outbound。
-    const vArr = this.coreVersion.split('.');
-    const vNum = parseFloat(vArr[0] + '.' + (vArr[1] || '0'));
-    if (isNaN(vNum) || vNum < 1.13) {
+    if (!coreVersionAtLeast(this.coreVersion, 1, 13)) {
       outbounds.push({
         type: 'direct',
         tag: 'direct-loopback',
@@ -1771,10 +1768,13 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    */
   private generateTransportConfig(server: ServerConfig): SingBoxOutbound['transport'] {
     if (server.network === 'ws' && server.wsSettings) {
+      // 0-RTT early-data：订阅/分享链解析时已存入 wsSettings，此前未落运行时配置导致静默失效
       return {
         type: 'ws',
         path: server.wsSettings.path || '/',
         headers: server.wsSettings.headers,
+        max_early_data: server.wsSettings.maxEarlyData,
+        early_data_header_name: server.wsSettings.earlyDataHeaderName,
       };
     }
 
@@ -1830,13 +1830,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         ? ({ ...matcher, network: ['udp'], port: [443], action: 'reject' } as any)
         : null;
 
-    const versionArr = this.coreVersion.split('.');
-    const versionNum = parseFloat(versionArr[0] + '.' + (versionArr[1] || '0'));
-
     // A. 嗅探规则（必须在前，用于识别域名）
     // 1.13+ 必须在路由层开启 sniff，替代已移除的 inbound 级别 sniff 字段
     // sing-box 1.13.x 嗅探后自动将域名用于路由匹配（等效旧版 sniff_override_destination）
-    if (!isNaN(versionNum) && versionNum >= 1.13) {
+    if (coreVersionAtLeast(this.coreVersion, 1, 13)) {
       rules.push({
         action: 'sniff',
       } as any);
@@ -1997,7 +1994,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       (d) => !UKEY_LOCAL_DOMAINS.includes(d)
     );
 
-    if (!isNaN(versionNum) && versionNum >= 1.13) {
+    if (coreVersionAtLeast(this.coreVersion, 1, 13)) {
       // 1.13+：路由规则支持 override_address
       rules.push({
         domain_suffix: UKEY_LOCAL_DOMAINS,
@@ -2764,9 +2761,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         // 这是银行 U盾本地域名（如 windows10.microdone.cn → 127.0.0.1）正常工作的前提。
         // 1.13+ 已将此功能迁移到路由规则，不需要此环境变量。
         const spawnEnv = { ...process.env };
-        const cvArr = this.coreVersion.split('.');
-        const cvNum = parseFloat(cvArr[0] + '.' + (cvArr[1] || '0'));
-        if (isNaN(cvNum) || cvNum < 1.13) {
+        if (!coreVersionAtLeast(this.coreVersion, 1, 13)) {
           spawnEnv['ENABLE_DEPRECATED_DESTINATION_OVERRIDE_FIELDS'] = 'true';
         }
 
@@ -3539,6 +3534,13 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   /** 核心更新待验证窗口内由 CoreUpdateService 置 true：抑制自动重启，首次失败即上报触发回滚。 */
   setAutoRestartSuppressed(suppressed: boolean): void {
     this.autoRestartSuppressed = suppressed;
+  }
+
+  /** 当前配置是否含 naive 节点（naive 依赖随 app 打包的 libcronet，核心更新可能引入 ABI 漂移）。 */
+  hasNaiveNodes(): boolean {
+    return (this.currentConfig?.servers || []).some(
+      (s) => (s.protocol || '').toLowerCase() === 'naive'
+    );
   }
 
   /**
