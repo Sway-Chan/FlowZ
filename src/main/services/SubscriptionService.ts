@@ -55,6 +55,18 @@ type SingboxOutbound = {
   obfs?: { type?: string; password?: string };
   // naive：是否启用 HTTP/3 (QUIC) 传输
   quic?: boolean;
+  // vmess：security=加密方式(auto/none/aes-128-gcm/...)，alter_id=0 走 AEAD
+  alter_id?: number;
+  security?: string;
+  // tuic
+  congestion_control?: string;
+  udp_relay_mode?: string;
+  zero_rtt_handshake?: boolean;
+  heartbeat?: string;
+  // anytls
+  idle_session_check_interval?: string;
+  idle_session_timeout?: string;
+  min_idle_session?: number;
   tls?: SingboxTls;
   transport?: SingboxTransport;
   multiplex?: SingboxMultiplex;
@@ -91,13 +103,23 @@ export class SubscriptionService {
 
   /**
    * 将 sing-box outbounds 数组转换为 ServerConfig 列表
-   * 支持: shadowsocks, vless, trojan, hysteria2
+   * 支持: shadowsocks, vless, trojan, hysteria2, naive, vmess, tuic, anytls, socks
    */
   private parseSingboxOutbounds(
     outbounds: SingboxOutbound[],
     subscriptionId: string
   ): ServerConfig[] {
-    const SUPPORTED = new Set(['shadowsocks', 'vless', 'trojan', 'hysteria2', 'naive']);
+    const SUPPORTED = new Set([
+      'shadowsocks',
+      'vless',
+      'trojan',
+      'hysteria2',
+      'naive',
+      'vmess',
+      'tuic',
+      'anytls',
+      'socks',
+    ]);
     const servers: ServerConfig[] = [];
     const now = new Date().toISOString();
 
@@ -221,6 +243,66 @@ export class SubscriptionService {
             username: ob.username ?? '',
             password: ob.password ?? '',
             naiveSettings: ob.quic ? { useHttp3: true } : undefined,
+          });
+        } else if (ob.type === 'vmess') {
+          servers.push({
+            ...(base as ServerConfig),
+            protocol: 'vmess',
+            uuid: ob.uuid ?? '',
+            alterId: ob.alter_id ?? 0,
+            vmessSecurity: ob.security || 'auto',
+          });
+        } else if (ob.type === 'tuic') {
+          const tuicSettings: NonNullable<ServerConfig['tuicSettings']> = {};
+          if (
+            ob.congestion_control === 'bbr' ||
+            ob.congestion_control === 'cubic' ||
+            ob.congestion_control === 'new_reno'
+          ) {
+            tuicSettings.congestionControl = ob.congestion_control;
+          }
+          if (ob.udp_relay_mode === 'native' || ob.udp_relay_mode === 'quic') {
+            tuicSettings.udpRelayMode = ob.udp_relay_mode;
+          }
+          if (ob.zero_rtt_handshake !== undefined) {
+            tuicSettings.zeroRttHandshake = ob.zero_rtt_handshake;
+          }
+          if (ob.heartbeat) tuicSettings.heartbeat = ob.heartbeat;
+          servers.push({
+            ...(base as ServerConfig),
+            protocol: 'tuic',
+            uuid: ob.uuid ?? '',
+            password: ob.password ?? '',
+            security: 'tls',
+            tuicSettings: Object.keys(tuicSettings).length > 0 ? tuicSettings : undefined,
+          });
+        } else if (ob.type === 'anytls') {
+          const anyTlsSettings: NonNullable<ServerConfig['anyTlsSettings']> = {};
+          if (ob.idle_session_check_interval) {
+            anyTlsSettings.idleSessionCheckInterval = ob.idle_session_check_interval;
+          }
+          if (ob.idle_session_timeout) {
+            anyTlsSettings.idleSessionTimeout = ob.idle_session_timeout;
+          }
+          if (ob.min_idle_session !== undefined) {
+            anyTlsSettings.minIdleSession = ob.min_idle_session;
+          }
+          servers.push({
+            ...(base as ServerConfig),
+            protocol: 'anytls',
+            password: ob.password ?? '',
+            security: 'tls',
+            anyTlsSettings: Object.keys(anyTlsSettings).length > 0 ? anyTlsSettings : undefined,
+          });
+        } else if (ob.type === 'socks') {
+          // socks 无 TLS：覆盖 base 可能因 transport 推断的 network，固定为 tcp/none
+          servers.push({
+            ...(base as ServerConfig),
+            protocol: 'socks',
+            username: ob.username,
+            password: ob.password,
+            network: 'tcp',
+            security: 'none',
           });
         }
       } catch (e: any) {
