@@ -655,12 +655,31 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 配置生成的字段（blockQuic/tlsFragment/dnsConfig/各 TUN 子字段/appRules/customRules/端口/interrupt
     // 开关 等）有差异都退回重启，避免「切节点 + 改某设置」同时发生时把那个设置静默丢掉。
     const norm = (c: UserConfig) =>
-      JSON.stringify({
+      this.stableStringify({
         ...c,
         selectedServerId: null,
         servers: [...c.servers].sort((a, b) => a.id.localeCompare(b.id)),
       });
     return norm(old) === norm(newConfig);
+  }
+
+  /**
+   * 递归按 key 排序后序列化——使深比较对对象属性插入顺序不敏感。
+   * 渲染层重建配置对象时键序常与原对象不同，普通 JSON.stringify 会因此误判"配置已变"而退回重启、
+   * 废掉热切换。数组顺序保留（customRules/appRules 顺序具语义，顺序变化应视为真变更触发重启）。
+   */
+  private stableStringify(v: any): string {
+    if (v === null || typeof v !== 'object') return JSON.stringify(v) ?? 'null';
+    if (Array.isArray(v)) return '[' + v.map((x) => this.stableStringify(x)).join(',') + ']';
+    return (
+      '{' +
+      Object.keys(v)
+        .sort()
+        .filter((k) => v[k] !== undefined) // 与 JSON.stringify 一致：丢弃 undefined 键，避免 undefined↔null 误判相等
+        .map((k) => JSON.stringify(k) + ':' + this.stableStringify(v[k]))
+        .join(',') +
+      '}'
+    );
   }
 
   /**
