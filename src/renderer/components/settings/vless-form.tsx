@@ -21,6 +21,7 @@ import {
 } from '@/components/ui/select';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Loader2 } from 'lucide-react';
+import { EchField, MultiplexFields } from './shared/anti-censor-fields';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -37,7 +38,7 @@ const createVlessSchema = (t: any) =>
       ),
     encryption: z.string().optional(),
     flow: z.string().optional(),
-    network: z.enum(['Tcp', 'Ws', 'H2']),
+    network: z.enum(['Tcp', 'Ws', 'H2', 'HttpUpgrade']),
     security: z.enum(['None', 'Tls', 'Reality']),
     tlsServerName: z.string().optional(),
     tlsAllowInsecure: z.boolean(),
@@ -46,6 +47,12 @@ const createVlessSchema = (t: any) =>
     realityShortId: z.string().optional(),
     wsPath: z.string().optional(),
     wsHost: z.string().optional(),
+    ech: z.boolean().optional(),
+    muxEnabled: z.boolean().optional(),
+    muxProtocol: z.enum(['h2mux', 'smux', 'yamux']).optional(),
+    muxMaxConnections: z.number().optional(),
+    muxMinStreams: z.number().optional(),
+    muxPadding: z.boolean().optional(),
   });
 
 type VlessFormValues = z.infer<ReturnType<typeof createVlessSchema>>;
@@ -59,9 +66,10 @@ export function VlessForm({ serverConfig, onSubmit }: VlessFormProps) {
   const { t } = useTranslation();
   const vlessFormSchema = createVlessSchema(t);
 
-  const normalizeNetwork = (n: string | undefined): 'Tcp' | 'Ws' | 'H2' => {
+  const normalizeNetwork = (n: string | undefined): 'Tcp' | 'Ws' | 'H2' | 'HttpUpgrade' => {
     const lower = (n || 'tcp').toLowerCase();
     if (lower === 'ws' || lower === 'websocket') return 'Ws';
+    if (lower === 'httpupgrade') return 'HttpUpgrade';
     if (lower === 'h2' || lower === 'http2') return 'H2';
     return 'Tcp';
   };
@@ -90,6 +98,13 @@ export function VlessForm({ serverConfig, onSubmit }: VlessFormProps) {
         realityShortId: serverConfig.realitySettings?.shortId || '',
         wsPath: serverConfig.wsSettings?.path || '',
         wsHost: serverConfig.wsSettings?.headers?.['Host'] || '',
+        ech: serverConfig.tlsSettings?.ech === true,
+        muxEnabled: serverConfig.multiplexSettings?.enabled === true,
+        muxProtocol:
+          (serverConfig.multiplexSettings?.protocol as 'h2mux' | 'smux' | 'yamux') || 'h2mux',
+        muxMaxConnections: serverConfig.multiplexSettings?.maxConnections,
+        muxMinStreams: serverConfig.multiplexSettings?.minStreams,
+        muxPadding: serverConfig.multiplexSettings?.padding === true,
       };
     }
     return {
@@ -107,6 +122,12 @@ export function VlessForm({ serverConfig, onSubmit }: VlessFormProps) {
       realityShortId: '',
       wsPath: '',
       wsHost: '',
+      ech: false,
+      muxEnabled: false,
+      muxProtocol: 'h2mux',
+      muxMaxConnections: undefined,
+      muxMinStreams: undefined,
+      muxPadding: false,
     };
   };
 
@@ -116,7 +137,7 @@ export function VlessForm({ serverConfig, onSubmit }: VlessFormProps) {
   });
 
   const handleSubmit = async (values: VlessFormValues) => {
-    const network = values.network.toLowerCase() as 'tcp' | 'ws' | 'h2';
+    const network = values.network.toLowerCase() as 'tcp' | 'ws' | 'h2' | 'httpupgrade';
     const security = values.security.toLowerCase() as 'none' | 'tls' | 'reality';
 
     const serverConfig = {
@@ -134,6 +155,7 @@ export function VlessForm({ serverConfig, onSubmit }: VlessFormProps) {
               serverName: values.tlsServerName?.trim() || null,
               allowInsecure: security === 'tls' ? values.tlsAllowInsecure : false,
               fingerprint: values.tlsFingerprint || 'chrome',
+              ech: values.ech ? true : undefined,
             }
           : null,
       realitySettings:
@@ -144,12 +166,22 @@ export function VlessForm({ serverConfig, onSubmit }: VlessFormProps) {
             }
           : null,
       wsSettings:
-        network === 'ws'
+        network === 'ws' || network === 'httpupgrade'
           ? {
               path: values.wsPath || '/',
-              host: values.wsHost || null,
+              headers: values.wsHost ? { Host: values.wsHost } : undefined,
             }
           : null,
+      multiplexSettings:
+        values.muxEnabled && values.flow !== 'xtls-rprx-vision'
+          ? {
+              enabled: true,
+              protocol: values.muxProtocol || 'h2mux',
+              maxConnections: values.muxMaxConnections,
+              minStreams: values.muxMinStreams,
+              padding: values.muxPadding === true,
+            }
+          : undefined,
     };
 
     await onSubmit(serverConfig);
@@ -157,7 +189,8 @@ export function VlessForm({ serverConfig, onSubmit }: VlessFormProps) {
 
   const isTlsEnabled = form.watch('security') === 'Tls';
   const isRealityEnabled = form.watch('security') === 'Reality';
-  const isWebSocketEnabled = form.watch('network') === 'Ws';
+  const isWebSocketEnabled =
+    form.watch('network') === 'Ws' || form.watch('network') === 'HttpUpgrade';
 
   return (
     <Form {...form}>
@@ -249,6 +282,7 @@ export function VlessForm({ serverConfig, onSubmit }: VlessFormProps) {
                 <SelectContent>
                   <SelectItem value="Tcp">TCP</SelectItem>
                   <SelectItem value="Ws">WebSocket</SelectItem>
+                  <SelectItem value="HttpUpgrade">HTTPUpgrade</SelectItem>
                   <SelectItem value="H2">HTTP/2</SelectItem>
                 </SelectContent>
               </Select>
@@ -345,6 +379,8 @@ export function VlessForm({ serverConfig, onSubmit }: VlessFormProps) {
                 </FormItem>
               )}
             />
+
+            <EchField control={form.control} t={t} />
           </>
         )}
 
@@ -490,6 +526,16 @@ export function VlessForm({ serverConfig, onSubmit }: VlessFormProps) {
             />
           </>
         )}
+
+        <MultiplexFields
+          control={form.control}
+          t={t}
+          disabled={form.watch('flow') === 'xtls-rprx-vision'}
+          disabledReason={t(
+            'servers.multiplexVisionConflict',
+            'Multiplex 与 xtls-rprx-vision flow 不兼容，已禁用。'
+          )}
+        />
 
         <div className="flex gap-4">
           <Button type="submit" disabled={form.formState.isSubmitting}>

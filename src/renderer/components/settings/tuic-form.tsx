@@ -21,6 +21,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import { EchField } from './shared/anti-censor-fields';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -35,6 +36,7 @@ const createTuicSchema = (t: any) =>
     tlsServerName: z.string().optional(),
     tlsAllowInsecure: z.boolean(),
     alpn: z.string().optional(),
+    ech: z.boolean().optional(),
   });
 
 type TuicFormValues = z.infer<ReturnType<typeof createTuicSchema>>;
@@ -60,6 +62,7 @@ export function TuicForm({ serverConfig, onSubmit }: TuicFormProps) {
       tlsServerName: '',
       tlsAllowInsecure: false,
       alpn: 'h3',
+      ech: false,
     },
   });
 
@@ -75,6 +78,7 @@ export function TuicForm({ serverConfig, onSubmit }: TuicFormProps) {
         tlsServerName: serverConfig.tlsSettings?.serverName || '',
         tlsAllowInsecure: serverConfig.tlsSettings?.allowInsecure || false,
         alpn: serverConfig.tlsSettings?.alpn?.join(',') || 'h3',
+        ech: serverConfig.tlsSettings?.ech === true,
       };
       form.reset(formData);
     }
@@ -92,6 +96,7 @@ export function TuicForm({ serverConfig, onSubmit }: TuicFormProps) {
         serverName: values.tlsServerName || undefined,
         allowInsecure: values.tlsAllowInsecure,
         alpn: values.alpn ? values.alpn.split(',').map((s) => s.trim()) : undefined,
+        ech: values.ech ? true : undefined,
       },
       tuicSettings: {
         congestionControl: values.congestionControl || undefined,
@@ -264,6 +269,8 @@ export function TuicForm({ serverConfig, onSubmit }: TuicFormProps) {
             </FormItem>
           )}
         />
+
+        <EchField control={form.control} t={t} />
 
         <Button type="submit" className="w-full">
           {t('common.save')}

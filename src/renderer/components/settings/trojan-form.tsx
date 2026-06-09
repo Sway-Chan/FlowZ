@@ -22,6 +22,7 @@ import {
 } from '@/components/ui/select';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Loader2 } from 'lucide-react';
+import { EchField, MultiplexFields } from './shared/anti-censor-fields';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -30,12 +31,20 @@ const createTrojanSchema = (t: any) =>
     address: z.string().min(1, t('servers.addressRequired')),
     port: z.number().min(1).max(65535),
     password: z.string().min(1, t('servers.passwordRequired')),
-    network: z.enum(['tcp', 'ws', 'h2']),
+    network: z.enum(['tcp', 'ws', 'h2', 'httpupgrade']),
     security: z.enum(['none', 'tls']),
     tlsServerName: z.string().optional(),
     tlsAllowInsecure: z.boolean(),
     tlsFingerprint: z.string().optional(),
     alpn: z.string().optional(),
+    wsPath: z.string().optional(),
+    wsHost: z.string().optional(),
+    ech: z.boolean().optional(),
+    muxEnabled: z.boolean().optional(),
+    muxProtocol: z.enum(['h2mux', 'smux', 'yamux']).optional(),
+    muxMaxConnections: z.number().optional(),
+    muxMinStreams: z.number().optional(),
+    muxPadding: z.boolean().optional(),
   });
 
 type TrojanFormValues = z.infer<ReturnType<typeof createTrojanSchema>>;
@@ -61,6 +70,14 @@ export function TrojanForm({ serverConfig, onSubmit }: TrojanFormProps) {
       tlsAllowInsecure: false,
       tlsFingerprint: 'none',
       alpn: '',
+      wsPath: '',
+      wsHost: '',
+      ech: false,
+      muxEnabled: false,
+      muxProtocol: 'h2mux',
+      muxMaxConnections: undefined,
+      muxMinStreams: undefined,
+      muxPadding: false,
     },
   });
 
@@ -68,9 +85,10 @@ export function TrojanForm({ serverConfig, onSubmit }: TrojanFormProps) {
     console.log('[TrojanForm] Server config changed:', serverConfig);
     if (serverConfig && serverConfig.protocol?.toLowerCase() === 'trojan') {
       // 标准化 network 和 security 值（转为全小写以匹配 schema）
-      const normalizeNetwork = (n: string | undefined): 'tcp' | 'ws' | 'h2' => {
+      const normalizeNetwork = (n: string | undefined): 'tcp' | 'ws' | 'h2' | 'httpupgrade' => {
         const lower = (n || 'tcp').toLowerCase();
         if (lower === 'ws' || lower === 'websocket') return 'ws';
+        if (lower === 'httpupgrade') return 'httpupgrade';
         if (lower === 'h2' || lower === 'http2') return 'h2';
         return 'tcp';
       };
@@ -89,6 +107,15 @@ export function TrojanForm({ serverConfig, onSubmit }: TrojanFormProps) {
         tlsAllowInsecure: serverConfig.tlsSettings?.allowInsecure || false,
         tlsFingerprint: serverConfig.tlsSettings?.fingerprint || 'none',
         alpn: serverConfig.tlsSettings?.alpn?.join(',') || '',
+        wsPath: serverConfig.wsSettings?.path || '',
+        wsHost: serverConfig.wsSettings?.headers?.['Host'] || '',
+        ech: serverConfig.tlsSettings?.ech === true,
+        muxEnabled: serverConfig.multiplexSettings?.enabled === true,
+        muxProtocol:
+          (serverConfig.multiplexSettings?.protocol as 'h2mux' | 'smux' | 'yamux') || 'h2mux',
+        muxMaxConnections: serverConfig.multiplexSettings?.maxConnections,
+        muxMinStreams: serverConfig.multiplexSettings?.minStreams,
+        muxPadding: serverConfig.multiplexSettings?.padding === true,
       };
       console.log('[TrojanForm] Resetting form with:', formData);
       form.reset(formData);
@@ -111,8 +138,25 @@ export function TrojanForm({ serverConfig, onSubmit }: TrojanFormProps) {
               allowInsecure: values.tlsAllowInsecure,
               fingerprint: values.tlsFingerprint || 'none',
               alpn: values.alpn ? values.alpn.split(',').map((s) => s.trim()) : undefined,
+              ech: values.ech ? true : undefined,
             }
           : null,
+      wsSettings:
+        values.network === 'ws' || values.network === 'httpupgrade'
+          ? {
+              path: values.wsPath || '/',
+              headers: values.wsHost ? { Host: values.wsHost } : undefined,
+            }
+          : null,
+      multiplexSettings: values.muxEnabled
+        ? {
+            enabled: true,
+            protocol: values.muxProtocol || 'h2mux',
+            maxConnections: values.muxMaxConnections,
+            minStreams: values.muxMinStreams,
+            padding: values.muxPadding === true,
+          }
+        : undefined,
     };
 
     try {
@@ -123,6 +167,8 @@ export function TrojanForm({ serverConfig, onSubmit }: TrojanFormProps) {
   };
 
   const isTlsEnabled = form.watch('security') === 'tls';
+  const isWebSocketEnabled =
+    form.watch('network') === 'ws' || form.watch('network') === 'httpupgrade';
 
   return (
     <Form {...form}>
@@ -192,6 +238,7 @@ export function TrojanForm({ serverConfig, onSubmit }: TrojanFormProps) {
                 <SelectContent>
                   <SelectItem value="tcp">TCP</SelectItem>
                   <SelectItem value="ws">WebSocket</SelectItem>
+                  <SelectItem value="httpupgrade">HTTPUpgrade</SelectItem>
                   <SelectItem value="h2">HTTP/2</SelectItem>
                 </SelectContent>
               </Select>
@@ -304,8 +351,46 @@ export function TrojanForm({ serverConfig, onSubmit }: TrojanFormProps) {
                 </FormItem>
               )}
             />
+
+            <EchField control={form.control} t={t} />
           </>
         )}
+
+        {isWebSocketEnabled && (
+          <>
+            <FormField
+              control={form.control}
+              name="wsPath"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>{t('servers.wsPath')}</FormLabel>
+                  <FormControl>
+                    <Input placeholder="" {...field} />
+                  </FormControl>
+                  <FormDescription>{t('servers.wsPathDesc')}</FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+
+            <FormField
+              control={form.control}
+              name="wsHost"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>{t('servers.wsHost')}</FormLabel>
+                  <FormControl>
+                    <Input placeholder="example.com" {...field} />
+                  </FormControl>
+                  <FormDescription>{t('servers.wsHostDesc')}</FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+          </>
+        )}
+
+        <MultiplexFields control={form.control} t={t} disabled={false} />
 
         <div className="flex gap-4">
           <Button type="submit" disabled={form.formState.isSubmitting}>
