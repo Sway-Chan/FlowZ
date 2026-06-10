@@ -429,6 +429,7 @@ export interface TrafficStats {
   downloadSpeed: number;
   totalUpload: number;
   totalDownload: number;
+  activeConnections?: number;
 }
 
 // ============================================================================

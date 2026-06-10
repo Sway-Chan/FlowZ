@@ -737,6 +737,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     return secret ? { Authorization: `Bearer ${secret}` } : {};
   }
 
+  /** 当前 clash_api secret（供 StatsService 等其它主进程内部 9090 调用带鉴权）。 */
+  getClashApiSecret(): string {
+    return this.currentConfig?.clashApiSecret || '';
+  }
+
   private async hotSwitchNode(newConfig: UserConfig): Promise<boolean> {
     const targetTag = this.currentIdToTagMap?.get(newConfig.selectedServerId as string);
     if (!targetTag) return false;

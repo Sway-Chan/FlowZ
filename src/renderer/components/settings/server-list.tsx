@@ -110,7 +110,6 @@ const getTransportLabel = (server: ServerConfigWithId): string => {
 
 interface ServerListProps {
   servers: ServerConfigWithId[];
-  subscriptions?: import('@/bridge/types').SubscriptionConfig[];
   selectedServerId?: string;
   showAddButton?: boolean;
   onAddServer: () => void;

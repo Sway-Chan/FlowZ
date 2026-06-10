@@ -5,10 +5,11 @@
 
 import { IpcMainInvokeEvent } from 'electron';
 import { IPC_CHANNELS } from '../../../shared/ipc-channels';
-import type { UserConfig, ProxyStatus } from '../../../shared/types';
+import type { UserConfig, ProxyStatus, TrafficStats } from '../../../shared/types';
 import { registerIpcHandler } from '../ipc-handler';
 import { ProxyManager } from '../../services/ProxyManager';
 import { ISystemProxyManager } from '../../services/SystemProxyManager';
+import type { StatsService } from '../../services/StatsService';
 
 /**
  * 托盘状态更新回调
@@ -29,8 +30,16 @@ export function setTrayStateCallback(callback: TrayStateUpdateCallback): void {
  */
 export function registerProxyHandlers(
   proxyManager: ProxyManager,
-  systemProxyManager?: ISystemProxyManager
+  systemProxyManager?: ISystemProxyManager,
+  statsService?: StatsService | null
 ): void {
+  // 流量统计快照（窗口重建/挂载时回填初值）
+  registerIpcHandler<void, TrafficStats>(IPC_CHANNELS.STATS_GET, async () =>
+    statsService
+      ? statsService.getSnapshot()
+      : { uploadSpeed: 0, downloadSpeed: 0, totalUpload: 0, totalDownload: 0, activeConnections: 0 }
+  );
+
   // 启动代理
   registerIpcHandler<UserConfig, void>(
     IPC_CHANNELS.PROXY_START,

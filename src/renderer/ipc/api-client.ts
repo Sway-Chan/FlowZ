@@ -9,7 +9,6 @@ import type {
   UserConfig,
   ServerConfig,
   ProxyStatus,
-  SystemProxyStatus,
   LogEntry,
   TrafficStats,
   DomainRule,
@@ -296,32 +295,6 @@ export const logsApi = {
    */
   onReceived(listener: (log: LogEntry) => void): () => void {
     return ipcClient.on(IPC_CHANNELS.EVENT_LOG_RECEIVED, listener);
-  },
-};
-
-/**
- * 系统代理管理 API
- */
-export const systemProxyApi = {
-  /**
-   * 启用系统代理
-   */
-  async enable(address: string, port: number): Promise<void> {
-    return ipcClient.invoke(IPC_CHANNELS.SYSTEM_PROXY_ENABLE, { address, port });
-  },
-
-  /**
-   * 禁用系统代理
-   */
-  async disable(): Promise<void> {
-    return ipcClient.invoke(IPC_CHANNELS.SYSTEM_PROXY_DISABLE);
-  },
-
-  /**
-   * 获取系统代理状态
-   */
-  async getStatus(): Promise<SystemProxyStatus> {
-    return ipcClient.invoke(IPC_CHANNELS.SYSTEM_PROXY_GET_STATUS);
   },
 };
 
@@ -676,7 +649,6 @@ export const api = {
   server: serverApi,
   rules: rulesApi,
   logs: logsApi,
-  systemProxy: systemProxyApi,
   autoStart: autoStartApi,
   stats: statsApi,
   connection: connectionApi,

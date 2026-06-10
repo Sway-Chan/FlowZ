@@ -35,7 +35,6 @@ export const IPC_CHANNELS = {
   SUBSCRIPTION_UPDATE: 'subscription:update',
   SUBSCRIPTION_DELETE: 'subscription:delete',
   SUBSCRIPTION_UPDATE_SERVERS: 'subscription:updateServers',
-  SUBSCRIPTION_UPDATE_ALL: 'subscription:updateAll',
 
   // 路由规则管理
   RULES_GET_ALL: 'rules:getAll',
@@ -47,11 +46,6 @@ export const IPC_CHANNELS = {
   LOGS_GET: 'logs:get',
   LOGS_CLEAR: 'logs:clear',
   LOGS_SET_LEVEL: 'logs:setLevel',
-
-  // 系统代理管理
-  SYSTEM_PROXY_ENABLE: 'systemProxy:enable',
-  SYSTEM_PROXY_DISABLE: 'systemProxy:disable',
-  SYSTEM_PROXY_GET_STATUS: 'systemProxy:getStatus',
 
   // 自启动管理
   AUTO_START_SET: 'autoStart:set',

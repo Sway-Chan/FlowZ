@@ -6,6 +6,7 @@ import { useEffect } from 'react';
 import { api } from '../ipc';
 import { ErrorHandler, ErrorCategory } from '../lib/error-handler';
 import { toast } from 'sonner';
+import type { TrafficStats } from '../../shared/types';
 
 // 定义事件数据类型
 interface NativeEventData {
@@ -15,7 +16,7 @@ interface NativeEventData {
   // 统一按 message 优先、error 兜底消费
   processError: { message?: string; error?: string; code?: number; signal?: string | null };
   configChanged: { key?: string; oldValue?: any; newValue?: any };
-  statsUpdated: any;
+  statsUpdated: TrafficStats;
   navigateToPage: string;
   proxyModeSwitched: { success: boolean; newMode: string };
   proxyModeSwitchFailed: { success: boolean; error: string };
@@ -156,10 +157,9 @@ export function useNativeEventListeners() {
   };
 
   const handleStatsUpdated = (data: NativeEventData['statsUpdated']) => {
-    console.log('Stats updated:', data);
-    // 更新统计信息到 store
+    // 事件 payload 即最新 TrafficStats，直接写 store（省去 refreshStatistics 的二次 IPC 拉取）
     import('../store/app-store').then(({ useAppStore }) => {
-      useAppStore.getState().refreshStatistics();
+      useAppStore.setState({ stats: data });
     });
   };
 

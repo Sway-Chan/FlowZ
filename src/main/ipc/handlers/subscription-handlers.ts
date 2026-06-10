@@ -157,54 +157,7 @@ export function registerSubscriptionHandlers(
     }
   );
 
-  // 启动时批量更新所有开启了 autoUpdate 的订阅
-  registerIpcHandler<void, { updated: number; failed: number }>(
-    IPC_CHANNELS.SUBSCRIPTION_UPDATE_ALL,
-    async (_event: IpcMainInvokeEvent) => {
-      const config = await configManager.loadConfig();
-      if (!config.subscriptions || config.subscriptions.length === 0) {
-        return { updated: 0, failed: 0 };
-      }
-
-      let updatedCount = 0;
-      let failedCount = 0;
-
-      for (const subscription of config.subscriptions) {
-        if (!subscription.autoUpdate) continue;
-        try {
-          const result = await subscriptionService.fetchSubscription(
-            subscription.url,
-            subscription.id,
-            config.subscriptionUpdateViaProxy === true
-          );
-          const fetchedServers = result.servers;
-
-          const oldServers = config.servers.filter((s) => s.subscriptionId === subscription.id);
-          const { servers: newServersToKeep, deletedIds } = SubscriptionService.reconcileServers(
-            oldServers,
-            fetchedServers,
-            new Date().toISOString()
-          );
-
-          if (config.selectedServerId && deletedIds.has(config.selectedServerId)) {
-            config.selectedServerId = null;
-          }
-
-          const otherServers = config.servers.filter((s) => s.subscriptionId !== subscription.id);
-          config.servers = [...otherServers, ...newServersToKeep];
-          subscription.lastUpdated = new Date().toISOString();
-          if (result.userInfo) subscription.userInfo = result.userInfo;
-
-          updatedCount++;
-        } catch {
-          failedCount++;
-        }
-      }
-
-      await configManager.saveConfig(config);
-      return { updated: updatedCount, failed: failedCount };
-    }
-  );
+  // 启动补更/周期更新已由 SubscriptionScheduler 接管（含退避+防丢更新两阶段），此处不再注册 UPDATE_ALL
 
   console.log('[Subscription Handlers] Registered all subscription IPC handlers');
 }

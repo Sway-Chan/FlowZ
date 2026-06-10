@@ -32,6 +32,7 @@ import { CoreUpdateService } from './services/CoreUpdateService';
 import { SpeedTestService } from './services/SpeedTestService';
 import { AutoSwitchService } from './services/AutoSwitchService';
 import { SubscriptionScheduler } from './services/SubscriptionScheduler';
+import { StatsService } from './services/StatsService';
 import { ipcEventEmitter } from './ipc/ipc-events';
 import { mainEventEmitter, MAIN_EVENTS } from './ipc/main-events';
 import { initUserDataPath } from './utils/paths';
@@ -111,6 +112,7 @@ let subscriptionService: SubscriptionService;
 let speedTestService: SpeedTestService;
 let autoSwitchService: AutoSwitchService;
 let subscriptionScheduler: SubscriptionScheduler;
+let statsService: StatsService | null = null;
 
 // 全局异常捕获 - 主进程
 process.on('uncaughtException', (error: Error) => {
@@ -603,6 +605,12 @@ if (gotTheLock) {
     coreUpdateService.setProxyManager(proxyManager);
     coreUpdateService.setConfigProvider(() => configManager.loadConfig());
 
+    // 流量统计：代理运行时轮询 clash_api，经事件推渲染端展示（带 clash secret 鉴权）
+    statsService = new StatsService(
+      (stats) => ipcEventEmitter.sendToAll(IPC_CHANNELS.EVENT_STATS_UPDATED, stats),
+      () => proxyManager?.getClashApiSecret() ?? ''
+    );
+
     // 初始化自动换节点服务
     autoSwitchService = new AutoSwitchService(
       configManager,
@@ -670,6 +678,7 @@ if (gotTheLock) {
     });
 
     proxyManager.on('started', async () => {
+      statsService?.start();
       try {
         await coreUpdateService.recordSuccessfulVersion();
         logManager.addLog('info', '已记录当前运行的内核版本基线', 'Main');
@@ -696,6 +705,7 @@ if (gotTheLock) {
     });
 
     proxyManager.on('stopped', async () => {
+      statsService?.stop();
       try {
         const { session } = require('electron');
         await session.defaultSession.setProxy({});
@@ -729,7 +739,7 @@ if (gotTheLock) {
     registerConfigHandlers(configManager);
     registerServerHandlers(protocolParser, configManager);
     registerLogHandlers(logManager, proxyManager);
-    registerProxyHandlers(proxyManager, systemProxyManager);
+    registerProxyHandlers(proxyManager, systemProxyManager, statsService);
     registerVersionHandlers(coreUpdateService);
     registerAdminHandlers();
 

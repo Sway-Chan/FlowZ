@@ -495,8 +495,6 @@ export class TrayManager implements ITrayManager {
     if (this.onLightweightMode) {
       this.onLightweightMode();
     } else if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-      this.mainWindow.webContents.send('lightweight-mode-active');
-
       // 销毁窗口，释放整个 Chromium 渲染进程（最大内存释放）
       this.mainWindow.destroy();
       this.logManager.addLog('info', 'Main window destroyed for lightweight mode', 'TrayManager');

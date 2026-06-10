@@ -298,7 +298,6 @@ export function ServerPage() {
         <TabsContent value="manual">
           <ServerList
             servers={manualServers}
-            subscriptions={subscriptions}
             selectedServerId={selectedServerId ?? undefined}
             onAddServer={handleAddServer}
             onEditServer={handleEditServer}
@@ -382,7 +381,6 @@ export function ServerPage() {
                 {/* 节点列表 */}
                 <ServerList
                   servers={subServers}
-                  subscriptions={subscriptions}
                   showAddButton={false}
                   selectedServerId={selectedServerId ?? undefined}
                   onAddServer={() => {}}

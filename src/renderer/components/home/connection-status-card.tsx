@@ -9,9 +9,11 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { useAppStore } from '@/store/app-store';
-import { Plus } from 'lucide-react';
+import { Plus, ArrowUp, ArrowDown } from 'lucide-react';
 import { toast } from 'sonner';
+import { useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
+import { formatBytes } from '@/lib/format';
 
 export function ConnectionStatusCard() {
   const connectionStatus = useAppStore((state) => state.connectionStatus);
@@ -20,6 +22,13 @@ export function ConnectionStatusCard() {
   const isLoading = useAppStore((state) => state.isLoading);
   const saveConfig = useAppStore((state) => state.saveConfig);
   const setCurrentView = useAppStore((state) => state.setCurrentView);
+  const stats = useAppStore((state) => state.stats);
+  const refreshStatistics = useAppStore((state) => state.refreshStatistics);
+
+  // 挂载时拉一次初值（事件驱动更新由 useNativeEventListeners 负责）
+  useEffect(() => {
+    refreshStatistics();
+  }, [refreshStatistics]);
 
   const servers = config?.servers || [];
   const selectedServerId = config?.selectedServerId;
@@ -296,6 +305,36 @@ export function ConnectionStatusCard() {
         <div className="pt-2 border-t">
           <p className="text-xs text-muted-foreground">{statusInfo.description}</p>
         </div>
+
+        {/* 流量统计：代理运行时展示实时上下行速率 + 累计 + 连接数 */}
+        {connectionStatus?.proxyCore?.running && stats && (
+          <div className="grid grid-cols-3 gap-2 pt-2 border-t text-center">
+            <div>
+              <p className="text-xs text-muted-foreground flex items-center justify-center gap-0.5">
+                <ArrowUp className="h-3 w-3" />
+                {formatBytes(stats.uploadSpeed)}/s
+              </p>
+              <p className="text-[10px] text-muted-foreground/70 mt-0.5">
+                {formatBytes(stats.totalUpload)}
+              </p>
+            </div>
+            <div>
+              <p className="text-xs text-muted-foreground flex items-center justify-center gap-0.5">
+                <ArrowDown className="h-3 w-3" />
+                {formatBytes(stats.downloadSpeed)}/s
+              </p>
+              <p className="text-[10px] text-muted-foreground/70 mt-0.5">
+                {formatBytes(stats.totalDownload)}
+              </p>
+            </div>
+            <div>
+              <p className="text-xs text-muted-foreground">{stats.activeConnections ?? 0}</p>
+              <p className="text-[10px] text-muted-foreground/70 mt-0.5">
+                {t('home.connections', '连接')}
+              </p>
+            </div>
+          </div>
+        )}
 
         {/* 仅本地代理特殊提示区 */}
         {(statusInfo as any).isManualNotice && (
