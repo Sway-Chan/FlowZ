@@ -479,6 +479,7 @@ export class ConfigManager implements IConfigManager {
       socksPort: 2081,
       httpPort: 2080,
       logLevel: 'info',
+      disableLogFile: false,
       uiTheme: 'system',
     };
   }

@@ -370,6 +370,8 @@ export interface UserConfig {
 
   // 日志设置
   logLevel: LogLevel;
+  // 关闭日志写盘（sing-box log.disabled）；默认 false=写盘。关闭后应用内无法查看实时日志/基于日志的诊断
+  disableLogFile?: boolean;
 
   // UI 设置
   uiTheme?: 'light' | 'dark' | 'system';

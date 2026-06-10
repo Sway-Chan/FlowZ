@@ -97,6 +97,7 @@ interface SingBoxLogConfig {
   level: string;
   timestamp: boolean;
   output?: string;
+  disabled?: boolean;
 }
 
 interface SingBoxDnsServer {
@@ -916,12 +917,17 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 生成日志配置
    */
   private generateLogConfig(config: UserConfig): SingBoxLogConfig {
-    // 默认使用 debug 级别以显示路由决策（哪些请求走代理/直连）
-    // 应用层会过滤掉不重要的日志，只保留有价值的信息
+    // 日志级别由用户配置（默认 info）。level 影响是否记录访问域名/SNI（info/debug 会记，warn+ 不记）。
     const logConfig: SingBoxLogConfig = {
-      level: config.logLevel || 'debug',
+      level: config.logLevel || 'info',
       timestamp: true,
     };
+
+    // 用户关闭日志写盘：整体禁用 sing-box 日志（隐私/省盘），不再写文件
+    if (config.disableLogFile) {
+      logConfig.disabled = true;
+      return logConfig;
+    }
 
     // 在 TUN 模式下（macOS 和 Windows），使用权限提升运行时无法捕获 stdout
     // 需要将日志输出到文件，然后通过文件监控读取

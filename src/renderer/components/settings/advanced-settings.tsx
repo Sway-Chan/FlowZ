@@ -4,6 +4,13 @@ import { Label } from '@/components/ui/label';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 import { useAppStore } from '@/store/app-store';
 import { toast } from 'sonner';
 import { useTranslation } from 'react-i18next';
@@ -351,6 +358,46 @@ export function AdvancedSettings() {
             </div>
             <p className="text-xs text-muted-foreground ml-6 mb-2">
               {t('settings.advanced.tlsFragmentDesc')}
+            </p>
+
+            {/* 日志级别 */}
+            <div className="space-y-1.5 pt-2">
+              <Label className="font-normal">{t('settings.advanced.logLevel')}</Label>
+              <Select
+                value={config.logLevel || 'info'}
+                onValueChange={(v) =>
+                  saveConfig({ ...config, logLevel: v as typeof config.logLevel })
+                }
+              >
+                <SelectTrigger className="w-40">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="debug">debug</SelectItem>
+                  <SelectItem value="info">info</SelectItem>
+                  <SelectItem value="warn">warn</SelectItem>
+                  <SelectItem value="error">error</SelectItem>
+                  <SelectItem value="fatal">fatal</SelectItem>
+                </SelectContent>
+              </Select>
+              <p className="text-xs text-muted-foreground">{t('settings.advanced.logLevelDesc')}</p>
+            </div>
+
+            {/* 关闭日志写盘 */}
+            <div className="flex items-center space-x-2 pt-2">
+              <Checkbox
+                id="disableLogFile"
+                checked={config.disableLogFile === true}
+                onCheckedChange={(checked) => {
+                  saveConfig({ ...config, disableLogFile: checked as boolean });
+                }}
+              />
+              <Label htmlFor="disableLogFile" className="font-normal cursor-pointer">
+                {t('settings.advanced.disableLogFile')}
+              </Label>
+            </div>
+            <p className="text-xs text-muted-foreground ml-6 mb-2">
+              {t('settings.advanced.disableLogFileDesc')}
             </p>
 
             {/* 自动换节点 */}
