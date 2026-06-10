@@ -298,6 +298,8 @@ interface SingBoxRuleSet {
   path?: string;
   url?: string;
   download_detour?: string;
+  // remote rule_set 更新周期；不填 sing-box 用隐式默认，显式设定避免长期不更新 / 频繁拉取
+  update_interval?: string;
 }
 
 interface SingBoxRouteConfig {
@@ -319,6 +321,12 @@ const DOH_LEAK_DOMAIN_KEYWORDS = [
   'dns.quad9.net',
   'one.one.one.one',
 ];
+
+/**
+ * 远程 rule_set 更新周期：显式设定，避免依赖 sing-box 隐式默认（geo 数据约日更，
+ * 24h 在新鲜度与启动拉取频次间取平衡）。所有 type:'remote' 的 rule_set 共用此值。
+ */
+const REMOTE_RULESET_UPDATE_INTERVAL = '24h';
 
 /** 主机字符串是否为 IPv4 字面量（与 DNS/route 生成各处保持同一判定，避免分类不一致）。 */
 const isIpv4Host = (host: string): boolean => /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(host);
@@ -1875,6 +1883,36 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   /**
    * 生成路由配置（sing-box 1.12.x / 1.13.x 兼容格式）
    */
+  /** 本地 geo 规则集运行时目录（内置 .srs 拷贝落地处）。copy 与 route 生成共用，单一真值。 */
+  private getRuleSetRuntimeDir(): string {
+    return path.join(getUserDataPath(), 'rules');
+  }
+
+  /**
+   * 内置 geo 规则集的单一真值表：tag、运行时文件名、内置源路径。
+   * copyRuleSetsToUserData（写入）与 generateRouteConfig（引用 path）共用此表，避免两处各自硬编码
+   * 目录+文件名导致漂移——改一处而另一处仍指旧路径会让 sing-box 加载本地 rule_set 失败。
+   */
+  private getLocalGeoRuleSets(): { tag: string; fileName: string; srcPath: string }[] {
+    return [
+      {
+        tag: 'geosite-cn',
+        fileName: 'geosite-cn.srs',
+        srcPath: resourceManager.getGeoSiteCNPath(),
+      },
+      {
+        tag: 'geosite-geolocation-!cn',
+        fileName: 'geosite-geolocation-!cn.srs',
+        srcPath: resourceManager.getGeoSiteNonCNPath(),
+      },
+      {
+        tag: 'geoip-cn',
+        fileName: 'geoip-cn.srs',
+        srcPath: resourceManager.getGeoIPPath(),
+      },
+    ];
+  }
+
   private generateRouteConfig(
     config: UserConfig,
     idToTagMap: Map<string, string>
@@ -2315,26 +2353,16 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       if (!routeConfig.rule_set) {
         routeConfig.rule_set = [];
       }
-      routeConfig.rule_set.push(
-        {
-          tag: 'geosite-cn',
+      // 路径取自与 copyRuleSetsToUserData 同一真值表，杜绝目录/文件名漂移
+      const runtimeDir = this.getRuleSetRuntimeDir();
+      for (const rs of this.getLocalGeoRuleSets()) {
+        routeConfig.rule_set.push({
+          tag: rs.tag,
           type: 'local',
           format: 'binary',
-          path: path.join(getUserDataPath(), 'rules', 'geosite-cn.srs'),
-        },
-        {
-          tag: 'geosite-geolocation-!cn',
-          type: 'local',
-          format: 'binary',
-          path: path.join(getUserDataPath(), 'rules', 'geosite-geolocation-!cn.srs'),
-        },
-        {
-          tag: 'geoip-cn',
-          type: 'local',
-          format: 'binary',
-          path: path.join(getUserDataPath(), 'rules', 'geoip-cn.srs'),
-        }
-      );
+          path: path.join(runtimeDir, rs.fileName),
+        });
+      }
     }
 
     // 添加自定义规则和应用分流所需的 Geosite/GeoIP rule_set
@@ -2372,7 +2400,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           url: geositeUrl,
           // 必须走直连下载，避免启动时循环依赖
           download_detour: 'direct',
-        } as any);
+          update_interval: REMOTE_RULESET_UPDATE_INTERVAL,
+        });
       }
 
       // 添加 GeoIP 远程规则集
@@ -2384,7 +2413,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           url: `https://fastly.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-${category}.srs`,
           // 必须走直连下载，避免启动时循环依赖
           download_detour: 'direct',
-        } as any);
+          update_interval: REMOTE_RULESET_UPDATE_INTERVAL,
+        });
       }
     }
 
@@ -2528,7 +2558,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         format: 'binary',
         url: ruleSet.url,
         download_detour: selectedServerTag, // 默认通过当前选中的代理下载自定义规则集
-      } as any);
+        update_interval: REMOTE_RULESET_UPDATE_INTERVAL,
+      });
 
       const singboxRule: SingBoxRouteRule = {
         action: 'route',
@@ -3786,7 +3817,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 解决 macOS TUN 模式下特权进程无法读取 Downloads/Documents 目录的问题
    */
   private async copyRuleSetsToUserData(): Promise<void> {
-    const rulesDir = path.join(getUserDataPath(), 'rules');
+    const rulesDir = this.getRuleSetRuntimeDir();
 
     // 确保目录存在
     try {
@@ -3798,11 +3829,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       return;
     }
 
-    const filesToCopy = [
-      { src: resourceManager.getGeoSiteCNPath(), dest: 'geosite-cn.srs' },
-      { src: resourceManager.getGeoSiteNonCNPath(), dest: 'geosite-geolocation-!cn.srs' },
-      { src: resourceManager.getGeoIPPath(), dest: 'geoip-cn.srs' },
-    ];
+    // 与 generateRouteConfig 引用同一真值表：dest 文件名即 route 里 path 指向的文件名
+    const filesToCopy = this.getLocalGeoRuleSets().map((rs) => ({
+      src: rs.srcPath,
+      dest: rs.fileName,
+    }));
 
     const fs = require('fs/promises');
 
