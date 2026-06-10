@@ -5,7 +5,7 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Input } from '@/components/ui/input';
 import { useAppStore } from '@/store/app-store';
 import { Trash2, ArrowDown, Search } from 'lucide-react';
-import { getLogs, clearLogs, addEventListener, removeEventListener } from '@/bridge/api-wrapper';
+import { getLogs, clearLogs, addEventListener } from '@/bridge/api-wrapper';
 import type { LogEntry } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -44,10 +44,10 @@ export function RealTimeLogs() {
       });
     };
 
-    addEventListener('logReceived', handleLogReceived);
+    const unsubscribe = addEventListener('logReceived', handleLogReceived);
 
     return () => {
-      removeEventListener('logReceived', handleLogReceived);
+      unsubscribe();
     };
   }, []);
 

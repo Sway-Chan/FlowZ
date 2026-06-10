@@ -9,9 +9,11 @@ import { toast } from 'sonner';
 
 // 定义事件数据类型
 interface NativeEventData {
-  processStarted: { pid: number; timestamp: string };
-  processStopped: { timestamp: string };
-  processError: { error: string; timestamp: string };
+  processStarted: { pid: number | null; startTime?: string | Date; autoRestarted?: boolean };
+  processStopped: Record<string, never>;
+  // 主进程各 emit 点 payload 不完全一致（{message,code}|{message,error}|{message,code,signal}），
+  // 统一按 message 优先、error 兜底消费
+  processError: { message?: string; error?: string; code?: number; signal?: string | null };
   configChanged: { key?: string; oldValue?: any; newValue?: any };
   statsUpdated: any;
   navigateToPage: string;
@@ -86,37 +88,39 @@ export function useNativeEventListeners() {
   const handleProcessError = (data: NativeEventData['processError']) => {
     console.error('Process error:', data);
 
+    // 各 emit 点 message/error 不一致 → 统一取值，避免「崩溃达上限」等场景因只读 data.error 而漏弹 toast
+    const errText = data.message ?? data.error;
     // Display user-friendly error notification
-    if (data.error) {
+    if (errText) {
       // Determine error category and retry capability
       let category = ErrorCategory.Process;
       let canRetry = true;
 
       // Check for Trojan-specific errors
-      if (data.error.includes('Trojan') || data.error.includes('trojan')) {
+      if (errText.includes('Trojan') || errText.includes('trojan')) {
         category = ErrorCategory.Connection;
 
         // Authentication and config errors are not retryable
         if (
-          data.error.includes('认证失败') ||
-          data.error.includes('密码错误') ||
-          data.error.includes('配置错误')
+          errText.includes('认证失败') ||
+          errText.includes('密码错误') ||
+          errText.includes('配置错误')
         ) {
           canRetry = false;
         }
       }
 
       // Check for VLESS-specific errors
-      if (data.error.includes('VLESS') || data.error.includes('vless')) {
+      if (errText.includes('VLESS') || errText.includes('vless')) {
         category = ErrorCategory.Connection;
 
-        if (data.error.includes('UUID 错误') || data.error.includes('认证失败')) {
+        if (errText.includes('UUID 错误') || errText.includes('认证失败')) {
           canRetry = false;
         }
       }
 
       // Check for protocol errors
-      if (data.error.includes('不支持的协议') || data.error.includes('Protocol')) {
+      if (errText.includes('不支持的协议') || errText.includes('Protocol')) {
         category = ErrorCategory.Config;
         canRetry = false;
       }
@@ -124,8 +128,8 @@ export function useNativeEventListeners() {
       // Handle the error with appropriate category
       ErrorHandler.handle({
         category,
-        userMessage: data.error,
-        technicalMessage: data.error,
+        userMessage: errText,
+        technicalMessage: errText,
         canRetry,
       });
     }

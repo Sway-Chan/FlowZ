@@ -54,21 +54,34 @@ export const proxyApi = {
   /**
    * 监听代理启动事件
    */
-  onStarted(listener: (data: { pid: number; timestamp: string }) => void): () => void {
+  onStarted(
+    listener: (data: {
+      pid: number | null;
+      startTime?: string | Date | null;
+      autoRestarted?: boolean;
+    }) => void
+  ): () => void {
     return ipcClient.on(IPC_CHANNELS.EVENT_PROXY_STARTED, listener);
   },
 
   /**
    * 监听代理停止事件
    */
-  onStopped(listener: (data: { timestamp: string }) => void): () => void {
+  onStopped(listener: (data: Record<string, never>) => void): () => void {
     return ipcClient.on(IPC_CHANNELS.EVENT_PROXY_STOPPED, listener);
   },
 
   /**
-   * 监听代理错误事件
+   * 监听代理错误事件。主进程各 emit 点 payload 形状不一，message 优先 / error 兜底。
    */
-  onError(listener: (data: { error: string; timestamp: string }) => void): () => void {
+  onError(
+    listener: (data: {
+      message?: string;
+      error?: string;
+      code?: number;
+      signal?: string | null;
+    }) => void
+  ): () => void {
     return ipcClient.on(IPC_CHANNELS.EVENT_PROXY_ERROR, listener);
   },
 

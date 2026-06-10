@@ -22,6 +22,7 @@ import {
   getCachePath,
 } from '../utils/paths';
 import { getAppPreset } from '../../shared/app-rules-preset';
+import { parseDnsServerSpec, type ParsedDnsServer } from '../../shared/dns';
 import coreManifest from '../../shared/core-manifest.json';
 
 /**
@@ -981,6 +982,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     }
   }
 
+  /** 用户自定义国内 DNS 若为 IP（非 DoH 域名），返回 {ip, port} 供 TUN 直连放行/排除集；否则 null。 */
+  private getCustomDomesticDnsEndpoint(config: UserConfig): { ip: string; port: number } | null {
+    const p = parseDnsServerSpec(config.dnsConfig?.domesticDns);
+    return p && !p.isDomain ? { ip: p.server, port: p.port } : null;
+  }
+
   private generateDnsConfig(config: UserConfig, selectedServerTag: string): SingBoxDnsConfig {
     const proxyMode = (config.proxyMode || 'smart').toLowerCase();
 
@@ -999,6 +1006,46 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 从而完美避开机场对纯 IP 请求的无情封杀！
     const enableFakeIp =
       config.proxyModeType?.toLowerCase() !== 'systemproxy' ? true : userDnsConfig.enableFakeIp;
+
+    // 用户自定义 DNS：解析 domesticDns/foreignDns（https DoH / tls DoT / udp / 裸 IP），非法或空回退默认并告警。
+    const DEFAULT_DOMESTIC: ParsedDnsServer = {
+      type: 'https',
+      server: 'doh.pub',
+      port: 443,
+      path: '/dns-query',
+      isDomain: true,
+    };
+    const DEFAULT_FOREIGN: ParsedDnsServer = {
+      type: 'https',
+      server: 'dns.google',
+      port: 443,
+      path: '/dns-query',
+      isDomain: true,
+    };
+    const domestic = parseDnsServerSpec(userDnsConfig.domesticDns) ?? DEFAULT_DOMESTIC;
+    const foreign = parseDnsServerSpec(userDnsConfig.foreignDns) ?? DEFAULT_FOREIGN;
+    if (userDnsConfig.domesticDns && !parseDnsServerSpec(userDnsConfig.domesticDns)) {
+      this.logToManager(
+        'warn',
+        `国内 DNS 无法解析，已回退默认 doh.pub: ${userDnsConfig.domesticDns}`
+      );
+    }
+    if (userDnsConfig.foreignDns && !parseDnsServerSpec(userDnsConfig.foreignDns)) {
+      this.logToManager(
+        'warn',
+        `境外 DNS 无法解析，已回退默认 dns.google: ${userDnsConfig.foreignDns}`
+      );
+    }
+    // 由解析结果构造 dns server：域名型 DNS 需 domain_resolver 引导解析；DoH 带 path；remote 走代理 detour。
+    const buildUserDns = (tag: string, p: ParsedDnsServer, detour?: string): SingBoxDnsServer => ({
+      tag,
+      type: p.type,
+      server: p.server,
+      server_port: p.port,
+      ...(p.type === 'https' ? { path: p.path || '/dns-query' } : {}),
+      ...(p.isDomain ? { domain_resolver: 'dns-bootstrap' } : {}),
+      ...(detour ? { detour } : {}),
+    });
 
     // sing-box 1.13+ 新格式：每个 server 必须有显式 type 字段
     //
@@ -1031,26 +1078,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         tag: 'dns-local',
         type: 'local',
       },
-      {
-        // 国内直连 DNS (推荐 DoH)
-        tag: 'dns-domestic',
-        type: 'https',
-        server: 'doh.pub',
-        server_port: 443,
-        path: '/dns-query',
-        domain_resolver: 'dns-bootstrap',
-      },
-      {
-        // 远程代理 DNS (推荐 DoH)
-        tag: 'dns-remote',
-        type: 'https',
-        server: 'dns.google',
-        server_port: 443,
-        path: '/dns-query',
-        domain_resolver: 'dns-bootstrap',
-        // 关键核心：远程解析必须走代理，否则在境内直接发起会因 GFW 拦截/污染导致 FakeIP 映射失败或由于 TTL 极短产生大量无效解析。
-        detour: selectedServerTag,
-      },
+      // 国内直连 DNS（用户可自定义，默认 doh.pub DoH）
+      buildUserDns('dns-domestic', domestic),
+      // 远程代理 DNS（用户可自定义，默认 dns.google DoH）。必须走代理 detour，
+      // 否则在境内直接发起会因 GFW 拦截/污染导致 FakeIP 映射失败或 TTL 极短产生大量无效解析。
+      buildUserDns('dns-remote', foreign, selectedServerTag),
     ];
 
     if (enableFakeIp) {
@@ -1090,9 +1122,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       } as SingBoxDnsRule);
     }
 
-    // 处理基础 DNS 服务的地址解析，确保它们走引导解析器
+    // 处理基础 DNS 服务的地址解析，确保它们走引导解析器（含用户自定义的 DoH 域名）
+    const bootstrapDomains = ['doh.pub', 'dns.google', 'cloudflare-dns.com', 'one.one.one.one'];
+    if (domestic.isDomain) bootstrapDomains.push(domestic.server);
+    if (foreign.isDomain) bootstrapDomains.push(foreign.server);
     dnsRules.push({
-      domain: ['doh.pub', 'dns.google', 'cloudflare-dns.com', 'one.one.one.one'],
+      domain: Array.from(new Set(bootstrapDomains)),
       server: 'dns-bootstrap-udp',
     } as SingBoxDnsRule);
 
@@ -1254,6 +1289,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           '8.8.8.8/32',
           '1.1.1.1/32'
         );
+        // 用户自定义的国内 DNS（IP 型）一并排除，防 WFP 进程匹配失效时回流死循环
+        const customDns = this.getCustomDomesticDnsEndpoint(config);
+        if (customDns) {
+          excludeAddr.push(`${customDns.ip}/${isIpv6Host(customDns.ip) ? 128 : 32}`);
+        }
       }
 
       // 绝杀级修复（多服务器版本）：如果在 应用分流 (App Policy) 中选择了其他节点，那么这些节点的 IP 也必须被排除。
@@ -1967,6 +2007,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // C. 强制引导核心 DNS 直连（必须在 hijack-dns 之前！）
     // 把已知 bootstrap DNS IP 放在 hijack-dns 之前，无论哪个进程发包都走直连，彻底断环。
     // 注意：这里只应该放国内的 DNS IP。如果放 8.8.8.8，会导致用户去 ping 8.8.8.8 时走直连被墙！
+    const customDomesticDns = this.getCustomDomesticDnsEndpoint(config);
     rules.push({
       ip_cidr: [
         '223.5.5.5/32',
@@ -1974,8 +2015,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         '119.29.29.29/32',
         '119.28.28.28/32',
         '114.114.114.114/32',
+        // 用户自定义的国内 DNS（IP 型）也须在 hijack-dns 之前直连放行，否则其 53 端口查询会被劫持成 FakeIP
+        ...(customDomesticDns
+          ? [`${customDomesticDns.ip}/${isIpv6Host(customDomesticDns.ip) ? 128 : 32}`]
+          : []),
       ],
-      port: [53, 443],
+      port: Array.from(new Set([53, 443, ...(customDomesticDns ? [customDomesticDns.port] : [])])),
       action: 'route',
       outbound: 'direct',
     });

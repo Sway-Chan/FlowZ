@@ -460,34 +460,25 @@ export async function updateSubscriptionServers(subscriptionId: string): Promise
 /**
  * Event listener functions
  */
-export function addEventListener(event: string, listener: (...args: any[]) => void): void {
+/** 注册事件监听并返回 unsubscribe 清理函数（调用方 useEffect cleanup 必须调用，否则监听器泄漏）。 */
+export function addEventListener(event: string, listener: (...args: any[]) => void): () => void {
   // 根据事件类型注册对应的监听器
   switch (event) {
     case 'proxyStarted':
-      api.proxy.onStarted(listener);
-      break;
+      return api.proxy.onStarted(listener);
     case 'proxyStopped':
-      api.proxy.onStopped(listener);
-      break;
+      return api.proxy.onStopped(listener);
     case 'proxyError':
-      api.proxy.onError(listener);
-      break;
+      return api.proxy.onError(listener);
     case 'configChanged':
-      api.config.onChanged(listener);
-      break;
+      return api.config.onChanged(listener);
     case 'logReceived':
-      api.logs.onReceived(listener);
-      break;
+      return api.logs.onReceived(listener);
     case 'statsUpdated':
-      api.stats.onUpdated(listener);
-      break;
+      return api.stats.onUpdated(listener);
     case 'connectionStateChanged':
-      api.connection.onStateChanged(listener);
-      break;
+      return api.connection.onStateChanged(listener);
+    default:
+      return () => {};
   }
-}
-
-export function removeEventListener(_event: string, _listener: (...args: any[]) => void): void {
-  // Electron IPC 的 removeListener 由返回的清理函数处理
-  // 这里保留接口兼容性
 }

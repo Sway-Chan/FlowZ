@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect } from 'react';
 import { MainLayout } from './components/layout/main-layout';
 import { useAppStore } from './store/app-store';
 import { useNativeEventListeners } from './hooks/use-native-events';
@@ -18,20 +18,13 @@ import i18n from './i18n';
 function App() {
   const currentView = useAppStore((state) => state.currentView);
   const setCurrentView = useAppStore((state) => state.setCurrentView);
+  const settingsSection = useAppStore((state) => state.settingsSection);
+  const setSettingsSection = useAppStore((state) => state.setSettingsSection);
   const loadConfig = useAppStore((state) => state.loadConfig);
   const refreshConnectionStatus = useAppStore((state) => state.refreshConnectionStatus);
   const setPrivacyMode = useAppStore((state) => state.setPrivacyMode);
 
-  // Settings sub-navigation state
-  const [settingsSection, setSettingsSection] = useState('general');
-
-  // When leaving settings, reset to general
-  const handleViewChange = (view: string) => {
-    setCurrentView(view);
-    if (view !== 'settings') {
-      setSettingsSection('general');
-    }
-  };
+  // 离开设置页重置子节的逻辑已下沉到 store.setCurrentView，此处直接用 setCurrentView
 
   // Listen to native events
   useNativeEventListeners();
@@ -64,7 +57,7 @@ function App() {
     const unsubscribe = ipcClient.on<string>('navigate', (route) => {
       const view = routeMap[route];
       if (view) {
-        handleViewChange(view);
+        setCurrentView(view);
       }
     });
 
@@ -113,7 +106,7 @@ function App() {
       <PrivacyOverlay />
       <MainLayout
         currentView={currentView}
-        onViewChange={handleViewChange}
+        onViewChange={setCurrentView}
         settingsSection={settingsSection}
         onSettingsSectionChange={setSettingsSection}
       >

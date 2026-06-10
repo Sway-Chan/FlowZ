@@ -26,6 +26,8 @@ interface ConnectionStatus {
 interface AppState {
   // UI State
   currentView: string;
+  // 设置页子节（general/about/...）。提升到 store，供非设置页组件（如 naive 横幅「去更新」）跨页导航到指定节
+  settingsSection: string;
   isLoading: boolean;
   error: string | null;
 
@@ -46,6 +48,7 @@ interface AppState {
 
   // Actions
   setCurrentView: (view: string) => void;
+  setSettingsSection: (section: string) => void;
   setLoading: (loading: boolean) => void;
   setError: (error: string | null) => void;
   setLatencyMap: (map: Record<string, number>) => void;
@@ -79,6 +82,7 @@ interface AppState {
 export const useAppStore = create<AppState>((set, get) => ({
   // Initial State
   currentView: 'home',
+  settingsSection: 'general',
   isLoading: false,
   error: null,
   connectionStatus: null,
@@ -88,7 +92,13 @@ export const useAppStore = create<AppState>((set, get) => ({
   isPrivacyMode: false,
 
   // UI Actions
-  setCurrentView: (view) => set({ currentView: view }),
+  // 离开设置页时把子节重置回 general（保留原 App 行为）；导航到设置页则保留当前/外部指定的子节
+  setCurrentView: (view) =>
+    set((s) => ({
+      currentView: view,
+      settingsSection: view === 'settings' ? s.settingsSection : 'general',
+    })),
+  setSettingsSection: (section) => set({ settingsSection: section }),
   setLoading: (loading) => set({ isLoading: loading }),
   setError: (error) => set({ error }),
   setLatencyMap: (map) => set({ latencyMap: map }),

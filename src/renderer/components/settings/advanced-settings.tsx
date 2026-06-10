@@ -12,6 +12,7 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { useAppStore } from '@/store/app-store';
+import { parseDnsServerSpec } from '@shared/dns';
 import { toast } from 'sonner';
 import { useTranslation } from 'react-i18next';
 import { BackupRestoreSection } from './backup-restore-section';
@@ -114,6 +115,10 @@ export function AdvancedSettings() {
                   updatedConfig.dnsConfig.domesticDns = e.target.value;
                   saveConfig(updatedConfig);
                 }}
+                onBlur={(e) => {
+                  const v = e.target.value.trim();
+                  if (v && !parseDnsServerSpec(v)) toast.error(t('settings.advanced.dnsInvalid'));
+                }}
                 className="max-w-md"
                 placeholder={t('settings.advanced.domesticDnsPlaceholder')}
               />
@@ -138,6 +143,10 @@ export function AdvancedSettings() {
                   }
                   updatedConfig.dnsConfig.foreignDns = e.target.value;
                   saveConfig(updatedConfig);
+                }}
+                onBlur={(e) => {
+                  const v = e.target.value.trim();
+                  if (v && !parseDnsServerSpec(v)) toast.error(t('settings.advanced.dnsInvalid'));
                 }}
                 className="max-w-md"
                 placeholder={t('settings.advanced.foreignDnsPlaceholder')}
