@@ -56,6 +56,18 @@ type SingboxOutbound = {
   obfs?: { type?: string; password?: string };
   // naive：是否启用 HTTP/3 (QUIC) 传输
   quic?: boolean;
+  // vmess
+  alter_id?: number;
+  security?: string;
+  // tuic
+  congestion_control?: string;
+  udp_relay_mode?: string;
+  zero_rtt_handshake?: boolean;
+  heartbeat?: string;
+  // anytls
+  idle_session_check_interval?: string;
+  idle_session_timeout?: string;
+  min_idle_session?: number;
   tls?: SingboxTls;
   transport?: SingboxTransport;
   multiplex?: SingboxMultiplex;
@@ -177,7 +189,16 @@ export class SubscriptionService {
     outbounds: SingboxOutbound[],
     subscriptionId: string
   ): ServerConfig[] {
-    const SUPPORTED = new Set(['shadowsocks', 'vless', 'trojan', 'hysteria2', 'naive']);
+    const SUPPORTED = new Set([
+      'shadowsocks',
+      'vless',
+      'trojan',
+      'hysteria2',
+      'naive',
+      'vmess',
+      'tuic',
+      'anytls',
+    ]);
     const servers: ServerConfig[] = [];
     const now = new Date().toISOString();
 
@@ -309,6 +330,47 @@ export class SubscriptionService {
             password: ob.password ?? '',
             naiveSettings: ob.quic ? { useHttp3: true } : undefined,
           });
+        } else if (ob.type === 'vmess') {
+          servers.push({
+            ...(base as ServerConfig),
+            protocol: 'vmess',
+            uuid: ob.uuid ?? '',
+            alterId: ob.alter_id,
+            vmessSecurity: ob.security,
+          });
+        } else if (ob.type === 'tuic') {
+          const tuic: ServerConfig = {
+            ...(base as ServerConfig),
+            protocol: 'tuic',
+            uuid: ob.uuid ?? '',
+            password: ob.password ?? '',
+          };
+          const ts: NonNullable<ServerConfig['tuicSettings']> = {};
+          if (ob.congestion_control)
+            ts.congestionControl = ob.congestion_control as NonNullable<
+              ServerConfig['tuicSettings']
+            >['congestionControl'];
+          if (ob.udp_relay_mode)
+            ts.udpRelayMode = ob.udp_relay_mode as NonNullable<
+              ServerConfig['tuicSettings']
+            >['udpRelayMode'];
+          if (ob.zero_rtt_handshake !== undefined) ts.zeroRttHandshake = ob.zero_rtt_handshake;
+          if (ob.heartbeat) ts.heartbeat = ob.heartbeat;
+          if (Object.keys(ts).length > 0) tuic.tuicSettings = ts;
+          servers.push(tuic);
+        } else if (ob.type === 'anytls') {
+          const anytls: ServerConfig = {
+            ...(base as ServerConfig),
+            protocol: 'anytls',
+            password: ob.password ?? '',
+          };
+          const as: NonNullable<ServerConfig['anyTlsSettings']> = {};
+          if (ob.idle_session_check_interval)
+            as.idleSessionCheckInterval = ob.idle_session_check_interval;
+          if (ob.idle_session_timeout) as.idleSessionTimeout = ob.idle_session_timeout;
+          if (ob.min_idle_session !== undefined) as.minIdleSession = ob.min_idle_session;
+          if (Object.keys(as).length > 0) anytls.anyTlsSettings = as;
+          servers.push(anytls);
         }
       } catch (e: any) {
         this.logManager.addLog(

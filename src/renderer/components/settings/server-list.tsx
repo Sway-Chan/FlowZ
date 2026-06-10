@@ -261,7 +261,10 @@ export function ServerList({
 
   const handleBatchCopy = async () => {
     try {
-      const selectedServersList = servers.filter((s) => selectedIds.has(s.id));
+      // ssh 无分享链接，批量复制时排除（避免 per-server 抛错刷屏 toast）
+      const selectedServersList = servers.filter(
+        (s) => selectedIds.has(s.id) && s.protocol?.toLowerCase() !== 'ssh'
+      );
       const urls: string[] = [];
       let successCount = 0;
 
@@ -396,15 +399,18 @@ export function ServerList({
           {latencyMap[server.id] === -1 ? t('servers.timeout') : `${latencyMap[server.id]} ms`}
         </span>
       )}
-      <Button
-        variant="ghost"
-        size="sm"
-        title={t('servers.copyShareUrl')}
-        className="h-7 w-7 p-0"
-        onClick={(e) => handleCopyShareUrl(server, e)}
-      >
-        <Copy className="h-3.5 w-3.5" />
-      </Button>
+      {/* ssh 无分享链接(ProtocolParser.generateUrl 无 ssh 分支)，隐藏复制按钮 */}
+      {server.protocol?.toLowerCase() !== 'ssh' && (
+        <Button
+          variant="ghost"
+          size="sm"
+          title={t('servers.copyShareUrl')}
+          className="h-7 w-7 p-0"
+          onClick={(e) => handleCopyShareUrl(server, e)}
+        >
+          <Copy className="h-3.5 w-3.5" />
+        </Button>
+      )}
       {onCloneServer && (
         <Button
           variant="ghost"
