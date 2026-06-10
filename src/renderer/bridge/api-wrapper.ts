@@ -118,38 +118,6 @@ export async function updateProxyMode(mode: UserConfig['proxyMode']): Promise<Ap
 }
 
 /**
- * Status and Statistics APIs
- */
-export async function getConnectionStatus(): Promise<ApiResponse<any>> {
-  try {
-    const status = await api.proxy.getStatus();
-    return { success: true, data: status };
-  } catch (error: any) {
-    return { success: false, error: error?.message };
-  }
-}
-
-export async function getStatistics(): Promise<ApiResponse<any>> {
-  try {
-    const stats = await api.stats.get();
-    return { success: true, data: stats };
-  } catch (error: any) {
-    return { success: false, error: error?.message };
-  }
-}
-
-export async function resetStatistics(): Promise<ApiResponse<void>> {
-  try {
-    await api.stats.reset();
-    ErrorHandler.showSuccess('流量统计已重置');
-    return { success: true };
-  } catch (error: any) {
-    ErrorHandler.handleApiError(error, '重置流量统计');
-    return { success: false, error: error?.message };
-  }
-}
-
-/**
  * Custom Rules APIs
  */
 export async function addCustomRule(

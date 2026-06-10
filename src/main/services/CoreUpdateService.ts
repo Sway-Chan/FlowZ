@@ -12,7 +12,7 @@ import { ProxyManager } from './ProxyManager';
 import { resourceManager } from './ResourceManager';
 
 import type { UserConfig } from '../../shared/types';
-import { encodeMajorMinor } from '../utils/version';
+import { encodeMajorMinor } from '../../shared/version';
 import coreManifest from '../../shared/core-manifest.json';
 
 export interface CoreUpdateCheckResult {

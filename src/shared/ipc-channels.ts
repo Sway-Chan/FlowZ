@@ -53,7 +53,6 @@ export const IPC_CHANNELS = {
 
   // 统计信息
   STATS_GET: 'stats:get',
-  STATS_RESET: 'stats:reset',
 
   // 版本信息
   VERSION_GET_INFO: 'version:getInfo',

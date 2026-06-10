@@ -329,13 +329,6 @@ export const statsApi = {
   },
 
   /**
-   * 重置流量统计
-   */
-  async reset(): Promise<void> {
-    return ipcClient.invoke(IPC_CHANNELS.STATS_RESET);
-  },
-
-  /**
    * 监听统计更新事件
    */
   onUpdated(listener: (stats: TrafficStats) => void): () => void {

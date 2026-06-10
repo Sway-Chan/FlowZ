@@ -68,7 +68,6 @@ interface AppState {
   // Status Actions
   refreshConnectionStatus: () => Promise<void>;
   refreshStatistics: () => Promise<void>;
-  resetStatistics: () => Promise<void>;
 
   // Server Management Actions
   deleteServer: (serverId: string) => Promise<void>;
@@ -343,25 +342,6 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ stats });
     } catch (error) {
       console.error('Failed to refresh statistics:', error);
-    }
-  },
-
-  resetStatistics: async () => {
-    set({ isLoading: true, error: null });
-    try {
-      await api.stats.reset();
-      set({
-        stats: {
-          uploadSpeed: 0,
-          downloadSpeed: 0,
-          totalUpload: 0,
-          totalDownload: 0,
-        },
-      });
-    } catch (error) {
-      set({ error: String(error) });
-    } finally {
-      set({ isLoading: false });
     }
   },
 

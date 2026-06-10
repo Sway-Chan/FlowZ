@@ -13,7 +13,7 @@ import type { ILogManager } from './LogManager';
 import { IPC_CHANNELS } from '../../shared/ipc-channels';
 import { resourceManager } from './ResourceManager';
 import { retry } from '../utils/retry';
-import { coreVersionAtLeast } from '../utils/version';
+import { coreVersionAtLeast } from '../../shared/version';
 import {
   getUserDataPath,
   getSingBoxConfigPath,

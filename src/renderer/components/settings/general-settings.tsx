@@ -23,7 +23,6 @@ export function GeneralSettings() {
       | 'autoCheckUpdate'
       | 'autoLightweightMode'
       | 'rememberWindowSize'
-      | 'enableIPv6'
       | 'autoPrivacyMode',
     value: boolean
   ) => {
