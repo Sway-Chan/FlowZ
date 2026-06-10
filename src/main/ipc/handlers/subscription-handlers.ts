@@ -1,6 +1,6 @@
 import { IpcMainInvokeEvent } from 'electron';
 import { IPC_CHANNELS } from '../../../shared/ipc-channels';
-import type { SubscriptionConfig, ServerConfig } from '../../../shared/types';
+import type { SubscriptionConfig } from '../../../shared/types';
 import { registerIpcHandler } from '../ipc-handler';
 import { SubscriptionService, SubscriptionUpdateResult } from '../../services/SubscriptionService';
 import { ConfigManager } from '../../services/ConfigManager';
@@ -108,42 +108,19 @@ export function registerSubscriptionHandlers(
         );
         const fetchedServers = result.servers;
 
-        let added = 0;
-        let updated = 0;
-        let deleted = 0;
-
-        // 获取原来的该订阅下的节点
+        // 获取原来的该订阅下的节点，按稳定指纹对账（不依赖显示名）
         const oldServers = config.servers.filter((s) => s.subscriptionId === subscription.id);
-        const oldServersMap = new Map<string, ServerConfig>();
-
-        oldServers.forEach((s) => {
-          const key = `${s.name}-${s.protocol}-${s.address}-${s.port}`;
-          oldServersMap.set(key, s);
-        });
-
-        const newServersToKeep: ServerConfig[] = [];
-
-        for (const newServer of fetchedServers) {
-          const key = `${newServer.name}-${newServer.protocol}-${newServer.address}-${newServer.port}`;
-          if (oldServersMap.has(key)) {
-            const oldServer = oldServersMap.get(key)!;
-            const mergedServer = {
-              ...newServer,
-              id: oldServer.id,
-              createdAt: oldServer.createdAt,
-              updatedAt: new Date().toISOString(),
-            };
-            newServersToKeep.push(mergedServer);
-            oldServersMap.delete(key);
-            updated++;
-          } else {
-            newServersToKeep.push(newServer);
-            added++;
-          }
-        }
-
-        deleted = oldServersMap.size;
-        const deletedIds = new Set(Array.from(oldServersMap.values()).map((s) => s.id));
+        const {
+          servers: newServersToKeep,
+          added,
+          updated,
+          deleted,
+          deletedIds,
+        } = SubscriptionService.reconcileServers(
+          oldServers,
+          fetchedServers,
+          new Date().toISOString()
+        );
 
         if (config.selectedServerId && deletedIds.has(config.selectedServerId)) {
           config.selectedServerId = null;
@@ -201,29 +178,12 @@ export function registerSubscriptionHandlers(
           const fetchedServers = result.servers;
 
           const oldServers = config.servers.filter((s) => s.subscriptionId === subscription.id);
-          const oldServersMap = new Map<string, ServerConfig>();
-          oldServers.forEach((s) => {
-            oldServersMap.set(`${s.name}-${s.protocol}-${s.address}-${s.port}`, s);
-          });
+          const { servers: newServersToKeep, deletedIds } = SubscriptionService.reconcileServers(
+            oldServers,
+            fetchedServers,
+            new Date().toISOString()
+          );
 
-          const newServersToKeep: ServerConfig[] = [];
-          for (const newServer of fetchedServers) {
-            const key = `${newServer.name}-${newServer.protocol}-${newServer.address}-${newServer.port}`;
-            if (oldServersMap.has(key)) {
-              const old = oldServersMap.get(key)!;
-              newServersToKeep.push({
-                ...newServer,
-                id: old.id,
-                createdAt: old.createdAt,
-                updatedAt: new Date().toISOString(),
-              });
-              oldServersMap.delete(key);
-            } else {
-              newServersToKeep.push(newServer);
-            }
-          }
-
-          const deletedIds = new Set(Array.from(oldServersMap.values()).map((s) => s.id));
           if (config.selectedServerId && deletedIds.has(config.selectedServerId)) {
             config.selectedServerId = null;
           }

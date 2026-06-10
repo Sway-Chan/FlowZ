@@ -71,6 +71,66 @@ export class SubscriptionService {
   }
 
   /**
+   * 节点稳定指纹：协议 + 地址 + 端口 + 凭据（uuid/password/username）。
+   * 刻意排除显示名 name 与本地自定义 detour —— 订阅方常改名/调顺序，用 name 做键会把
+   * 同一物理节点误判为「删旧增新」，导致 id 抖动、selectedServerId 丢失、本地编辑被清。
+   * 凭据可区分同 host:port 的并列节点，几乎不随更新变化。
+   */
+  static serverFingerprint(s: ServerConfig): string {
+    const cred = s.uuid || s.password || s.username || '';
+    return `${(s.protocol || '').toLowerCase()}|${s.address}|${s.port}|${cred}`;
+  }
+
+  /**
+   * 订阅节点对账：按稳定指纹匹配新旧节点。
+   * - 命中：原地更新（保留旧 id/createdAt），其余字段（含 name、detour）以订阅最新值为准
+   *   —— 订阅节点不保留本地 detour，需长期自定义请用「克隆到自建」。
+   * - 仅新订阅有：新增。
+   * - 仅旧配置有：删除（id 收入 deletedIds 供清理 selectedServerId）。
+   * 用桶（数组）承接同指纹的多个节点，按出现顺序成对匹配，避免 Map 覆盖丢 id。
+   */
+  static reconcileServers(
+    oldServers: ServerConfig[],
+    fetchedServers: ServerConfig[],
+    now: string
+  ): {
+    servers: ServerConfig[];
+    added: number;
+    updated: number;
+    deleted: number;
+    deletedIds: Set<string>;
+  } {
+    const oldBuckets = new Map<string, ServerConfig[]>();
+    for (const s of oldServers) {
+      const key = SubscriptionService.serverFingerprint(s);
+      const bucket = oldBuckets.get(key);
+      if (bucket) bucket.push(s);
+      else oldBuckets.set(key, [s]);
+    }
+
+    const kept: ServerConfig[] = [];
+    let added = 0;
+    let updated = 0;
+    for (const ns of fetchedServers) {
+      const key = SubscriptionService.serverFingerprint(ns);
+      const bucket = oldBuckets.get(key);
+      const old = bucket && bucket.length > 0 ? bucket.shift() : undefined;
+      if (old) {
+        kept.push({ ...ns, id: old.id, createdAt: old.createdAt, updatedAt: now });
+        updated++;
+      } else {
+        kept.push(ns);
+        added++;
+      }
+    }
+
+    const leftover: ServerConfig[] = [];
+    for (const bucket of oldBuckets.values()) leftover.push(...bucket);
+    const deletedIds = new Set(leftover.map((s) => s.id));
+    return { servers: kept, added, updated, deleted: leftover.length, deletedIds };
+  }
+
+  /**
    * 解析 Subscription-UserInfo header
    * 格式: upload=xxx; download=xxx; total=xxx; expire=xxx
    */

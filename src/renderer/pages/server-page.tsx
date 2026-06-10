@@ -118,7 +118,9 @@ export function ServerPage() {
             ? {
                 ...serverData,
                 id: editingServer.id,
-                subscriptionId: undefined, // 编辑后转换为手动节点以防被订阅刷新覆盖
+                // 保留归属订阅：订阅节点的编辑属临时改动，下次订阅更新会覆盖；
+                // 需长期自定义请用「克隆到自建」生成脱离订阅的副本。
+                subscriptionId: editingServer.subscriptionId,
                 createdAt: editingServer.createdAt,
                 updatedAt: now,
               }
@@ -146,6 +148,28 @@ export function ServerPage() {
         description: error instanceof Error ? error.message : t('servers.saveFailDesc'),
       });
       throw error;
+    }
+  };
+
+  // 克隆节点到自建列表：生成脱离订阅的持久副本（订阅节点的本地自定义需用此方式保留）
+  const handleCloneServer = async (server: ServerConfigWithId) => {
+    if (!config) return;
+    try {
+      const now = new Date().toISOString();
+      const cloned: ServerConfigWithId = {
+        ...server,
+        id: crypto.randomUUID(),
+        subscriptionId: undefined,
+        name: t('servers.cloneNameSuffix', { name: server.name }),
+        createdAt: now,
+        updatedAt: now,
+      };
+      await saveConfig({ ...config, servers: [...servers, cloned] });
+      toast.success(t('servers.cloneSuccess'), { description: cloned.name });
+    } catch (error) {
+      toast.error(t('servers.cloneFail'), {
+        description: error instanceof Error ? error.message : String(error),
+      });
     }
   };
 
@@ -279,6 +303,7 @@ export function ServerPage() {
             onAddServer={handleAddServer}
             onEditServer={handleEditServer}
             onDeleteServer={handleDeleteServer}
+            onCloneServer={handleCloneServer}
             onSelectServer={handleSelectServer}
             onImportSuccess={handleImportSuccess}
           />
@@ -363,6 +388,7 @@ export function ServerPage() {
                   onAddServer={() => {}}
                   onEditServer={handleEditServer}
                   onDeleteServer={handleDeleteServer}
+                  onCloneServer={handleCloneServer}
                   onSelectServer={handleSelectServer}
                   onImportSuccess={handleImportSuccess}
                 />
