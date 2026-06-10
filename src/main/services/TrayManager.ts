@@ -311,7 +311,7 @@ export class TrayManager implements ITrayManager {
         // 多来源：每个订阅/自建一个子菜单
         for (const g of groups) {
           serverSubmenu.push({
-            label: g.isManual ? this.t('自建节点', 'Manual Nodes') : g.name,
+            label: g.isManual ? this.t('自建节点', 'Custom Nodes') : g.name,
             submenu: g.servers.map(buildServerItem),
           });
         }
