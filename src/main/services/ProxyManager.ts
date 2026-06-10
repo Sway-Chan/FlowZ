@@ -3631,6 +3631,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 尝试自动重启
    */
   private async attemptAutoRestart(): Promise<void> {
+    // 幂等去重：进程 exit 事件与健康检查轮询可能对同一次崩溃同时触发，已有重启在途则跳过
+    if (this.isRestarting) {
+      return;
+    }
     if (!this.currentConfig) {
       return;
     }
@@ -4297,7 +4301,19 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
       this.logToManager('error', `sing-box异常退出: ${errorMessage}`);
 
-      // 触发错误事件
+      // 崩溃恢复主导：原地重启同节点（与健康检查复用同一内部机制，单一计数器 + 上限 + 冷却）。
+      // 仅当 shouldAutoRestart 放行（未被核心更新校验窗口抑制、未达上限）时重启；否则下沉到 error 上报，
+      // 由主进程做核心回滚 / 放弃恢复。崩溃不触发换节点（换节点交给心跳连通性检测）。
+      if (this.shouldAutoRestart()) {
+        this.singboxProcess = null;
+        this.pid = null;
+        this.singboxPid = null;
+        this.stopLogFileWatcher();
+        void this.attemptAutoRestart();
+        return; // 重启接管：保留健康检查与重启计数，不 emit error、不 cleanup
+      }
+
+      // 触发错误事件（重启被抑制或已达上限）
       this.emit('error', {
         message: errorMessage,
         code,

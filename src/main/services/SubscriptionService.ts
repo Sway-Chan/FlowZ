@@ -88,7 +88,15 @@ export class SubscriptionService {
    * 凭据可区分同 host:port 的并列节点，几乎不随更新变化。
    */
   static serverFingerprint(s: ServerConfig): string {
-    const cred = s.uuid || s.password || s.username || '';
+    // 凭据按协议落点取：vless/vmess/tuic→uuid；trojan/hy2/anytls→password；ss→shadowsocksSettings.password；
+    // naive/socks/http→username；ssh→sshSettings.password。覆盖嵌套落点，避免 SS 等凭据落空致同 host:port 误并。
+    const cred =
+      s.uuid ||
+      s.password ||
+      s.shadowsocksSettings?.password ||
+      s.username ||
+      s.sshSettings?.password ||
+      '';
     return `${(s.protocol || '').toLowerCase()}|${s.address}|${s.port}|${cred}`;
   }
 

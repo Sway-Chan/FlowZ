@@ -89,10 +89,15 @@ export class SubscriptionScheduler {
 
       const now = Date.now();
       const intervalMs = this.intervalMs(config);
-      let changed = false;
-      let updated = 0;
       let failed = 0;
 
+      // 阶段 1：仅做网络拉取（不触碰 config），收集到期订阅的抓取结果
+      const fetched: Array<{
+        subId: string;
+        name: string;
+        servers: typeof config.servers;
+        userInfo: (typeof subs)[number]['userInfo'];
+      }> = [];
       for (const sub of subs) {
         if (!sub.autoUpdate) continue;
 
@@ -111,22 +116,13 @@ export class SubscriptionScheduler {
             sub.id,
             viaProxy
           );
-          const oldServers = config.servers.filter((s) => s.subscriptionId === sub.id);
-          const { servers: kept, deletedIds } = SubscriptionService.reconcileServers(
-            oldServers,
-            result.servers,
-            new Date().toISOString()
-          );
-          if (config.selectedServerId && deletedIds.has(config.selectedServerId)) {
-            config.selectedServerId = null;
-          }
-          const others = config.servers.filter((s) => s.subscriptionId !== sub.id);
-          config.servers = [...others, ...kept];
-          sub.lastUpdated = new Date().toISOString();
-          if (result.userInfo) sub.userInfo = result.userInfo;
+          fetched.push({
+            subId: sub.id,
+            name: sub.name,
+            servers: result.servers,
+            userInfo: result.userInfo,
+          });
           this.backoff.delete(sub.id);
-          changed = true;
-          updated++;
         } catch (e: any) {
           failed++;
           const failures = (this.backoff.get(sub.id)?.failures ?? 0) + 1;
@@ -143,10 +139,37 @@ export class SubscriptionScheduler {
         }
       }
 
-      if (changed) {
+      if (fetched.length === 0) return;
+
+      // 阶段 2：重载最新 config，逐订阅对账并合并，单次落盘。
+      // 关键：reconcile 针对「重载后的最新 servers」做，且只替换该订阅自己的节点 —— 期间渲染端对
+      // 自建节点/其它订阅/其它设置的写入不会被本次后台更新覆盖（缩小读改写丢更新窗口）。
+      const fresh = await this.configManager.loadConfig();
+      const nowIso = new Date().toISOString();
+      let updated = 0;
+      for (const f of fetched) {
+        const sub = fresh.subscriptions?.find((x) => x.id === f.subId);
+        if (!sub) continue; // 订阅在此期间被删除 → 跳过
+        const oldServers = fresh.servers.filter((s) => s.subscriptionId === f.subId);
+        const { servers: kept, deletedIds } = SubscriptionService.reconcileServers(
+          oldServers,
+          f.servers,
+          nowIso
+        );
+        if (fresh.selectedServerId && deletedIds.has(fresh.selectedServerId)) {
+          fresh.selectedServerId = null;
+        }
+        const others = fresh.servers.filter((s) => s.subscriptionId !== f.subId);
+        fresh.servers = [...others, ...kept];
+        sub.lastUpdated = nowIso;
+        if (f.userInfo) sub.userInfo = f.userInfo;
+        updated++;
+      }
+
+      if (updated > 0) {
         // 仅落盘 + 通知 UI，绝不重启代理 → 不打断当前连接
-        await this.configManager.saveConfig(config);
-        this.notifyConfigChanged(config);
+        await this.configManager.saveConfig(fresh);
+        this.notifyConfigChanged(fresh);
         this.logManager.addLog(
           'info',
           `[${reason}] 订阅自动更新完成：成功 ${updated}，失败 ${failed}`,

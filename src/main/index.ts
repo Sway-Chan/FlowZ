@@ -616,52 +616,16 @@ if (gotTheLock) {
     );
     subscriptionScheduler.start();
 
-    // 崩溃恢复：原地重启同节点（窗口内次数上限 + 退避，防崩溃环）。崩溃不再触发换节点——
-    // 崩溃多为瞬时/配置问题，换节点既不对症又会丢失用户选中节点；换节点交给「心跳检测到不可达」。
-    const CRASH_MAX_RESTARTS = 3;
-    const CRASH_WINDOW_MS = 5 * 60_000;
-    const CRASH_BACKOFF_BASE_MS = 2_000;
-    let crashRestartAttempts = 0;
-    let crashWindowStart = 0;
-    const tryCrashRestartSameNode = async (): Promise<boolean> => {
-      const now = Date.now();
-      if (now - crashWindowStart > CRASH_WINDOW_MS) {
-        crashWindowStart = now;
-        crashRestartAttempts = 0;
-      }
-      if (crashRestartAttempts >= CRASH_MAX_RESTARTS) {
-        logManager.addLog(
-          'error',
-          `崩溃自动重启已达上限（${CRASH_WINDOW_MS / 60_000} 分钟内 ${CRASH_MAX_RESTARTS} 次），停止自动重启，请检查节点/配置`,
-          'Main'
-        );
-        return false;
-      }
-      crashRestartAttempts++;
-      const delay = CRASH_BACKOFF_BASE_MS * crashRestartAttempts;
-      logManager.addLog(
-        'warn',
-        `检测到 sing-box 崩溃，${delay / 1000}s 后原地重启同节点（第 ${crashRestartAttempts}/${CRASH_MAX_RESTARTS} 次）`,
-        'Main'
-      );
-      await new Promise((r) => setTimeout(r, delay));
-      try {
-        const cfg = await configManager.loadConfig();
-        await proxyManager?.start(cfg);
-        return true;
-      } catch (e) {
-        logManager.addLog('error', `崩溃后原地重启失败: ${e}`, 'Main');
-        return false;
-      }
-    };
-
-    // 监听代理管理器事件，更新托盘状态
-    proxyManager.on('error', async (error: Error) => {
+    // 监听代理管理器事件，更新托盘状态。
+    // 说明：同节点「原地重启」由 ProxyManager 内部接管（handleProcessExit / 健康检查 → attemptAutoRestart，
+    // 单一计数器 + 上限 + 冷却）。'error' 仅在「自动重启被抑制（核心更新校验窗口）或已达上限」时触发，
+    // 故此处只需处理：核心回滚 → 放弃恢复并清理系统代理。崩溃不触发换节点（换节点交给心跳连通性检测）。
+    proxyManager.on('error', async (error: { message: string; code?: number }) => {
       logManager.addLog('error', `Proxy error: ${error.message}`, 'Main');
       // 发生错误时，更新托盘显示为"连接异常"
       updateTrayMenuState(false, true);
 
-      // 1) 新核心首次启动失败 → 自动回滚旧核心并重启（优先级最高）
+      // 1) 新核心首次启动失败（自动重启被抑制时）→ 自动回滚旧核心并重启
       try {
         const rolledBack = await coreUpdateService.autoRollbackIfPendingUpdate();
         if (rolledBack) {
@@ -674,10 +638,7 @@ if (gotTheLock) {
         logManager.addLog('error', `自动回滚重启失败: ${rollbackErr}`, 'Main');
       }
 
-      // 2) 崩溃恢复主导：原地重启同节点（成功即返回，保持系统代理不动以减少断网抖动）
-      if (await tryCrashRestartSameNode()) return;
-
-      // 3) 放弃自动恢复：清理系统代理，避免网络不可用（错误已由 ProxyManager 投递前端）
+      // 2) 放弃自动恢复（重启已达上限）：清理系统代理，避免网络不可用（错误已由 ProxyManager 投递前端）
       try {
         const proxyStatus = await systemProxyManager.getProxyStatus();
         if (proxyStatus.enabled) {
