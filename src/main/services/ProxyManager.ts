@@ -2774,6 +2774,54 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   /**
    * 启动 sing-box 进程
    */
+  /** macOS root 看护脚本路径（osascript 以 root 执行它来托管 sing-box）。 */
+  private getWrapperScriptPath(): string {
+    return path.join(getUserDataPath(), 'singbox-wrapper.sh');
+  }
+
+  /** 停止信号文件：app 以普通用户写入，root 看护脚本检测到后自杀 sing-box —— 停止无需再次提权。 */
+  private getStopFlagPath(): string {
+    return path.join(getUserDataPath(), 'singbox.stopflag');
+  }
+
+  /**
+   * 写出 macOS root 看护脚本。设计：osascript 一次授权后以 root 跑此脚本 → 它起 sing-box 并循环监听
+   * stopflag(普通用户可写)与父进程(Electron)存活；二者任一触发即 TERM→(等待)→KILL sing-box 并清理。
+   * 收益：停止/退出/崩溃回收均无需再次管理员授权（仅启动那一次）。app 退出时父进程消失 → 不留孤儿。
+   */
+  private writeWrapperScript(): void {
+    const script = `#!/bin/bash
+# FlowZ 看护脚本（osascript 以 root 执行）；勿手改。
+SB="$1"; CFG="$2"; LOG="$3"; PIDFILE="$4"; STOPFLAG="$5"; PARENT="$6"; FWD="$7"
+if [ "$FWD" = "1" ]; then sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1; sysctl -w net.ipv6.conf.all.forwarding=1 >/dev/null 2>&1; fi
+"$SB" run -c "$CFG" > "$LOG" 2>&1 &
+SBPID=$!
+echo "$SBPID" > "$PIDFILE"
+while kill -0 "$SBPID" 2>/dev/null; do
+  [ -f "$STOPFLAG" ] && break
+  kill -0 "$PARENT" 2>/dev/null || break
+  sleep 0.5
+done
+kill -TERM "$SBPID" 2>/dev/null
+for i in $(seq 1 10); do kill -0 "$SBPID" 2>/dev/null || break; sleep 0.5; done
+kill -9 "$SBPID" 2>/dev/null
+rm -f "$STOPFLAG"
+`;
+    require('fs').writeFileSync(this.getWrapperScriptPath(), script, { mode: 0o755 });
+  }
+
+  /** 停止收尾：删 PID 文件 + 资源清理 + 通知前端。 */
+  private finishStop(): void {
+    try {
+      require('fs').unlinkSync(this.getPidFilePath());
+    } catch {
+      /* 忽略 */
+    }
+    this.cleanup();
+    this.emit('stopped');
+    this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
+  }
+
   private async startSingBoxProcess(): Promise<void> {
     return new Promise((resolve, reject) => {
       try {
@@ -2814,28 +2862,31 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         let args: string[];
 
         if (this.needsOsascript()) {
-          // macOS: 使用 osascript 请求管理员权限运行
-          // 注意：路径中可能包含空格，需要使用转义引号
-          // sing-box 配置中已经设置了 log.output，日志会写入文件
-          // 使用 & 让进程在后台运行，并将 PID 写入文件
+          // macOS: osascript 一次授权 → 以 root 跑「看护脚本」托管 sing-box（停止/退出/崩溃回收无需再提权）。
+          // 路径单引号包裹以容忍空格（与原实现一样不处理路径内引号——FlowZ 路径不含单/双引号）。
           const pidFile = getSingBoxPidPath();
           const startupLogFile = path.join(getUserDataPath(), 'singbox_startup.log');
+          const wrapper = this.getWrapperScriptPath();
+          const stopFlag = this.getStopFlagPath();
+          const fwd = this.currentConfig?.allowLan ? '1' : '0';
+          const parentPid = process.pid; // Electron 主进程 PID：退出即让看护脚本联动停 sing-box，杜绝孤儿
+
+          // 清掉上轮残留 stopflag + 写出最新看护脚本
+          try {
+            require('fs').unlinkSync(stopFlag);
+          } catch {
+            /* 不存在则忽略 */
+          }
+          this.writeWrapperScript();
+
           command = '/usr/bin/osascript';
-
-          // 如果开启了局域网共享且是 TUN 模式，同时开启系统的 IP 转发功能
-          const forwardCmd = this.currentConfig?.allowLan
-            ? 'sysctl -w net.ipv4.ip_forward=1; sysctl -w net.ipv6.conf.all.forwarding=1; '
-            : '';
-
-          // 使用 bash -c 来执行后台命令，确保 & 正常工作
-          // 重定向 stdout 和 stderr 到日志文件，以便排查启动失败原因
           args = [
             '-e',
-            `do shell script "/bin/bash -c '${forwardCmd}\\"${this.singboxPath}\\" run -c \\"${this.configPath}\\" > \\"${startupLogFile}\\" 2>&1 & echo $! > \\"${pidFile}\\"'" with administrator privileges`,
+            `do shell script "/bin/bash '${wrapper}' '${this.singboxPath}' '${this.configPath}' '${startupLogFile}' '${pidFile}' '${stopFlag}' ${parentPid} '${fwd}' >/dev/null 2>&1 &" with administrator privileges`,
           ];
           this.logToManager(
             'info',
-            `TUN 模式需要管理员权限${this.currentConfig?.allowLan ? '及开启 IP 转发' : ''}，正在请求...`
+            `TUN 模式需要管理员权限${this.currentConfig?.allowLan ? '及开启 IP 转发' : ''}，正在请求（仅此一次，后续启停免授权）...`
           );
         } else if (this.needsWindowsUAC()) {
           // Windows TUN 模式: 使用 PowerShell 请求 UAC 权限运行
@@ -3188,10 +3239,30 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     }
 
     const pidToKill = this.singboxPid;
-    this.logToManager('info', `正在停止 sing-box 进程 (PID: ${pidToKill})...`);
 
+    // M1-a：进程已不在 → 直接收尾，免一次提权授权框
+    if (!this.isProcessAlive(pidToKill)) {
+      this.logToManager('info', 'sing-box 进程已不在，跳过提权终止');
+      this.finishStop();
+      return;
+    }
+
+    // M1-b：写 stopflag，由 root 看护脚本自杀 sing-box —— 停止无需再次提权
+    this.logToManager('info', `正在停止 sing-box (PID: ${pidToKill})，通知看护脚本...`);
+    try {
+      require('fs').writeFileSync(this.getStopFlagPath(), '');
+    } catch (e) {
+      this.logToManager('warn', `写 stopflag 失败: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (await this.waitForProcessExit(pidToKill, 8000)) {
+      this.logToManager('info', 'sing-box 已由看护脚本停止（无需提权）');
+      this.finishStop();
+      return;
+    }
+
+    // Fallback：看护脚本未在预期内收口（异常/旧式直起）→ 退回 osascript 提权终止
+    this.logToManager('warn', '看护脚本未及时停止 sing-box，退回提权终止');
     return new Promise((resolve) => {
-      // 先尝试 SIGTERM 优雅终止
       const killProcess = spawn('/usr/bin/osascript', [
         '-e',
         `do shell script "kill -TERM ${pidToKill}" with administrator privileges`,
@@ -3199,10 +3270,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
       killProcess.on('exit', async (code) => {
         if (code === 0) {
-          // 等待进程退出
           await this.waitForProcessExit(pidToKill, 3000);
-
-          // 检查进程是否真的退出了
           if (this.isProcessAlive(pidToKill)) {
             this.logToManager('warn', '进程未响应 SIGTERM，尝试强制终止...');
             await this.forceKillProcess(pidToKill);
@@ -3211,30 +3279,14 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           }
         } else {
           this.logToManager('warn', `停止 sing-box 进程可能失败，退出码: ${code}`);
-          // 尝试强制终止
           await this.forceKillProcess(pidToKill);
         }
-
-        // 清理 PID 文件
-        const fsSync = require('fs');
-        try {
-          fsSync.unlinkSync(this.getPidFilePath());
-        } catch {
-          // 忽略错误
-        }
-
-        this.cleanup();
-
-        // 触发停止事件
-        this.emit('stopped');
-        this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
-
+        this.finishStop();
         resolve();
       });
 
       killProcess.on('error', async (error) => {
         this.logToManager('error', `停止 sing-box 进程失败: ${error.message}`);
-        // 尝试强制终止
         await this.forceKillProcess(pidToKill);
         this.cleanup();
         resolve();
