@@ -73,11 +73,11 @@ function App() {
         .map((r) =>
           r.latency !== null
             ? `${r.name}（${r.protocol}）: ${r.latency}ms`
-            : `${r.name}（${r.protocol}）: 超时`
+            : `${r.name}（${r.protocol}）: ${i18n.t('servers.timeout')}`
         )
         .join('\n');
 
-      toast.info('测速结果', {
+      toast.info(i18n.t('home.speedTestResult'), {
         description: message,
         duration: 10000,
         style: { whiteSpace: 'pre-line' },

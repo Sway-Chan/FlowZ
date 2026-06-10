@@ -6,6 +6,7 @@ import { useEffect } from 'react';
 import { api } from '../ipc';
 import { ErrorHandler, ErrorCategory } from '../lib/error-handler';
 import { toast } from 'sonner';
+import i18n from '../i18n';
 import type { TrafficStats } from '../../shared/types';
 
 // 定义事件数据类型
@@ -176,10 +177,13 @@ export function useNativeEventListeners() {
       useAppStore.getState().loadConfig();
     });
     // 显示 toast 通知
-    toast.success(`已自动切换到 ${data.newServerName}（${data.latency}ms）`, {
-      description: `触发原因：${data.reason === '崩溃检测' ? '节点崩溃' : '心跳检测连续失败'}`,
-      duration: 5000,
-    });
+    toast.success(
+      i18n.t('home.autoSwitched', { name: data.newServerName, latency: data.latency }),
+      {
+        description: i18n.t('home.autoSwitchedDesc'),
+        duration: 5000,
+      }
+    );
   };
 
   useNativeEvent('autoNodeSwitched', handleAutoNodeSwitched);
