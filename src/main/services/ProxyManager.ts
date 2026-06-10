@@ -686,10 +686,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     if (!newConfig.selectedServerId) return false;
     // 目标节点必须已存在于运行中的 selector（= 启动时的 servers），否则 PUT 指向不存在的成员
     if (!old.servers.some((s) => s.id === newConfig.selectedServerId)) return false;
-    // Windows TUN：route_exclude_address 在 start 时仅按「选中 + appRules」节点构建；热切到其它
-    // IP-literal 节点时其 server IP 不在排除集 → Wintun 会把 sing-box 自身出向包回捕进 TUN 成环。
-    // 配置不重生成无法补排除集，故 Windows TUN 一律退回重启（由重启重生成排除集）。
-    if (process.platform === 'win32' && newConfig.proxyModeType === 'tun') return false;
+    // Windows TUN：旧版担心「热切到非排除 IP 节点 → Wintun 回捕 sing-box 自身出向包成环」而一律退回重启。
+    // 实测(2026-06-10, Win11 + sing-box 1.13.13, system 栈)证伪：route.auto_detect_interface=true 已把
+    // 出站对节点的拨号绑定到物理网卡、不回灌 TUN，与 server IP 是否在 route_exclude_address 无关 →
+    // 热切换零断流、零环路（出口 IP 实测正确切换、日志无 loop）。故 system 栈放行热切换(省去 ~1.2s 重启断流)；
+    // gvisor 栈未实测，保守仍退回重启。auto_detect_interface 在 generateRouteConfig 恒为 true，无需额外判定。
+    if (process.platform === 'win32' && newConfig.proxyModeType === 'tun') {
+      const winTunStack = newConfig.tunConfig?.stack || 'system'; // Windows 默认 system 栈
+      if (winTunStack !== 'system') return false;
+    }
     // 唯一允许变化的就是 selectedServerId：对齐它、servers 按 id 归一化后整体深比较——任何其它影响
     // 配置生成的字段（blockQuic/tlsFragment/dnsConfig/各 TUN 子字段/appRules/customRules/端口/interrupt
     // 开关 等）有差异都退回重启，避免「切节点 + 改某设置」同时发生时把那个设置静默丢掉。
