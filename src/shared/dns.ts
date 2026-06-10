@@ -13,14 +13,25 @@ export interface ParsedDnsServer {
   isDomain: boolean;
 }
 
-const IPV4_RE = /^(?:\d{1,3}\.){3}\d{1,3}$/;
-
-function isIpLiteral(host: string): boolean {
-  return IPV4_RE.test(host) || host.includes(':');
-}
+// 严格 IPv4（每段 0-255），避免 999.1.1.1 等被误收
+const IPV4_RE = /^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$/;
 
 function stripBrackets(host: string): string {
   return host.replace(/^\[/, '').replace(/\]$/, '');
+}
+
+function isIpv4Literal(host: string): boolean {
+  return IPV4_RE.test(host);
+}
+
+/** 粗判 IPv6 字面量：去方括号后仅含 hex 与冒号，且至少两个冒号（排除 "8.8.8.8:53" 这类带端口裸输入）。 */
+function isIpv6Literal(host: string): boolean {
+  const h = stripBrackets(host);
+  return /^[0-9a-fA-F:]+$/.test(h) && (h.match(/:/g)?.length ?? 0) >= 2;
+}
+
+function isIpLiteral(host: string): boolean {
+  return isIpv4Literal(host) || isIpv6Literal(host);
 }
 
 /**
@@ -56,11 +67,11 @@ export function parseDnsServerSpec(spec: string | undefined | null): ParsedDnsSe
   if (s.startsWith('tls://')) return fromUrl('tls', 853, false);
   if (s.startsWith('udp://')) return fromUrl('udp', 53, false);
 
-  // 裸 IP 字面量 → UDP:53
-  if (isIpLiteral(s)) {
-    return { type: 'udp', server: s, port: 53, isDomain: false };
+  // 裸 IP 字面量（无 scheme、无端口）→ UDP:53；去 IPv6 方括号
+  if (isIpv4Literal(s) || isIpv6Literal(s)) {
+    return { type: 'udp', server: stripBrackets(s), port: 53, isDomain: false };
   }
 
-  // 裸域名无 scheme：无法判定 DoH/DoT/UDP，判非法（避免猜错）
+  // 裸域名 / IP:port / 非法：无法判定或格式不完整，判非法（回退默认 + 提示）
   return null;
 }
