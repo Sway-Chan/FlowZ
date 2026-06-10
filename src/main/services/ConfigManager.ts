@@ -5,6 +5,7 @@
 
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import { randomBytes } from 'crypto';
 import type { UserConfig } from '../../shared/types';
 import { getConfigPath } from '../utils/paths';
 
@@ -52,6 +53,14 @@ export class ConfigManager implements IConfigManager {
 
       // 验证配置
       this.validateConfig(config);
+
+      // 旧配置回填 clash_api secret（首次升级时随机生成并持久化，后续稳定，供 external_ui/外部客户端复用）
+      if (!config.clashApiSecret) {
+        config.clashApiSecret = randomBytes(16).toString('hex');
+        await this.saveConfig(config).catch((e) =>
+          console.warn('持久化 clashApiSecret 失败（不阻断）:', e)
+        );
+      }
 
       // 缓存配置
       this.currentConfig = config;
@@ -482,6 +491,7 @@ export class ConfigManager implements IConfigManager {
       httpPort: 2080,
       logLevel: 'info',
       disableLogFile: false,
+      clashApiSecret: randomBytes(16).toString('hex'),
       uiTheme: 'system',
     };
   }

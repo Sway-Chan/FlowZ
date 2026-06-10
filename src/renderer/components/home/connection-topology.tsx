@@ -92,6 +92,9 @@ export function ConnectionTopology() {
         // We catch errors anyway.
         const res = await fetch('http://127.0.0.1:9090/connections', {
           mode: 'cors',
+          headers: config?.clashApiSecret
+            ? { Authorization: `Bearer ${config.clashApiSecret}` }
+            : {},
         });
         if (!res.ok) {
           throw new Error(`HTTP error! status: ${res.status}`);
@@ -112,7 +115,7 @@ export function ConnectionTopology() {
     fetchConnections();
     timer = setInterval(fetchConnections, POLL_INTERVAL);
     return () => clearInterval(timer);
-  }, []);
+  }, [config?.clashApiSecret]);
 
   const { nodes, links } = useMemo(() => {
     // Only recalc if we have width and connections

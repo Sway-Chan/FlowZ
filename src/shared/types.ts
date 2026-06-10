@@ -375,6 +375,10 @@ export interface UserConfig {
   // 关闭日志写盘（sing-box log.disabled）；默认 false=写盘。关闭后应用内无法查看实时日志/基于日志的诊断
   disableLogFile?: boolean;
 
+  // clash_api(127.0.0.1:9090) 鉴权 secret：首次启动随机生成并持久化，统一管所有 clash_api 访问(含 external_ui)。
+  // 内部调用(热切换/流量统计/拓扑)带 Authorization；防恶意网页跨域读连接历史。可在设置里查看/重置。
+  clashApiSecret?: string;
+
   // UI 设置
   uiTheme?: 'light' | 'dark' | 'system';
 }

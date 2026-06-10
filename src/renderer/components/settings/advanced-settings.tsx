@@ -31,7 +31,20 @@ export function AdvancedSettings() {
   const [subInterval, setSubInterval] = useState(
     config?.subscriptionUpdateIntervalHours?.toString() || '12'
   );
+  const [showClashSecret, setShowClashSecret] = useState(false);
   const { t } = useTranslation();
+
+  // 重置 clash_api secret：浏览器侧随机 16 字节 hex，保存后重启代理生效
+  const resetClashSecret = () => {
+    if (!config) return;
+    const bytes = new Uint8Array(16);
+    crypto.getRandomValues(bytes);
+    const secret = Array.from(bytes)
+      .map((b) => b.toString(16).padStart(2, '0'))
+      .join('');
+    saveConfig({ ...config, clashApiSecret: secret });
+    toast.success(t('settings.advanced.clashSecretReset'));
+  };
 
   const handleSavePorts = async () => {
     if (!config) return;
@@ -517,6 +530,57 @@ export function AdvancedSettings() {
               </p>
             </div>
           )}
+        </div>
+
+        {/* 外部控制 / clash API */}
+        <div className="space-y-4 pt-4 border-t">
+          <h4 className="text-sm font-medium mb-2">{t('settings.advanced.externalControl')}</h4>
+          <p className="text-xs text-muted-foreground">
+            {t('settings.advanced.externalControlDesc')}
+          </p>
+          <div className="space-y-1.5">
+            <Label className="font-normal">{t('settings.advanced.clashApiAddress')}</Label>
+            <div className="flex items-center gap-2">
+              <code className="px-2 py-1 text-xs bg-muted rounded font-mono">127.0.0.1:9090</code>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  navigator.clipboard.writeText('127.0.0.1:9090');
+                  toast.success(t('settings.advanced.copied'));
+                }}
+              >
+                {t('settings.advanced.copy')}
+              </Button>
+            </div>
+          </div>
+          <div className="space-y-1.5">
+            <Label className="font-normal">{t('settings.advanced.clashApiSecret')}</Label>
+            <div className="flex flex-wrap items-center gap-2">
+              <code className="flex-1 min-w-[160px] max-w-md px-2 py-1 text-xs bg-muted rounded font-mono truncate">
+                {showClashSecret ? config.clashApiSecret || '—' : '•'.repeat(16)}
+              </code>
+              <Button variant="outline" size="sm" onClick={() => setShowClashSecret((v) => !v)}>
+                {showClashSecret ? t('settings.advanced.hide') : t('settings.advanced.show')}
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => {
+                  navigator.clipboard.writeText(config.clashApiSecret || '');
+                  toast.success(t('settings.advanced.copied'));
+                }}
+              >
+                {t('settings.advanced.copy')}
+              </Button>
+              <Button variant="outline" size="sm" onClick={resetClashSecret}>
+                {t('settings.advanced.reset')}
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {t('settings.advanced.clashApiSecretDesc')}
+            </p>
+          </div>
         </div>
 
         <div className="space-y-4 pt-4 border-t">

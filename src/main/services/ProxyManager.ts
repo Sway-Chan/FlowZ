@@ -610,7 +610,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       try {
         const res = await fetch('http://127.0.0.1:9090/proxies/proxy-selector', {
           method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...this.clashAuthHeaders() },
           body: JSON.stringify({ name: tag }),
           signal: AbortSignal.timeout(2000),
         });
@@ -731,13 +731,19 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 通过 clash_api `PUT /proxies/proxy-selector` 把 selector 切到目标节点（无需重启）。
    * 成功返回 true；任何异常/非 2xx 返回 false（调用方退回重启）。
    */
+  /** clash_api 鉴权头：带持久化的 secret（为空则不带）。所有内部 9090 调用复用。 */
+  private clashAuthHeaders(): Record<string, string> {
+    const secret = this.currentConfig?.clashApiSecret;
+    return secret ? { Authorization: `Bearer ${secret}` } : {};
+  }
+
   private async hotSwitchNode(newConfig: UserConfig): Promise<boolean> {
     const targetTag = this.currentIdToTagMap?.get(newConfig.selectedServerId as string);
     if (!targetTag) return false;
     try {
       const res = await fetch('http://127.0.0.1:9090/proxies/proxy-selector', {
         method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...this.clashAuthHeaders() },
         body: JSON.stringify({ name: targetTag }),
         signal: AbortSignal.timeout(2000),
       });
@@ -900,7 +906,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         clash_api: {
           external_controller: '127.0.0.1:9090',
           external_ui: path.join(userDataPath, 'ui'),
-          secret: '', // 为空以保持与现有渲染进程 fetch 逻辑兼容
+          // 随机 secret 鉴权（持久化于 config）：内部调用带 Authorization，防恶意网页跨域读连接历史
+          secret: config.clashApiSecret || '',
           default_mode: 'rule',
         },
       },
