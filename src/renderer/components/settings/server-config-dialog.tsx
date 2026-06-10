@@ -26,6 +26,7 @@ import { VmessForm } from './vmess-form';
 import { SocksForm } from './socks-form';
 import { HttpForm } from './http-form';
 import { SshForm } from './ssh-form';
+import { ServerSelectGroups } from './server-select-groups';
 import type { ServerConfig, ProtocolType } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -176,13 +177,7 @@ export function ServerConfigDialog({
                 <SelectItem value="direct">
                   {t('servers.directConnection', 'Direct (No Chain)')}
                 </SelectItem>
-                {servers
-                  .filter((s) => s.id !== server?.id)
-                  .map((s) => (
-                    <SelectItem key={s.id} value={s.id}>
-                      {s.name}
-                    </SelectItem>
-                  ))}
+                <ServerSelectGroups servers={servers} excludeId={server?.id} />
               </SelectContent>
             </Select>
             <p className="text-sm text-muted-foreground">

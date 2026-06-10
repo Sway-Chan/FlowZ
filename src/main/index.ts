@@ -399,6 +399,17 @@ async function createWindow() {
   mainWindow.on('blur', startInactivityTimers);
   mainWindow.on('hide', startInactivityTimers);
 
+  // macOS：隐藏到托盘时一并清理 Dock 图标（仅驻留托盘，不占 Dock / Cmd-Tab），重新显示时恢复。
+  // 用 show/hide 事件钩子覆盖所有显示/隐藏路径（托盘打开 / 第二实例 / activate）。
+  if (process.platform === 'darwin') {
+    mainWindow.on('hide', () => {
+      app.dock?.hide();
+    });
+    mainWindow.on('show', () => {
+      void app.dock?.show();
+    });
+  }
+
   mainWindow.on('focus', () => {
     if (inactivityTimer) {
       clearTimeout(inactivityTimer);
@@ -517,6 +528,7 @@ async function updateTrayMenuState(isProxyRunning: boolean, hasError?: boolean):
       isProxyRunning,
       hasError,
       servers: config.servers,
+      subscriptions: config.subscriptions || [],
       selectedServerId: config.selectedServerId,
       proxyMode: config.proxyMode,
     });

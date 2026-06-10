@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Select, SelectContent, SelectItem, SelectTrigger } from '@/components/ui/select';
+import { ServerSelectGroups } from '@/components/settings/server-select-groups';
 import {
   Dialog,
   DialogContent,
@@ -405,11 +406,11 @@ export function AppRulesCard() {
                         <div className="px-2 py-1.5 mt-1 text-[10px] font-bold text-muted-foreground uppercase tracking-wide border-t">
                           独立路由节点
                         </div>
-                        {config.servers.map((s) => (
-                          <SelectItem key={s.id} value={`node-${s.id}`} className="text-xs">
-                            {s.name}
-                          </SelectItem>
-                        ))}
+                        <ServerSelectGroups
+                          servers={config.servers}
+                          valuePrefix="node-"
+                          itemClassName="text-xs"
+                        />
                       </>
                     )}
                   </SelectContent>
