@@ -27,6 +27,9 @@ export function AdvancedSettings() {
     config?.mixedPort && config.mixedPort > 0 ? config.mixedPort.toString() : '7890'
   );
   const [isLoading, setIsLoading] = useState(false);
+  const [subInterval, setSubInterval] = useState(
+    config?.subscriptionUpdateIntervalHours?.toString() || '12'
+  );
   const { t } = useTranslation();
 
   const handleSavePorts = async () => {
@@ -439,6 +442,72 @@ export function AdvancedSettings() {
                 '仅自动更新到与当前配置生成器兼容的 sing-box 版本带（如 1.13.x）；跨版本带（如 1.14）不自动更新、转为提示随 App 升级，避免配置不兼容。手动更新不受此限制。'}
             </p>
           </div>
+        </div>
+
+        {/* 订阅自动更新 */}
+        <div className="space-y-4 pt-4 border-t">
+          <h4 className="text-sm font-medium mb-2">{t('settings.advanced.subAutoUpdate')}</h4>
+
+          <div className="flex items-center space-x-2">
+            <Checkbox
+              id="autoUpdateSub"
+              checked={config.autoUpdateSubscriptionOnStart === true}
+              onCheckedChange={(checked) =>
+                saveConfig({ ...config, autoUpdateSubscriptionOnStart: checked as boolean })
+              }
+            />
+            <Label htmlFor="autoUpdateSub" className="font-normal cursor-pointer">
+              {t('settings.advanced.autoUpdateSub')}
+            </Label>
+          </div>
+          <p className="text-xs text-muted-foreground ml-6">
+            {t('settings.advanced.autoUpdateSubDesc')}
+          </p>
+
+          {config.autoUpdateSubscriptionOnStart && (
+            <div className="ml-6 space-y-3">
+              <div className="space-y-1.5">
+                <Label htmlFor="subInterval" className="font-normal">
+                  {t('settings.advanced.subUpdateInterval')}
+                </Label>
+                <Input
+                  id="subInterval"
+                  type="text"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  value={subInterval}
+                  onChange={(e) => {
+                    const v = e.target.value.replace(/[^0-9]/g, '');
+                    setSubInterval(v);
+                    const n = parseInt(v, 10);
+                    if (!isNaN(n) && n >= 1 && n <= 168) {
+                      saveConfig({ ...config, subscriptionUpdateIntervalHours: n });
+                    }
+                  }}
+                  className="max-w-[120px]"
+                />
+                <p className="text-xs text-muted-foreground">
+                  {t('settings.advanced.subUpdateIntervalDesc')}
+                </p>
+              </div>
+
+              <div className="flex items-center space-x-2">
+                <Checkbox
+                  id="subViaProxy"
+                  checked={config.subscriptionUpdateViaProxy === true}
+                  onCheckedChange={(checked) =>
+                    saveConfig({ ...config, subscriptionUpdateViaProxy: checked as boolean })
+                  }
+                />
+                <Label htmlFor="subViaProxy" className="font-normal cursor-pointer">
+                  {t('settings.advanced.subUpdateViaProxy')}
+                </Label>
+              </div>
+              <p className="text-xs text-muted-foreground ml-6">
+                {t('settings.advanced.subUpdateViaProxyDesc')}
+              </p>
+            </div>
+          )}
         </div>
 
         <div className="space-y-4 pt-4 border-t">

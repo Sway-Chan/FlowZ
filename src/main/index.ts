@@ -31,6 +31,7 @@ import { UpdateService } from './services/UpdateService';
 import { CoreUpdateService } from './services/CoreUpdateService';
 import { SpeedTestService } from './services/SpeedTestService';
 import { AutoSwitchService } from './services/AutoSwitchService';
+import { SubscriptionScheduler } from './services/SubscriptionScheduler';
 import { ipcEventEmitter } from './ipc/ipc-events';
 import { mainEventEmitter, MAIN_EVENTS } from './ipc/main-events';
 import { initUserDataPath } from './utils/paths';
@@ -109,6 +110,7 @@ let coreUpdateService: CoreUpdateService;
 let subscriptionService: SubscriptionService;
 let speedTestService: SpeedTestService;
 let autoSwitchService: AutoSwitchService;
+let subscriptionScheduler: SubscriptionScheduler;
 
 // 全局异常捕获 - 主进程
 process.on('uncaughtException', (error: Error) => {
@@ -457,6 +459,10 @@ async function cleanupResources(): Promise<void> {
   logManager.addLog('info', 'Cleaning up resources before exit...', 'Main');
 
   try {
+    // 0. 停止后台定时器（订阅调度 / 自动换节点）
+    subscriptionScheduler?.stop();
+    autoSwitchService?.destroy();
+
     // 1. 停止代理进程
     if (proxyManager) {
       const status = proxyManager.getStatus();
@@ -599,6 +605,16 @@ if (gotTheLock) {
         autoSwitchService.enable();
       }
     }
+
+    // 订阅自动更新调度器：启动补更陈旧订阅 + 周期更新（不打断当前连接）
+    subscriptionScheduler = new SubscriptionScheduler(
+      configManager,
+      subscriptionService,
+      logManager,
+      () => proxyManager?.getStatus().running ?? false,
+      (cfg) => ipcEventEmitter.sendToAll('event:configChanged', { newValue: cfg })
+    );
+    subscriptionScheduler.start();
 
     // 崩溃恢复：原地重启同节点（窗口内次数上限 + 退避，防崩溃环）。崩溃不再触发换节点——
     // 崩溃多为瞬时/配置问题，换节点既不对症又会丢失用户选中节点；换节点交给「心跳检测到不可达」。
@@ -1062,90 +1078,8 @@ if (gotTheLock) {
       }
     }, 5000);
 
-    // 启动后自动更新订阅（延迟 8 秒，避免干扰启动）
-    setTimeout(async () => {
-      try {
-        const config = await configManager.loadConfig();
-        if (config.autoUpdateSubscriptionOnStart) {
-          logManager.addLog('info', '启动时自动更新订阅已启用，正在更新...', 'Main');
-
-          if (!config.subscriptions || config.subscriptions.length === 0) {
-            logManager.addLog('info', '没有可更新的订阅', 'Main');
-            return;
-          }
-
-          let updatedCount = 0;
-          let failedCount = 0;
-
-          for (const subscription of config.subscriptions) {
-            if (!subscription.autoUpdate) continue;
-            try {
-              const result = await subscriptionService.fetchSubscription(
-                subscription.url,
-                subscription.id
-              );
-              const fetchedServers = result.servers;
-
-              const oldServers = config.servers.filter((s) => s.subscriptionId === subscription.id);
-              const oldServersMap = new Map<string, (typeof config.servers)[0]>();
-              oldServers.forEach((s) => {
-                oldServersMap.set(`${s.name}-${s.protocol}-${s.address}-${s.port}`, s);
-              });
-
-              const newServersToKeep = [];
-              for (const newServer of fetchedServers) {
-                const key = `${newServer.name}-${newServer.protocol}-${newServer.address}-${newServer.port}`;
-                if (oldServersMap.has(key)) {
-                  const old = oldServersMap.get(key)!;
-                  newServersToKeep.push({
-                    ...newServer,
-                    id: old.id,
-                    createdAt: old.createdAt,
-                    updatedAt: new Date().toISOString(),
-                  });
-                  oldServersMap.delete(key);
-                } else {
-                  newServersToKeep.push(newServer);
-                }
-              }
-
-              const deletedIds = new Set(Array.from(oldServersMap.values()).map((s) => s.id));
-              if (config.selectedServerId && deletedIds.has(config.selectedServerId)) {
-                config.selectedServerId = null;
-              }
-
-              const otherServers = config.servers.filter(
-                (s) => s.subscriptionId !== subscription.id
-              );
-              config.servers = [...otherServers, ...newServersToKeep];
-              subscription.lastUpdated = new Date().toISOString();
-              if (result.userInfo) subscription.userInfo = result.userInfo;
-
-              updatedCount++;
-            } catch (e: any) {
-              logManager.addLog(
-                'warn',
-                `更新订阅 [${subscription.name}] 失败: ${e.message}`,
-                'Main'
-              );
-              failedCount++;
-            }
-          }
-
-          await configManager.saveConfig(config);
-          logManager.addLog(
-            'info',
-            `启动时自动更新订阅完成。成功：${updatedCount}，失败：${failedCount}`,
-            'Main'
-          );
-
-          // 广播配置变更事件以更新 UI
-          ipcEventEmitter.sendToAll('event:configChanged', { newValue: config });
-        }
-      } catch (error) {
-        logManager.addLog('error', `启动时自动更新订阅异常: ${error}`, 'Main');
-      }
-    }, 8000);
+    // 订阅自动更新由 SubscriptionScheduler 接管（启动补更 + 周期巡检 + 退避 + 不打断连接），
+    // 取代旧的「启动后一次性 setTimeout 拉取」。详见 subscriptionScheduler.start() 调用处。
 
     // 监听配置变更事件，更新托盘菜单并自动重启代理
     mainEventEmitter.on(MAIN_EVENTS.CONFIG_CHANGED, async () => {

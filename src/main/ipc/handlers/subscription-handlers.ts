@@ -104,7 +104,8 @@ export function registerSubscriptionHandlers(
       try {
         const result = await subscriptionService.fetchSubscription(
           subscription.url,
-          subscription.id
+          subscription.id,
+          config.subscriptionUpdateViaProxy === true
         );
         const fetchedServers = result.servers;
 
@@ -173,7 +174,8 @@ export function registerSubscriptionHandlers(
         try {
           const result = await subscriptionService.fetchSubscription(
             subscription.url,
-            subscription.id
+            subscription.id,
+            config.subscriptionUpdateViaProxy === true
           );
           const fetchedServers = result.servers;
 

@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { net } from 'electron';
+import { net, session, type Session } from 'electron';
 import type { ServerConfig, SubscriptionConfig } from '../../shared/types';
 import { ProtocolParser } from './ProtocolParser';
 import { LogManager } from './LogManager';
@@ -64,10 +64,21 @@ type SingboxOutbound = {
 export class SubscriptionService {
   private protocolParser: ProtocolParser;
   private logManager: LogManager;
+  // 直连会话：强制 mode:'direct'，无视默认会话/系统代理，供 viaProxy=false 的订阅拉取使用
+  private directSession: Session | null = null;
 
   constructor(protocolParser: ProtocolParser, logManager: LogManager) {
     this.protocolParser = protocolParser;
     this.logManager = logManager;
+  }
+
+  /** 懒加载强制直连会话（默认会话在代理运行时会走代理，直连拉取须绕开它）。 */
+  private async getDirectSession(): Promise<Session> {
+    if (this.directSession) return this.directSession;
+    const s = session.fromPartition('flowz-subscription-direct');
+    await s.setProxy({ mode: 'direct' });
+    this.directSession = s;
+    return s;
   }
 
   /**
@@ -334,10 +345,15 @@ export class SubscriptionService {
    */
   async fetchSubscription(
     url: string,
-    subscriptionId: string
+    subscriptionId: string,
+    viaProxy: boolean = false
   ): Promise<{ servers: ServerConfig[]; userInfo?: SubscriptionConfig['userInfo'] }> {
     try {
-      this.logManager.addLog('info', `正在拉取订阅: ${url}`, 'Subscription');
+      this.logManager.addLog(
+        'info',
+        `正在拉取订阅: ${url}（${viaProxy ? '经代理' : '直连'}）`,
+        'Subscription'
+      );
 
       // SSRF 防护：订阅地址来自用户/分享，限 http(s)、拒指向本机/内网/link-local 的字面 IP
       // （拦 file://、http://169.254.169.254 云元数据、内网回环等）。基于主机名的 DNS 旁路仍存在，
@@ -356,7 +372,15 @@ export class SubscriptionService {
         throw new Error(`订阅地址指向本机/内网/link-local，已拒绝: ${urlObj.hostname}`);
       }
 
-      const response = await net.fetch(url, {
+      // viaProxy=true 用默认会话（代理运行时即经代理）；否则用强制直连会话
+      let fetchImpl: typeof net.fetch;
+      if (viaProxy) {
+        fetchImpl = net.fetch;
+      } else {
+        const ds = await this.getDirectSession();
+        fetchImpl = ds.fetch.bind(ds);
+      }
+      const response = await fetchImpl(url, {
         headers: { 'User-Agent': 'FlowZ-Client' },
       });
 
