@@ -330,14 +330,14 @@
       "manualProxyMode": "Local Proxy Only (Manual)",
       "manualProxyModeDesc": "Start local ports only without modifying system proxy or virtual adapters. Ideal for advanced users configuring third-party tools.",
       "confirmTitle": "Confirm Proxy Mode Change",
-      "confirmDesc": "Changing proxy mode will disconnect the current connection. You will need to reconnect manually.",
+      "confirmDesc": "Switching the takeover mode restarts the proxy to apply it, briefly dropping the current connection.",
       "confirmSwitch": "Are you sure you want to switch to ",
       "confirmQuestion": "?",
       "cancel": "Cancel",
       "confirmBtn": "Confirm Switch",
       "successUpdate": "Proxy mode updated",
       "failUpdate": "Failed to save settings",
-      "reconnectToast": "Please reconnect to apply the new mode"
+      "reconnectToast": "Restarting the proxy to apply the new takeover mode…"
     },
     "advanced": {
       "title": "Advanced",
@@ -872,7 +872,7 @@
     "ruleInstructions": "Rule Guide",
     "block": "Block",
     "realDns": "Bypass FakeIP",
-    "remarksLabel": "Remarks (Optional)",
+    "remarksLabel": "Remark",
     "remarksPlaceholder": "e.g., Company Intranet, Netflix Server",
     "enable": "Enable",
     "addRule": "Add Rule",
@@ -928,7 +928,11 @@
       "geositePlaceholder": "e.g. apple,icloud",
       "geoipPlaceholder": "Optional, e.g. apple",
       "save": "Save App"
-    }
+    },
+    "errorRemarksRequired": "Please enter a remark",
+    "multiCondition": "Multi-condition",
+    "policyLabel": "Policy",
+    "unnamedRule": "Unnamed rule"
   },
   "sub": {
     "requireName": "Please enter a subscription name",

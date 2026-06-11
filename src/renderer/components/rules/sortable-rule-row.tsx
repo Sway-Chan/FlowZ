@@ -2,10 +2,12 @@ import type { ReactNode } from 'react';
 import { useSortable } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
 import { TableCell, TableRow } from '@/components/ui/table';
 import { Badge } from '@/components/ui/badge';
 import { Switch } from '@/components/ui/switch';
 import { Button } from '@/components/ui/button';
+import { HoverCard, HoverCardContent, HoverCardTrigger } from '@/components/ui/hover-card';
 import {
   Pencil,
   Trash2,
@@ -16,6 +18,7 @@ import {
   GripVertical,
 } from 'lucide-react';
 import type { Rule } from '@/bridge/types';
+import { ruleConditions } from '../../../shared/rules';
 import { TYPE_TO_CATEGORY, CATEGORY_BADGE_CLASS, RULE_TYPE_NAME } from './rule-type-meta';
 
 interface SortableRuleRowProps {
@@ -32,9 +35,72 @@ interface SortableRuleRowProps {
   renderExitNode: (rule: Rule) => ReactNode;
 }
 
+/** 规则详情悬浮卡内容：多条件头(AND/OR) + 逐条件(类型 badge + 值) + 策略。备注列与类型列共用。 */
+function RuleDetailContent({
+  rule,
+  t,
+  renderExitNode,
+}: {
+  rule: Rule;
+  t: TFunction;
+  renderExitNode: (rule: Rule) => ReactNode;
+}) {
+  const conds = ruleConditions(rule);
+  const multi = conds.length > 1;
+  return (
+    <div className="space-y-2 text-sm">
+      {rule.remarks && <div className="truncate font-semibold text-foreground">{rule.remarks}</div>}
+      {multi && (
+        <div className="text-xs font-medium text-muted-foreground">
+          {t('rules.multiCondition', '多条件')} ·{' '}
+          {rule.combineMode === 'and'
+            ? t('rules.combineAnd', '全部满足')
+            : t('rules.combineOr', '满足任一')}
+        </div>
+      )}
+      <div className="space-y-1.5">
+        {conds.map((c, i) => (
+          <div key={i} className="flex items-start gap-2">
+            <Badge
+              variant="outline"
+              className={`${CATEGORY_BADGE_CLASS[TYPE_TO_CATEGORY[c.type]]} shrink-0 whitespace-nowrap`}
+            >
+              {t(`rules.types.${c.type}.name`, RULE_TYPE_NAME[c.type])}
+            </Badge>
+            <span className="min-w-0 break-all font-mono text-xs text-foreground/90">
+              {c.values.join(', ')}
+            </span>
+          </div>
+        ))}
+      </div>
+      <div className="flex items-center gap-2 border-t pt-2">
+        <span className="text-xs text-muted-foreground">{t('rules.policyLabel', '策略')}</span>
+        <Badge
+          variant="default"
+          className={`whitespace-nowrap ${
+            rule.action === 'direct'
+              ? 'border-transparent bg-green-600 text-white'
+              : rule.action === 'block'
+                ? 'border-transparent bg-red-600 text-white'
+                : ''
+          }`}
+        >
+          {rule.action === 'proxy'
+            ? t('rules.proxy')
+            : rule.action === 'direct'
+              ? t('rules.direct')
+              : t('rules.block')}
+        </Badge>
+        {rule.action === 'proxy' && renderExitNode(rule)}
+      </div>
+    </div>
+  );
+}
+
 /**
  * 单条规则行（可拖拽排序）。编辑态：首列为拖拽手柄 + 序号，操作列为 置顶/上/下/置底；
  * 常态：首列为启用开关，操作列为 编辑/删除。useSortable 的 transform 施加到 TableRow。
+ * 规则列只显示备注名（悬浮看完整规则）；类型列首条件 badge + 多条件计数，悬浮看全部条件。
  */
 export function SortableRuleRow({
   rule,
@@ -64,6 +130,9 @@ export function SortableRuleRow({
     zIndex: isDragging ? 1 : undefined,
   };
 
+  const conds = ruleConditions(rule);
+  const extraConds = conds.length - 1;
+
   return (
     <TableRow ref={setNodeRef} style={style} data-dragging={isDragging || undefined}>
       <TableCell>
@@ -87,47 +156,49 @@ export function SortableRuleRow({
           <Switch checked={rule.enabled} onCheckedChange={() => onToggle(rule)} />
         )}
       </TableCell>
-      <TableCell className="font-mono">
-        <div className="flex max-w-[400px] flex-col gap-1">
-          {rule.remarks && (
-            <div className="truncate text-sm font-semibold text-foreground" title={rule.remarks}>
-              {rule.remarks}
-            </div>
-          )}
-          {rule.values.length > 0 && (
-            <div className="truncate text-sm" title={rule.values.join(', ')}>
-              {rule.values.length <= 3 ? (
-                rule.values.join(', ')
+      <TableCell>
+        {/* 规则列：只显示备注名（悬浮展开完整规则）。遗留规则无备注 → 回退首值摘要（灰）。 */}
+        <HoverCard openDelay={120} closeDelay={80}>
+          <HoverCardTrigger asChild>
+            <button type="button" className="block max-w-[360px] cursor-default text-left">
+              {rule.remarks ? (
+                <span className="block truncate text-sm font-semibold text-foreground">
+                  {rule.remarks}
+                </span>
               ) : (
-                <>
-                  {rule.values.slice(0, 3).join(', ')}
-                  <span className="ml-1 text-muted-foreground">+{rule.values.length - 3}</span>
-                </>
+                <span className="block truncate font-mono text-sm text-muted-foreground">
+                  {rule.values.slice(0, 2).join(', ') || t('rules.unnamedRule', '未命名规则')}
+                </span>
               )}
-            </div>
-          )}
-        </div>
+            </button>
+          </HoverCardTrigger>
+          <HoverCardContent>
+            <RuleDetailContent rule={rule} t={t} renderExitNode={renderExitNode} />
+          </HoverCardContent>
+        </HoverCard>
       </TableCell>
       <TableCell className="hidden lg:table-cell">
-        <div className="flex items-center gap-1">
-          <Badge
-            variant="outline"
-            className={`${CATEGORY_BADGE_CLASS[TYPE_TO_CATEGORY[rule.type]]} whitespace-nowrap`}
-          >
-            {t(`rules.types.${rule.type}.name`, RULE_TYPE_NAME[rule.type])}
-          </Badge>
-          {/* 多条件规则：首条件类型 badge + 额外条件计数 +N */}
-          {rule.conditions && rule.conditions.length > 1 && (
-            <span
-              className="whitespace-nowrap text-xs text-muted-foreground"
-              title={rule.conditions
-                .map((c) => t(`rules.types.${c.type}.name`, RULE_TYPE_NAME[c.type]))
-                .join(rule.combineMode === 'and' ? ' & ' : ' / ')}
-            >
-              +{rule.conditions.length - 1}
-            </span>
-          )}
-        </div>
+        {/* 类型列：首条件 badge + 多条件计数；悬浮看全部条件类型与值（与备注列共用卡片）。 */}
+        <HoverCard openDelay={120} closeDelay={80}>
+          <HoverCardTrigger asChild>
+            <button type="button" className="flex cursor-default items-center gap-1">
+              <Badge
+                variant="outline"
+                className={`${CATEGORY_BADGE_CLASS[TYPE_TO_CATEGORY[rule.type]]} whitespace-nowrap`}
+              >
+                {t(`rules.types.${rule.type}.name`, RULE_TYPE_NAME[rule.type])}
+              </Badge>
+              {extraConds > 0 && (
+                <span className="whitespace-nowrap text-xs text-muted-foreground">
+                  +{extraConds}
+                </span>
+              )}
+            </button>
+          </HoverCardTrigger>
+          <HoverCardContent>
+            <RuleDetailContent rule={rule} t={t} renderExitNode={renderExitNode} />
+          </HoverCardContent>
+        </HoverCard>
       </TableCell>
       <TableCell>
         {/* 两行：action badge 在上、出口节点/realDns 第二行——避免窄窗竖压 */}

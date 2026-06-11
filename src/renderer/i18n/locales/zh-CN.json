@@ -330,14 +330,14 @@
       "manualProxyMode": "仅本地代理 (手动)",
       "manualProxyModeDesc": "仅启动本地端口组，不修改系统代理和虚拟网卡。适用于高级用户配置第三方软件。",
       "confirmTitle": "确认切换代理模式",
-      "confirmDesc": "切换代理模式将断开当前连接，您需要手动重新连接。",
+      "confirmDesc": "切换接管方式将重启代理以应用，期间会短暂断开当前连接。",
       "confirmSwitch": "确定要切换到 ",
       "confirmQuestion": " 吗？",
       "cancel": "取消",
       "confirmBtn": "确认切换",
       "successUpdate": "代理模式已更新",
       "failUpdate": "保存设置失败",
-      "reconnectToast": "请重新连接以应用新模式"
+      "reconnectToast": "正在重启代理以应用新接管方式…"
     },
     "advanced": {
       "title": "高级",
@@ -872,7 +872,7 @@
     "ruleInstructions": "规则说明",
     "block": "阻断",
     "realDns": "绕过 FakeIP",
-    "remarksLabel": "备注 (可选)",
+    "remarksLabel": "备注",
     "remarksPlaceholder": "例如：公司内网、奈飞服务器",
     "enable": "启用",
     "addRule": "添加规则",
@@ -928,7 +928,11 @@
       "geositePlaceholder": "如 apple,icloud",
       "geoipPlaceholder": "可选，如 apple",
       "save": "保存应用"
-    }
+    },
+    "errorRemarksRequired": "请填写备注名",
+    "multiCondition": "多条件",
+    "policyLabel": "策略",
+    "unnamedRule": "未命名规则"
   },
   "sub": {
     "requireName": "请输入订阅名称",

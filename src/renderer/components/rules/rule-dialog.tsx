@@ -213,6 +213,11 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
       toast.error(t('rules.errorEmpty'));
       return;
     }
+    // 备注名强制必填（列表只显示备注名，空备注会让规则不可辨识）
+    if (!remarks.trim()) {
+      toast.error(t('rules.errorRemarksRequired', '请填写备注名'));
+      return;
+    }
 
     const tid = targetServerId === 'default' ? undefined : targetServerId;
     const bypass = bypassApplicable ? bypassFakeIP : undefined;
@@ -229,7 +234,7 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
       enabled,
       bypassFakeIP: bypass,
       targetServerId: tid,
-      remarks: remarks || undefined,
+      remarks: remarks.trim(),
     };
 
     setSubmitting(true);
@@ -421,9 +426,12 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
             )}
           </div>
 
-          {/* 备注 */}
+          {/* 备注（必填：规则列表只显示备注名） */}
           <div className="space-y-2">
-            <label className="text-sm font-medium">{t('rules.remarksLabel')}</label>
+            <label className="text-sm font-medium">
+              {t('rules.remarksLabel')}
+              <span className="ml-0.5 text-destructive">*</span>
+            </label>
             <Input
               value={remarks}
               onChange={(e) => setRemarks(e.target.value)}
