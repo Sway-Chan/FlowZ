@@ -43,6 +43,7 @@ import { RuleResourceManager } from './services/RuleResourceManager';
 import { seedBuiltinRuleSets } from './services/builtin-geo-rulesets';
 import { RuleResourceScheduler } from './services/RuleResourceScheduler';
 import { HelperManager } from './services/HelperManager';
+import type { HelperStatus, UserConfig } from '../shared/types';
 import { ipcEventEmitter } from './ipc/ipc-events';
 import { mainEventEmitter, MAIN_EVENTS } from './ipc/main-events';
 import { initUserDataPath } from './utils/paths';
@@ -164,6 +165,62 @@ let ruleResourceManager: RuleResourceManager | null = null;
 let ruleResourceScheduler: RuleResourceScheduler | null = null;
 let helperManager: HelperManager | null = null;
 let currentLanguage = 'zh-CN'; // 渲染端 APP_SET_LANGUAGE 同步，供主进程 native dialog 文案选语言
+
+/**
+ * helper 引导对话框（注入 ProxyManager.setHelperGate，由 start() 在 darwin+TUN+helper 未就绪+未 dismiss
+ * 时统一调用——收敛单点，覆盖按钮/托盘/切模式/config-changed 重启等全部入口）。
+ * 返回 'abort' → 终止本次启动（终态等价 osascript 取消=停止态）；'proceed' → 继续（装好走零提权，否则 osascript 回退）。
+ */
+async function promptHelperGate(
+  hs: HelperStatus,
+  _config: UserConfig
+): Promise<'proceed' | 'abort'> {
+  if (!helperManager) return 'proceed';
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.show();
+    mainWindow.focus();
+  }
+  const zh = currentLanguage.toLowerCase().startsWith('zh');
+  if (hs.backgroundDisabled) {
+    // 后台被系统禁用：install 大概率被 BTM 拦截 → 引导去系统设置 reenable，而非「安装」
+    const { response } = await dialog.showMessageBox({
+      type: 'question',
+      buttons: zh
+        ? ['打开系统设置', '用系统授权启动', '取消']
+        : ['Open System Settings', 'Use system auth', 'Cancel'],
+      defaultId: 0,
+      cancelId: 2,
+      message: zh ? '提权助手后台运行被系统关闭' : 'Helper background run disabled',
+      detail: zh
+        ? '请在系统设置「登录项与扩展」重新开启本应用的「允许在后台」，否则 TUN 启停将每次弹系统授权。也可本次用系统授权启动。'
+        : 'Re-enable "Allow in the Background" for this app under System Settings → Login Items & Extensions; otherwise TUN start/stop prompts each time. Or start with system auth this time.',
+    });
+    if (response === 2) return 'abort'; // 取消：不启动
+    if (response === 0) {
+      await shell
+        .openExternal('x-apple.systempreferences:com.apple.LoginItems-Settings.extension')
+        .catch(() => {});
+      return 'abort'; // 去设置修，本次不启动
+    }
+    return 'proceed'; // response 1 → osascript 回退
+  }
+  // 未安装 / 路径不符 → 安装并启动
+  const { response } = await dialog.showMessageBox({
+    type: 'question',
+    buttons: zh
+      ? ['安装并启动', '用系统授权启动', '取消']
+      : ['Install & start', 'Use system auth', 'Cancel'],
+    defaultId: 0,
+    cancelId: 2,
+    message: zh ? '安装提权助手？' : 'Install privileged helper?',
+    detail: zh
+      ? '安装后 TUN 模式启停代理免每次系统授权；也可本次用系统授权启动。'
+      : 'After install, TUN start/stop no longer needs system authorization each time; or start with system auth this time.',
+  });
+  if (response === 2) return 'abort'; // 取消：不启动
+  if (response === 0) await helperManager.install().catch(() => {}); // 装好后 start 走 helper 零提权
+  return 'proceed';
+}
 
 // 全局异常捕获 - 主进程
 process.on('uncaughtException', (error: Error) => {
@@ -762,6 +819,7 @@ if (gotTheLock) {
     // macOS 提权 helper：装一次后 TUN 模式启停 sing-box 免提权；未装则回退 PR-M1 看护脚本。
     helperManager = new HelperManager(logManager);
     proxyManager.setHelperManager(helperManager);
+    proxyManager.setHelperGate(promptHelperGate);
 
     // 流量统计：代理运行时轮询 clash_api，经事件推渲染端展示（带 clash secret 鉴权）
     statsService = new StatsService(
@@ -1027,72 +1085,7 @@ if (gotTheLock) {
       onStartProxy: async () => {
         try {
           const config = await configManager.loadConfig();
-          // mac + TUN + helper 未就绪：托盘启动也给一次提权助手引导（与「开启代理」按钮 start 门对齐，
-          // 批C 删被动弹窗后托盘路径曾丢失引导）。取消则不启动；装好后 start 自动走 helper 零提权。
-          if (
-            process.platform === 'darwin' &&
-            (config.proxyModeType || '').toLowerCase() === 'tun' &&
-            helperManager
-          ) {
-            const hs = await helperManager.getStatus().catch(() => null);
-            if (hs && !hs.ready && (hs.backgroundDisabled || hs.needsRepair || !hs.installed)) {
-              // 尊重「不再提示」（与渲染端 gate 一致）：dismissed 用户托盘启动不弹模态、直接走 osascript。
-              // needsRepair（路径不符）不可 dismiss。
-              const dismissed = hs.backgroundDisabled
-                ? config.helperDisabledPromptDismissed === true
-                : !hs.installed
-                  ? config.helperPromptDismissed === true
-                  : false;
-              if (!dismissed) {
-                if (mainWindow && !mainWindow.isDestroyed()) {
-                  mainWindow.show();
-                  mainWindow.focus();
-                }
-                const zh = currentLanguage.toLowerCase().startsWith('zh');
-                if (hs.backgroundDisabled) {
-                  // 后台被系统禁用：install 大概率被 BTM 拦截 → 引导去系统设置 reenable，而非「安装」
-                  const { response } = await dialog.showMessageBox({
-                    type: 'question',
-                    buttons: zh
-                      ? ['打开系统设置', '用系统授权启动', '取消']
-                      : ['Open System Settings', 'Use system auth', 'Cancel'],
-                    defaultId: 0,
-                    cancelId: 2,
-                    message: zh ? '提权助手后台运行被系统关闭' : 'Helper background run disabled',
-                    detail: zh
-                      ? '请在系统设置「登录项与扩展」重新开启本应用的「允许在后台」，否则 TUN 启停将每次弹系统授权。也可本次用系统授权启动。'
-                      : 'Re-enable "Allow in the Background" for this app under System Settings → Login Items & Extensions; otherwise TUN start/stop prompts each time. Or start with system auth this time.',
-                  });
-                  if (response === 2) return; // 取消：不启动
-                  if (response === 0) {
-                    await shell
-                      .openExternal(
-                        'x-apple.systempreferences:com.apple.LoginItems-Settings.extension'
-                      )
-                      .catch(() => {});
-                    return; // 去设置修，本次不启动
-                  }
-                  // response 1 → 继续 start（osascript 回退）
-                } else {
-                  // 未安装 / 路径不符 → 安装并启动
-                  const { response } = await dialog.showMessageBox({
-                    type: 'question',
-                    buttons: zh
-                      ? ['安装并启动', '用系统授权启动', '取消']
-                      : ['Install & start', 'Use system auth', 'Cancel'],
-                    defaultId: 0,
-                    cancelId: 2,
-                    message: zh ? '安装提权助手？' : 'Install privileged helper?',
-                    detail: zh
-                      ? '安装后 TUN 模式启停代理免每次系统授权；也可本次用系统授权启动。'
-                      : 'After install, TUN start/stop no longer needs system authorization each time; or start with system auth this time.',
-                  });
-                  if (response === 2) return; // 取消：不启动
-                  if (response === 0) await helperManager.install().catch(() => {}); // 装好后 start 走 helper 零提权
-                }
-              }
-            }
-          }
+          // helper 引导已收敛到 ProxyManager.start() 单点（promptHelperGate 注入），托盘启动自动覆盖。
           if (proxyManager) {
             await proxyManager.start(config);
 
@@ -1184,6 +1177,8 @@ if (gotTheLock) {
         } catch (error) {
           const errorMessage = error instanceof Error ? error.message : String(error);
           logManager.addLog('error', `Failed to change proxy mode: ${errorMessage}`, 'Main');
+          // helper gate 取消等导致 start 中止 → 代理已停，刷新托盘态防显示陈旧「运行中」
+          updateTrayMenuState(proxyManager?.getStatus().running ?? false);
         }
       },
       onChangeProxyModeType: async (modeType) => {
@@ -1205,6 +1200,8 @@ if (gotTheLock) {
         } catch (error) {
           const errorMessage = error instanceof Error ? error.message : String(error);
           logManager.addLog('error', `Failed to change takeover mode: ${errorMessage}`, 'Main');
+          // helper gate 取消等导致 start 中止 → 代理已停，刷新托盘态防显示陈旧「运行中」
+          updateTrayMenuState(proxyManager?.getStatus().running ?? false);
         }
       },
       onOpenSettings: () => {

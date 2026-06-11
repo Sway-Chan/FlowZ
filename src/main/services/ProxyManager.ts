@@ -9,7 +9,7 @@ import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as net from 'net';
 import { EventEmitter } from 'events';
-import type { UserConfig, ServerConfig, ProxyStatus } from '../../shared/types';
+import type { UserConfig, ServerConfig, ProxyStatus, HelperStatus } from '../../shared/types';
 import { ProxyErrorCode } from '../../shared/types';
 import type { ILogManager } from './LogManager';
 import { HelperManager } from './HelperManager';
@@ -29,10 +29,19 @@ import {
   getSingBoxPidPath,
   getCachePath,
   getRuleResourcesPath,
+  getCustomRulesDir,
 } from '../utils/paths';
 import { getAppPreset } from '../../shared/app-rules-preset';
 import { parseDnsServerSpec, type ParsedDnsServer } from '../../shared/dns';
-import { parsePortValues, ruleConditions } from '../../shared/rules';
+import { ruleConditions } from '../../shared/rules';
+import {
+  EXT_TYPES,
+  planCustomRule,
+  customRuleFileBase,
+  buildCustomRuleFiles,
+  usesFakeIp,
+  condMatcherFields,
+} from './custom-rule-files';
 import coreManifest from '../../shared/core-manifest.json';
 
 /**
@@ -395,10 +404,16 @@ interface SingBoxConfig {
 }
 
 export interface IProxyManager {
-  start(config: UserConfig): Promise<void>;
+  start(
+    config: UserConfig,
+    options?: { interactive?: boolean; helperGateDone?: boolean }
+  ): Promise<void>;
   stop(opts?: { quitting?: boolean }): Promise<void>;
   teardownForQuit(): Promise<void>;
-  restart(config: UserConfig): Promise<void>;
+  restart(
+    config: UserConfig,
+    options?: { interactive?: boolean; helperGateDone?: boolean }
+  ): Promise<void>;
   switchMode(config: UserConfig): Promise<void>;
   getStatus(): ProxyStatus;
   generateSingBoxConfig(config: UserConfig, resolvedIps?: Record<string, string>): SingBoxConfig;
@@ -421,8 +436,21 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private singboxPid: number | null = null; // macOS TUN 模式下实际的 sing-box PID
   // macOS 提权 helper（装一次后免提权启停）；未注入/未就绪则回退 PR-M1 osascript 看护脚本。
   private helperManager: HelperManager | null = null;
+  // helper 引导门控回调（主进程 UI 注入）。收敛单点：所有 start/restart 入口（按钮/托盘/切模式/
+  // config-changed 重启/换节点回退重启…）最终都汇入 start()，gate 设在此处即不可能漏。
+  // 返回 'abort' → start() 抛 HELPER_GATE_ABORTED 终止启动（终态等价 osascript 取消=停止态）。
+  private helperGate:
+    | ((hs: HelperStatus, config: UserConfig) => Promise<'proceed' | 'abort'>)
+    | null = null;
   // 本次 sing-box 是否经 helper 启动（决定停止走 helper socket 还是 osascript）。
   private startedViaHelper: boolean = false;
+  // 重启去抖：连改多条配置（编辑多条规则/导入/迁移）合并为一次重启，避免每次编辑 ~1.2s 断流。
+  // trailing 触发时取 this.currentConfig（恒最新），故各 switchMode 分支须先更新 currentConfig。
+  private restartDebounceTimer: NodeJS.Timeout | null = null;
+  private static readonly RESTART_DEBOUNCE_MS = 1500;
+  // 上次生成时有外化规则因「文件未落盘」降级走 inline（值已在 inline route 规则里、文件无消费者）。
+  // 置 true → 热路径(switchMode no-op 分支)改走重启重落盘，防「写文件但无人消费」导致值陈旧。
+  private customRuleFilesDegraded = false;
   private currentConfig: UserConfig | null = null;
   // 启动时生成的「节点 id → selector 成员 tag」映射，用于 clash_api 热切换时定位目标 tag
   private currentIdToTagMap: Map<string, string> | null = null;
@@ -487,7 +515,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   /**
    * 启动代理
    */
-  async start(config: UserConfig): Promise<void> {
+  async start(
+    config: UserConfig,
+    options: { interactive?: boolean; helperGateDone?: boolean } = {}
+  ): Promise<void> {
+    // 真正 start 即作废未决的去抖重启（崩溃自动重启直走 start、不经 stop，避免窗口内 crash 后被二次拉起）
+    if (this.restartDebounceTimer) {
+      clearTimeout(this.restartDebounceTimer);
+      this.restartDebounceTimer = null;
+    }
     // 如果已经在运行，先停止
     if (this.singboxProcess || this.singboxPid) {
       await this.stop();
@@ -513,6 +549,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 清理可能残留的 sing-box 孤儿进程（崩溃残留占 TUN 设备/端口致下次启动失败）。1B：去掉旧 TUN gate，
     // 系统代理模式也清——Mac 非 TUN 走零提权用户态 kill（systemProxy sing-box 是用户进程，绝不弹 osascript）。
     const isTunMode = config.proxyModeType === 'tun';
+
+    // macOS 提权 helper 引导门控（收敛单点，先于一切重活；abort 直接抛出、不留半启动态）。
+    await this.maybePromptHelperGate(config, isTunMode, options);
+
     await this.killOrphanedSingBoxProcesses(isTunMode);
 
     // 0. 获取核心版本（用于后续生成兼容的配置文件）
@@ -535,6 +575,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // 3. 准备规则文件（必须在生成配置前完成）
     await this.copyRuleSetsToUserData();
+    // 3.1 落盘外化自定义规则文件 + 孤儿对账清扫（必须在 generateSingBoxConfig 前——缺文件 sing-box 启动 FATAL）
+    await this.writeCustomRuleFiles(config);
 
     // 3.5. 预解析所有节点的域名为 IP（仅针对 TUN 模式），防止 Windows 下回流死循环
     // 【待真机验证 / CDN 风险】：对"域名节点"预解析得到的 IP 会进 route_exclude_address，若节点在
@@ -676,6 +718,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 停止代理
    */
   async stop(opts?: { quitting?: boolean }): Promise<void> {
+    // 取消未决的去抖重启（停止/退出优先于 trailing 重启，避免停了又被自动拉起）
+    if (this.restartDebounceTimer) {
+      clearTimeout(this.restartDebounceTimer);
+      this.restartDebounceTimer = null;
+    }
     // macOS TUN 模式：即使 singboxProcess 为 null，也可能有后台进程在运行
     if (!this.singboxProcess && !this.singboxPid) {
       return;
@@ -715,11 +762,146 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
+   * macOS 提权 helper 引导门控（收敛单点）。仅 interactive 启动 + darwin + TUN + helper 未就绪 +
+   * 用户未 dismiss 时，经注入回调弹引导；回调返回 'abort' → 抛 HELPER_GATE_ABORTED 终止启动
+   * （终态等价 osascript 取消=停止态）。崩溃自动重启(interactive:false) 与 渲染端已弹过(helperGateDone)
+   * 均跳过，避免模态风暴 / 双弹。dismissed 语义与原托盘/按钮 gate 逐字一致。
+   */
+  private async maybePromptHelperGate(
+    config: UserConfig,
+    isTunMode: boolean,
+    options: { interactive?: boolean; helperGateDone?: boolean }
+  ): Promise<void> {
+    if (options.interactive === false) return; // 崩溃自动重启等：禁模态
+    if (options.helperGateDone) return; // 渲染端富 UX gate 已处理
+    if (process.platform !== 'darwin' || !isTunMode) return; // 非 macOS / 非 TUN：systemProxy 绝不弹
+    if (!this.helperManager || !this.helperGate) return;
+    const hs = await this.helperManager.getStatus().catch(() => null);
+    if (!hs || hs.ready) return; // 就绪→零提权静默；查询失败→交由 osascript 兜底
+    if (!(hs.backgroundDisabled || hs.needsRepair || !hs.installed)) return;
+    // 尊重「不再提示」（needsRepair=路径不符 不可 dismiss）
+    const dismissed = hs.backgroundDisabled
+      ? config.helperDisabledPromptDismissed === true
+      : !hs.installed
+        ? config.helperPromptDismissed === true
+        : false;
+    if (dismissed) return; // 静默落 osascript（与今天 dismissed 行为一致）
+    const decision = await this.helperGate(hs, config).catch(() => 'proceed' as const);
+    if (decision === 'abort') {
+      const err = new Error('用户取消了提权助手引导') as Error & { code?: string };
+      err.code = 'HELPER_GATE_ABORTED';
+      throw err;
+    }
+  }
+
+  /**
    * 重启代理
    */
-  async restart(config: UserConfig): Promise<void> {
+  async restart(
+    config: UserConfig,
+    options: { interactive?: boolean; helperGateDone?: boolean } = {}
+  ): Promise<void> {
     await this.stop();
-    await this.start(config);
+    await this.start(config, options);
+  }
+
+  /**
+   * 去抖重启：连改多条配置合并为一次重启。trailing 触发时取最新 this.currentConfig（调用方须已更新它），
+   * 故窗口内的后续切节点(hotSwitch)/no-op/再次结构变更都会被最终那次重启自然纳入。stop()/quit 取消未决重启。
+   */
+  private scheduleDebouncedRestart(): void {
+    if (this.restartDebounceTimer) clearTimeout(this.restartDebounceTimer);
+    this.restartDebounceTimer = setTimeout(() => {
+      this.restartDebounceTimer = null;
+      // 窗口内可能已被 stop()/quit 清掉：仅在仍运行时重启
+      if (!this.singboxProcess && !this.singboxPid) return;
+      const cfg = this.currentConfig;
+      if (!cfg) return;
+      // helper gate abort / 其它错误内部消化（终态=停止），防 timer 回调 unhandled rejection
+      void this.restart(cfg).catch((e) =>
+        this.logToManager('warn', `去抖重启结束: ${e instanceof Error ? e.message : String(e)}`)
+      );
+    }, ProxyManager.RESTART_DEBOUNCE_MS);
+  }
+
+  /**
+   * 启动期落盘外化规则文件 + 孤儿对账清扫（start() 在 generateSingBoxConfig 前调用）。
+   * 函数头先清降级标记；① mkdir；② 删孤儿（custom-rule-*(.tmp) 但不在期望集——删规则/禁用/转 inline/
+   * 改 id/direct 切换的遗留）；③ 期望集全量写（仅内容变化的原子写）。逐文件写失败 → 删旧副本 + 置降级标记
+   * （缺文件触发 generateCustomRules inline 降级，用内存态值），仅 warn 不抛。
+   */
+  private async writeCustomRuleFiles(config: UserConfig): Promise<void> {
+    const dir = getCustomRulesDir();
+    const expected = buildCustomRuleFiles(config); // fileName → JSON
+    this.customRuleFilesDegraded = false;
+    try {
+      await fs.mkdir(dir, { recursive: true });
+      // 孤儿清扫（含 atomicWrite 可能残留的 .tmp）
+      let existing: string[] = [];
+      try {
+        existing = await fs.readdir(dir);
+      } catch {
+        /* 目录刚建/读失败：无孤儿可清 */
+      }
+      for (const name of existing) {
+        if (/^custom-rule-.+\.json(\.tmp)?$/.test(name) && !expected.has(name)) {
+          await fs.unlink(path.join(dir, name)).catch(() => {});
+        }
+      }
+      // 期望集落盘（内容未变跳过）。单文件写失败（EIO/磁盘满）→ 删旧副本，避免 sing-box 消费陈旧值：
+      // 缺文件触发 generateCustomRules existsSync 降级走 inline（用内存态值，功能不损）+ 置 degraded 走重启兜底。
+      for (const [name, content] of expected) {
+        const filePath = path.join(dir, name);
+        const cur = await fs.readFile(filePath, 'utf-8').catch(() => null);
+        if (cur === content) continue;
+        try {
+          await this.atomicWrite(filePath, content);
+        } catch (e) {
+          await fs.unlink(filePath).catch(() => {});
+          this.customRuleFilesDegraded = true;
+          this.logToManager(
+            'warn',
+            `外化规则文件写失败，已删旧副本回退 inline: ${name} (${e instanceof Error ? e.message : String(e)})`
+          );
+        }
+      }
+    } catch (e) {
+      this.customRuleFilesDegraded = true;
+      this.logToManager(
+        'warn',
+        `落盘外化规则文件失败（回退 inline）: ${e instanceof Error ? e.message : String(e)}`
+      );
+    }
+  }
+
+  /**
+   * 运行中外化规则「值」热更：仅原子替换内容变化的文件（fswatch 热重载），**绝不删文件**
+   *（运行中删被挂载文件会致 sing-box reload 报错；删除只在 start() 清扫）。写失败 → 去抖重启兜底。
+   */
+  private async syncCustomRuleFiles(config: UserConfig): Promise<void> {
+    const dir = getCustomRulesDir();
+    const expected = buildCustomRuleFiles(config);
+    try {
+      for (const [name, content] of expected) {
+        const filePath = path.join(dir, name);
+        const cur = await fs.readFile(filePath, 'utf-8').catch(() => null);
+        if (cur === content) continue;
+        await this.atomicWrite(filePath, content);
+      }
+    } catch (e) {
+      this.logToManager(
+        'warn',
+        `热更外化规则文件失败，退回去抖重启: ${e instanceof Error ? e.message : String(e)}`
+      );
+      this.scheduleDebouncedRestart();
+    }
+  }
+
+  /** 原子写：临时文件 + rename（与 RuleResourceManager 同形；rename-over 触发 sing-box fswatch 热重载）。 */
+  private async atomicWrite(filePath: string, content: string): Promise<void> {
+    const tmp = `${filePath}.tmp`;
+    await fs.writeFile(tmp, content, 'utf-8');
+    await fs.rename(tmp, filePath);
   }
 
   /**
@@ -738,6 +920,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     if (this.canHotSwitch(newConfig)) {
       if (await this.hotSwitchNode(newConfig)) {
         this.currentConfig = newConfig;
+        // L3：norm 排除了外化规则的值 → 「切节点 + 改外化规则值」同一次 save 会通过 canHotSwitch 检查，
+        //   补一次文件对账防值静默丢失（通常零 diff、幂等）。降级态文件无消费者 → 改走重启重落盘（与 no-op 分支对称）。
+        if (this.customRuleFilesDegraded) this.scheduleDebouncedRestart();
+        else await this.syncCustomRuleFiles(newConfig);
         // 唯一热切换出口（覆盖渲染端/托盘/自动换节点三条切节点路径）→ 通知重测代理出口 IP。
         // 切节点不重测本地出口（direct 出站绑物理网卡，物理出口不变）。
         // 注意：所有切节点路径必须经 switchMode，否则代理 IP 会陈旧至手动刷新。
@@ -755,12 +941,19 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       this.configGenerationNorm(this.currentConfig) === this.configGenerationNorm(newConfig)
     ) {
       this.currentConfig = newConfig;
+      // L3 值热更主路径：norm 结构相等但外化规则的值可能变了 ⇔ 文件内容 diff → 原子替换 + fswatch 热重载、零重启。
+      // 降级桥：上次有外化规则未落盘走 inline（文件无消费者）→ 改走重启重落盘，防「写了没人消费」的值陈旧。
+      if (this.customRuleFilesDegraded) this.scheduleDebouncedRestart();
+      else await this.syncCustomRuleFiles(newConfig);
       return;
     }
 
     // 其余变化（模式/端口/TUN/规则/节点集合/interrupt 开关 等需重生成配置的项）→ 重启应用。
-    this.logToManager('info', '配置已更改，正在重启代理以应用...');
-    await this.restart(newConfig);
+    // 去抖合并：先把缓存更新到最新 newConfig（窗口内 hotSwitch/no-op/再次结构变更都对账到它），
+    // 再调度 trailing 重启（~1.5s 内连改多条只重启一次，消除「连改 5 条规则=5 次断流」）。
+    this.logToManager('info', '配置已更改，调度去抖重启以应用...');
+    this.currentConfig = newConfig;
+    this.scheduleDebouncedRestart();
   }
 
   /**
@@ -816,6 +1009,39 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       builtinGeoMeta: null,
       subscriptions: null,
       mainSessionViaProxy: null,
+      // helper 引导「不再提示」纯 UI 偏好，不影响 sing-box 生成 → 运行中勾选不应触发重启断流。
+      helperPromptDismissed: null,
+      helperDisabledPromptDismissed: null,
+      // 规则投影：禁用规则不进生成（generateCustomRules / DNS 侧均跳过 disabled）→ 内容/增删不触发重启；
+      //   remarks 纯展示元数据，不影响生成。顺序保留（reorder 仍重启，语义正确）。
+      // L3：外化规则（非 direct、全 EXT 可表达）的「值」移出 norm（值变 ⇔ 文件 diff → 热重载、不重启）；
+      //   保留结构位（id/action/target/combineMode/bypassFakeIP/各 cond 的 type 与 ok=有无 matcher）。
+      //   direct 模式 / inline 规则 → 全量投影回退（值仍在 DNS/route inline 消费，值变须重启），与现状一致。
+      customRules: (() => {
+        const extProjection = (c.proxyMode || 'smart').toLowerCase() !== 'direct';
+        return (c.customRules || [])
+          .filter((r) => r.enabled)
+          .map((r) => {
+            if (!extProjection || planCustomRule(r).kind === 'inline') {
+              const copy: Record<string, unknown> = { ...r };
+              delete copy.remarks;
+              return copy;
+            }
+            return {
+              __ext: 1, // 防与 inline 形态键集碰撞误判等价
+              id: r.id, // 文件身份绑定 id；id 变=结构变=重启
+              action: r.action,
+              targetServerId: r.targetServerId ?? null,
+              combineMode: r.combineMode ?? null,
+              bypassFakeIP: !!r.bypassFakeIP,
+              // ok 位承载 fail-closed/skip 决策与「值空↔非空」翻转（值本身不入 norm）
+              conds: ruleConditions(r).map((cd) => ({
+                t: cd.type,
+                ok: condMatcherFields(cd) !== null,
+              })),
+            };
+          });
+      })(),
       ruleResources: (c.ruleResources || [])
         .filter((rr) => ids.has(rr.id))
         .map((rr) => rr.id)
@@ -1205,8 +1431,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 配合我们刚刚修复的 macOS gvisor strict_route DHCP DNS 劫持逻辑，
     // FakeIP 现在能够 100% 完美的用内部 cache 把假 IP 还原成真域名丢给代理节点。
     // 从而完美避开机场对纯 IP 请求的无情封杀！
-    const enableFakeIp =
-      config.proxyModeType?.toLowerCase() !== 'systemproxy' ? true : userDnsConfig.enableFakeIp;
+    // 单一真值：与 custom-rule-files.usesFakeIp 同源（外化判定一致，避免漂移）
+    const enableFakeIp = usesFakeIp(config);
 
     // 用户自定义 DNS：解析 domesticDns/foreignDns（https DoH / tls DoT / udp / 裸 IP），非法或空回退默认并告警。
     const DEFAULT_DOMESTIC: ParsedDnsServer = {
@@ -1340,14 +1566,29 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       server: 'dns-local',
     } as SingBoxDnsRule);
 
-    // 处理自定义规则中的 bypassFakeIP（仅 domain / domainSuffix / domainKeyword 三类域名规则有效）
+    // 处理自定义规则中的 bypassFakeIP（仅 domain / domainSuffix / domainKeyword 三类域名规则有效）。
+    // 可外化规则（smart/global + 已落盘 <base>.dns.json）→ 引用其 <base>-dns rule_set，值不进 DNS 配置
+    // （改值原子替换文件 → fswatch 热重载、零重启）；inline / direct 模式 / 文件缺失降级 → 仍按值提取合并（现状）。
     if (config.customRules && enableFakeIp) {
       const bypassDomains: string[] = []; // type 'domain'
       const bypassSuffixes: string[] = []; // type 'domainSuffix'
       const bypassKeywords: string[] = []; // type 'domainKeyword'
+      const dnsTags: string[] = [];
+      const externalize = proxyMode !== 'direct'; // direct 不外化（route 侧 generateCustomRules 不执行）
       for (const rule of config.customRules) {
         if (!rule.enabled || !rule.bypassFakeIP) continue;
-        // 多条件规则：取所有 domain/domainSuffix/domainKeyword 条件的值并集
+        if (externalize) {
+          const plan = planCustomRule(rule);
+          if (plan.kind !== 'inline' && plan.dnsRules) {
+            const base = customRuleFileBase(rule.id);
+            const dnsPath = path.join(getCustomRulesDir(), `${base}.dns.json`);
+            if (require('fs').existsSync(dnsPath)) {
+              if (!dnsTags.includes(`${base}-dns`)) dnsTags.push(`${base}-dns`);
+              continue; // 已外化：域名值走文件，不在此提取
+            }
+          }
+        }
+        // inline / direct / 文件缺失降级：取所有 domain/domainSuffix/domainKeyword 条件的值并集
         for (const cond of ruleConditions(rule)) {
           const vals = (cond.values || []).map((v) => v.trim()).filter(Boolean);
           if (vals.length === 0) continue;
@@ -1369,6 +1610,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         }
         if (bypassKeywords.length) bypassRule.domain_keyword = bypassKeywords;
         dnsRules.push(bypassRule as unknown as SingBoxDnsRule);
+      }
+      // 外化规则的域名匹配走 rule_set 引用（与上面 inline 合并规则相邻，OR 语义等价）
+      if (dnsTags.length) {
+        dnsRules.push({ rule_set: dnsTags, server: 'dns-bootstrap' } as unknown as SingBoxDnsRule);
       }
     }
 
@@ -2436,7 +2681,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         config.selectedServerId || undefined,
         idToTagMap,
         selectedServerTag,
-        config.ruleResources || []
+        config.ruleResources || [],
+        usesFakeIp(config) // FakeIP 启用 → 注册外化 bypass 规则的 DNS rule_set 条目（供 generateDnsConfig 引用）
       );
       // 走代理的自定义规则同样要配对 udp443 reject（终止规则、在末尾兜底前命中）。逐条插入：
       // 代理向规则前先放一条同匹配器的 udp443 reject；direct/block 规则不配对。
@@ -2816,7 +3062,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     selectedServerId?: string,
     idToTagMap?: Map<string, string>,
     selectedServerTag: string = 'proxy',
-    ruleResources: import('../../shared/types').RuleResource[] = []
+    ruleResources: import('../../shared/types').RuleResource[] = [],
+    registerDnsBypass: boolean = false // FakeIP 启用时：为外化 bypassFakeIP 规则注册 <base>-dns rule_set 条目
   ): { rules: SingBoxRouteRule[]; ruleSets: SingBoxRuleSet[] } {
     const rules: SingBoxRouteRule[] = [];
     const ruleSets: SingBoxRuleSet[] = [];
@@ -2831,50 +3078,20 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       cond: import('../../shared/types').RuleCondition,
       target: SingBoxRouteRule
     ): boolean => {
+      // EXT 类型（域名/IP/端口/进程 系）委托单一真值 condMatcherFields——与外化文件内容永不漂移。
+      // geosite/geoip/ruleSet 不可 headless 表达，留 inline（下方 switch）。
+      if (EXT_TYPES.has(cond.type)) {
+        const fields = condMatcherFields(cond);
+        if (!fields) return false;
+        const t = target as Record<string, unknown>;
+        for (const k of Object.keys(fields)) {
+          t[k] = pushU(t[k] as unknown[] | undefined, fields[k] as unknown[]);
+        }
+        return true;
+      }
       const vals = (cond.values || []).map((v) => v.trim()).filter(Boolean);
       if (vals.length === 0) return false;
       switch (cond.type) {
-        case 'domain':
-          target.domain = pushU(target.domain, vals);
-          return true;
-        case 'domainSuffix':
-          // domain_suffix 匹配该域名及所有子域名；剥 *. 前缀
-          target.domain_suffix = pushU(
-            target.domain_suffix,
-            vals.map((d) => (d.startsWith('*.') ? d.slice(2) : d))
-          );
-          return true;
-        case 'domainKeyword':
-          target.domain_keyword = pushU(target.domain_keyword, vals);
-          return true;
-        case 'domainRegex':
-          target.domain_regex = pushU(target.domain_regex, vals);
-          return true;
-        case 'ipCidr':
-          target.ip_cidr = pushU(target.ip_cidr, vals);
-          return true;
-        case 'sourceIpCidr':
-          target.source_ip_cidr = pushU(target.source_ip_cidr, vals);
-          return true;
-        case 'port': {
-          const { ports, ranges } = parsePortValues(vals);
-          if (ports.length) target.port = pushU(target.port as number[] | undefined, ports);
-          if (ranges.length) target.port_range = pushU(target.port_range, ranges);
-          return ports.length > 0 || ranges.length > 0;
-        }
-        case 'sourcePort': {
-          const { ports, ranges } = parsePortValues(vals);
-          if (ports.length)
-            target.source_port = pushU(target.source_port as number[] | undefined, ports);
-          if (ranges.length) target.source_port_range = pushU(target.source_port_range, ranges);
-          return ports.length > 0 || ranges.length > 0;
-        }
-        case 'processName':
-          target.process_name = pushU(target.process_name as string[] | undefined, vals);
-          return true;
-        case 'processPath':
-          target.process_path = pushU(target.process_path as string[] | undefined, vals);
-          return true;
         case 'geosite':
           // 裸标签 → geosite-<tag>（lowercase 对齐 getRequiredGeoCategories 与远程 .srs 文件名）
           target.rule_set = pushU(
@@ -2943,6 +3160,43 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 或 logical rule（跨维度/含 rule_set 的 OR、或 AND）。绝不把「应 OR」的条件塞进单 default rule 当 AND。
     for (const rule of customRules) {
       if (!rule.enabled) continue;
+
+      // ── L3 外化分流：全条件可 headless 表达 → 写独立 rule_set 文件，route 仅引用 tag（改值热重载零重启）。
+      const plan = planCustomRule(rule);
+      const extBase = customRuleFileBase(rule.id);
+      // DNS 文件注册须在 ext-skip 跳过之前：route 侧 fail-closed 跳过的 bypass 规则，DNS 侧今日仍消费其域名值。
+      if (registerDnsBypass && rule.bypassFakeIP && plan.kind !== 'inline' && plan.dnsRules) {
+        const dnsPath = path.join(getCustomRulesDir(), `${extBase}.dns.json`);
+        if (
+          require('fs').existsSync(dnsPath) &&
+          !ruleSets.some((rs) => rs.tag === `${extBase}-dns`)
+        ) {
+          ruleSets.push({ tag: `${extBase}-dns`, type: 'local', format: 'source', path: dnsPath });
+        }
+      }
+      if (plan.kind === 'ext-skip') continue; // 全 EXT 但 fail-closed → 无 route 规则（DNS 已上方处理）
+      if (plan.kind === 'ext') {
+        const filePath = path.join(getCustomRulesDir(), `${extBase}.json`);
+        if (require('fs').existsSync(filePath)) {
+          if (!ruleSets.some((rs) => rs.tag === extBase)) {
+            ruleSets.push({ tag: extBase, type: 'local', format: 'source', path: filePath });
+          }
+          const extRule: SingBoxRouteRule = { action: 'route', rule_set: [extBase] };
+          this.applyRuleAction(
+            extRule,
+            rule.action,
+            rule.targetServerId,
+            selectedServerId,
+            idToTagMap,
+            selectedServerTag
+          );
+          rules.push(extRule);
+          continue;
+        }
+        // 文件未落盘（预检/onRetry 重生成期）→ 标记降级，回落 inline 现状（值已知，功能不损）。
+        this.customRuleFilesDegraded = true;
+      }
+
       const rawConds = ruleConditions(rule);
       const conds = rawConds
         .map((c) => ({
@@ -4223,6 +4477,11 @@ exit 0
     this.helperManager = helperManager;
   }
 
+  /** 注入 helper 引导门控回调（index.ts 启动时调用）。收敛单点，见 maybePromptHelperGate。 */
+  setHelperGate(fn: (hs: HelperStatus, config: UserConfig) => Promise<'proceed' | 'abort'>): void {
+    this.helperGate = fn;
+  }
+
   /**
    * 清理可能残留的 sing-box 进程
    * 这是解决"重启代理后网络不恢复"问题的关键
@@ -4727,8 +4986,8 @@ exit 0
       // 等待一小段时间让系统清理
       await new Promise((resolve) => setTimeout(resolve, 2000));
 
-      // 重新启动
-      await this.start(this.currentConfig);
+      // 重新启动（崩溃自动重启：interactive:false，禁 helper 引导模态，防崩溃循环弹窗风暴）
+      await this.start(this.currentConfig, { interactive: false });
 
       this.logToManager('info', 'sing-box 自动重启成功');
 

@@ -663,7 +663,7 @@ export class ConfigManager implements IConfigManager {
       minimizeToTray: true,
       autoCheckUpdate: true, // 默认启用启动时自动检查更新
       autoLightweightMode: false, // 默认不启用自动轻量模式
-      autoUpdateSubscriptionOnStart: false, // 默认不启用订阅自动更新
+      autoUpdateSubscriptionOnStart: true, // 默认启用订阅自动更新（启动补更陈旧订阅 + 周期更新）
       subscriptionUpdateIntervalHours: 12, // 订阅自动更新周期/陈旧阈值（小时）
       subscriptionUpdateViaProxy: false, // 默认直连拉取订阅
       mainSessionViaProxy: true, // 更新检查/规则资源默认走代理（运行时）

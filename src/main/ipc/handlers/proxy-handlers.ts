@@ -64,8 +64,9 @@ export function registerProxyHandlers(
         throw new Error('配置参数未传递');
       }
 
-      // 启动 sing-box 进程
-      await proxyManager.start(config);
+      // 启动 sing-box 进程。helperGateDone:true —— 渲染端「开启代理」按钮已弹过富 UX helper 引导
+      // （helper-install-dialog），主进程跳过 native 引导防双弹；isReady 重判与 osascript 兜底不受影响。
+      await proxyManager.start(config, { helperGateDone: true });
 
       // 系统代理模式：设置系统代理
       const modeType = (config.proxyModeType || 'systemProxy').toLowerCase();
