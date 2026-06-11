@@ -45,6 +45,9 @@ async function startDev() {
   console.log('⚡ 启动 Electron...\n');
   const env = { ...process.env, NODE_ENV: 'development' };
   delete env.ELECTRON_RUN_AS_NODE;
+  // Electron 42 起 postinstall 不再下载二进制，首次 `electron .` 改为现场下载；
+  // 默认走 npmmirror 避免卡 GitHub Releases（已设 ELECTRON_MIRROR 的环境不覆盖）。
+  env.ELECTRON_MIRROR ??= 'https://npmmirror.com/mirrors/electron/';
 
   const electron = spawn('npx', ['electron', '.'], {
     shell: true,

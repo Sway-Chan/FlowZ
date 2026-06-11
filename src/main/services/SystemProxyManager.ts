@@ -5,7 +5,10 @@
 
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import * as fs from 'fs';
+import * as path from 'path';
 import { retry } from '../utils/retry';
+import { getUserDataPath } from '../utils/paths';
 
 const execAsync = promisify(exec);
 
@@ -49,6 +52,59 @@ export interface ISystemProxyManager {
  */
 export abstract class SystemProxyBase implements ISystemProxyManager {
   protected originalSettings: SystemProxyStatus | null = null;
+
+  /** 持久化 marker 文件路径（userData/system-proxy.marker.json） */
+  private static getMarkerPath(): string {
+    return path.join(getUserDataPath(), 'system-proxy.marker.json');
+  }
+
+  /**
+   * 写入持久化 marker（enableProxy 成功后调用）
+   * 记录"系统代理由 FlowZ 设置"，供崩溃/强杀后下次启动恢复与退出兜底门控使用。
+   * 同步 fs API（文件极小）；失败仅告警，绝不抛出影响代理设置结果。
+   */
+  protected writeMarker(ourHostPort: string): void {
+    try {
+      fs.writeFileSync(
+        SystemProxyBase.getMarkerPath(),
+        JSON.stringify({ ourHostPort, at: Date.now() })
+      );
+    } catch (error) {
+      console.warn('写入系统代理 marker 失败:', error);
+    }
+  }
+
+  /**
+   * 删除持久化 marker（disableProxy / disableProxySync 成功后调用）
+   * 同步 fs API，可安全用于 process'exit' 等同步退出路径；失败仅告警，绝不抛出。
+   */
+  protected clearMarker(): void {
+    SystemProxyBase.clearMarkerFile();
+  }
+
+  /** 删除持久化 marker（静态入口，供启动恢复清理失效 marker）；失败仅告警，绝不抛出 */
+  static clearMarkerFile(): void {
+    try {
+      fs.rmSync(SystemProxyBase.getMarkerPath(), { force: true });
+    } catch (error) {
+      console.warn('删除系统代理 marker 失败:', error);
+    }
+  }
+
+  /** 读取持久化 marker；文件不存在或内容损坏一律返回 null（启动恢复/退出门控用） */
+  static readMarker(): { ourHostPort: string } | null {
+    try {
+      const raw = fs.readFileSync(SystemProxyBase.getMarkerPath(), 'utf-8');
+      const data = JSON.parse(raw);
+      if (data && typeof data.ourHostPort === 'string' && data.ourHostPort) {
+        return { ourHostPort: data.ourHostPort };
+      }
+      return null;
+    } catch {
+      // ENOENT / JSON 损坏 → 视为无 marker
+      return null;
+    }
+  }
 
   abstract enableProxy(address: string, httpPort: number, socksPort: number): Promise<void>;
   abstract disableProxy(): Promise<void>;
@@ -164,6 +220,8 @@ export class WindowsSystemProxy extends SystemProxyBase {
         }
       );
 
+      // 持久化 marker：标记系统代理由 FlowZ 设置（崩溃/强杀后下次启动据此恢复）
+      this.writeMarker(`${address}:${httpPort}`);
       console.log('Windows 系统代理设置成功');
     } catch (error) {
       console.error('设置 Windows 系统代理失败:', error);
@@ -215,6 +273,8 @@ export class WindowsSystemProxy extends SystemProxyBase {
         await this.notifyProxyChange();
         console.log('已禁用系统代理');
       }
+      // 拆除成功 → 删除持久化 marker
+      this.clearMarker();
     } catch (error) {
       console.error('禁用 Windows 系统代理失败:', error);
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -240,6 +300,8 @@ export class WindowsSystemProxy extends SystemProxyBase {
       execSync(`reg add "${this.regPath}" /v ProxyEnable /t REG_DWORD /d 0 /f`, {
         stdio: 'ignore',
       });
+      // 禁用成功 → 删除持久化 marker（clearMarker 内部为同步 fs API 且不抛）
+      this.clearMarker();
       // 尝试刷新设置
       execSync('ipconfig /flushdns', { stdio: 'ignore' });
     } catch (error) {
@@ -457,6 +519,8 @@ export class MacOSSystemProxy extends SystemProxyBase {
         }
       );
 
+      // 持久化 marker：标记系统代理由 FlowZ 设置（崩溃/强杀后下次启动据此恢复）
+      this.writeMarker(`${address}:${httpPort}`);
       console.log('macOS 系统代理设置成功');
     } catch (error) {
       console.error('设置 macOS 系统代理失败:', error);
@@ -504,6 +568,8 @@ export class MacOSSystemProxy extends SystemProxyBase {
         }
         console.log('已禁用系统代理');
       }
+      // 拆除成功 → 删除持久化 marker
+      this.clearMarker();
     } catch (error) {
       console.error('禁用 macOS 系统代理失败:', error);
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -522,6 +588,7 @@ export class MacOSSystemProxy extends SystemProxyBase {
         .split('\n')
         .filter((s: string) => s && !s.includes('*') && !s.includes('Bluetooth'));
 
+      let allOff = true;
       for (const service of activeInterfaces) {
         try {
           execSync(`networksetup -setwebproxystate "${service}" off`, { stdio: 'ignore' });
@@ -530,9 +597,11 @@ export class MacOSSystemProxy extends SystemProxyBase {
             stdio: 'ignore',
           });
         } catch {
-          /* ignore */
+          allOff = false;
         }
       }
+      // 全部服务成功关闭才删 marker；任一失败则保留，交下次启动恢复重试（避免漏关服务而 marker 已删失去兜底）
+      if (allOff) this.clearMarker();
     } catch (error) {
       console.error('同步禁用 macOS 系统代理失败:', error);
     }
@@ -706,6 +775,8 @@ export class LinuxSystemProxy extends SystemProxyBase {
         },
         { maxRetries: 1, delay: 500 }
       );
+      // 持久化 marker：标记系统代理由 FlowZ 设置（崩溃/强杀后下次启动据此恢复）
+      this.writeMarker(`${address}:${httpPort}`);
       console.log('Linux 系统代理设置成功');
     } catch (error) {
       console.error('设置 Linux 系统代理失败:', error);
@@ -721,6 +792,8 @@ export class LinuxSystemProxy extends SystemProxyBase {
     try {
       await execAsync('gsettings set org.gnome.system.proxy mode "none"');
       console.log('已禁用系统代理');
+      // 拆除成功 → 删除持久化 marker
+      this.clearMarker();
     } catch (error) {
       console.error('禁用 Linux 系统代理失败:', error);
     }
@@ -761,6 +834,8 @@ export class LinuxSystemProxy extends SystemProxyBase {
     try {
       // GNOME
       execSync('gsettings set org.gnome.system.proxy mode "none"', { stdio: 'ignore' });
+      // GNOME 禁用成功 → 删除持久化 marker（enableProxy 仅走 GNOME 路径）
+      this.clearMarker();
     } catch {
       /* ignore */
     }

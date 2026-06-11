@@ -168,6 +168,13 @@ export function getCachePath(): string {
 }
 
 /**
+ * 规则资源目录（已下载的 .srs + catalog.json 缓存）。与内置 geo 的 <userData>/rules 分目录。
+ */
+export function getRuleResourcesPath(): string {
+  return path.join(getUserDataPath(), 'rule-resources');
+}
+
+/**
  * 获取日志目录路径
  */
 export function getLogsPath(): string {

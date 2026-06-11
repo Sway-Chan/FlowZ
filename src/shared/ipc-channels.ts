@@ -18,6 +18,9 @@ export const IPC_CHANNELS = {
   CONFIG_SET_VALUE: 'config:setValue',
   CONFIG_GET_PRIVACY_MODE: 'config:getPrivacyMode',
   CONFIG_SET_PRIVACY_MODE: 'config:setPrivacyMode',
+  PRIVACY_SET_PASSWORD: 'privacy:setPassword',
+  PRIVACY_UNLOCK: 'privacy:unlock',
+  PRIVACY_HAS_PASSWORD: 'privacy:hasPassword',
 
   // 服务器管理
   SERVER_SWITCH: 'server:switch',
@@ -41,6 +44,19 @@ export const IPC_CHANNELS = {
   RULES_ADD: 'rules:add',
   RULES_UPDATE: 'rules:update',
   RULES_DELETE: 'rules:delete',
+  RULES_REORDER: 'rules:reorder',
+
+  // 规则资源管理（.srs 下载/管理）
+  RULE_RESOURCES_LIST: 'ruleResources:list',
+  RULE_RESOURCES_DOWNLOAD: 'ruleResources:download',
+  RULE_RESOURCES_REDOWNLOAD: 'ruleResources:redownload',
+  RULE_RESOURCES_DELETE: 'ruleResources:delete',
+  RULE_RESOURCES_SET_GH_PROXY: 'ruleResources:setGhProxy',
+  RULE_RESOURCES_GET_CATALOG: 'ruleResources:getCatalog',
+  RULE_RESOURCES_REFRESH_CATALOG: 'ruleResources:refreshCatalog',
+  RULE_RESOURCES_SET_AUTO_UPDATE: 'ruleResources:setAutoUpdate',
+  RULE_RESOURCES_UPDATE_ALL: 'ruleResources:updateAll',
+  RULE_RESOURCES_RESET_BUILTIN: 'ruleResources:resetBuiltin',
 
   // 日志管理
   LOGS_GET: 'logs:get',
@@ -53,6 +69,13 @@ export const IPC_CHANNELS = {
 
   // 统计信息
   STATS_GET: 'stats:get',
+  CONNECTIONS_GET: 'connections:get',
+
+  // 出口 IP 信息（本地直连出口 / 代理出口）
+  IP_INFO_GET: 'ipinfo:get',
+
+  // 系统进程枚举（路由规则的进程快速选择器）
+  SYSTEM_LIST_PROCESSES: 'system:listProcesses',
 
   // 版本信息
   VERSION_GET_INFO: 'version:getInfo',
@@ -78,6 +101,11 @@ export const IPC_CHANNELS = {
   // 管理员权限
   ADMIN_CHECK: 'admin:check',
 
+  // macOS 提权 helper（免提权启停 sing-box）
+  HELPER_GET_STATUS: 'helper:getStatus',
+  HELPER_INSTALL: 'helper:install',
+  HELPER_UNINSTALL: 'helper:uninstall',
+
   // 事件 (主进程 -> 渲染进程)
   EVENT_PROXY_STARTED: 'event:proxyStarted',
   EVENT_PROXY_STOPPED: 'event:proxyStopped',
@@ -85,10 +113,12 @@ export const IPC_CHANNELS = {
   EVENT_CONFIG_CHANGED: 'event:configChanged',
   EVENT_LOG_RECEIVED: 'event:logReceived',
   EVENT_STATS_UPDATED: 'event:statsUpdated',
-  EVENT_CONNECTION_STATE_CHANGED: 'event:connectionStateChanged',
+  EVENT_CONNECTIONS_UPDATED: 'event:connectionsUpdated',
   EVENT_ENTER_PRIVACY_MODE: 'event:enterPrivacyMode',
   EVENT_CORE_VERSION_CHANGED: 'event:coreVersionChanged',
   EVENT_AUTO_NODE_SWITCHED: 'event:autoNodeSwitched', // 自动换节点成功通知
+  EVENT_IP_INFO_UPDATED: 'event:ipInfoUpdated', // 出口 IP 信息更新
+  EVENT_RULE_RESOURCE_PROGRESS: 'event:ruleResourceProgress', // 规则资源下载进度
 
   // 应用语言同步（渲染进程 -> 主进程）
   APP_SET_LANGUAGE: 'app:setLanguage',

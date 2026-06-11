@@ -76,6 +76,15 @@ export class ResourceManager {
   }
 
   /**
+   * 获取随包内置的 macOS 提权 helper 二进制路径（与 sing-box 同目录）。
+   * 生产环境：<App>/Contents/Resources/mac/com.flowz.helper；开发环境：resources/mac-${arch}/com.flowz.helper。
+   * 仅 macOS 有意义；安装时由 HelperManager 复制到 /Library/PrivilegedHelperTools/。
+   */
+  getMacHelperPath(): string {
+    return path.join(this.getPlatformResourceDir(), 'com.flowz.helper');
+  }
+
+  /**
    * 获取应用图标路径（统一使用 app.png）
    */
   getAppIconPath(): string {
