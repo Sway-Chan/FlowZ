@@ -1,203 +1,157 @@
 import { Card, CardContent } from '@/components/ui/card';
-import { Checkbox } from '@/components/ui/checkbox';
-import { Label } from '@/components/ui/label';
+import { Switch } from '@/components/ui/switch';
 import { useAppStore } from '@/store/app-store';
 import { toast } from 'sonner';
 import { api } from '@/ipc';
 import { useTranslation } from 'react-i18next';
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { Input } from '@/components/ui/input';
+import { Button } from '@/components/ui/button';
+import { SettingsRow } from './settings-row';
+
+type ToggleField =
+  | 'autoStart'
+  | 'silentStart'
+  | 'autoConnect'
+  | 'minimizeToTray'
+  | 'autoCheckUpdate'
+  | 'autoLightweightMode'
+  | 'rememberWindowSize'
+  | 'autoPrivacyMode';
 
 export function GeneralSettings() {
   const { t } = useTranslation();
   const config = useAppStore((state) => state.config);
   const saveConfig = useAppStore((state) => state.saveConfig);
-  const [passwordValue, setPasswordValue] = useState(config?.privacyPassword || '');
+  // F29：密码哈希在 main，渲染端不读明文。输入框 write-only（恒空起始），是否已设密码经 IPC 查询。
+  const [passwordValue, setPasswordValue] = useState('');
+  const [hasPrivacyPassword, setHasPrivacyPassword] = useState(false);
+  useEffect(() => {
+    api.privacy
+      .hasPassword()
+      .then(setHasPrivacyPassword)
+      .catch(() => setHasPrivacyPassword(false));
+  }, []);
 
-  const handleToggle = async (
-    field:
-      | 'autoStart'
-      | 'silentStart'
-      | 'autoConnect'
-      | 'minimizeToTray'
-      | 'autoCheckUpdate'
-      | 'autoLightweightMode'
-      | 'rememberWindowSize'
-      | 'autoPrivacyMode',
-    value: boolean
-  ) => {
+  const handleToggle = async (field: ToggleField, value: boolean) => {
     if (!config) return;
-
     try {
       if (field === 'autoStart') {
         await api.autoStart.set(value);
       }
-
-      const updatedConfig = {
-        ...config,
-        [field]: value,
-      };
-
-      await saveConfig(updatedConfig);
-      toast.success(t('settings.general.successUpdate'));
+      await saveConfig({ ...config, [field]: value });
+      toast.success(t('settings.general.successUpdate'), { duration: 2000 });
     } catch (error) {
-      const errorMessage =
-        error instanceof Error ? error.message : t('settings.general.failUpdate');
-      toast.error(errorMessage);
+      toast.error(error instanceof Error ? error.message : t('settings.general.failUpdate'));
     }
   };
 
+  // F29：空白失焦不动（清除走显式按钮，避免 write-only 框误清已设密码）；非空 → main 哈希存储
   const handlePasswordSave = async (value: string) => {
-    if (!config) return;
+    if (value === '') return;
     try {
-      const updatedConfig = { ...config, privacyPassword: value };
-      await saveConfig(updatedConfig);
-      toast.success(t('settings.general.successUpdate'));
+      const { success } = await api.privacy.setPassword(value);
+      if (!success) throw new Error('set password rejected');
+      setPasswordValue('');
+      setHasPrivacyPassword(true);
+      toast.success(t('settings.general.successUpdate'), { duration: 2000 });
     } catch {
       toast.error(t('settings.general.failUpdate'));
     }
   };
 
-  if (!config) {
-    return null;
-  }
+  const handleClearPassword = async () => {
+    try {
+      await api.privacy.setPassword('');
+      setPasswordValue('');
+      setHasPrivacyPassword(false);
+      toast.success(t('settings.general.successUpdate'), { duration: 2000 });
+    } catch {
+      toast.error(t('settings.general.failUpdate'));
+    }
+  };
+
+  if (!config) return null;
 
   return (
     <Card>
-      <CardContent className="space-y-4 pt-6">
-        <div className="flex items-center space-x-2">
-          <Checkbox
-            id="silentStart"
+      <CardContent className="divide-y divide-border/60 pt-2">
+        <SettingsRow
+          label={t('settings.general.silentStart')}
+          description={t('settings.general.silentStartDesc')}
+        >
+          <Switch
             checked={config.silentStart}
-            onCheckedChange={(checked) => handleToggle('silentStart', checked as boolean)}
+            onCheckedChange={(c) => handleToggle('silentStart', c)}
           />
-          <Label
-            htmlFor="silentStart"
-            className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer"
-          >
-            {t('settings.general.silentStart')}
-          </Label>
-        </div>
-
-        <div className="flex items-center space-x-2">
-          <Checkbox
-            id="autoStart"
+        </SettingsRow>
+        <SettingsRow label={t('settings.general.autoStartTitle')}>
+          <Switch
             checked={config.autoStart}
-            onCheckedChange={(checked) => handleToggle('autoStart', checked as boolean)}
+            onCheckedChange={(c) => handleToggle('autoStart', c)}
           />
-          <Label
-            htmlFor="autoStart"
-            className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer"
-          >
-            {t('settings.general.autoStartTitle')}
-          </Label>
-        </div>
-
-        <div className="flex items-center space-x-2">
-          <Checkbox
-            id="autoConnect"
+        </SettingsRow>
+        <SettingsRow label={t('settings.general.autoConnect')}>
+          <Switch
             checked={config.autoConnect}
-            onCheckedChange={(checked) => handleToggle('autoConnect', checked as boolean)}
+            onCheckedChange={(c) => handleToggle('autoConnect', c)}
           />
-          <Label
-            htmlFor="autoConnect"
-            className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer"
-          >
-            {t('settings.general.autoConnect')}
-          </Label>
-        </div>
-
-        <div className="flex items-center space-x-2">
-          <Checkbox
-            id="minimizeToTray"
+        </SettingsRow>
+        <SettingsRow label={t('settings.general.minimizeToTrayTitle')}>
+          <Switch
             checked={config.minimizeToTray}
-            onCheckedChange={(checked) => handleToggle('minimizeToTray', checked as boolean)}
+            onCheckedChange={(c) => handleToggle('minimizeToTray', c)}
           />
-          <Label
-            htmlFor="minimizeToTray"
-            className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer"
-          >
-            {t('settings.general.minimizeToTrayTitle')}
-          </Label>
-        </div>
-
-        <div className="flex items-center space-x-2">
-          <Checkbox
-            id="autoCheckUpdate"
+        </SettingsRow>
+        <SettingsRow label={t('settings.general.autoCheckUpdate')}>
+          <Switch
             checked={config.autoCheckUpdate !== false}
-            onCheckedChange={(checked) => handleToggle('autoCheckUpdate', checked as boolean)}
+            onCheckedChange={(c) => handleToggle('autoCheckUpdate', c)}
           />
-          <Label
-            htmlFor="autoCheckUpdate"
-            className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer"
-          >
-            {t('settings.general.autoCheckUpdate')}
-          </Label>
-        </div>
-
-        <div className="flex items-center space-x-2">
-          <Checkbox
-            id="rememberWindowSize"
+        </SettingsRow>
+        <SettingsRow label={t('settings.general.rememberWindowSize')}>
+          <Switch
             checked={config.rememberWindowSize === true}
-            onCheckedChange={(checked) => handleToggle('rememberWindowSize', checked as boolean)}
+            onCheckedChange={(c) => handleToggle('rememberWindowSize', c)}
           />
-          <Label
-            htmlFor="rememberWindowSize"
-            className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer"
-          >
-            {t('settings.general.rememberWindowSize')}
-          </Label>
-        </div>
-
-        <div className="flex items-center space-x-2 border-t pt-4 mt-2">
-          <Checkbox
-            id="autoLightweightMode"
+        </SettingsRow>
+        <SettingsRow
+          label={t('settings.general.autoLightweightMode')}
+          description={t('settings.general.autoLightweightModeDesc')}
+        >
+          <Switch
             checked={config.autoLightweightMode}
-            onCheckedChange={(checked) => handleToggle('autoLightweightMode', checked as boolean)}
+            onCheckedChange={(c) => handleToggle('autoLightweightMode', c)}
           />
-          <Label
-            htmlFor="autoLightweightMode"
-            className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer"
-          >
-            {t('settings.general.autoLightweightMode')}
-          </Label>
-        </div>
-
-        <div className="flex flex-col space-y-2">
-          <div className="flex items-center space-x-2">
-            <Checkbox
-              id="autoPrivacyMode"
-              checked={config.autoPrivacyMode === true}
-              onCheckedChange={(checked) => handleToggle('autoPrivacyMode', checked as boolean)}
-            />
-            <Label
-              htmlFor="autoPrivacyMode"
-              className="text-sm font-medium leading-none peer-disabled:cursor-not-allowed peer-disabled:opacity-70 cursor-pointer"
-            >
-              {t('settings.general.autoPrivacyMode')}
-            </Label>
-          </div>
-
-          {config.autoPrivacyMode && (
-            <div className="flex items-center space-x-2 pl-6 pt-1 pb-2">
-              <Label
-                htmlFor="privacyPassword"
-                className="text-sm font-medium pr-2 text-muted-foreground whitespace-nowrap"
-              >
-                {t('settings.general.privacyPassword')}
-              </Label>
+        </SettingsRow>
+        <SettingsRow
+          label={t('settings.general.autoPrivacyMode')}
+          description={t('settings.general.autoPrivacyModeDesc')}
+        >
+          <Switch
+            checked={config.autoPrivacyMode === true}
+            onCheckedChange={(c) => handleToggle('autoPrivacyMode', c)}
+          />
+        </SettingsRow>
+        {config.autoPrivacyMode && (
+          <SettingsRow label={t('settings.general.privacyPassword')} stacked>
+            <div className="flex items-center gap-2">
               <Input
-                id="privacyPassword"
                 type="password"
                 placeholder={t('settings.general.privacyPasswordPlaceholder')}
                 value={passwordValue}
                 onChange={(e) => setPasswordValue(e.target.value)}
                 onBlur={() => handlePasswordSave(passwordValue)}
-                className="max-w-[260px] h-8"
+                className="h-8 max-w-[260px]"
               />
+              {hasPrivacyPassword && (
+                <Button variant="outline" size="sm" className="h-8" onClick={handleClearPassword}>
+                  {t('settings.general.clearPassword')}
+                </Button>
+              )}
             </div>
-          )}
-        </div>
+          </SettingsRow>
+        )}
       </CardContent>
     </Card>
   );

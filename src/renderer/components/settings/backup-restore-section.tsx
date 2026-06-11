@@ -115,7 +115,7 @@ export function BackupRestoreSection() {
   const hasData = totalNodes > 0 || (backupInfo?.subscriptionCount ?? 0) > 0;
 
   return (
-    <div className="space-y-4 pt-4 border-t">
+    <div className="space-y-4">
       {/* Section header */}
       <div className="flex items-start justify-between gap-4">
         <div>

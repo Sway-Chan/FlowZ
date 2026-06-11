@@ -15,6 +15,7 @@ import { Switch } from '@/components/ui/switch';
 import { Loader2, Link as LinkIcon, Edit, Activity } from 'lucide-react';
 import type { SubscriptionConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
+import { formatBytes } from '@/lib/format';
 
 interface SubscriptionDialogProps {
   open: boolean;
@@ -32,7 +33,7 @@ export function SubscriptionDialog({
   const { t } = useTranslation();
   const [name, setName] = useState('');
   const [url, setUrl] = useState('');
-  const [autoUpdate, setAutoUpdate] = useState(false);
+  const [autoUpdate, setAutoUpdate] = useState(true); // 新增订阅默认开启自动更新（否则「启动自动更新」总开关无意义）
   const [isSaving, setIsSaving] = useState(false);
 
   useEffect(() => {
@@ -44,7 +45,7 @@ export function SubscriptionDialog({
       } else {
         setName('');
         setUrl('');
-        setAutoUpdate(false);
+        setAutoUpdate(true); // 新增订阅默认开启自动更新（否则「启动自动更新」总开关无意义）
       }
     }
   }, [open, subscription]);
@@ -75,16 +76,6 @@ export function SubscriptionDialog({
   };
 
   const isEditing = !!subscription;
-
-  // 格式化流量显示
-  const formatBytes = (bytes?: number) => {
-    if (bytes === undefined || isNaN(bytes)) return t('sub.unknown', 'Unknown');
-    if (bytes === 0) return '0 B';
-    const k = 1024;
-    const sizes = ['B', 'KB', 'MB', 'GB', 'TB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-  };
 
   // 格式化日期显示
   const formatDate = (timestamp?: number) => {
@@ -144,7 +135,11 @@ export function SubscriptionDialog({
               </div>
               <div className="flex justify-between">
                 <span>{t('sub.totalTraffic')}</span>
-                <span className="font-medium">{formatBytes(subscription.userInfo.total)}</span>
+                <span className="font-medium">
+                  {subscription.userInfo.total === undefined
+                    ? t('sub.unknown', 'Unknown')
+                    : formatBytes(subscription.userInfo.total)}
+                </span>
               </div>
               <div className="flex justify-between">
                 <span>{t('sub.expireTime')}</span>

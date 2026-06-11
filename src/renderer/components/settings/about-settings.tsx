@@ -17,6 +17,8 @@ import { api } from '@/ipc/api-client';
 import type { UpdateProgress } from '@/ipc/api-client';
 import { useTranslation } from 'react-i18next';
 import { CoreVersionBanner } from './core-version-banner';
+import { AppUpdateBanner } from './app-update-banner';
+import { useAppStore } from '@/store/app-store';
 
 interface VersionInfo {
   appVersion: string;
@@ -28,6 +30,9 @@ interface VersionInfo {
 }
 
 export function AboutSettings() {
+  // F28：App 更新可用信息放 store（本组件随设置子节切换会卸载，本地 state 无法持久承载入口）
+  const availableAppUpdate = useAppStore((s) => s.availableAppUpdate);
+  const setAvailableAppUpdate = useAppStore((s) => s.setAvailableAppUpdate);
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
@@ -146,15 +151,17 @@ export function AboutSettings() {
 
       if (data.hasUpdate && data.updateInfo) {
         const updateInfo = data.updateInfo;
+        setAvailableAppUpdate(updateInfo); // 常驻入口（toast 8s 后消失，卡片持久）
         toast.success(t('settings.about.foundUpdate', { version: updateInfo.version }), {
           description: t('settings.about.clickToInstall'),
           action: {
             label: t('settings.about.updateNow'),
             onClick: () => handleDownloadAndInstall(updateInfo),
           },
-          duration: 15000,
+          duration: 8000,
         });
       } else {
+        setAvailableAppUpdate(null); // 已是最新：清除可能残留的旧 banner
         toast.success(t('settings.about.alreadyLatest'));
       }
     } catch (error) {
@@ -192,7 +199,7 @@ export function AboutSettings() {
             label: t('settings.about.clickToUpdate'),
             onClick: () => handleUpdateCore(data.downloadUrl!, data.latestVersion!),
           },
-          duration: 15000,
+          duration: 8000,
         });
       } else if (data.error) {
         toast.error(t('settings.about.checkCoreUpdateFail'), { description: data.error });
@@ -280,6 +287,15 @@ export function AboutSettings() {
   return (
     <div className="space-y-4">
       <CoreVersionBanner />
+
+      {availableAppUpdate && (
+        <AppUpdateBanner
+          updateInfo={availableAppUpdate}
+          downloading={downloading}
+          onUpdate={() => handleDownloadAndInstall(availableAppUpdate)}
+          onDismiss={() => setAvailableAppUpdate(null)}
+        />
+      )}
       <Card>
         <CardContent className="space-y-6 pt-6">
           <div className="space-y-4">
@@ -288,7 +304,7 @@ export function AboutSettings() {
                 {t('settings.about.appVersion')}
               </h4>
               <p className="text-lg font-semibold">
-                {versionInfo?.appName || 'FlowZ'} v{versionInfo?.appVersion || '1.0.0'}
+                {versionInfo?.appName || 'FlowZ'} v{versionInfo?.appVersion || '—'}
               </p>
             </div>
 

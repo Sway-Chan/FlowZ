@@ -17,7 +17,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Loader2 } from 'lucide-react';
 import type { ServerConfig } from '@/bridge/types';
-import { useTranslation } from 'react-i18next';
+import { useTranslation, Trans } from 'react-i18next';
 
 const createSshSchema = (t: any) =>
   z.object({
@@ -165,11 +165,11 @@ export function SshForm({ serverConfig, onSubmit }: SshFormProps) {
           name="user"
           render={({ field }) => (
             <FormItem>
-              <FormLabel>SSH 用户名</FormLabel>
+              <FormLabel>{t('servers.ssh.user')}</FormLabel>
               <FormControl>
                 <Input placeholder="root" {...field} />
               </FormControl>
-              <FormDescription>SSH 登录用户，默认 root</FormDescription>
+              <FormDescription>{t('servers.ssh.userDesc')}</FormDescription>
               <FormMessage />
             </FormItem>
           )}
@@ -177,14 +177,14 @@ export function SshForm({ serverConfig, onSubmit }: SshFormProps) {
 
         {/* 认证方式 Tabs */}
         <div className="space-y-3">
-          <p className="text-sm font-medium">认证方式</p>
+          <p className="text-sm font-medium">{t('servers.ssh.authMethod')}</p>
           <Tabs value={authMode} onValueChange={(v) => setAuthMode(v as 'password' | 'privatekey')}>
             <TabsList className="w-full">
               <TabsTrigger value="password" className="flex-1">
-                密码认证
+                {t('servers.ssh.passwordAuth')}
               </TabsTrigger>
               <TabsTrigger value="privatekey" className="flex-1">
-                私钥认证
+                {t('servers.ssh.privateKeyAuth')}
               </TabsTrigger>
             </TabsList>
 
@@ -195,9 +195,13 @@ export function SshForm({ serverConfig, onSubmit }: SshFormProps) {
                 name="password"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>密码</FormLabel>
+                    <FormLabel>{t('servers.ssh.password')}</FormLabel>
                     <FormControl>
-                      <Input type="password" placeholder="SSH 登录密码" {...field} />
+                      <Input
+                        type="password"
+                        placeholder={t('servers.ssh.passwordPlaceholder')}
+                        {...field}
+                      />
                     </FormControl>
                     <FormMessage />
                   </FormItem>
@@ -212,13 +216,11 @@ export function SshForm({ serverConfig, onSubmit }: SshFormProps) {
                 name="privateKeyPath"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>私钥路径（推荐）</FormLabel>
+                    <FormLabel>{t('servers.ssh.privateKeyPath')}</FormLabel>
                     <FormControl>
                       <Input placeholder="$HOME/.ssh/id_rsa" {...field} />
                     </FormControl>
-                    <FormDescription>
-                      指定私钥文件的绝对路径，留空则使用下方内联私钥
-                    </FormDescription>
+                    <FormDescription>{t('servers.ssh.privateKeyPathDesc')}</FormDescription>
                     <FormMessage />
                   </FormItem>
                 )}
@@ -229,7 +231,7 @@ export function SshForm({ serverConfig, onSubmit }: SshFormProps) {
                 name="privateKey"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>内联私钥内容（可选）</FormLabel>
+                    <FormLabel>{t('servers.ssh.privateKey')}</FormLabel>
                     <FormControl>
                       <Textarea
                         placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...&#10;-----END OPENSSH PRIVATE KEY-----"
@@ -237,7 +239,7 @@ export function SshForm({ serverConfig, onSubmit }: SshFormProps) {
                         {...field}
                       />
                     </FormControl>
-                    <FormDescription>直接粘贴私钥内容（优先使用私钥路径）</FormDescription>
+                    <FormDescription>{t('servers.ssh.privateKeyDesc')}</FormDescription>
                     <FormMessage />
                   </FormItem>
                 )}
@@ -248,9 +250,13 @@ export function SshForm({ serverConfig, onSubmit }: SshFormProps) {
                 name="privateKeyPassphrase"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>私钥密码（可选）</FormLabel>
+                    <FormLabel>{t('servers.ssh.passphrase')}</FormLabel>
                     <FormControl>
-                      <Input type="password" placeholder="私钥加密密码" {...field} />
+                      <Input
+                        type="password"
+                        placeholder={t('servers.ssh.passphrasePlaceholder')}
+                        {...field}
+                      />
                     </FormControl>
                     <FormMessage />
                   </FormItem>
@@ -266,18 +272,19 @@ export function SshForm({ serverConfig, onSubmit }: SshFormProps) {
           name="hostKey"
           render={({ field }) => (
             <FormItem>
-              <FormLabel>主机公钥（可选）</FormLabel>
+              <FormLabel>{t('servers.ssh.hostKey')}</FormLabel>
               <FormControl>
                 <Textarea
-                  placeholder="ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYA...（每行一条）"
+                  placeholder={t('servers.ssh.hostKeyPlaceholder')}
                   className="font-mono text-xs min-h-[60px] resize-y"
                   {...field}
                 />
               </FormControl>
               <FormDescription>
-                留空则接受所有主机密钥（不建议在生产环境中使用）。可运行{' '}
-                <code className="rounded bg-muted px-1 py-0.5 text-xs">ssh-keyscan 主机</code>{' '}
-                获取。
+                <Trans
+                  i18nKey="servers.ssh.hostKeyDesc"
+                  components={{ code: <code className="rounded bg-muted px-1 py-0.5 text-xs" /> }}
+                />
               </FormDescription>
               <FormMessage />
             </FormItem>
