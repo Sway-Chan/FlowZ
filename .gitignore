@@ -27,10 +27,10 @@ release/
 *.sln
 *.sw?
 
-# Logs
+# Logs (anchor to repo root so 源码目录 src/.../components/logs/ 不被误忽略)
 *.log
-[Ll]og/
-[Ll]ogs/
+/[Ll]og/
+/[Ll]ogs/
 
 # Test files
 samples/
