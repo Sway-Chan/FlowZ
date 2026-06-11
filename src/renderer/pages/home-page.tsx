@@ -1,6 +1,6 @@
 import { ConnectionStatusCard } from '@/components/home/connection-status-card';
-import { ProxyModeSelector } from '@/components/home/proxy-mode-selector';
-import { RealTimeLogs } from '@/components/home/real-time-logs';
+import { ProxyControlCard } from '@/components/home/proxy-control-card';
+import { NetworkInfoCard } from '@/components/home/network-info-card';
 import { ConnectionTopology } from '@/components/home/connection-topology';
 import { useTranslation } from 'react-i18next';
 
@@ -13,14 +13,14 @@ export function HomePage() {
         <p className="text-muted-foreground mt-1">{t('home.pageDesc')}</p>
       </div>
 
-      <div className="grid gap-6 md:grid-cols-2">
+      <div className="grid gap-6 lg:grid-cols-2">
         <ConnectionStatusCard />
-        <ProxyModeSelector />
+        <ProxyControlCard />
       </div>
 
-      <ConnectionTopology />
+      <NetworkInfoCard />
 
-      <RealTimeLogs />
+      <ConnectionTopology />
     </div>
   );
 }
