@@ -205,6 +205,16 @@
     color: hsl(var(--foreground));
   }
 
+  /* 消除窗口重建/复焦后 Chromium 默认 :focus-visible 的橙黄 outline 钉在首个 nav 上；保留键盘可达性。 */
+  .nav-item:focus {
+    outline: none;
+  }
+
+  .nav-item:focus-visible {
+    outline: 2px solid hsl(var(--ring));
+    outline-offset: -2px;
+  }
+
   .nav-item.active {
     background: hsl(var(--primary) / 0.1);
     color: hsl(var(--primary));

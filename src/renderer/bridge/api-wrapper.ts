@@ -4,156 +4,10 @@
  */
 
 import { api } from '../ipc/api-client';
-import { ErrorHandler, ErrorCategory } from '../lib/error-handler';
-import type { ApiResponse, UserConfig, ServerConfig, DomainRule } from './types';
-
-/**
- * 包装 API 调用，自动处理错误
- */
-async function wrapApiCall<T>(
-  apiCall: () => Promise<T>,
-  context: string,
-  _errorCategory: ErrorCategory = ErrorCategory.System
-): Promise<T | null> {
-  try {
-    const result = await apiCall();
-    return result;
-  } catch (error) {
-    ErrorHandler.handleApiError(error, context);
-    return null;
-  }
-}
-
-// 导出以避免未使用警告（保留用于未来扩展）
-export { wrapApiCall };
-
-/**
- * Proxy Control APIs with error handling
- */
-export async function startProxy(config?: any): Promise<ApiResponse<void>> {
-  try {
-    // 如果没有传入配置，先获取当前配置
-    const currentConfig = config || (await api.config.get());
-    await api.proxy.start(currentConfig);
-    ErrorHandler.showSuccess('代理已启动');
-    return { success: true };
-  } catch (error: any) {
-    const errorMessage = error?.message || '启动代理失败';
-
-    // Determine error category based on error message
-    let category = ErrorCategory.Connection;
-    let canRetry = true;
-
-    if (errorMessage.includes('不支持的协议') || errorMessage.includes('Protocol')) {
-      category = ErrorCategory.Config;
-      canRetry = false;
-    } else if (
-      errorMessage.includes('认证失败') ||
-      errorMessage.includes('密码错误') ||
-      errorMessage.includes('UUID 错误')
-    ) {
-      category = ErrorCategory.Config;
-      canRetry = false;
-    } else if (errorMessage.includes('配置错误') || errorMessage.includes('配置格式')) {
-      category = ErrorCategory.Config;
-      canRetry = false;
-    }
-
-    ErrorHandler.handle({
-      category,
-      userMessage: errorMessage,
-      technicalMessage: errorMessage,
-      canRetry,
-    });
-
-    return { success: false, error: errorMessage };
-  }
-}
-
-export async function stopProxy(): Promise<ApiResponse<void>> {
-  try {
-    await api.proxy.stop();
-    ErrorHandler.showSuccess('代理已停止');
-    return { success: true };
-  } catch (error: any) {
-    const errorMessage = error?.message || '停止代理失败';
-    ErrorHandler.handleApiError(error, '停止代理');
-    return { success: false, error: errorMessage };
-  }
-}
-
-/**
- * Configuration Management APIs
- */
-export async function getConfig(): Promise<ApiResponse<UserConfig>> {
-  try {
-    const config = await api.config.get();
-    return { success: true, data: config };
-  } catch (error: any) {
-    ErrorHandler.handleApiError(error, '获取配置');
-    return { success: false, error: error?.message };
-  }
-}
-
-export async function saveConfig(config: UserConfig): Promise<ApiResponse<void>> {
-  try {
-    await api.config.save(config);
-    ErrorHandler.showSuccess('配置已保存');
-    return { success: true };
-  } catch (error: any) {
-    ErrorHandler.handleApiError(error, '保存配置');
-    return { success: false, error: error?.message };
-  }
-}
-
-export async function updateProxyMode(mode: UserConfig['proxyMode']): Promise<ApiResponse<void>> {
-  try {
-    await api.config.updateMode(mode);
-    ErrorHandler.showSuccess('代理模式已更新');
-    return { success: true };
-  } catch (error: any) {
-    ErrorHandler.handleApiError(error, '更新代理模式');
-    return { success: false, error: error?.message };
-  }
-}
-
-/**
- * Custom Rules APIs
- */
-export async function addCustomRule(
-  rule: Omit<DomainRule, 'id'>
-): Promise<ApiResponse<DomainRule>> {
-  try {
-    const newRule = await api.rules.add(rule);
-    ErrorHandler.showSuccess('规则已添加');
-    return { success: true, data: newRule };
-  } catch (error: any) {
-    ErrorHandler.handleApiError(error, '添加自定义规则');
-    return { success: false, error: error?.message };
-  }
-}
-
-export async function updateCustomRule(rule: DomainRule): Promise<ApiResponse<void>> {
-  try {
-    await api.rules.update(rule);
-    ErrorHandler.showSuccess('规则已更新');
-    return { success: true };
-  } catch (error: any) {
-    ErrorHandler.handleApiError(error, '更新自定义规则');
-    return { success: false, error: error?.message };
-  }
-}
-
-export async function deleteCustomRule(ruleId: string): Promise<ApiResponse<void>> {
-  try {
-    await api.rules.delete(ruleId);
-    ErrorHandler.showSuccess('规则已删除');
-    return { success: true };
-  } catch (error: any) {
-    ErrorHandler.handleApiError(error, '删除自定义规则');
-    return { success: false, error: error?.message };
-  }
-}
+import { ErrorHandler } from '../lib/error-handler';
+import i18n from '../i18n';
+import { IPC_CHANNELS } from '../../shared/ipc-channels';
+import type { ApiResponse, ServerConfig, SubscriptionConfig } from './types';
 
 /**
  * Logging APIs
@@ -170,10 +24,10 @@ export async function getLogs(count?: number): Promise<ApiResponse<any[]>> {
 export async function clearLogs(): Promise<ApiResponse<void>> {
   try {
     await api.logs.clear();
-    ErrorHandler.showSuccess('日志已清空');
+    ErrorHandler.showSuccess(i18n.t('apiToast.logsCleared'));
     return { success: true };
   } catch (error: any) {
-    ErrorHandler.handleApiError(error, '清空日志');
+    ErrorHandler.handleApiError(error, i18n.t('apiToast.clearLogs'));
     return { success: false, error: error?.message };
   }
 }
@@ -204,7 +58,7 @@ export async function getVersionInfo(): Promise<
  */
 export async function openExternal(url: string): Promise<ApiResponse<boolean>> {
   try {
-    await window.electron.ipcRenderer.invoke('shell:openExternal', url);
+    await window.electron.ipcRenderer.invoke(IPC_CHANNELS.SHELL_OPEN_EXTERNAL, url);
     return { success: true, data: true };
   } catch (error: any) {
     return { success: false, error: error?.message };
@@ -221,7 +75,7 @@ export async function parseProtocolUrl(
     const server = await api.server.parseUrl(url);
     return { success: true, data: server };
   } catch (error: any) {
-    ErrorHandler.handleApiError(error, '解析协议URL');
+    ErrorHandler.handleApiError(error, i18n.t('apiToast.parseProtocolUrl'));
     return { success: false, error: error?.message };
   }
 }
@@ -232,10 +86,10 @@ export async function addServerFromUrl(
 ): Promise<ApiResponse<ServerConfig>> {
   try {
     const server = await api.server.addFromUrl(url, name);
-    ErrorHandler.showSuccess('服务器已添加');
+    ErrorHandler.showSuccess(i18n.t('apiToast.serverAdded'));
     return { success: true, data: server };
   } catch (error: any) {
-    ErrorHandler.handleApiError(error, '从URL添加服务器');
+    ErrorHandler.handleApiError(error, i18n.t('apiToast.addServerFromUrl'));
     return { success: false, error: error?.message };
   }
 }
@@ -245,7 +99,7 @@ export async function generateShareUrl(server: ServerConfig): Promise<ApiRespons
     const url = await api.server.generateUrl(server);
     return { success: true, data: url };
   } catch (error: any) {
-    ErrorHandler.handleApiError(error, '生成分享链接');
+    ErrorHandler.handleApiError(error, i18n.t('apiToast.generateShareUrl'));
     return { success: false, error: error?.message };
   }
 }
@@ -282,7 +136,7 @@ export async function downloadUpdate(updateInfo: any): Promise<ApiResponse<strin
     if (result.success && result.filePath) {
       return { success: true, data: result.filePath };
     }
-    return { success: false, error: result.error || '下载失败' };
+    return { success: false, error: result.error || i18n.t('apiToast.downloadFailed') };
   } catch (error: any) {
     return { success: false, error: error?.message };
   }
@@ -294,25 +148,7 @@ export async function installUpdate(filePath: string): Promise<ApiResponse<void>
     if (result.success) {
       return { success: true };
     }
-    return { success: false, error: result.error || '安装失败' };
-  } catch (error: any) {
-    return { success: false, error: error?.message };
-  }
-}
-
-export async function skipUpdateVersion(version: string): Promise<ApiResponse<void>> {
-  try {
-    await api.update.skip(version);
-    return { success: true };
-  } catch (error: any) {
-    return { success: false, error: error?.message };
-  }
-}
-
-export async function openReleasesPage(): Promise<ApiResponse<void>> {
-  try {
-    await api.update.openReleases();
-    return { success: true };
+    return { success: false, error: result.error || i18n.t('apiToast.installFailed') };
   } catch (error: any) {
     return { success: false, error: error?.message };
   }
@@ -352,29 +188,17 @@ export async function updateCore(downloadUrl: string): Promise<ApiResponse<boole
 }
 
 /**
- * Get Core Version
- */
-export async function getCoreVersion(): Promise<ApiResponse<string>> {
-  try {
-    const version = await api.coreUpdate.getVersion();
-    return { success: true, data: version };
-  } catch (error: any) {
-    return { success: false, error: error?.message };
-  }
-}
-
-/**
  * Subscription Management APIs
  */
 export async function addSubscription(
-  subscription: Omit<ServerConfig['subscriptionId'] extends string ? any : any, any> // avoid type error here if we didn't import SubscriptionConfig
+  subscription: Omit<SubscriptionConfig, 'id' | 'createdAt'>
 ): Promise<ApiResponse<any>> {
   try {
     const newSub = await api.subscription.add(subscription);
-    ErrorHandler.showSuccess('订阅已添加');
+    ErrorHandler.showSuccess(i18n.t('apiToast.subAdded'));
     return { success: true, data: newSub };
   } catch (error: any) {
-    ErrorHandler.handleApiError(error, '添加订阅');
+    ErrorHandler.handleApiError(error, i18n.t('apiToast.addSub'));
     return { success: false, error: error?.message };
   }
 }
@@ -382,10 +206,10 @@ export async function addSubscription(
 export async function updateSubscription(subscription: any): Promise<ApiResponse<void>> {
   try {
     await api.subscription.update(subscription);
-    ErrorHandler.showSuccess('订阅配置已更新');
+    ErrorHandler.showSuccess(i18n.t('apiToast.subUpdated'));
     return { success: true };
   } catch (error: any) {
-    ErrorHandler.handleApiError(error, '更新订阅配置');
+    ErrorHandler.handleApiError(error, i18n.t('apiToast.updateSub'));
     return { success: false, error: error?.message };
   }
 }
@@ -393,10 +217,10 @@ export async function updateSubscription(subscription: any): Promise<ApiResponse
 export async function deleteSubscription(subscriptionId: string): Promise<ApiResponse<void>> {
   try {
     await api.subscription.delete(subscriptionId);
-    ErrorHandler.showSuccess('订阅已删除');
+    ErrorHandler.showSuccess(i18n.t('apiToast.subDeleted'));
     return { success: true };
   } catch (error: any) {
-    ErrorHandler.handleApiError(error, '删除订阅');
+    ErrorHandler.handleApiError(error, i18n.t('apiToast.deleteSub'));
     return { success: false, error: error?.message };
   }
 }
@@ -412,15 +236,19 @@ export async function updateSubscriptionServers(subscriptionId: string): Promise
     const result = await api.subscription.updateServers(subscriptionId);
     if (result.success) {
       ErrorHandler.showSuccess(
-        `订阅更新成功：新增 ${result.addedServers}，更新 ${result.updatedServers}，删除 ${result.deletedServers}`
+        i18n.t('apiToast.subServersUpdated', {
+          added: result.addedServers,
+          updated: result.updatedServers,
+          deleted: result.deletedServers,
+        })
       );
       return { success: true, data: result };
     } else {
-      ErrorHandler.showError(`订阅更新失败: ${result.error}`);
+      ErrorHandler.showError(i18n.t('apiToast.subServersUpdateFailed', { error: result.error }));
       return { success: false, error: result.error };
     }
   } catch (error: any) {
-    ErrorHandler.handleApiError(error, '更新订阅节点');
+    ErrorHandler.handleApiError(error, i18n.t('apiToast.updateSubServers'));
     return { success: false, error: error?.message };
   }
 }
@@ -444,8 +272,6 @@ export function addEventListener(event: string, listener: (...args: any[]) => vo
       return api.logs.onReceived(listener);
     case 'statsUpdated':
       return api.stats.onUpdated(listener);
-    case 'connectionStateChanged':
-      return api.connection.onStateChanged(listener);
     default:
       return () => {};
   }

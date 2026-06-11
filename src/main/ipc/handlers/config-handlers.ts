@@ -19,7 +19,9 @@ export function registerConfigHandlers(configManager: ConfigManager): void {
   registerIpcHandler<void, UserConfig>(
     IPC_CHANNELS.CONFIG_GET,
     async (_event: IpcMainInvokeEvent) => {
-      return await configManager.loadConfig();
+      const cfg = await configManager.loadConfig();
+      // F29：绝不向渲染端下发隐私密码（迁移前的残留明文也一并剥除；哈希本就不在 config 内）
+      return { ...cfg, privacyPassword: undefined };
     }
   );
 

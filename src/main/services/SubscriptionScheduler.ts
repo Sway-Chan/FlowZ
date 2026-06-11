@@ -2,12 +2,13 @@
  * 订阅自动更新调度器
  *
  * 职责：在不打断当前连接的前提下，按需自动刷新订阅节点。
- * - 启动补更：启动后延迟一段时间，对「陈旧」订阅（距上次更新 ≥ 间隔阈值，或从未更新）补一次更新。
- * - 周期巡检：每 30 分钟扫一遍，更新到期的订阅。
+ * - 启动补更：启动后延迟一段时间，对启用自动更新的订阅补一次更新（忽略陈旧阈值，仅守 10min 地板——
+ *   开了「启动时更新」就应更新，而非"距上次≥间隔阈值才更"）。
+ * - 周期巡检：每 30 分钟扫一遍，更新到期（陈旧）的订阅。
  * - 退避：单个订阅失败后指数退避（5min→…→上限 6h），避免对故障源高频重试。
  * - 不打断连接：只「落盘 + 通知 UI」，绝不重启代理——运行中的 sing-box 保持其内存配置，
  *   节点增删仅在下次（重）启动或热切换时生效。配合 reconcile 保留 id/选中节点，连接零中断。
- * - 经代理开关：viaProxy 时若代理未运行则本轮跳过（冷启动鸡生蛋），待代理就绪后周期巡检自动补上。
+ * - 经代理开关：viaProxy 时若代理未运行则本轮跳过（冷启动鸡生蛋），挂起待代理就绪（onProxyStarted）补更。
  */
 
 import type { ConfigManager } from './ConfigManager';
@@ -21,12 +22,16 @@ export class SubscriptionScheduler {
   private isRunning = false; // 防重入（巡检与启动补更不并发）
   // 每订阅退避状态：累计失败次数 + 下次可尝试时刻
   private backoff = new Map<string, { failures: number; nextEligibleAt: number }>();
+  private pendingProxyCatchup = false; // viaProxy 但代理未起时跳过的「启动补更」挂起标记，待代理就绪补跑
+  private startupTimer: ReturnType<typeof setTimeout> | null = null; // 启动补更句柄（stop 时清，防 8s 内 stop→start 武装双补更）
 
   private static readonly TICK_MS = 30 * 60_000; // 30 分钟巡检一次
   private static readonly STARTUP_DELAY_MS = 8_000; // 启动延迟，避开启动高峰
   private static readonly BACKOFF_BASE_MS = 5 * 60_000; // 退避基数 5 分钟
   private static readonly BACKOFF_MAX_MS = 6 * 60 * 60_000; // 退避上限 6 小时
   private static readonly DEFAULT_INTERVAL_HOURS = 12;
+  // 启动 / 代理就绪补更免陈旧门时的最小间隔地板：防频繁重启把订阅源打爆
+  private static readonly STARTUP_MIN_GAP_MS = 10 * 60_000;
 
   constructor(
     private readonly configManager: ConfigManager,
@@ -40,8 +45,10 @@ export class SubscriptionScheduler {
     if (this.started) return;
     this.started = true;
 
-    setTimeout(() => {
-      this.runDueUpdates('启动补更').catch((e) => {
+    this.startupTimer = setTimeout(() => {
+      this.startupTimer = null;
+      // 启动补更忽略陈旧阈值：开了「启动时更新」就应更新，而非"距上次≥12h才更"（仅守 10min 地板）
+      this.runDueUpdates('启动补更', { ignoreStaleness: true }).catch((e) => {
         this.logManager.addLog('warn', `订阅启动补更异常: ${e}`, 'SubScheduler');
       });
     }, SubscriptionScheduler.STARTUP_DELAY_MS);
@@ -54,11 +61,25 @@ export class SubscriptionScheduler {
   }
 
   stop(): void {
+    if (this.startupTimer) {
+      clearTimeout(this.startupTimer);
+      this.startupTimer = null;
+    }
     if (this.tickTimer) {
       clearInterval(this.tickTimer);
       this.tickTimer = null;
     }
     this.started = false;
+  }
+
+  /** 代理就绪：补跑因 viaProxy + 代理未起而跳过的「启动补更」（忽略陈旧门，仅守 10min 地板）。 */
+  onProxyStarted(): void {
+    // isRunning 时不清 flag：已有更新在途，保留挂起标记待后续触发，避免补更被静默吞掉
+    if (!this.pendingProxyCatchup || this.isRunning) return;
+    this.pendingProxyCatchup = false;
+    this.runDueUpdates('代理就绪补更', { ignoreStaleness: true }).catch((e) => {
+      this.logManager.addLog('warn', `代理就绪补更异常: ${e}`, 'SubScheduler');
+    });
   }
 
   private intervalMs(config: UserConfig): number {
@@ -67,18 +88,22 @@ export class SubscriptionScheduler {
     return hours * 3_600_000;
   }
 
-  private async runDueUpdates(reason: string): Promise<void> {
+  private async runDueUpdates(reason: string, opts?: { ignoreStaleness?: boolean }): Promise<void> {
     if (this.isRunning) return;
     this.isRunning = true;
     try {
       const config = await this.configManager.loadConfig();
       if (!config.autoUpdateSubscriptionOnStart) return; // 总开关未开
       const subs = config.subscriptions || [];
+      // 清理已删除订阅的退避条目（仅内存，防无界增长）
+      const subIds = new Set(subs.map((s) => s.id));
+      for (const id of this.backoff.keys()) if (!subIds.has(id)) this.backoff.delete(id);
       if (subs.length === 0) return;
 
       const viaProxy = config.subscriptionUpdateViaProxy === true;
-      // viaProxy 但代理未运行：冷启动鸡生蛋，本轮跳过，待代理就绪后由周期巡检补上
+      // viaProxy 但代理未运行：冷启动鸡生蛋，本轮跳过，挂起待代理就绪后补跑（onProxyStarted）
       if (viaProxy && !this.getProxyRunning()) {
+        this.pendingProxyCatchup = true;
         this.logManager.addLog(
           'info',
           '订阅更新经代理但代理未运行，本轮跳过（待代理就绪后自动补更）',
@@ -86,6 +111,8 @@ export class SubscriptionScheduler {
         );
         return;
       }
+      // 走到这里本轮会真正巡检更新 → 任何挂起的代理就绪补更已被本轮覆盖，清除挂起标记（周期 tick 亦消费之）
+      this.pendingProxyCatchup = false;
 
       const now = Date.now();
       const intervalMs = this.intervalMs(config);
@@ -101,9 +128,11 @@ export class SubscriptionScheduler {
       for (const sub of subs) {
         if (!sub.autoUpdate) continue;
 
-        // 陈旧判断：从未更新或已超过间隔阈值
+        // 陈旧判断：从未更新或已超过间隔阈值；启动/代理就绪补更（ignoreStaleness）改为仅守 10min 地板
         const last = sub.lastUpdated ? Date.parse(sub.lastUpdated) : 0;
-        const stale = !last || now - last >= intervalMs;
+        const stale = opts?.ignoreStaleness
+          ? !last || now - last >= SubscriptionScheduler.STARTUP_MIN_GAP_MS
+          : !last || now - last >= intervalMs;
         if (!stale) continue;
 
         // 退避判断：失败源未到下次可尝试时刻则跳过
@@ -114,7 +143,8 @@ export class SubscriptionScheduler {
           const result = await this.subscriptionService.fetchSubscription(
             sub.url,
             sub.id,
-            viaProxy
+            viaProxy,
+            config.httpPort || 2080
           );
           fetched.push({
             subId: sub.id,

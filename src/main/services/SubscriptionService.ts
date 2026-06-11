@@ -78,6 +78,10 @@ export class SubscriptionService {
   private logManager: LogManager;
   // 直连会话：强制 mode:'direct'，无视默认会话/系统代理，供 viaProxy=false 的订阅拉取使用
   private directSession: Session | null = null;
+  // 经代理会话：强制借道本机 sing-box http 入站（127.0.0.1:httpPort），供 viaProxy=true 使用。
+  // 独立于 defaultSession → 不受「更新检查走代理」总开关(mainSessionViaProxy)影响（订阅有独立开关，不应被它静默改写）。
+  private proxiedSession: Session | null = null;
+  private proxiedSessionPort: number | null = null;
 
   constructor(protocolParser: ProtocolParser, logManager: LogManager) {
     this.protocolParser = protocolParser;
@@ -90,6 +94,16 @@ export class SubscriptionService {
     const s = session.fromPartition('flowz-subscription-direct');
     await s.setProxy({ mode: 'direct' });
     this.directSession = s;
+    return s;
+  }
+
+  /** 懒加载经代理会话（pin 到本机 http 代理端口）；端口变化时重设。订阅 URL 为外网，loopback 隐式 bypass 不影响。 */
+  private async getProxiedSession(httpPort: number): Promise<Session> {
+    if (this.proxiedSession && this.proxiedSessionPort === httpPort) return this.proxiedSession;
+    const s = this.proxiedSession ?? session.fromPartition('flowz-subscription-proxied');
+    await s.setProxy({ proxyRules: `http://127.0.0.1:${httpPort}` });
+    this.proxiedSession = s;
+    this.proxiedSessionPort = httpPort;
     return s;
   }
 
@@ -147,7 +161,20 @@ export class SubscriptionService {
       const bucket = oldBuckets.get(key);
       const old = bucket && bucket.length > 0 ? bucket.shift() : undefined;
       if (old) {
-        kept.push({ ...ns, id: old.id, createdAt: old.createdAt, updatedAt: now });
+        // 内容相同（忽略 id/时间戳）则保留 old.updatedAt，避免无变化也刷新 updatedAt「投毒」纯切节点热切换
+        const contentKey = (s: ServerConfig) => {
+          const copy: Record<string, unknown> = { ...s };
+          delete copy.id;
+          delete copy.createdAt;
+          delete copy.updatedAt;
+          return JSON.stringify(copy);
+        };
+        kept.push({
+          ...ns,
+          id: old.id,
+          createdAt: old.createdAt,
+          updatedAt: contentKey(ns) === contentKey(old) ? old.updatedAt : now,
+        });
         updated++;
       } else {
         kept.push(ns);
@@ -416,7 +443,8 @@ export class SubscriptionService {
   async fetchSubscription(
     url: string,
     subscriptionId: string,
-    viaProxy: boolean = false
+    viaProxy: boolean = false,
+    httpPort?: number
   ): Promise<{ servers: ServerConfig[]; userInfo?: SubscriptionConfig['userInfo'] }> {
     try {
       this.logManager.addLog(
@@ -442,10 +470,16 @@ export class SubscriptionService {
         throw new Error(`订阅地址指向本机/内网/link-local，已拒绝: ${urlObj.hostname}`);
       }
 
-      // viaProxy=true 用默认会话（代理运行时即经代理）；否则用强制直连会话
+      // viaProxy=true 用 pin 到本机代理端口的独立会话（不受 mainSessionViaProxy 总开关影响）；
+      // 缺 httpPort 时退回默认会话（向后兼容）。viaProxy=false → 强制直连会话。
       let fetchImpl: typeof net.fetch;
       if (viaProxy) {
-        fetchImpl = net.fetch;
+        if (httpPort) {
+          const ps = await this.getProxiedSession(httpPort);
+          fetchImpl = ps.fetch.bind(ps);
+        } else {
+          fetchImpl = net.fetch;
+        }
       } else {
         const ds = await this.getDirectSession();
         fetchImpl = ds.fetch.bind(ds);

@@ -6,13 +6,25 @@
 export type {
   UserConfig,
   ServerConfig,
-  DomainRule,
+  Rule,
+  RuleType,
+  SystemProcessInfo,
   ProxyStatus,
   TrafficStats,
   LogEntry,
   ApiResponse,
   SubscriptionConfig,
   ProxyModeType,
+  IpInfo,
+  IpInfoSnapshot,
+  RuleResource,
+  RuleResourceListItem,
+  RuleResourceCatalogItem,
+  RuleResourceCatalogResult,
+  RuleResourceProgress,
+  RuleResourceCategory,
+  RuleResourceDownloadItem,
+  RuleResourceDownloadResult,
 } from '../../shared/types';
 // 本文件内 interface 也用到 ProxyModeType，需本地绑定（re-export 不产生本地可用绑定）
 import type { ProxyModeType } from '../../shared/types';
@@ -46,29 +58,6 @@ export interface ConnectionStatus {
     server?: string;
   };
   proxyModeType: ProxyModeType;
-}
-
-// TUN 模式配置
-export interface TunModeConfig {
-  mtu: number;
-  stack: 'system' | 'gvisor' | 'mixed';
-  autoRoute: boolean;
-  strictRoute: boolean;
-  interfaceName?: string;
-  inet4Address?: string;
-  inet6Address?: string;
-}
-
-// TLS 设置
-export interface TlsSettings {
-  serverName?: string;
-  allowInsecure?: boolean;
-}
-
-// WebSocket 设置
-export interface WsSettings {
-  path?: string;
-  host?: string;
 }
 
 // 事件数据类型

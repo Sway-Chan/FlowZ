@@ -3,11 +3,23 @@
  */
 
 import { create } from 'zustand';
-import type { UserConfig, DomainRule, TrafficStats } from '../../shared/types';
+import type {
+  UserConfig,
+  Rule,
+  TrafficStats,
+  HelperStatus,
+  IpInfoSnapshot,
+} from '../../shared/types';
+import type { UpdateInfo } from '../../shared/types/update';
 import { api } from '../ipc';
+import { toast } from 'sonner';
+import i18n from '../i18n';
 
 // 兼容旧的类型定义
 type ProxyMode = UserConfig['proxyMode'];
+
+// loadConfig 单飞：防 configChanged 风暴 / 启动期重复拉取（替代原 isLoading 重入守卫）
+let loadConfigInflight: Promise<void> | null = null;
 
 interface ConnectionStatus {
   proxyCore: {
@@ -28,8 +40,12 @@ interface AppState {
   currentView: string;
   // 设置页子节（general/about/...）。提升到 store，供非设置页组件（如 naive 横幅「去更新」）跨页导航到指定节
   settingsSection: string;
-  isLoading: boolean;
-  error: string | null;
+  // F27：进入设置页前的来源视图，设置页「返回」按钮的导航目标（默认 home）
+  settingsReturnView: string;
+  // F2：拆分全局 error/isLoading → 仅 start/stop 写的 proxyBusy/proxyError，避免无关操作污染首页状态
+  proxyBusy: boolean;
+  proxyPhase: 'idle' | 'starting' | 'stopping'; // 操作意图相位：按钮文案/颜色由此驱动，与瞬时 connectionStatus 解耦
+  proxyError: string | null;
 
   // Connection State
   connectionStatus: ConnectionStatus | null;
@@ -40,19 +56,27 @@ interface AppState {
   // Statistics
   stats: TrafficStats | null;
 
+  // 出口 IP 信息（本地直连出口 / 代理出口）
+  ipInfo: IpInfoSnapshot | null;
+
   // Latency test results (persisted across view changes)
   latencyMap: Record<string, number>;
 
   // Privacy Protection Mode
   isPrivacyMode: boolean;
 
+  // macOS 提权 helper 状态
+  helperStatus: HelperStatus | null;
+
+  // F28：可用的 App 更新（持久入口数据源；放 store 因 AboutSettings 随子节切换会卸载，本地 state 承载不了）
+  availableAppUpdate: UpdateInfo | null;
+
   // Actions
   setCurrentView: (view: string) => void;
   setSettingsSection: (section: string) => void;
-  setLoading: (loading: boolean) => void;
-  setError: (error: string | null) => void;
   setLatencyMap: (map: Record<string, number>) => void;
   setPrivacyMode: (value: boolean) => void;
+  setAvailableAppUpdate: (info: UpdateInfo | null) => void;
 
   // Proxy Control Actions
   startProxy: () => Promise<void>;
@@ -62,7 +86,6 @@ interface AppState {
   loadConfig: () => Promise<void>;
   saveConfig: (config: UserConfig) => Promise<void>;
   updateProxyMode: (mode: ProxyMode) => Promise<void>;
-  switchServer: (serverId: string) => Promise<void>;
   setConfigValue: (key: keyof UserConfig, value: any) => Promise<void>;
 
   // Status Actions
@@ -73,22 +96,33 @@ interface AppState {
   deleteServer: (serverId: string) => Promise<void>;
 
   // Custom Rules Actions
-  addCustomRule: (rule: DomainRule) => Promise<void>;
-  updateCustomRule: (rule: DomainRule) => Promise<void>;
+  addCustomRule: (rule: Rule) => Promise<void>;
+  updateCustomRule: (rule: Rule) => Promise<void>;
   deleteCustomRule: (ruleId: string) => Promise<void>;
+  commitRuleOrder: (orderedIds: string[]) => Promise<void>;
+
+  // macOS 提权 helper Actions
+  refreshHelperStatus: () => Promise<void>;
+  installHelper: () => Promise<{ success: boolean; error?: string }>;
+  uninstallHelper: () => Promise<{ success: boolean; error?: string }>;
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
   // Initial State
   currentView: 'home',
   settingsSection: 'general',
-  isLoading: false,
-  error: null,
+  settingsReturnView: 'home',
+  proxyBusy: false,
+  proxyPhase: 'idle',
+  proxyError: null,
   connectionStatus: null,
   config: null,
   stats: null,
+  ipInfo: null,
   latencyMap: {},
   isPrivacyMode: false,
+  helperStatus: null,
+  availableAppUpdate: null,
 
   // UI Actions
   // 离开设置页时把子节重置回 general（保留原 App 行为）；导航到设置页则保留当前/外部指定的子节
@@ -96,11 +130,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     set((s) => ({
       currentView: view,
       settingsSection: view === 'settings' ? s.settingsSection : 'general',
+      // 仅在「从非设置页进入设置页」时记录来源；设置页内切子节/重复进入不覆盖
+      settingsReturnView:
+        view === 'settings' && s.currentView !== 'settings' ? s.currentView : s.settingsReturnView,
     })),
   setSettingsSection: (section) => set({ settingsSection: section }),
-  setLoading: (loading) => set({ isLoading: loading }),
-  setError: (error) => set({ error }),
   setLatencyMap: (map) => set({ latencyMap: map }),
+  setAvailableAppUpdate: (info) => set({ availableAppUpdate: info }),
   setPrivacyMode: async (value) => {
     if (get().isPrivacyMode === value) return;
     set({ isPrivacyMode: value });
@@ -113,32 +149,19 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   // Proxy Control Actions
   startProxy: async () => {
-    set({ isLoading: true, error: null });
+    if (get().proxyPhase !== 'idle') return; // 防重入（双击 / 竞态二次启动）
+    set({ proxyPhase: 'starting', proxyBusy: true, proxyError: null });
     try {
       // 获取当前配置
       const currentConfig = get().config;
       if (!currentConfig) {
-        throw new Error('配置未加载');
+        throw new Error(i18n.t('errors.configNotLoaded'));
       }
 
       // 直接启动代理，ProxyManager 会在需要时通过 osascript 请求管理员权限
       // 不再预先检查权限，因为 sing-box 进程会在 TUN 模式下自动请求权限
-      const isTunMode = currentConfig.proxyModeType?.toLowerCase() === 'tun';
-      console.log(
-        '[StartProxy] proxyModeType:',
-        currentConfig.proxyModeType,
-        'isTunMode:',
-        isTunMode
-      );
-
-      if (isTunMode) {
-        console.log(
-          '[StartProxy] TUN mode detected, sing-box will request admin privileges when needed'
-        );
-      }
-
       await api.proxy.start(currentConfig);
-      // 启动成功后不立即设置 isLoading = false，而是等待状态轮询完成
+      // 启动成功后不立即清 proxyBusy，而是等待状态轮询完成
 
       // Poll connection status until connected or timeout
       const maxAttempts = 20; // 10 seconds (20 * 500ms)
@@ -150,14 +173,6 @@ export const useAppStore = create<AppState>((set, get) => ({
 
         const status = get().connectionStatus;
 
-        // Debug logging
-        console.log(`[StartProxy] Polling attempt ${attempts}:`, {
-          proxyCoreRunning: status?.proxyCore?.running,
-          proxyEnabled: status?.proxy?.enabled,
-          proxyCoreError: status?.proxyCore?.error,
-          proxyCorePid: status?.proxyCore?.pid,
-        });
-
         // Check if connected based on proxy mode type
         const isTunMode = status?.proxyModeType === 'tun';
         const isConnected = isTunMode
@@ -165,39 +180,38 @@ export const useAppStore = create<AppState>((set, get) => ({
           : status?.proxyCore?.running && status?.proxy?.enabled; // System proxy mode: check both
 
         if (isConnected) {
-          console.log('[StartProxy] Connection successful!', { mode: status?.proxyModeType });
           // Ensure final status update before completing
           await get().refreshConnectionStatus();
-          set({ isLoading: false });
+          set({ proxyPhase: 'idle', proxyBusy: false });
           return;
         }
 
         // Check for proxy core errors
         if (status?.proxyCore?.error) {
-          console.log('[StartProxy] Proxy core error detected:', status.proxyCore.error);
           set({
-            error: status.proxyCore.error,
-            isLoading: false,
+            proxyError: status.proxyCore.error,
+            proxyPhase: 'idle',
+            proxyBusy: false,
           });
           return;
         }
 
         // Check if proxy core failed to start (not running and no error means startup failed)
         if (attempts > 3 && !status?.proxyCore?.running) {
-          console.log('[StartProxy] Proxy core failed to start');
           set({
-            error: 'sing-box 启动失败：进程无法正常启动，请检查服务器配置',
-            isLoading: false,
+            proxyError: i18n.t('errors.startupFailed'),
+            proxyPhase: 'idle',
+            proxyBusy: false,
           });
           return;
         }
 
         // Check timeout
         if (attempts >= maxAttempts) {
-          console.log('[StartProxy] Connection timeout');
           set({
-            error: '连接超时：无法在预期时间内建立连接，请检查服务器配置',
-            isLoading: false,
+            proxyError: i18n.t('errors.connectionTimeout'),
+            proxyPhase: 'idle',
+            proxyBusy: false,
           });
           return;
         }
@@ -209,76 +223,74 @@ export const useAppStore = create<AppState>((set, get) => ({
       // Start polling immediately
       await pollStatus();
     } catch (error) {
-      set({ error: String(error), isLoading: false });
+      set({ proxyPhase: 'idle', proxyError: String(error), proxyBusy: false });
       // Refresh status to ensure UI reflects actual state
       await get().refreshConnectionStatus();
     }
   },
 
   stopProxy: async () => {
-    set({ isLoading: true, error: null });
+    if (get().proxyPhase !== 'idle') return;
+    set({ proxyPhase: 'stopping', proxyBusy: true, proxyError: null });
     try {
       await api.proxy.stop();
       // Refresh status after stopping
       await get().refreshConnectionStatus();
     } catch (error) {
-      set({ error: String(error) });
+      // 卡片错误会被下一次 refresh 的「健康即清」掩盖，故启停失败必须 toast 保证用户感知
+      set({ proxyError: String(error) });
+      toast.error(i18n.t('home.stopProxyFailed'));
     } finally {
-      set({ isLoading: false });
+      set({ proxyPhase: 'idle', proxyBusy: false });
     }
   },
 
   // Configuration Actions
   loadConfig: async () => {
-    set({ isLoading: true, error: null });
-    try {
-      console.log('[Store] Loading config...');
-      const config = await api.config.get();
-      console.log('[Store] Config loaded successfully:', config);
+    // 单飞：在飞则复用同一 promise，防 configChanged 风暴 / 启动期重复拉取
+    if (loadConfigInflight) return loadConfigInflight;
+    loadConfigInflight = (async () => {
+      try {
+        const config = await api.config.get();
 
-      // 确保有默认的TUN配置
-      if (!config.tunConfig) {
-        config.tunConfig = {
-          mtu: window.electron?.platform === 'darwin' ? 1400 : 1350,
-          stack: window.electron?.platform === 'darwin' ? 'gvisor' : 'system',
-          autoRoute: true,
-          strictRoute: true,
-        };
+        // 确保有默认的TUN配置
+        if (!config.tunConfig) {
+          config.tunConfig = {
+            mtu: window.electron?.platform === 'darwin' ? 1400 : 1350,
+            stack: window.electron?.platform === 'darwin' ? 'gvisor' : 'system',
+            autoRoute: true,
+            strictRoute: true,
+          };
+        }
+
+        // 确保有默认的代理模式类型
+        if (!config.proxyModeType) {
+          config.proxyModeType = 'systemProxy';
+        }
+
+        const isPrivacyMode = await api.config.getPrivacyMode();
+        set({ config, isPrivacyMode });
+      } catch (error) {
+        console.error('[Store] Exception loading config:', error);
+        toast.error(i18n.t('common.configLoadFail'));
+      } finally {
+        loadConfigInflight = null;
       }
-
-      // 确保有默认的代理模式类型
-      if (!config.proxyModeType) {
-        config.proxyModeType = 'systemProxy';
-      }
-
-      const isPrivacyMode = await api.config.getPrivacyMode();
-      set({ config, isPrivacyMode });
-    } catch (error) {
-      console.error('[Store] Exception loading config:', error);
-      set({ error: String(error) });
-    } finally {
-      set({ isLoading: false });
-    }
+    })();
+    return loadConfigInflight;
   },
 
   saveConfig: async (config) => {
-    set({ isLoading: true, error: null });
     try {
-      console.log('[Store] Saving config:', config);
       await api.config.save(config);
-      console.log('[Store] Config saved successfully');
       set({ config });
     } catch (error) {
       console.error('[Store] Exception saving config:', error);
-      set({ error: String(error) });
-      throw error;
-    } finally {
-      set({ isLoading: false });
+      throw error; // 调用点负责局部 toast，不再写全局 error
     }
   },
 
   updateProxyMode: async (mode) => {
-    set({ isLoading: true, error: null });
     try {
       await api.config.updateMode(mode);
       // Update local config
@@ -287,28 +299,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         set({ config: { ...currentConfig, proxyMode: mode } });
       }
     } catch (error) {
-      set({ error: String(error) });
-    } finally {
-      set({ isLoading: false });
-    }
-  },
-
-  switchServer: async (serverId) => {
-    set({ isLoading: true, error: null });
-    try {
-      await api.server.switch(serverId);
-      // Update local config
-      const currentConfig = get().config;
-      if (currentConfig) {
-        set({ config: { ...currentConfig, selectedServerId: serverId } });
-      }
-      // Refresh connection status
-      await get().refreshConnectionStatus();
-    } catch (error) {
-      set({ error: String(error) });
-      throw error;
-    } finally {
-      set({ isLoading: false });
+      console.error('[Store] Exception updating proxy mode:', error);
+      throw error; // 调用点（proxy-control-card）catch + toast + 本地 busy
     }
   },
 
@@ -331,6 +323,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         proxyModeType: get().config?.proxyModeType || 'systemProxy',
       };
       set({ connectionStatus });
+      // F2：代理被观测到健康运行 ⇒ 上一次启停失败的 proxyError 已过时 ⇒ 清除（解决僵死）。
+      // 未运行时保留错误供用户查看，至下次 start/stop 入口清零（避免 2s 轮询把错误闪没）。
+      const healthy = connectionStatus.proxyCore.running && !connectionStatus.proxyCore.error;
+      if (healthy && get().proxyError) set({ proxyError: null });
     } catch (error) {
       console.error('Failed to refresh connection status:', error);
     }
@@ -347,65 +343,65 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   // Server Management Actions
   deleteServer: async (serverId) => {
-    set({ isLoading: true, error: null });
     try {
       await api.server.delete(serverId);
       // Reload config to get updated server list
       await get().loadConfig();
     } catch (error) {
-      set({ error: String(error) });
-      throw error;
-    } finally {
-      set({ isLoading: false });
+      console.error('[Store] Exception deleting server:', error);
+      throw error; // 调用点 catch + toast
     }
   },
 
   // Custom Rules Actions
   addCustomRule: async (rule) => {
-    set({ isLoading: true, error: null });
     try {
       await api.rules.add(rule);
       // Reload config to get updated rules
       await get().loadConfig();
     } catch (error) {
-      set({ error: String(error) });
+      console.error('[Store] Exception adding rule:', error);
       throw error;
-    } finally {
-      set({ isLoading: false });
     }
   },
 
   updateCustomRule: async (rule) => {
-    console.log('[Store] updateCustomRule called with:', rule);
-    set({ isLoading: true, error: null });
     try {
-      console.log('[Store] Calling api.rules.update...');
       await api.rules.update(rule);
-      console.log('[Store] Rule updated successfully, reloading config...');
       // Reload config to get updated rules
       await get().loadConfig();
-      console.log('[Store] Config reloaded after rule update');
     } catch (error) {
       console.error('[Store] Exception in updateCustomRule:', error);
-      set({ error: String(error) });
       throw error;
-    } finally {
-      console.log('[Store] updateCustomRule completed, setting isLoading to false');
-      set({ isLoading: false });
     }
   },
 
   deleteCustomRule: async (ruleId) => {
-    set({ isLoading: true, error: null });
     try {
       await api.rules.delete(ruleId);
       // Reload config to get updated rules
       await get().loadConfig();
     } catch (error) {
-      set({ error: String(error) });
-    } finally {
-      set({ isLoading: false });
+      console.error('[Store] Exception deleting rule:', error);
+      throw error; // 改 rethrow：原吞错使 delete-rule-dialog 失败也误弹「已删除」成功 toast
     }
+  },
+
+  // 排序编辑态「保存顺序」一次性提交：严格排列校验 + 乐观重排 + 立即 await（无 debounce）。
+  // 失败 rethrow，由 rules-page toast + loadConfig 回滚；净零序由 server 端跳过 save（≤1 次重启）。
+  commitRuleOrder: async (orderedIds) => {
+    const cfg = get().config;
+    if (!cfg) return;
+    const byId = new Map((cfg.customRules || []).map((r) => [r.id, r]));
+    if (
+      orderedIds.length !== byId.size ||
+      new Set(orderedIds).size !== orderedIds.length ||
+      !orderedIds.every((id) => byId.has(id))
+    ) {
+      throw new Error('invalid rule order');
+    }
+    set({ config: { ...cfg, customRules: orderedIds.map((id) => byId.get(id)!) } });
+    await api.rules.reorder(orderedIds);
   },
 
   setConfigValue: async (key, value) => {
@@ -420,7 +416,39 @@ export const useAppStore = create<AppState>((set, get) => ({
       }
     } catch (error) {
       console.error(`[Store] Failed to set config value for ${String(key)}:`, error);
-      set({ error: String(error) });
+    }
+  },
+
+  // macOS 提权 helper Actions
+  refreshHelperStatus: async () => {
+    try {
+      const helperStatus = await api.helper.getStatus();
+      set({ helperStatus });
+    } catch (error) {
+      console.error('[Store] Failed to refresh helper status:', error);
+    }
+  },
+
+  installHelper: async () => {
+    try {
+      const res = await api.helper.install();
+      if (res.status) set({ helperStatus: res.status });
+      // helperPromptDismissed 等配置可能已变 → 同步（helperToken 已解耦到独立文件，不经 config）
+      await get().loadConfig();
+      return { success: res.success, error: res.error };
+    } catch (error) {
+      return { success: false, error: String(error) };
+    }
+  },
+
+  uninstallHelper: async () => {
+    try {
+      const res = await api.helper.uninstall();
+      if (res.status) set({ helperStatus: res.status });
+      await get().loadConfig();
+      return { success: res.success, error: res.error };
+    } catch (error) {
+      return { success: false, error: String(error) };
     }
   },
 }));

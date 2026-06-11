@@ -400,6 +400,10 @@ export class CoreUpdateService {
   async recordSuccessfulVersion(): Promise<void> {
     try {
       const version = await this.getCurrentVersion();
+      // 版本未知时不记录：避免把占位串 '未知' 当作可回滚的「可用版本」持久化
+      if (!version || version === '未知') {
+        return;
+      }
       const versionFilePath = this.getVersionFilePath();
       const data = { version, recordedAt: new Date().toISOString() };
       fs.writeFileSync(versionFilePath, JSON.stringify(data, null, 2), 'utf-8');

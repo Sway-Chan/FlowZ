@@ -8,7 +8,9 @@ import {
   Palette,
   Cpu,
   Info,
-  Shield,
+  Network,
+  ScrollText,
+  FolderDown,
 } from 'lucide-react';
 
 // 自定义的分流图标（完整连贯的 Y 型，不带断点）
@@ -35,6 +37,7 @@ function FlowSplitIcon(props: any) {
   );
 }
 import { useTranslation } from 'react-i18next';
+import { useAppStore } from '@/store/app-store';
 
 interface SidebarProps {
   currentView: string;
@@ -45,14 +48,16 @@ interface SidebarProps {
 
 const mainNavItems = [
   { id: 'home', icon: Home },
+  { id: 'logs', icon: ScrollText },
   { id: 'server', icon: Server },
   { id: 'appPolicy', icon: FlowSplitIcon },
+  { id: 'ruleResources', icon: FolderDown },
   { id: 'rules', icon: ListFilter },
 ];
 
 const settingsNavItems = [
   { id: 'general', icon: Sliders },
-  { id: 'proxyMode', icon: Shield },
+  { id: 'network', icon: Network },
   { id: 'appearance', icon: Palette },
   { id: 'advanced', icon: Cpu },
   { id: 'about', icon: Info },
@@ -67,6 +72,8 @@ export function Sidebar({
   onSettingsSectionChange,
 }: SidebarProps) {
   const { t } = useTranslation();
+  // F27：设置页「返回」回到进入前的来源视图（默认 home）
+  const settingsReturnView = useAppStore((s) => s.settingsReturnView);
 
   const isSettings = currentView === 'settings';
 
@@ -82,7 +89,7 @@ export function Sidebar({
         <Icon
           className="h-[16px] w-[16px] flex-shrink-0"
           strokeWidth={isActive ? 2.2 : 1.8}
-          style={{ color: isActive ? 'var(--accent-blue)' : 'var(--ink-tertiary)' }}
+          style={{ color: isActive ? 'hsl(var(--primary))' : 'hsl(var(--muted-foreground))' }}
         />
         <span>{isSettings ? t(`settings.nav.${item.id}`, item.id) : t(`sidebar.${item.id}`)}</span>
       </button>
@@ -104,15 +111,15 @@ export function Sidebar({
           {/* Back button */}
           <div className="px-2 pb-2 app-region-no-drag">
             <button
-              onClick={() => onViewChange('home')}
+              onClick={() => onViewChange(settingsReturnView)}
               className="nav-item"
-              style={{ color: 'var(--ink-secondary)' }}
+              style={{ color: 'hsl(var(--muted-foreground))' }}
             >
               <ChevronLeft
                 className="h-4 w-4 flex-shrink-0"
-                style={{ color: 'var(--ink-secondary)' }}
+                style={{ color: 'hsl(var(--muted-foreground))' }}
               />
-              <span style={{ color: 'var(--ink-secondary)' }}>
+              <span style={{ color: 'hsl(var(--muted-foreground))' }}>
                 {t('settings.nav.back', '返回应用')}
               </span>
             </button>

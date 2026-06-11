@@ -105,7 +105,8 @@ export function registerSubscriptionHandlers(
         const result = await subscriptionService.fetchSubscription(
           subscription.url,
           subscription.id,
-          config.subscriptionUpdateViaProxy === true
+          config.subscriptionUpdateViaProxy === true,
+          config.httpPort || 2080
         );
         const fetchedServers = result.servers;
 

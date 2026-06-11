@@ -9,12 +9,21 @@ import type {
   UserConfig,
   ServerConfig,
   ProxyStatus,
+  ProxyErrorCode,
+  ConnectionsSnapshot,
   LogEntry,
   TrafficStats,
-  DomainRule,
+  Rule,
   AutoStartStatus,
-  ConnectionStateInfo,
   SubscriptionConfig,
+  HelperStatus,
+  IpInfoSnapshot,
+  SystemProcessInfo,
+  RuleResourceListItem,
+  RuleResourceDownloadItem,
+  RuleResourceDownloadResult,
+  RuleResourceProgress,
+  RuleResourceCatalogResult,
 } from '../../shared/types';
 
 /**
@@ -77,6 +86,7 @@ export const proxyApi = {
     listener: (data: {
       message?: string;
       error?: string;
+      errorCode?: ProxyErrorCode;
       code?: number;
       signal?: string | null;
     }) => void
@@ -164,6 +174,15 @@ export const configApi = {
   },
 };
 
+/** F29：隐私密码 API。哈希/校验全在 main；渲染端只拿 hasPassword 布尔与 verify 结果，永不接触明文/哈希。 */
+export const privacyApi = {
+  setPassword: (plain: string): Promise<{ success: boolean }> =>
+    ipcClient.invoke(IPC_CHANNELS.PRIVACY_SET_PASSWORD, { plain }),
+  unlock: (plain: string): Promise<{ ok: boolean }> =>
+    ipcClient.invoke(IPC_CHANNELS.PRIVACY_UNLOCK, { plain }),
+  hasPassword: (): Promise<boolean> => ipcClient.invoke(IPC_CHANNELS.PRIVACY_HAS_PASSWORD),
+};
+
 /**
  * 服务器管理 API
  */
@@ -239,21 +258,21 @@ export const rulesApi = {
   /**
    * 获取所有规则
    */
-  async getAll(): Promise<DomainRule[]> {
+  async getAll(): Promise<Rule[]> {
     return ipcClient.invoke(IPC_CHANNELS.RULES_GET_ALL);
   },
 
   /**
    * 添加规则
    */
-  async add(rule: Omit<DomainRule, 'id'>): Promise<DomainRule> {
+  async add(rule: Omit<Rule, 'id'>): Promise<Rule> {
     return ipcClient.invoke(IPC_CHANNELS.RULES_ADD, rule);
   },
 
   /**
    * 更新规则
    */
-  async update(rule: DomainRule): Promise<void> {
+  async update(rule: Rule): Promise<void> {
     return ipcClient.invoke(IPC_CHANNELS.RULES_UPDATE, rule);
   },
 
@@ -262,6 +281,11 @@ export const rulesApi = {
    */
   async delete(ruleId: string): Promise<void> {
     return ipcClient.invoke(IPC_CHANNELS.RULES_DELETE, { ruleId });
+  },
+
+  /** 重排规则：orderedIds 为全部规则 id 的新顺序 */
+  async reorder(orderedIds: string[]): Promise<void> {
+    return ipcClient.invoke(IPC_CHANNELS.RULES_REORDER, { orderedIds });
   },
 };
 
@@ -336,15 +360,77 @@ export const statsApi = {
   },
 };
 
+/** 连接快照 API：topology 经此消费 main 单一 poller 的数据，渲染端不再直连 :9090、不持 secret。 */
+export const connectionsApi = {
+  async get(): Promise<ConnectionsSnapshot> {
+    return ipcClient.invoke(IPC_CHANNELS.CONNECTIONS_GET);
+  },
+  onUpdated(listener: (snap: ConnectionsSnapshot) => void): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_CONNECTIONS_UPDATED, listener);
+  },
+};
+
 /**
- * 连接状态 API
+ * 系统能力 API（进程枚举等）
  */
-export const connectionApi = {
-  /**
-   * 监听连接状态变化事件
-   */
-  onStateChanged(listener: (state: ConnectionStateInfo) => void): () => void {
-    return ipcClient.on(IPC_CHANNELS.EVENT_CONNECTION_STATE_CHANGED, listener);
+export const systemApi = {
+  /** 枚举当前系统进程（聚合去重，供进程规则快速选择） */
+  async listProcesses(): Promise<SystemProcessInfo[]> {
+    return ipcClient.invoke(IPC_CHANNELS.SYSTEM_LIST_PROCESSES);
+  },
+};
+
+/**
+ * 规则资源 API（.srs 下载/管理）
+ */
+export const ruleResourcesApi = {
+  list(): Promise<RuleResourceListItem[]> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_LIST);
+  },
+  download(items: RuleResourceDownloadItem[]): Promise<RuleResourceDownloadResult[]> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_DOWNLOAD, { items });
+  },
+  redownload(id: string): Promise<RuleResourceDownloadResult> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_REDOWNLOAD, { id });
+  },
+  delete(id: string): Promise<{ ok: boolean }> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_DELETE, { id });
+  },
+  setGhProxy(prefix: string): Promise<{ ok: boolean; value?: string; error?: string }> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_SET_GH_PROXY, { prefix });
+  },
+  getCatalog(): Promise<RuleResourceCatalogResult> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_GET_CATALOG);
+  },
+  refreshCatalog(): Promise<RuleResourceCatalogResult> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_REFRESH_CATALOG);
+  },
+  setAutoUpdate(args: { enabled: boolean; intervalHours?: number }): Promise<{ ok: boolean }> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_SET_AUTO_UPDATE, args);
+  },
+  updateAll(): Promise<RuleResourceDownloadResult[]> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_UPDATE_ALL);
+  },
+  resetBuiltin(tag: string): Promise<RuleResourceDownloadResult> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_RESET_BUILTIN, { tag });
+  },
+  onProgress(listener: (p: RuleResourceProgress) => void): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_RULE_RESOURCE_PROGRESS, listener);
+  },
+};
+
+/**
+ * 出口 IP 信息 API
+ */
+export const ipInfoApi = {
+  /** 获取出口 IP 快照（force 强制重测） */
+  async get(force = false): Promise<IpInfoSnapshot> {
+    return ipcClient.invoke(IPC_CHANNELS.IP_INFO_GET, { force });
+  },
+
+  /** 监听出口 IP 更新事件 */
+  onUpdated(listener: (snap: IpInfoSnapshot) => void): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_IP_INFO_UPDATED, listener);
   },
 };
 
@@ -634,23 +720,48 @@ export const backupApi = {
 };
 
 /**
+ * macOS 提权 helper API（免提权启停 sing-box）
+ */
+export const helperApi = {
+  /** 查询 helper 安装/就绪状态 */
+  async getStatus(): Promise<HelperStatus> {
+    return ipcClient.invoke(IPC_CHANNELS.HELPER_GET_STATUS);
+  },
+
+  /** 安装/修复 helper（弹一次管理员授权框） */
+  async install(): Promise<{ success: boolean; error?: string; status: HelperStatus }> {
+    return ipcClient.invoke(IPC_CHANNELS.HELPER_INSTALL);
+  },
+
+  /** 卸载 helper（弹一次管理员授权框） */
+  async uninstall(): Promise<{ success: boolean; error?: string; status: HelperStatus }> {
+    return ipcClient.invoke(IPC_CHANNELS.HELPER_UNINSTALL);
+  },
+};
+
+/**
  * 统一的 API 客户端
  */
 export const api = {
   proxy: proxyApi,
   config: configApi,
+  privacy: privacyApi,
   server: serverApi,
   rules: rulesApi,
   logs: logsApi,
   autoStart: autoStartApi,
   stats: statsApi,
-  connection: connectionApi,
+  connections: connectionsApi,
+  system: systemApi,
+  ruleResources: ruleResourcesApi,
+  ipInfo: ipInfoApi,
   version: versionApi,
   admin: adminApi,
   update: updateApi,
   coreUpdate: coreUpdateApi,
   subscription: subscriptionApi,
   backup: backupApi,
+  helper: helperApi,
 };
 
 /**

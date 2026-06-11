@@ -5,7 +5,12 @@
 
 import { IpcMainInvokeEvent } from 'electron';
 import { IPC_CHANNELS } from '../../../shared/ipc-channels';
-import type { UserConfig, ProxyStatus, TrafficStats } from '../../../shared/types';
+import type {
+  UserConfig,
+  ProxyStatus,
+  TrafficStats,
+  ConnectionsSnapshot,
+} from '../../../shared/types';
 import { registerIpcHandler } from '../ipc-handler';
 import { ProxyManager } from '../../services/ProxyManager';
 import { ISystemProxyManager } from '../../services/SystemProxyManager';
@@ -38,6 +43,11 @@ export function registerProxyHandlers(
     statsService
       ? statsService.getSnapshot()
       : { uploadSpeed: 0, downloadSpeed: 0, totalUpload: 0, totalDownload: 0, activeConnections: 0 }
+  );
+
+  // 连接快照（topology 统一供数；窗口重建/挂载回填）
+  registerIpcHandler<void, ConnectionsSnapshot>(IPC_CHANNELS.CONNECTIONS_GET, async () =>
+    statsService ? statsService.getConnectionsSnapshot() : { connections: [], at: Date.now() }
   );
 
   // 启动代理

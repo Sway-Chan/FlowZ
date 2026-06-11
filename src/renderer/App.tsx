@@ -3,8 +3,10 @@ import { MainLayout } from './components/layout/main-layout';
 import { useAppStore } from './store/app-store';
 import { useNativeEventListeners } from './hooks/use-native-events';
 import { HomePage } from './pages/home-page';
+import { LogsPage } from './pages/logs-page';
 import { ServerPage } from './pages/server-page';
 import { RulesPage } from './pages/rules-page';
+import { RuleResourcesPage } from './pages/rule-resources-page';
 import { AppPolicyPage } from './pages/app-policy-page';
 import { SettingsPage } from './pages/settings-page';
 import { Toaster } from './components/ui/sonner';
@@ -50,7 +52,9 @@ function App() {
     const routeMap: Record<string, string> = {
       '/settings': 'settings',
       '/home': 'home',
+      '/logs': 'logs',
       '/server': 'server',
+      '/ruleResources': 'ruleResources',
       '/rules': 'rules',
     };
 
@@ -111,8 +115,10 @@ function App() {
         onSettingsSectionChange={setSettingsSection}
       >
         {currentView === 'home' && <HomePage />}
+        {currentView === 'logs' && <LogsPage />}
         {currentView === 'server' && <ServerPage />}
         {currentView === 'appPolicy' && <AppPolicyPage />}
+        {currentView === 'ruleResources' && <RuleResourcesPage />}
         {currentView === 'rules' && <RulesPage />}
         {currentView === 'settings' && <SettingsPage activeSection={settingsSection} />}
       </MainLayout>
