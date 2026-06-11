@@ -43,6 +43,7 @@ export function AppRulesCard() {
   // -- 图标库状态 --
   const [iconGalleries, setIconGalleries] = useState<{ name: string; url: string }[]>([]);
   const [isLoadingIcons, setIsLoadingIcons] = useState(false);
+  const [retryTick, setRetryTick] = useState(0);
   const [appSearchQuery, setAppSearchQuery] = useState('');
   const [searchQuery, setSearchQuery] = useState('');
   const [showIconGallery, setShowIconGallery] = useState(false);
@@ -107,7 +108,7 @@ export function AppRulesCard() {
       }
     };
     fetchIcons();
-  }, [showIconGallery, iconGalleries.length]);
+  }, [showIconGallery, iconGalleries.length, retryTick]);
 
   const filteredIcons = searchQuery
     ? iconGalleries.filter((i) => i.name.toLowerCase().includes(searchQuery.toLowerCase()))
@@ -144,38 +145,44 @@ export function AppRulesCard() {
     appRules.find((r) => r.appId === appId);
 
   const handlePolicyChange = async (preset: AppPreset, value: string) => {
+    const existing = getAppRule(preset.id);
+
+    // 「代理(默认)」= 恢复默认：有记录则删除该 appRule（不留 enabled:false 残留——恢复显示与无规则相同、
+    // 重选策略也是全新构造不读旧 targetServerId，删除即「恢复默认」，与用户心智一致）；无记录则 no-op。
+    if (value === 'proxy-default') {
+      if (!existing) return;
+      try {
+        await saveConfig({ ...config, appRules: appRules.filter((r) => r.appId !== preset.id) });
+      } catch {
+        toast.error(t('common.saveFailed'));
+      }
+      return;
+    }
+
     let action: RuleAction = 'proxy';
     let targetServerId: string | undefined = undefined;
-    let enabled = true;
-
     if (value === 'direct') action = 'direct';
     else if (value === 'block') action = 'block';
-    else if (value === 'proxy-default') {
-      action = 'proxy';
-      enabled = false;
-    } else if (value.startsWith('node-')) {
-      action = 'proxy';
+    else if (value.startsWith('node-')) {
       targetServerId = value.replace('node-', '');
     }
 
-    const existing = getAppRule(preset.id);
-    let newRules: AppRule[];
+    const newRules: AppRule[] = existing
+      ? appRules.map((r) =>
+          r.appId === preset.id ? { ...r, action, targetServerId, enabled: true } : r
+        )
+      : [...appRules, { appId: preset.id, action, targetServerId, enabled: true }];
 
-    if (existing) {
-      newRules = appRules.map((r) =>
-        r.appId === preset.id ? { ...r, action, targetServerId, enabled } : r
-      );
-    } else {
-      if (value === 'proxy-default') return;
-      newRules = [...appRules, { appId: preset.id, action, targetServerId, enabled: true }];
+    try {
+      await saveConfig({ ...config, appRules: newRules });
+    } catch {
+      toast.error(t('common.saveFailed'));
     }
-
-    await saveConfig({ ...config, appRules: newRules });
   };
 
   const handleAddCustomApp = async () => {
     if (!newAppName.trim() || !newAppGeosite.trim()) {
-      toast.error('请填写应用名称和 Geosite 标签');
+      toast.error(t('rules.customApp.fillNameAndGeosite'));
       return;
     }
 
@@ -197,10 +204,15 @@ export function AppRulesCard() {
         : undefined,
     };
 
-    await saveConfig({
-      ...config,
-      customAppPresets: [...customPresets, newPreset],
-    });
+    try {
+      await saveConfig({
+        ...config,
+        customAppPresets: [...customPresets, newPreset],
+      });
+    } catch {
+      toast.error(t('common.saveFailed'));
+      return;
+    }
 
     setIsAddDialogOpen(false);
     setShowIconGallery(false);
@@ -209,18 +221,23 @@ export function AppRulesCard() {
     setNewAppIconUrl('');
     setNewAppGeosite('');
     setNewAppGeoIP('');
-    toast.success('自定义应用添加成功');
+    toast.success(t('rules.customApp.addSuccess'));
   };
 
   const handleDeleteCustomApp = async (appId: string) => {
     const newPresets = customPresets.filter((p) => p.id !== appId);
     const newRules = appRules.filter((r) => r.appId !== appId);
-    await saveConfig({
-      ...config,
-      customAppPresets: newPresets,
-      appRules: newRules,
-    });
-    toast.success('自定义应用已删除');
+    try {
+      await saveConfig({
+        ...config,
+        customAppPresets: newPresets,
+        appRules: newRules,
+      });
+    } catch {
+      toast.error(t('common.saveFailed'));
+      return;
+    }
+    toast.success(t('rules.customApp.deleted'));
   };
 
   return (
@@ -231,7 +248,7 @@ export function AppRulesCard() {
           <div className="relative flex-1 group">
             <Search className="absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground/50 transition-colors group-focus-within:text-primary" />
             <Input
-              placeholder={t('rules.searchApps' as any) || '搜索应用...'}
+              placeholder={t('rules.searchApps')}
               value={appSearchQuery}
               onChange={(e) => setAppSearchQuery(e.target.value)}
               className="pl-10 h-11 bg-muted/40 border-muted-foreground/10 focus:border-primary/30 transition-all rounded-xl text-sm"
@@ -244,7 +261,7 @@ export function AppRulesCard() {
               size="icon"
               className={`h-9 w-9 rounded-lg ${viewMode === 'comfortable' ? 'shadow-sm' : ''}`}
               onClick={() => setViewMode('comfortable')}
-              title="舒适模式 (Style A)"
+              title={t('rules.viewComfortable')}
             >
               <LayoutGrid className="h-4 w-4" />
             </Button>
@@ -253,7 +270,7 @@ export function AppRulesCard() {
               size="icon"
               className={`h-9 w-9 rounded-lg ${viewMode === 'compact' ? 'shadow-sm' : ''}`}
               onClick={() => setViewMode('compact')}
-              title="紧凑模式 (Style B)"
+              title={t('rules.viewCompact')}
             >
               <List className="h-4 w-4" />
             </Button>
@@ -284,7 +301,7 @@ export function AppRulesCard() {
                   onValueChange={(v) => handlePolicyChange(preset, v)}
                 >
                   <SelectTrigger
-                    className={`h-${viewMode === 'comfortable' ? '[110px]' : '[88px]'} w-full p-${viewMode === 'comfortable' ? '3.5' : '2.5'} flex flex-col items-start rounded-xl border border-muted-foreground/10 transition-all duration-300 shadow-none focus:ring-0 [&>svg]:hidden bg-muted/40 hover:bg-muted/60 relative overflow-hidden`}
+                    className={`${viewMode === 'comfortable' ? 'h-[110px] p-3.5' : 'h-[88px] p-2.5'} w-full flex flex-col items-start rounded-xl border border-muted-foreground/10 transition-all duration-300 shadow-none focus:ring-0 [&>svg]:hidden bg-muted/40 hover:bg-muted/60 relative overflow-hidden`}
                   >
                     {/* 左上脚标：Surge 风格 */}
                     <div
@@ -301,7 +318,7 @@ export function AppRulesCard() {
                       }
                     >
                       <div
-                        className={`${viewMode === 'comfortable' ? 'h-9 w-9' : 'h-6 w-6'} flex items-center justify-center bg-background/80 rounded-lg shadow-sm border border-white/${viewMode === 'comfortable' ? '10' : '5'} p-${viewMode === 'comfortable' ? '1' : '0.5'} shrink-0 transition-transform group-hover:scale-105`}
+                        className={`${viewMode === 'comfortable' ? 'h-9 w-9 border-white/10 p-1' : 'h-6 w-6 border-white/5 p-0.5'} flex items-center justify-center bg-background/80 rounded-lg shadow-sm border shrink-0 transition-transform group-hover:scale-105`}
                       >
                         {/* Bug 3 修复：基于 React state 条件渲染，避免 onError DOM 操作被重渲染覆盖 */}
                         {preset.iconUrl && !failedIcons.has(preset.id) ? (
@@ -319,7 +336,7 @@ export function AppRulesCard() {
                         )}
                       </div>
                       <span
-                        className={`text-[${viewMode === 'comfortable' ? '13px' : '12px'}] font-bold truncate tracking-tight transition-colors ${
+                        className={`${viewMode === 'comfortable' ? 'text-[13px]' : 'text-[12px]'} font-bold truncate tracking-tight transition-colors ${
                           isEnabled ? 'text-foreground' : 'text-foreground/70'
                         }`}
                       >
@@ -336,7 +353,7 @@ export function AppRulesCard() {
                         viewMode === 'comfortable'
                           ? `absolute bottom-1.5 left-2.5 right-3.5 text-[9.5px] w-full text-left font-bold tracking-normal truncate ${
                               !rule || !isEnabled
-                                ? 'text-muted-foreground/60'
+                                ? 'text-primary'
                                 : rule.action === 'direct'
                                   ? 'text-green-600 dark:text-green-400'
                                   : rule.action === 'block'
@@ -345,7 +362,7 @@ export function AppRulesCard() {
                             }`
                           : `text-[9px] w-full text-left font-bold tracking-normal truncate ml-2 ${
                               !rule || !isEnabled
-                                ? 'text-muted-foreground/60'
+                                ? 'text-primary'
                                 : rule.action === 'direct'
                                   ? 'text-green-600 dark:text-green-400'
                                   : rule.action === 'block'
@@ -358,7 +375,7 @@ export function AppRulesCard() {
                         <div
                           className={`${viewMode === 'comfortable' ? 'h-1.5 w-1.5' : 'h-1 w-1'} rounded-full ${
                             !rule || !isEnabled
-                              ? 'bg-muted-foreground/30'
+                              ? 'bg-primary'
                               : rule.action === 'direct'
                                 ? 'bg-green-500'
                                 : rule.action === 'block'
@@ -368,16 +385,16 @@ export function AppRulesCard() {
                         />
                         <span className="truncate">
                           {(() => {
-                            if (!rule || !isEnabled) return 'Proxy';
-                            if (rule.action === 'direct') return 'DIRECT';
-                            if (rule.action === 'block') return 'BLOCK';
+                            if (!rule || !isEnabled) return t('rules.proxy');
+                            if (rule.action === 'direct') return t('rules.direct');
+                            if (rule.action === 'block') return t('rules.block');
                             if (rule.targetServerId) {
                               const s = config.servers?.find(
                                 (server) => server.id === rule.targetServerId
                               );
-                              return s ? s.name : 'Proxy';
+                              return s ? s.name : t('rules.proxy');
                             }
-                            return 'Proxy';
+                            return t('rules.proxy');
                           })()}
                         </span>
                       </div>
@@ -386,10 +403,10 @@ export function AppRulesCard() {
 
                   <SelectContent className="max-h-[300px]">
                     <div className="px-2 py-1.5 text-[10px] font-bold text-muted-foreground uppercase tracking-wide">
-                      系统策略
+                      {t('rules.systemPolicy')}
                     </div>
                     <SelectItem value="proxy-default" className="text-xs font-medium text-primary">
-                      代理
+                      {t('rules.proxy')}
                     </SelectItem>
                     <SelectItem
                       value="direct"
@@ -404,12 +421,13 @@ export function AppRulesCard() {
                     {config.servers && config.servers.length > 0 && (
                       <>
                         <div className="px-2 py-1.5 mt-1 text-[10px] font-bold text-muted-foreground uppercase tracking-wide border-t">
-                          独立路由节点
+                          {t('rules.standaloneNodes')}
                         </div>
                         <ServerSelectGroups
                           servers={config.servers}
                           valuePrefix="node-"
                           itemClassName="text-xs"
+                          selectedId={rule?.targetServerId}
                         />
                       </>
                     )}
@@ -446,7 +464,7 @@ export function AppRulesCard() {
                   <Plus className="h-6 w-6 text-muted-foreground/60 group-hover:text-primary" />
                 </div>
                 <span className="text-xs font-medium text-muted-foreground/70 group-hover:text-primary transition-colors">
-                  创建自定义
+                  {t('rules.createCustom')}
                 </span>
               </Button>
             </div>
@@ -468,14 +486,14 @@ export function AppRulesCard() {
                   >
                     <Plus className="h-4 w-4 rotate-45" />
                   </Button>
-                  选择图标库
+                  {t('rules.customApp.selectIconGallery')}
                 </DialogTitle>
               </DialogHeader>
               <div className="space-y-4 py-2">
                 <div className="relative">
                   <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
                   <Input
-                    placeholder="在 Qure Color / EDC 库中搜索..."
+                    placeholder={t('rules.customApp.searchIconPlaceholder')}
                     value={searchQuery}
                     onChange={(e) => setSearchQuery(e.target.value)}
                     className="pl-9 h-10 text-sm bg-muted/30 border-none focus-visible:ring-1"
@@ -485,7 +503,7 @@ export function AppRulesCard() {
                   <div className="grid grid-cols-5 gap-3 p-1">
                     {isLoadingIcons ? (
                       <div className="col-span-5 py-20 text-center text-sm text-muted-foreground animate-pulse">
-                        正在加载云端图标库...
+                        {t('rules.customApp.loadingIcons')}
                       </div>
                     ) : (
                       <>
@@ -528,12 +546,12 @@ export function AppRulesCard() {
                   {!isLoadingIcons && iconGalleries.length === 0 && (
                     <div className="py-6 px-2 space-y-3">
                       <p className="text-xs text-center text-muted-foreground">
-                        云端图标库加载失败（网络受限）
+                        {t('rules.customApp.iconLoadFailed')}
                       </p>
                       {/* 兜底方案：手动输入图标 URL */}
                       <div className="space-y-2">
                         <p className="text-[10px] text-muted-foreground">
-                          可手动粘贴图标图片地址（支持 .png / .webp 等）：
+                          {t('rules.customApp.manualIconHint')}
                         </p>
                         <div className="flex gap-2">
                           <Input
@@ -548,7 +566,7 @@ export function AppRulesCard() {
                             className="shrink-0 h-9"
                             onClick={() => setShowIconGallery(false)}
                           >
-                            确定
+                            {t('common.confirm')}
                           </Button>
                         </div>
                       </div>
@@ -556,9 +574,9 @@ export function AppRulesCard() {
                         variant="link"
                         size="sm"
                         className="text-[10px] w-full"
-                        onClick={() => setIconGalleries([])}
+                        onClick={() => setRetryTick((n) => n + 1)}
                       >
-                        重新尝试加载
+                        {t('rules.customApp.retryLoad')}
                       </Button>
                     </div>
                   )}
@@ -568,12 +586,12 @@ export function AppRulesCard() {
           ) : (
             <>
               <DialogHeader>
-                <DialogTitle>新增自定义应用分流</DialogTitle>
-                <DialogDescription>创建规则，像使用内置应用一样方便。</DialogDescription>
+                <DialogTitle>{t('rules.customApp.addTitle')}</DialogTitle>
+                <DialogDescription>{t('rules.customApp.addDesc')}</DialogDescription>
               </DialogHeader>
               <div className="grid gap-4 py-4">
                 <div className="grid grid-cols-4 items-center gap-4">
-                  <Label className="text-right">图标</Label>
+                  <Label className="text-right">{t('rules.customApp.iconLabel')}</Label>
                   <div className="col-span-3">
                     <Button
                       variant="outline"
@@ -589,9 +607,13 @@ export function AppRulesCard() {
                           )}
                         </div>
                         <div className="flex flex-col items-start overflow-hidden">
-                          <span className="text-sm font-medium">点击浏览图标库</span>
+                          <span className="text-sm font-medium">
+                            {t('rules.customApp.browseIcons')}
+                          </span>
                           <span className="text-[10px] text-muted-foreground truncate">
-                            {newAppIconUrl ? '已选: ' + newAppIconUrl : '从 Qure / EDC 中选择'}
+                            {newAppIconUrl
+                              ? t('rules.customApp.iconSelected', { url: newAppIconUrl })
+                              : t('rules.customApp.iconChoosePrompt')}
                           </span>
                         </div>
                       </div>
@@ -601,13 +623,13 @@ export function AppRulesCard() {
                 </div>
                 <div className="grid grid-cols-4 items-center gap-4">
                   <Label htmlFor="name" className="text-right">
-                    名称
+                    {t('rules.customApp.nameLabel')}
                   </Label>
                   <Input
                     id="name"
                     value={newAppName}
                     onChange={(e) => setNewAppName(e.target.value)}
-                    placeholder="应用名称"
+                    placeholder={t('rules.customApp.namePlaceholder')}
                     className="col-span-3 h-10 rounded-lg bg-muted/20 border-none focus-visible:ring-1"
                   />
                 </div>
@@ -619,7 +641,7 @@ export function AppRulesCard() {
                     id="geosite"
                     value={newAppGeosite}
                     onChange={(e) => setNewAppGeosite(e.target.value)}
-                    placeholder="如 apple,icloud"
+                    placeholder={t('rules.customApp.geositePlaceholder')}
                     className="col-span-3 h-10 rounded-lg bg-muted/20 border-none focus-visible:ring-1"
                   />
                 </div>
@@ -631,16 +653,16 @@ export function AppRulesCard() {
                     id="geoip"
                     value={newAppGeoIP}
                     onChange={(e) => setNewAppGeoIP(e.target.value)}
-                    placeholder="可选，如 apple"
+                    placeholder={t('rules.customApp.geoipPlaceholder')}
                     className="col-span-3 h-10 rounded-lg bg-muted/20 border-none focus-visible:ring-1"
                   />
                 </div>
               </div>
               <DialogFooter>
                 <Button variant="outline" onClick={() => setIsAddDialogOpen(false)}>
-                  取消
+                  {t('common.cancel')}
                 </Button>
-                <Button onClick={handleAddCustomApp}>保存应用</Button>
+                <Button onClick={handleAddCustomApp}>{t('rules.customApp.save')}</Button>
               </DialogFooter>
             </>
           )}

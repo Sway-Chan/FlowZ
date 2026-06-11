@@ -1,7 +1,4 @@
-import { useEffect } from 'react';
-import { useForm } from 'react-hook-form';
-import { zodResolver } from '@hookform/resolvers/zod';
-import * as z from 'zod';
+import { useEffect, useState } from 'react';
 import { toast } from 'sonner';
 import {
   Dialog,
@@ -11,392 +8,496 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog';
-import {
-  Form,
-  FormControl,
-  FormDescription,
-  FormField,
-  FormItem,
-  FormLabel,
-  FormMessage,
-} from '@/components/ui/form';
 import { Textarea } from '@/components/ui/textarea';
 import { Input } from '@/components/ui/input';
 import {
   Select,
   SelectContent,
+  SelectGroup,
   SelectItem,
+  SelectLabel,
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { Checkbox } from '@/components/ui/checkbox';
+import { Switch } from '@/components/ui/switch';
 import { Button } from '@/components/ui/button';
-import { Loader2 } from 'lucide-react';
+import { SegmentedControl } from '@/components/ui/segmented-control';
+import { SettingsRow } from '@/components/settings/settings-row';
+import { Loader2, ListPlus, Plus, X } from 'lucide-react';
 import { ServerSelectGroups } from '@/components/settings/server-select-groups';
 import { useAppStore } from '@/store/app-store';
-import type { DomainRule, RuleAction } from '../../../shared/types';
+import type { Rule, RuleType, RuleAction, RuleCondition } from '../../../shared/types';
+import { validateRuleValue, RULE_TYPE_IDS } from '../../../shared/rules';
 import { useTranslation } from 'react-i18next';
-
-const domainRegex = /^(\*\.)?([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
-const ipCidrRegex = /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/;
-
-const getRuleFormSchema = (t: any) =>
-  z
-    .object({
-      domains: z.string().optional(),
-      ipCidr: z.string().optional(),
-      action: z.enum(['proxy', 'direct', 'block']),
-      enabled: z.boolean(),
-      bypassFakeIP: z.boolean(),
-      targetServerId: z.string().optional(),
-      remarks: z
-        .string()
-        .max(100, { message: t('rules.remarksLengthError', '备注不能超过100个字符') })
-        .optional(),
-    })
-    .refine((data) => data.domains || data.ipCidr, {
-      message: t('rules.errorEmpty', '域名和 IP CIDR 不能同时为空'),
-      path: ['domains'],
-    });
-
-type RuleFormValues = z.infer<ReturnType<typeof getRuleFormSchema>>;
+import {
+  RULE_CATEGORIES,
+  CATEGORY_TYPES,
+  CATEGORY_NAME,
+  RULE_TYPE_NAME,
+  RULE_TYPE_DESC,
+  RULE_TYPE_PLACEHOLDER,
+  RULE_TYPE_HINT,
+  SHORT_VALUE_TYPES,
+  GEO_SUGGEST,
+  PROCESS_TYPES,
+  BYPASS_FAKEIP_TYPES,
+} from './rule-type-meta';
+import { ProcessPickerDialog } from './process-picker-dialog';
+import { ResourcePicker } from './resource-picker';
 
 interface RuleDialogProps {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   mode: 'add' | 'edit';
-  rule?: DomainRule;
+  rule?: Rule;
 }
+
+const DEFAULT_TYPE: RuleType = 'domain';
 
 export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) {
   const { t } = useTranslation();
-  const ruleFormSchema = getRuleFormSchema(t);
-
   const addCustomRule = useAppStore((state) => state.addCustomRule);
   const updateCustomRule = useAppStore((state) => state.updateCustomRule);
   const servers = useAppStore((state) => state.config?.servers || []);
 
-  const form = useForm<RuleFormValues>({
-    resolver: zodResolver(ruleFormSchema),
-    defaultValues: {
-      domains: '',
-      ipCidr: '',
-      action: 'proxy',
-      enabled: true,
-      bypassFakeIP: false,
-      targetServerId: 'default',
-      remarks: '',
-    },
-  });
+  // 多条件模型：conditionTypes 是有序的「激活条件类型」列表（[0]=首条件，镜像到 rule.type/values）。
+  // 匹配值仍按类型分桶存 valuesByType（天然多类型并行编辑、切换互不污染）；每类型至多一个条件。
+  const [conditionTypes, setConditionTypes] = useState<RuleType[]>([DEFAULT_TYPE]);
+  const [valuesByType, setValuesByType] = useState<Partial<Record<RuleType, string>>>({});
+  const [combineMode, setCombineMode] = useState<'and' | 'or'>('or');
+  const [action, setAction] = useState<RuleAction>('proxy');
+  const [enabled, setEnabled] = useState(true);
+  const [bypassFakeIP, setBypassFakeIP] = useState(false);
+  const [targetServerId, setTargetServerId] = useState('default');
+  const [remarks, setRemarks] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  // 进程选择器/聚焦态按「类型」定位（多块共存）：pickerType 标记哪个块的选择器打开，focusedType 标记哪个块输入中。
+  const [pickerType, setPickerType] = useState<RuleType | null>(null);
+  const [focusedType, setFocusedType] = useState<RuleType | null>(null);
 
   useEffect(() => {
-    if (open) {
-      if (mode === 'edit' && rule) {
-        form.reset({
-          domains: rule.domains.join('\n'),
-          ipCidr: rule.ipCidr?.join('\n') || '',
-          action: rule.action,
-          enabled: rule.enabled,
-          bypassFakeIP: rule.bypassFakeIP ?? false,
-          targetServerId: rule.targetServerId || 'default',
-          remarks: rule.remarks || '',
-        });
-      } else {
-        form.reset({
-          domains: '',
-          ipCidr: '',
-          action: 'proxy',
-          enabled: true,
-          bypassFakeIP: false,
-          targetServerId: 'default',
-          remarks: '',
-        });
+    if (!open) return;
+    setFocusedType(null);
+    setPickerType(null);
+    if (mode === 'edit' && rule) {
+      // 多条件优先；无 conditions 退化为单条件 [{type,values}]。去重类型（桶按类型键）、合并同类型值，保序。
+      const conds: RuleCondition[] =
+        rule.conditions && rule.conditions.length > 0
+          ? rule.conditions
+          : [{ type: rule.type, values: rule.values || [] }];
+      const order: RuleType[] = [];
+      const buckets: Partial<Record<RuleType, string>> = {};
+      for (const c of conds) {
+        const existing = buckets[c.type];
+        const joined = (c.values || []).join('\n');
+        if (existing === undefined) {
+          order.push(c.type);
+          buckets[c.type] = joined;
+        } else {
+          buckets[c.type] = existing ? `${existing}\n${joined}` : joined;
+        }
       }
+      setConditionTypes(order.length > 0 ? order : [rule.type]);
+      setValuesByType(buckets);
+      setCombineMode(rule.combineMode ?? 'or');
+      setAction(rule.action);
+      setEnabled(rule.enabled);
+      setBypassFakeIP(rule.bypassFakeIP ?? false);
+      setTargetServerId(rule.targetServerId || 'default');
+      setRemarks(rule.remarks || '');
+    } else {
+      setConditionTypes([DEFAULT_TYPE]);
+      setValuesByType({});
+      setCombineMode('or');
+      setAction('proxy');
+      setEnabled(true);
+      setBypassFakeIP(false);
+      setTargetServerId('default');
+      setRemarks('');
     }
-  }, [open, mode, rule, form]);
+  }, [open, mode, rule]);
 
-  const parseLines = (input: string | undefined): string[] => {
-    if (!input) return [];
-    return input
+  const usedTypes = new Set(conditionTypes);
+  // bypassFakeIP 是规则级设置：只要任一条件是域名类即可用（生成期对域名类条件取真实 DNS）。
+  const bypassApplicable = conditionTypes.some((ct) => BYPASS_FAKEIP_TYPES.includes(ct));
+
+  const parseLines = (input: string): string[] =>
+    input
       .split('\n')
-      .map((line) => line.trim())
-      .filter((line) => line.length > 0);
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0);
+
+  const valuesOf = (ct: RuleType) => valuesByType[ct] ?? '';
+  const setValuesOf = (ct: RuleType, text: string) =>
+    setValuesByType((prev) => ({ ...prev, [ct]: text }));
+
+  // 切换某条件块的类型：目标类型未被占用才生效（占用类型在 Select 里已 disabled，双保险）；重置聚焦态。
+  const changeConditionType = (index: number, next: RuleType) => {
+    setFocusedType(null);
+    setConditionTypes((prev) => {
+      if (prev[index] === next || prev.includes(next)) return prev;
+      const copy = [...prev];
+      copy[index] = next;
+      return copy;
+    });
   };
 
-  const validateDomain = (domain: string): boolean => {
-    if (domain.startsWith('geosite:')) return true;
-    return domainRegex.test(domain);
+  const addCondition = () => {
+    const next = RULE_TYPE_IDS.find((tp) => !usedTypes.has(tp));
+    if (!next) return; // 13 种类型全部用尽
+    setFocusedType(null);
+    setConditionTypes((prev) => [...prev, next]);
   };
 
-  const validateIpCidr = (ip: string): boolean => {
-    return ipCidrRegex.test(ip);
+  const removeCondition = (ct: RuleType) => {
+    setFocusedType(null);
+    setConditionTypes((prev) => (prev.length > 1 ? prev.filter((x) => x !== ct) : prev));
+    // 保留 valuesByType[ct] 桶（再次添加该类型可恢复，且不进入提交）
   };
 
-  const onSubmit = async (values: RuleFormValues) => {
+  // 函数式更新：从 prev 桶读最新值再回写，避免 render 捕获值的陈旧读。
+  const handleProcessPicked = (ct: RuleType, picked: string[]) => {
+    setValuesByType((prev) => {
+      const lines = parseLines(prev[ct] ?? '');
+      const existing = new Set(lines);
+      const merged = [...lines];
+      for (const p of picked) {
+        if (!existing.has(p)) {
+          merged.push(p);
+          existing.add(p);
+        }
+      }
+      return { ...prev, [ct]: merged.join('\n') };
+    });
+  };
+
+  // 点击常用标签：已存在则移除该行，否则追加
+  const toggleValue = (ct: RuleType, v: string) => {
+    setValuesByType((prev) => {
+      const lines = parseLines(prev[ct] ?? '');
+      const next = lines.includes(v) ? lines.filter((x) => x !== v) : [...lines, v];
+      return { ...prev, [ct]: next.join('\n') };
+    });
+  };
+
+  // 单条件块的实时非法值（聚焦时排除末尾「正在输入行」；ruleSet 走 ResourcePicker 不校验）
+  const invalidValuesOf = (ct: RuleType): string[] => {
+    if (ct === 'ruleSet') return [];
+    const text = valuesOf(ct);
+    const parsed = parseLines(text);
+    const checkable = focusedType === ct && !text.endsWith('\n') ? parsed.slice(0, -1) : parsed;
+    return checkable.filter((v) => !validateRuleValue(ct, v));
+  };
+
+  const onSubmit = async () => {
+    // 收集每个条件块（按 conditionTypes 顺序）的非空值
+    const conds: RuleCondition[] = [];
+    for (const ct of conditionTypes) {
+      const values = parseLines(valuesOf(ct));
+      if (values.length === 0) {
+        toast.error(
+          t('rules.errorEmptyCondition', { type: t(`rules.types.${ct}.name`, RULE_TYPE_NAME[ct]) })
+        );
+        return;
+      }
+      const invalid = values.filter((v) => !validateRuleValue(ct, v));
+      if (invalid.length > 0) {
+        toast.error(t('rules.invalidValue'), {
+          description: `${invalid.slice(0, 3).join(', ')}${invalid.length > 3 ? ' …' : ''}`,
+        });
+        return;
+      }
+      conds.push({ type: ct, values });
+    }
+    if (conds.length === 0) {
+      toast.error(t('rules.errorEmpty'));
+      return;
+    }
+
+    const tid = targetServerId === 'default' ? undefined : targetServerId;
+    const bypass = bypassApplicable ? bypassFakeIP : undefined;
+    // 单条件 → 退化为 type/values（不写 conditions/combineMode，与历史规则逐字节等价）；
+    // 多条件 → 首条件镜像到 type/values（回滚兼容），并写 conditions + combineMode。
+    const first = conds[0];
+    const multi = conds.length > 1;
+    const base = {
+      type: first.type,
+      values: first.values,
+      conditions: multi ? conds : undefined,
+      combineMode: multi ? combineMode : undefined,
+      action,
+      enabled,
+      bypassFakeIP: bypass,
+      targetServerId: tid,
+      remarks: remarks || undefined,
+    };
+
+    setSubmitting(true);
     try {
-      const domains = parseLines(values.domains);
-      const ipCidrs = parseLines(values.ipCidr);
-
-      if (domains.length === 0 && ipCidrs.length === 0) {
-        toast.error(t('rules.errorEmpty', '请输入至少一个域名或 IP CIDR'));
-        return;
-      }
-
-      const invalidDomains = domains.filter((d) => !validateDomain(d));
-      if (invalidDomains.length > 0) {
-        toast.error(t('rules.invalidDomainFormat', '域名格式不正确'), {
-          description: t('rules.invalidDomainFormatDesc', '以下域名格式无效: {{domains}}', {
-            domains: `${invalidDomains.slice(0, 3).join(', ')}${invalidDomains.length > 3 ? '...' : ''}`,
-          }),
-        });
-        return;
-      }
-
-      const invalidIpCidrs = ipCidrs.filter((ip) => !validateIpCidr(ip));
-      if (invalidIpCidrs.length > 0) {
-        toast.error(t('rules.invalidIpCidrFormat', 'IP CIDR 格式不正确'), {
-          description: t('rules.invalidIpCidrFormatDesc', '以下 CIDR 格式无效: {{ips}}', {
-            ips: `${invalidIpCidrs.slice(0, 3).join(', ')}${invalidIpCidrs.length > 3 ? '...' : ''}`,
-          }),
-        });
-        return;
-      }
-
-      const targetServerId =
-        values.targetServerId === 'default' ? undefined : values.targetServerId;
-
       if (mode === 'add') {
-        const newRule: DomainRule = {
+        const newRule: Rule = {
           id: `rule_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`,
-          domains,
-          ipCidr: ipCidrs,
-          action: values.action as RuleAction,
-          enabled: values.enabled,
-          bypassFakeIP: values.bypassFakeIP,
-          targetServerId,
-          remarks: values.remarks,
+          ...base,
         };
         await addCustomRule(newRule);
-        toast.success(t('rules.ruleAdded', '规则已添加'));
+        toast.success(t('rules.ruleAdded'));
       } else if (rule) {
-        const updatedRule: DomainRule = {
-          ...rule,
-          domains,
-          ipCidr: ipCidrs,
-          action: values.action as RuleAction,
-          enabled: values.enabled,
-          bypassFakeIP: values.bypassFakeIP,
-          targetServerId,
-          remarks: values.remarks,
-        };
-        await updateCustomRule(updatedRule);
-        toast.success(t('rules.ruleUpdated', '规则已更新'));
+        const updated: Rule = { ...rule, ...base };
+        await updateCustomRule(updated);
+        toast.success(t('rules.ruleUpdated'));
       }
-
       onOpenChange(false);
     } catch (error) {
-      toast.error(t('rules.saveFailed', '保存失败'), {
-        description:
-          error instanceof Error ? error.message : t('rules.saveErrorDesc', '保存规则时发生错误'),
+      toast.error(t('rules.saveFailed'), {
+        description: error instanceof Error ? error.message : t('rules.saveErrorDesc'),
       });
+    } finally {
+      setSubmitting(false);
     }
   };
+
+  // 单个条件块的「匹配值」编辑器（ruleSet→资源选择器；其余→Textarea + 常用标签 / 进程选择器）。
+  const renderValueEditor = (ct: RuleType) => {
+    if (ct === 'ruleSet') {
+      return (
+        <ResourcePicker
+          value={parseLines(valuesOf(ct))}
+          onChange={(vals) => setValuesOf(ct, vals.join('\n'))}
+          onRequestClose={() => onOpenChange(false)}
+        />
+      );
+    }
+    const text = valuesOf(ct);
+    const parsed = parseLines(text);
+    const invalid = invalidValuesOf(ct);
+    return (
+      <>
+        <Textarea
+          value={text}
+          onChange={(e) => setValuesOf(ct, e.target.value)}
+          onFocus={() => setFocusedType(ct)}
+          onBlur={() => setFocusedType((prev) => (prev === ct ? null : prev))}
+          placeholder={t(`rules.types.${ct}.placeholder`, RULE_TYPE_PLACEHOLDER[ct])}
+          className={`${SHORT_VALUE_TYPES.includes(ct) ? 'min-h-[60px]' : 'min-h-[100px]'} font-mono text-sm ${
+            invalid.length > 0 ? 'border-red-500/60 focus-visible:ring-red-500/40' : ''
+          }`}
+        />
+        <p className="text-xs text-muted-foreground">
+          {t(`rules.typeHints.${ct}`, RULE_TYPE_HINT[ct])}
+          {PROCESS_TYPES.includes(ct) && ` · ${t('rules.processHint')}`}
+        </p>
+        {invalid.length > 0 && (
+          <p className="text-xs text-red-600 dark:text-red-400">
+            {t('rules.invalidInline', {
+              values: `${invalid.slice(0, 3).join(', ')}${invalid.length > 3 ? ' …' : ''}`,
+            })}
+          </p>
+        )}
+        {GEO_SUGGEST[ct] && (
+          <div className="flex flex-wrap gap-1.5 pt-1">
+            <span className="text-xs text-muted-foreground">{t('rules.commonTags')}</span>
+            {GEO_SUGGEST[ct]!.map((tag) => {
+              const active = parsed.includes(tag);
+              return (
+                <button
+                  key={tag}
+                  type="button"
+                  onClick={() => toggleValue(ct, tag)}
+                  className={`rounded-md border px-2 py-0.5 text-xs ${
+                    active
+                      ? 'border-primary bg-primary/10 text-primary'
+                      : 'bg-muted hover:bg-muted/70'
+                  }`}
+                >
+                  {tag}
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </>
+    );
+  };
+
+  const multiCondition = conditionTypes.length > 1;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-[500px] max-h-[95vh] overflow-y-auto">
+      <DialogContent className="sm:max-w-[560px] max-h-[95vh] overflow-y-auto">
         <DialogHeader>
-          <DialogTitle>
-            {mode === 'add' ? t('rules.addRule', '添加规则') : t('rules.editRule', '编辑规则')}
-          </DialogTitle>
-          <DialogDescription>
-            {mode === 'add'
-              ? t('rules.addRuleDesc', '添加新的代理规则 (域名或 IP CIDR)')
-              : t('rules.editRuleDesc', '修改代理规则')}
-          </DialogDescription>
+          <DialogTitle>{mode === 'add' ? t('rules.addRule') : t('rules.editRule')}</DialogTitle>
+          <DialogDescription>{t('rules.ruleDialogDesc')}</DialogDescription>
         </DialogHeader>
 
-        <Form {...form}>
-          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-6">
-            <FormField
-              control={form.control}
-              name="domains"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>{t('rules.domainLabel', '域名')}</FormLabel>
-                  <FormControl>
-                    <Textarea
-                      placeholder={`google.com\ngithub.com\nopenai.com`}
-                      className="min-h-[100px] font-mono text-sm"
-                      {...field}
-                    />
-                  </FormControl>
-                  <FormDescription className="space-y-1">
-                    <span className="block">
-                      {t('rules.domainTip', '每行输入一个域名，会自动匹配该域名及其所有子域名')}
-                    </span>
-                    <span className="block text-amber-600/80 dark:text-amber-400/80">
-                      {t(
-                        'rules.geositeTip',
-                        '输入 geosite:标签（如 geosite:youtube）可匹配整个网站分组。注意：标签必须存在于 sing-geosite 数据库（如资源包都没有 geosite:bbc，请直接输入 bbc.com）'
-                      )}
-                    </span>
-                  </FormDescription>
-                  <FormMessage />
-                </FormItem>
+        <div className="min-w-0 space-y-5">
+          {/* 匹配条件（1..N）：每块 = 类型 Select + 值编辑器 + 删除 */}
+          <div className="space-y-2">
+            <div className="flex items-center justify-between">
+              <label className="text-sm font-medium">{t('rules.matchConditions')}</label>
+              {multiCondition && (
+                <SegmentedControl<'and' | 'or'>
+                  value={combineMode}
+                  onChange={setCombineMode}
+                  options={[
+                    { value: 'or', label: t('rules.combineOr') },
+                    { value: 'and', label: t('rules.combineAnd') },
+                  ]}
+                />
               )}
-            />
+            </div>
 
-            <FormField
-              control={form.control}
-              name="ipCidr"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>{t('rules.ipCidrLabel', 'IP CIDR (可选)')}</FormLabel>
-                  <FormControl>
-                    <Textarea
-                      placeholder={`192.168.1.0/24\n10.0.0.0/8`}
-                      className="min-h-[80px] font-mono text-sm"
-                      {...field}
-                    />
-                  </FormControl>
-                  <FormDescription>
-                    {t('rules.ipCidrTip', '每行输入一个 IP CIDR 网段')}
-                  </FormDescription>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-
-            <FormField
-              control={form.control}
-              name="remarks"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>{t('rules.remarksLabel', '备注 (可选)')}</FormLabel>
-                  <FormControl>
-                    <Input
-                      placeholder={t('rules.remarksPlaceholder', '例如：公司内网、奈飞服务器')}
-                      {...field}
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-
-            <FormField
-              control={form.control}
-              name="action"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>{t('rules.policy', '策略')}</FormLabel>
-                  <Select onValueChange={field.onChange} value={field.value}>
-                    <FormControl>
-                      <SelectTrigger>
-                        <SelectValue placeholder={t('rules.selectPolicy', '选择策略')} />
-                      </SelectTrigger>
-                    </FormControl>
+            {conditionTypes.map((ct, index) => (
+              <div key={ct} className="rounded-lg border p-3 space-y-2">
+                <div className="flex items-center gap-2">
+                  <Select
+                    value={ct}
+                    onValueChange={(v) => changeConditionType(index, v as RuleType)}
+                  >
+                    <SelectTrigger className="flex-1">
+                      <SelectValue />
+                    </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="proxy">{t('rules.policyProxy', '代理')}</SelectItem>
-                      <SelectItem value="direct">{t('rules.policyDirect', '直连')}</SelectItem>
-                      <SelectItem value="block">{t('rules.policyBlock', '阻止')}</SelectItem>
+                      {RULE_CATEGORIES.map((cat) => (
+                        <SelectGroup key={cat}>
+                          <SelectLabel>
+                            {t(`rules.category.${cat}`, CATEGORY_NAME[cat])}
+                          </SelectLabel>
+                          {CATEGORY_TYPES[cat].map((tp) => (
+                            <SelectItem
+                              key={tp}
+                              value={tp}
+                              disabled={usedTypes.has(tp) && tp !== ct}
+                            >
+                              {t(`rules.types.${tp}.name`, RULE_TYPE_NAME[tp])}
+                            </SelectItem>
+                          ))}
+                        </SelectGroup>
+                      ))}
                     </SelectContent>
                   </Select>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
+                  {PROCESS_TYPES.includes(ct) && (
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-9 shrink-0"
+                      onClick={() => setPickerType(ct)}
+                    >
+                      <ListPlus className="mr-1 h-3.5 w-3.5" />
+                      {t('rules.pickProcess')}
+                    </Button>
+                  )}
+                  {multiCondition && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="icon"
+                      className="h-9 w-9 shrink-0 text-muted-foreground"
+                      onClick={() => removeCondition(ct)}
+                      aria-label={t('rules.removeCondition')}
+                    >
+                      <X className="h-4 w-4" />
+                    </Button>
+                  )}
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  {t(`rules.types.${ct}.desc`, RULE_TYPE_DESC[ct])}
+                </p>
+                {renderValueEditor(ct)}
+              </div>
+            ))}
 
-            {form.watch('action') === 'proxy' && (
-              <FormField
-                control={form.control}
-                name="targetServerId"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>{t('rules.targetNode', '目标节点 (可选)')}</FormLabel>
-                    <Select onValueChange={field.onChange} value={field.value}>
-                      <FormControl>
-                        <SelectTrigger>
-                          <SelectValue
-                            placeholder={t('rules.defaultNodeTip', '默认 (跟随主节点)')}
-                          />
-                        </SelectTrigger>
-                      </FormControl>
-                      <SelectContent>
-                        <SelectItem value="default">
-                          {t('rules.defaultNodeTip', '默认 (跟随主节点)')}
-                        </SelectItem>
-                        <ServerSelectGroups servers={servers} />
-                      </SelectContent>
-                    </Select>
-                    <FormDescription>
-                      {t(
-                        'rules.targetNodeTip',
-                        '指定该规则使用的代理节点。如果不选，则跟随主界面选中的节点。'
-                      )}
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-            )}
-
-            <FormField
-              control={form.control}
-              name="enabled"
-              render={({ field }) => (
-                <FormItem className="flex flex-row items-start space-x-3 space-y-0">
-                  <FormControl>
-                    <Checkbox checked={field.value} onCheckedChange={field.onChange} />
-                  </FormControl>
-                  <div className="space-y-1 leading-none">
-                    <FormLabel>{t('rules.enableRule', '启用规则')}</FormLabel>
-                    <FormDescription>
-                      {t('rules.enableRuleTip', '禁用的规则不会生效')}
-                    </FormDescription>
-                  </div>
-                </FormItem>
-              )}
-            />
-
-            <FormField
-              control={form.control}
-              name="bypassFakeIP"
-              render={({ field }) => (
-                <FormItem className="flex flex-row items-start space-x-3 space-y-0">
-                  <FormControl>
-                    <Checkbox checked={field.value} onCheckedChange={field.onChange} />
-                  </FormControl>
-                  <div className="space-y-1 leading-none">
-                    <FormLabel>{t('rules.bypassFakeIp', '绕过 FakeIP')}</FormLabel>
-                    <FormDescription>
-                      {t(
-                        'rules.bypassFakeIpTip',
-                        '默认无需开启，不理解请保持关闭。仅用于解决 Cloudflare Tunnel 等应用的 QUIC 协议兼容性问题。'
-                      )}
-                    </FormDescription>
-                  </div>
-                </FormItem>
-              )}
-            />
-
-            <DialogFooter>
+            {usedTypes.size < RULE_TYPE_IDS.length && (
               <Button
                 type="button"
                 variant="outline"
-                onClick={() => onOpenChange(false)}
-                disabled={form.formState.isSubmitting}
+                size="sm"
+                className="w-full"
+                onClick={addCondition}
               >
-                {t('servers.cancel', '取消')}
+                <Plus className="mr-1 h-3.5 w-3.5" />
+                {t('rules.addCondition')}
               </Button>
-              <Button type="submit" disabled={form.formState.isSubmitting}>
-                {form.formState.isSubmitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                {mode === 'add' ? t('rules.add', '添加') : t('rules.save', '保存')}
-              </Button>
-            </DialogFooter>
-          </form>
-        </Form>
+            )}
+          </div>
+
+          {/* 备注 */}
+          <div className="space-y-2">
+            <label className="text-sm font-medium">{t('rules.remarksLabel')}</label>
+            <Input
+              value={remarks}
+              onChange={(e) => setRemarks(e.target.value)}
+              placeholder={t('rules.remarksPlaceholder')}
+              maxLength={100}
+            />
+          </div>
+
+          {/* 策略 */}
+          <div className="space-y-2">
+            <label className="text-sm font-medium">{t('rules.policy')}</label>
+            <SegmentedControl<RuleAction>
+              value={action}
+              onChange={setAction}
+              options={[
+                { value: 'proxy', label: t('rules.policyProxy') },
+                { value: 'direct', label: t('rules.policyDirect') },
+                { value: 'block', label: t('rules.policyBlock') },
+              ]}
+            />
+          </div>
+
+          {/* 目标节点（仅代理） */}
+          {action === 'proxy' && (
+            <div className="space-y-2">
+              <label className="text-sm font-medium">{t('rules.targetNode')}</label>
+              <Select value={targetServerId} onValueChange={setTargetServerId}>
+                <SelectTrigger>
+                  <SelectValue placeholder={t('rules.defaultNodeTip')} />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="default">{t('rules.defaultNodeTip')}</SelectItem>
+                  <ServerSelectGroups servers={servers} selectedId={targetServerId} />
+                </SelectContent>
+              </Select>
+            </div>
+          )}
+
+          {/* 开关区 */}
+          <div className="rounded-lg border divide-y divide-border/60 px-3">
+            <SettingsRow label={t('rules.enableRule')} description={t('rules.enableRuleTip')}>
+              <Switch checked={enabled} onCheckedChange={setEnabled} />
+            </SettingsRow>
+            {bypassApplicable && (
+              <SettingsRow label={t('rules.bypassFakeIp')} description={t('rules.bypassFakeIpTip')}>
+                <Switch checked={bypassFakeIP} onCheckedChange={setBypassFakeIP} />
+              </SettingsRow>
+            )}
+          </div>
+        </div>
+
+        <DialogFooter>
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => onOpenChange(false)}
+            disabled={submitting}
+          >
+            {t('servers.cancel')}
+          </Button>
+          <Button type="button" onClick={onSubmit} disabled={submitting}>
+            {submitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+            {mode === 'add' ? t('rules.add') : t('rules.save')}
+          </Button>
+        </DialogFooter>
+
+        <ProcessPickerDialog
+          open={pickerType !== null}
+          onOpenChange={(o) => !o && setPickerType(null)}
+          mode={pickerType === 'processPath' ? 'path' : 'name'}
+          onAdd={(picked) => {
+            if (pickerType) handleProcessPicked(pickerType, picked);
+          }}
+        />
       </DialogContent>
     </Dialog>
   );

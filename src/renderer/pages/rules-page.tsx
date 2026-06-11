@@ -1,47 +1,192 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useAppStore } from '@/store/app-store';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from '@/components/ui/table';
+import { Table, TableBody, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 import { Badge } from '@/components/ui/badge';
-import { Switch } from '@/components/ui/switch';
-import { Plus, Pencil, Trash2 } from 'lucide-react';
+import { Plus, ListOrdered, Check, X, Search } from 'lucide-react';
 import { RuleDialog } from '@/components/rules/rule-dialog';
 import { DeleteRuleDialog } from '@/components/rules/delete-rule-dialog';
-import type { DomainRule } from '@/bridge/types';
-import { useTranslation } from 'react-i18next';
-import { BypassProcessSettings } from '@/components/settings/bypass-process-settings';
+import { SortableRuleRow } from '@/components/rules/sortable-rule-row';
+import type { Rule } from '@/bridge/types';
+import { ruleConditions } from '../../shared/rules';
+import { useTranslation, Trans } from 'react-i18next';
+import { toast } from 'sonner';
+import { RULE_TYPE_NAME } from '@/components/rules/rule-type-meta';
+import {
+  DndContext,
+  closestCenter,
+  KeyboardSensor,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  type DragEndEvent,
+} from '@dnd-kit/core';
+import {
+  SortableContext,
+  sortableKeyboardCoordinates,
+  verticalListSortingStrategy,
+  arrayMove,
+} from '@dnd-kit/sortable';
+
+const SEARCH_THRESHOLD = 10;
 
 export function RulesPage() {
   const { t } = useTranslation();
   const config = useAppStore((state) => state.config);
   const updateCustomRule = useAppStore((state) => state.updateCustomRule);
+  const commitRuleOrder = useAppStore((state) => state.commitRuleOrder);
+  const loadConfig = useAppStore((state) => state.loadConfig);
   const [isAddDialogOpen, setIsAddDialogOpen] = useState(false);
-  const [editingRule, setEditingRule] = useState<DomainRule | null>(null);
-  const [deletingRule, setDeletingRule] = useState<DomainRule | null>(null);
+  const [editingRule, setEditingRule] = useState<Rule | null>(null);
+  const [deletingRule, setDeletingRule] = useState<Rule | null>(null);
+  // 排序编辑态：null=常态；非 null=本地 draft 序（纯本地，零 store 写、零 IPC，直到「保存顺序」）
+  const [orderDraft, setOrderDraft] = useState<string[] | null>(null);
+  const [savingOrder, setSavingOrder] = useState(false);
+  const [search, setSearch] = useState('');
 
   const customRules = config?.customRules || [];
+  const isOrderEditing = orderDraft !== null;
+  const searchActive = !isOrderEditing && search.trim() !== '';
 
-  const handleToggleRule = async (rule: DomainRule) => {
-    await updateCustomRule({
-      ...rule,
-      enabled: !rule.enabled,
+  // 外部变更（别处增删规则）防御：编辑态下 draft 与当前 id 集不一致 → 自动退出，避免影子序错位
+  useEffect(() => {
+    if (
+      orderDraft &&
+      (orderDraft.length !== customRules.length ||
+        !orderDraft.every((id) => customRules.some((r) => r.id === id)))
+    ) {
+      setOrderDraft(null);
+      toast.info(t('rules.orderConflict', '规则已在别处变更，已退出排序编辑'));
+    }
+  }, [customRules, orderDraft, t]);
+
+  const handleToggleRule = async (rule: Rule) => {
+    try {
+      await updateCustomRule({ ...rule, enabled: !rule.enabled });
+    } catch {
+      toast.error(t('common.saveFailed'));
+    }
+  };
+
+  const handleEditRule = (rule: Rule) => setEditingRule(rule);
+  const handleDeleteRule = (rule: Rule) => setDeletingRule(rule);
+
+  const servers = config?.servers || [];
+  const selectedServer = servers.find((s) => s.id === config?.selectedServerId);
+
+  // ── 排序编辑态 ──────────────────────────────────────────────────────────
+  const enterOrderEdit = () => {
+    setSearch('');
+    setOrderDraft(customRules.map((r) => r.id));
+  };
+  const cancelOrderEdit = () => setOrderDraft(null);
+  const moveDraft = (index: number, dir: -1 | 1) => {
+    setOrderDraft((prev) => {
+      if (!prev) return prev;
+      const j = index + dir;
+      if (j < 0 || j >= prev.length) return prev;
+      const next = prev.slice();
+      [next[index], next[j]] = [next[j], next[index]];
+      return next;
+    });
+  };
+  // 置顶/置底：长距离移动一步到位（解 40→1 需 39 次点击）
+  const moveDraftToEdge = (index: number, edge: 'top' | 'bottom') => {
+    setOrderDraft((prev) => {
+      if (!prev || index < 0 || index >= prev.length) return prev;
+      const next = prev.slice();
+      const [id] = next.splice(index, 1);
+      if (edge === 'top') next.unshift(id);
+      else next.push(id);
+      return next;
+    });
+  };
+  // 拖拽落点：把 active 从原位移到 over 位（@dnd-kit 自带越界自动滚动覆盖屏外目标）
+  const handleDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over || active.id === over.id) return;
+    setOrderDraft((prev) => {
+      if (!prev) return prev;
+      const from = prev.indexOf(String(active.id));
+      const to = prev.indexOf(String(over.id));
+      if (from < 0 || to < 0) return prev;
+      return arrayMove(prev, from, to);
+    });
+  };
+  // PointerSensor 5px 激活距离：点击行内按钮（置顶/上下/置底）不误触发拖拽；KeyboardSensor 给无障碍
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 5 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
+  );
+  const saveOrderEdit = async () => {
+    if (!orderDraft) return;
+    setSavingOrder(true);
+    try {
+      await commitRuleOrder(orderDraft); // 立即提交，≤1 次重启；净零序由 server 端跳过 save
+      setOrderDraft(null);
+    } catch {
+      toast.error(t('common.saveFailed'));
+      await loadConfig(); // 回滚到磁盘真值
+    } finally {
+      setSavingOrder(false);
+    }
+  };
+
+  // ── 搜索过滤（备注/值/类型/策略，大小写不敏感；遍历全部条件，覆盖多条件规则的次级条件） ──
+  const matchesSearch = (rule: Rule): boolean => {
+    const q = search.trim().toLowerCase();
+    if (!q) return true;
+    const actionName = t(`rules.${rule.action}`).toLowerCase();
+    if ((rule.remarks || '').toLowerCase().includes(q) || actionName.includes(q)) return true;
+    return ruleConditions(rule).some((c) => {
+      const typeName = t(`rules.types.${c.type}.name`, RULE_TYPE_NAME[c.type]).toLowerCase();
+      return typeName.includes(q) || c.values.some((v) => (v || '').toLowerCase().includes(q));
     });
   };
 
-  const handleEditRule = (rule: DomainRule) => {
-    setEditingRule(rule);
-  };
+  // 渲染序：编辑态=draft 映射；搜索=过滤；否则=全量（config 为单一真值）
+  const byId = new Map(customRules.map((r) => [r.id, r]));
+  const rows: Rule[] = isOrderEditing
+    ? orderDraft.map((id) => byId.get(id)).filter((r): r is Rule => !!r)
+    : searchActive
+      ? customRules.filter(matchesSearch)
+      : customRules;
 
-  const handleDeleteRule = (rule: DomainRule) => {
-    setDeletingRule(rule);
+  // 策略=代理时展示实际出口：固定节点名 / 节点已失效 / 跟随全局
+  const renderExitNode = (rule: Rule) => {
+    if (rule.action !== 'proxy') return null;
+    if (rule.targetServerId) {
+      const srv = servers.find((s) => s.id === rule.targetServerId);
+      if (!srv) {
+        return (
+          <Badge
+            variant="outline"
+            className="whitespace-nowrap border-transparent bg-red-600/15 text-xs text-red-600 dark:text-red-300"
+            title={t('rules.targetMissingTip', '指定节点已删除，运行时回退为跟随全局选中节点')}
+          >
+            {t('rules.targetMissing', '节点已失效')}
+          </Badge>
+        );
+      }
+      return (
+        <span
+          className="max-w-[140px] truncate whitespace-nowrap text-xs text-muted-foreground"
+          title={srv.name}
+        >
+          → {srv.name}
+        </span>
+      );
+    }
+    return (
+      <span
+        className="max-w-[140px] truncate whitespace-nowrap text-xs text-muted-foreground/80"
+        title={selectedServer?.name}
+      >
+        → {selectedServer?.name || '—'} · {t('rules.followGlobal', '跟随全局')}
+      </span>
+    );
   };
 
   return (
@@ -51,7 +196,7 @@ export function RulesPage() {
           <h2 className="text-2xl font-bold">{t('rules.customRules')}</h2>
           <p className="text-muted-foreground mt-1">{t('rules.customRulesDesc')}</p>
         </div>
-        <Button onClick={() => setIsAddDialogOpen(true)}>
+        <Button onClick={() => setIsAddDialogOpen(true)} disabled={isOrderEditing}>
           <Plus className="mr-2 h-4 w-4" />
           {t('rules.addRule')}
         </Button>
@@ -59,8 +204,59 @@ export function RulesPage() {
 
       <Card>
         <CardHeader>
-          <CardTitle>{t('rules.ruleList')}</CardTitle>
-          <CardDescription>{t('rules.ruleListDesc')}</CardDescription>
+          <div className="flex items-start justify-between gap-2">
+            <div>
+              <CardTitle>{t('rules.ruleList')}</CardTitle>
+              <CardDescription>{t('rules.ruleListDesc')}</CardDescription>
+            </div>
+            {/* 排序编辑工具栏（≥2 条才显示） */}
+            {customRules.length >= 2 &&
+              (isOrderEditing ? (
+                <div className="flex shrink-0 gap-2">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={cancelOrderEdit}
+                    disabled={savingOrder}
+                  >
+                    <X className="mr-1 h-4 w-4" />
+                    {t('common.cancel')}
+                  </Button>
+                  <Button size="sm" onClick={saveOrderEdit} disabled={savingOrder}>
+                    <Check className="mr-1 h-4 w-4" />
+                    {t('rules.saveOrder', '保存顺序')}
+                  </Button>
+                </div>
+              ) : (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="shrink-0"
+                  onClick={enterOrderEdit}
+                  disabled={searchActive}
+                  title={
+                    searchActive
+                      ? t('rules.editOrderHintSearch', '清除搜索后可编辑顺序')
+                      : undefined
+                  }
+                >
+                  <ListOrdered className="mr-1 h-4 w-4" />
+                  {t('rules.editOrder', '编辑顺序')}
+                </Button>
+              ))}
+          </div>
+          {/* 搜索框：>阈值 或 已有查询（删到 ≤阈值时仍显示，否则隐形过滤无法清除）；非排序编辑态 */}
+          {(customRules.length > SEARCH_THRESHOLD || search.trim() !== '') && !isOrderEditing && (
+            <div className="relative mt-3">
+              <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+              <Input
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                placeholder={t('rules.searchPlaceholder', '搜索规则（备注 / 值 / 类型 / 策略）')}
+                className="pl-8"
+              />
+            </div>
+          )}
         </CardHeader>
         <CardContent>
           {customRules.length === 0 ? (
@@ -71,110 +267,55 @@ export function RulesPage() {
                 {t('rules.addFirstRule')}
               </Button>
             </div>
+          ) : rows.length === 0 ? (
+            <div className="py-10 text-center text-sm text-muted-foreground">
+              {t('rules.searchNoMatch', '无匹配规则')}
+            </div>
           ) : (
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-[50px]">{t('rules.enable')}</TableHead>
-                  <TableHead>{t('rules.domain')}</TableHead>
-                  <TableHead className="w-[160px]">{t('rules.policy')}</TableHead>
-                  <TableHead className="w-[120px] text-right">{t('common.actions')}</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {customRules.map((rule) => (
-                  <TableRow key={rule.id}>
-                    <TableCell>
-                      <Switch
-                        checked={rule.enabled}
-                        onCheckedChange={() => handleToggleRule(rule)}
-                      />
-                    </TableCell>
-                    <TableCell className="font-mono">
-                      <div className="flex flex-col gap-1 max-w-[400px]">
-                        {/* Remarks Row */}
-                        {rule.remarks && (
-                          <div
-                            className="text-sm font-semibold truncate text-foreground"
-                            title={rule.remarks}
-                          >
-                            {rule.remarks}
-                          </div>
-                        )}
-
-                        {/* Domain rows */}
-                        {rule.domains.length > 0 && (
-                          <div className="text-sm truncate" title={rule.domains.join(', ')}>
-                            {rule.domains.length <= 3 ? (
-                              rule.domains.join(', ')
-                            ) : (
-                              <>
-                                {rule.domains.slice(0, 3).join(', ')}
-                                <span className="text-muted-foreground ml-1">
-                                  +{rule.domains.length - 3}
-                                </span>
-                              </>
-                            )}
-                          </div>
-                        )}
-
-                        {/* IP CIDR rows */}
-                        {rule.ipCidr && rule.ipCidr.length > 0 && (
-                          <div
-                            className="text-xs text-muted-foreground truncate"
-                            title={rule.ipCidr.join(', ')}
-                          >
-                            <Badge
-                              variant="outline"
-                              className="scale-[0.8] origin-left mr-1 h-4 px-1 py-0 font-sans tracking-tight opacity-70"
-                            >
-                              IP
-                            </Badge>
-                            {rule.ipCidr.length <= 3 ? (
-                              rule.ipCidr.join(', ')
-                            ) : (
-                              <>
-                                {rule.ipCidr.slice(0, 3).join(', ')}
-                                <span className="ml-1">+{rule.ipCidr.length - 3}</span>
-                              </>
-                            )}
-                          </div>
-                        )}
-                      </div>
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex items-center gap-2">
-                        <Badge variant={rule.action === 'proxy' ? 'default' : 'secondary'}>
-                          {rule.action === 'proxy'
-                            ? t('rules.proxy')
-                            : rule.action === 'direct'
-                              ? t('rules.direct')
-                              : t('rules.block')}
-                        </Badge>
-                        {rule.bypassFakeIP && (
-                          <Badge
-                            variant="outline"
-                            className="text-xs text-muted-foreground whitespace-nowrap"
-                          >
-                            {t('rules.realDns')}
-                          </Badge>
-                        )}
-                      </div>
-                    </TableCell>
-                    <TableCell className="text-right">
-                      <div className="flex justify-end gap-2">
-                        <Button variant="ghost" size="sm" onClick={() => handleEditRule(rule)}>
-                          <Pencil className="h-4 w-4" />
-                        </Button>
-                        <Button variant="ghost" size="sm" onClick={() => handleDeleteRule(rule)}>
-                          <Trash2 className="h-4 w-4" />
-                        </Button>
-                      </div>
-                    </TableCell>
+            <DndContext
+              sensors={sensors}
+              collisionDetection={closestCenter}
+              onDragEnd={handleDragEnd}
+            >
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="w-[72px]">
+                      {isOrderEditing ? '#' : t('rules.enable')}
+                    </TableHead>
+                    <TableHead>{t('rules.ruleColumn', '规则')}</TableHead>
+                    <TableHead className="hidden w-[110px] lg:table-cell">
+                      {t('rules.typeColumn', '类型')}
+                    </TableHead>
+                    <TableHead className="w-[120px]">{t('rules.policy')}</TableHead>
+                    <TableHead className="w-[100px] text-right">{t('common.actions')}</TableHead>
                   </TableRow>
-                ))}
-              </TableBody>
-            </Table>
+                </TableHeader>
+                <TableBody>
+                  <SortableContext
+                    items={rows.map((r) => r.id)}
+                    strategy={verticalListSortingStrategy}
+                  >
+                    {rows.map((rule, index) => (
+                      <SortableRuleRow
+                        key={rule.id}
+                        rule={rule}
+                        index={index}
+                        rowsLength={rows.length}
+                        isOrderEditing={isOrderEditing}
+                        savingOrder={savingOrder}
+                        onToggle={handleToggleRule}
+                        onEdit={handleEditRule}
+                        onDelete={handleDeleteRule}
+                        onMove={moveDraft}
+                        onMoveToEdge={moveDraftToEdge}
+                        renderExitNode={renderExitNode}
+                      />
+                    ))}
+                  </SortableContext>
+                </TableBody>
+              </Table>
+            </DndContext>
           )}
         </CardContent>
       </Card>
@@ -189,12 +330,11 @@ export function RulesPage() {
           <p>{t('rules.instruction3')}</p>
           <p>{t('rules.instruction4')}</p>
           <p>{t('rules.instruction5')}</p>
-          <p dangerouslySetInnerHTML={{ __html: t('rules.instruction6') }} />
+          <p>
+            <Trans i18nKey="rules.instruction6" components={{ strong: <strong /> }} />
+          </p>
         </CardContent>
       </Card>
-
-      {/* Bypass Process Settings */}
-      <BypassProcessSettings />
 
       {/* Add Rule Dialog */}
       <RuleDialog open={isAddDialogOpen} onOpenChange={setIsAddDialogOpen} mode="add" />
