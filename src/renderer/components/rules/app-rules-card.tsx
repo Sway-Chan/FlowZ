@@ -147,12 +147,20 @@ export function AppRulesCard() {
   const handlePolicyChange = async (preset: AppPreset, value: string) => {
     const existing = getAppRule(preset.id);
 
-    // 「代理(默认)」= 恢复默认：有记录则删除该 appRule（不留 enabled:false 残留——恢复显示与无规则相同、
-    // 重选策略也是全新构造不读旧 targetServerId，删除即「恢复默认」，与用户心智一致）；无记录则 no-op。
+    // 「代理(默认)」= 跟全局：保留 appRule、清 targetServerId（action='proxy' 无 target）→ rule-sel-app
+    //   default=proxy-selector（嵌套跟全局）→ 「节点↔默认」= rule-sel-app default 变（PUT 热切换 0 断流），
+    //   与 customRules 节点↔默认语义一致（非删 appRule 致结构变重启）。无记录则 no-op。
     if (value === 'proxy-default') {
       if (!existing) return;
       try {
-        await saveConfig({ ...config, appRules: appRules.filter((r) => r.appId !== preset.id) });
+        await saveConfig({
+          ...config,
+          appRules: appRules.map((r) =>
+            r.appId === preset.id
+              ? { ...r, action: 'proxy', targetServerId: undefined, enabled: true }
+              : r
+          ),
+        });
       } catch {
         toast.error(t('common.saveFailed'));
       }

@@ -14,6 +14,7 @@ import {
   findCatalogItem,
   deriveResourceMeta,
 } from '../../shared/rule-resource-catalog';
+import { APP_USER_AGENT } from '../../shared/constants';
 import type { ConfigManager } from './ConfigManager';
 import type {
   UserConfig,
@@ -552,7 +553,7 @@ export class RuleResourceManager {
       let total: number | null = null;
       const chunks: Buffer[] = [];
       const req = net.request({ url, redirect: 'follow' });
-      req.setHeader('User-Agent', 'FlowZ-Electron');
+      req.setHeader('User-Agent', APP_USER_AGENT);
 
       let encoded = false; // 响应被压缩（content-encoding）→ data 为解压字节，content-length 是压缩长度，跳过比对
       let idle: NodeJS.Timeout;
@@ -704,7 +705,7 @@ export class RuleResourceManager {
   private fetchJson(url: string): Promise<any> {
     return new Promise((resolve, reject) => {
       const req = net.request({ url, redirect: 'follow' });
-      req.setHeader('User-Agent', 'FlowZ-Electron');
+      req.setHeader('User-Agent', APP_USER_AGENT);
       req.setHeader('Accept', 'application/vnd.github+json');
       const chunks: Buffer[] = [];
       const overall = setTimeout(() => {

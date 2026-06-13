@@ -1,0 +1,364 @@
+/**
+ * core-swap 手动轴门控单测（T1 + T2，本会话改动）。
+ *
+ * 背景：内核二进制替换窗口（installCoreFromDir / 手动替换 / 回滚 写核期间）须拒绝手动 start/restart/switchMode，
+ *   防撞半替换核致 sing-box FATAL。门控分两层：
+ *
+ * T1 ProxyManager 门控（src/main/services/ProxyManager.ts）：
+ *   - setCoreSwapInProgress(b)：置/清 private coreSwapInProgress 字段（CoreUpdateService 调）。
+ *   - rejectIfCoreSwapInProgress(action)：true → 抛带 CORE_UPDATE_IN_PROGRESS code 的 Error；false → 放行。
+ *   - 真实调用方：startInternal（start 经之）+ switchMode 开头各调一次。
+ *
+ * T2 CoreUpdateService 4 写核路径 try/finally 置位/清位（src/main/services/CoreUpdateService.ts）：
+ *   - updateCore / tryApplyStaged / replaceManualCore / rollbackCore 均在写核前 setCoreSwapInProgress(true)、
+ *     finally 清 false（含异常路径）。验 spy setCoreSwapInProgress 调用序：true → install 执行 → false（异常也清）。
+ *
+ * 参考 core-update-scheduler.test.ts 的 makeSvc mock + spy private 模式。
+ */
+const os = require('os');
+const path = require('path');
+const fsSync = require('fs');
+
+// T1 用临时目录（ProxyManager 构造需 configPath）
+const TMP_PM = fsSync.mkdtempSync(path.join(os.tmpdir(), 'flowz-gate-pm-'));
+
+jest.mock('electron', () => ({
+  app: {
+    getPath: () => TMP_PM,
+    getVersion: () => '9.9.9',
+    isPackaged: false,
+    getAppPath: () => TMP_PM,
+  },
+  BrowserWindow: class {},
+  Notification: class {},
+  net: {},
+  session: {},
+  dialog: { showOpenDialog: jest.fn() },
+}));
+
+// ResourceManager 含 electron 间接依赖；T2 落位路径会读 getSingBoxUpdateTargetPath。
+jest.mock('../ResourceManager', () => ({
+  resourceManager: {
+    getSingBoxPath: () => '/tmp/flowz-fake/sing-box',
+    getSingBoxUpdateTargetPath: () => '/tmp/flowz-fake/sing-box',
+    ensureCronetBeside: jest.fn(),
+  },
+}));
+
+import { ProxyManager } from '../ProxyManager';
+import { CoreUpdateService } from '../CoreUpdateService';
+import { ProxyErrorCode } from '../../../shared/types';
+import type { UserConfig } from '../../../shared/types';
+
+afterAll(() => {
+  try {
+    fsSync.rmSync(TMP_PM, { recursive: true, force: true });
+  } catch {
+    /* ignore */
+  }
+});
+
+// ============================================================================
+// T1：ProxyManager core-swap 门控
+// ============================================================================
+
+describe('T1：ProxyManager core-swap 手动轴门控', () => {
+  function makeSvc(): any {
+    const configPath = path.join(TMP_PM, `pm-${Math.random().toString(36).slice(2)}.json`);
+    return new ProxyManager(undefined, undefined, configPath, '/fake/sing-box');
+  }
+
+  function makeConfig(): UserConfig {
+    return {
+      servers: [],
+      selectedServerId: null,
+      proxyMode: 'smart',
+      proxyModeType: 'systemProxy',
+      tunConfig: { enable: false } as any,
+      customRules: [],
+      appRules: [],
+      autoStart: false,
+      silentStart: false,
+      autoConnect: false,
+      minimizeToTray: false,
+      autoCheckUpdate: false,
+      autoLightweightMode: false,
+      autoUpdateSubscriptionOnStart: false,
+      socksPort: 1080,
+      httpPort: 1081,
+      logLevel: 'info',
+    } as UserConfig;
+  }
+
+  it('setCoreSwapInProgress 置/清 private coreSwapInProgress 字段', () => {
+    const svc = makeSvc();
+    expect(svc.coreSwapInProgress).toBe(false); // 初始 false
+    svc.setCoreSwapInProgress(true);
+    expect(svc.coreSwapInProgress).toBe(true);
+    svc.setCoreSwapInProgress(false);
+    expect(svc.coreSwapInProgress).toBe(false);
+  });
+
+  it('rejectIfCoreSwapInProgress：置位时抛带 CORE_UPDATE_IN_PROGRESS code 的 Error', () => {
+    const svc = makeSvc();
+    svc.setCoreSwapInProgress(true);
+    expect(() => svc.rejectIfCoreSwapInProgress('启动代理')).toThrow(/内核更新进行中/);
+    let threw: any;
+    try {
+      svc.rejectIfCoreSwapInProgress('启动代理');
+    } catch (e) {
+      threw = e;
+    }
+    expect(threw).toBeDefined();
+    expect(threw.code).toBe(ProxyErrorCode.CORE_UPDATE_IN_PROGRESS);
+  });
+
+  it('rejectIfCoreSwapInProgress：未置位时放行（不抛）', () => {
+    const svc = makeSvc();
+    svc.setCoreSwapInProgress(false);
+    expect(() => svc.rejectIfCoreSwapInProgress('启动代理')).not.toThrow();
+  });
+
+  it('start（经 startInternal）：置位时被门控拒绝、抛 CORE_UPDATE_IN_PROGRESS', async () => {
+    const svc = makeSvc();
+    svc.setCoreSwapInProgress(true);
+    // start 公开方法开头即 startInternal → rejectIfCoreSwapInProgress；不应触达 sing-box 启动
+    await expect(svc.start(makeConfig())).rejects.toThrow(/内核更新进行中/);
+    // 再验 code 透传
+    await expect(svc.start(makeConfig())).rejects.toMatchObject({
+      code: ProxyErrorCode.CORE_UPDATE_IN_PROGRESS,
+    });
+  });
+
+  it('switchMode：置位时被门控拒绝（代理未运行时门控在前，不会触 sing-box）', async () => {
+    const svc = makeSvc();
+    svc.setCoreSwapInProgress(true);
+    // 代理未运行（未 start）→ switchMode 开头 rejectIfCoreSwapInProgress 先抛
+    await expect(svc.switchMode(makeConfig())).rejects.toThrow(/内核更新进行中/);
+    await expect(svc.switchMode(makeConfig())).rejects.toMatchObject({
+      code: ProxyErrorCode.CORE_UPDATE_IN_PROGRESS,
+    });
+  });
+
+  it('switchMode：清位后放行（代理未运行 → 仅更新 currentConfig，不抛、不触 sing-box）', async () => {
+    const svc = makeSvc();
+    svc.setCoreSwapInProgress(false);
+    const cfg = makeConfig();
+    await expect(svc.switchMode(cfg)).resolves.toBeUndefined();
+    // 代理未运行分支：仅 currentConfig = newConfig
+    expect(svc.currentConfig).toBe(cfg);
+  });
+});
+
+// ============================================================================
+// T2：CoreUpdateService 4 写核路径 try/finally 置位/清位 setCoreSwapInProgress
+// ============================================================================
+
+describe('T2：CoreUpdateService 4 写核路径 setCoreSwapInProgress try/finally', () => {
+  function makeLogManager() {
+    return { addLog: jest.fn() } as any;
+  }
+
+  /** 真实临时 staged 目录 + sing-box 文件（tryApplyStaged 落位路径需 staged.dir 存文件）。 */
+  const stagedDir = fsSync.mkdtempSync(path.join(os.tmpdir(), 'flowz-gate-staged-'));
+  const coreName = process.platform === 'win32' ? 'sing-box.exe' : 'sing-box';
+  fsSync.writeFileSync(path.join(stagedDir, coreName), 'fake-core');
+
+  afterAll(() => {
+    try {
+      fsSync.rmSync(stagedDir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+  });
+
+  /**
+   * 构造 proxy spy 捕获 setCoreSwapInProgress 调用序列。
+   * running=false 避免 tryApplyStaged/replaceManualCore 的「代理运行中 deferred/停代理」分支（聚焦门控）。
+   */
+  function makeProxyWithSpy() {
+    const calls: boolean[] = [];
+    const proxy = {
+      getStatus: jest.fn(() => ({ running: false })),
+      getCoreVersion: jest.fn().mockResolvedValue('1.13.13'),
+      buildPreflightConfigJson: () => null,
+      hasNaiveNodes: () => false,
+      setAutoRestartSuppressed: jest.fn(),
+      setCoreSwapInProgress: jest.fn((b: boolean) => calls.push(b)),
+      stop: jest.fn().mockResolvedValue(undefined),
+      start: jest.fn().mockResolvedValue(undefined),
+    } as any;
+    return { proxy, calls };
+  }
+
+  function makeSvc(proxy: any) {
+    const svc = new CoreUpdateService(makeLogManager());
+    svc.setProxyManager(proxy);
+    svc.setConfigProvider(() => Promise.resolve({ autoUpdateCore: true } as any));
+    svc.setEventSender(() => {});
+    return svc;
+  }
+
+  afterEach(() => jest.restoreAllMocks());
+
+  // --- updateCore：line 290-297 try installCoreFromDir / finally 清位 ---
+  it('updateCore：install 成功 → setCoreSwapInProgress(true) → install → finally false', async () => {
+    const { proxy, calls } = makeProxyWithSpy();
+    const svc = makeSvc(proxy);
+    jest.spyOn(svc as any, 'downloadFile').mockResolvedValue('/tmp/fake.tar.gz');
+    jest
+      .spyOn(svc as any, 'extractCore')
+      .mockResolvedValue({ corePath: '/tmp/x/sing-box', extractDir: '/tmp/x' });
+    jest.spyOn(svc as any, 'preflightValidate').mockResolvedValue({ ok: true, version: '1.13.14' });
+    const installSpy = jest.spyOn(svc as any, 'installCoreFromDir').mockResolvedValue(undefined);
+    jest.spyOn(svc as any, 'saveAutoState').mockImplementation(() => {});
+
+    await svc.updateCore('https://x/sing-box.tar.gz');
+
+    expect(installSpy).toHaveBeenCalledTimes(1);
+    // 序列：true（置位）→ ... → false（finally 清位）
+    expect(calls).toEqual([true, false]);
+  });
+
+  it('updateCore：install 抛错 → finally 仍清位（[true, false]，不挂死闩）', async () => {
+    const { proxy, calls } = makeProxyWithSpy();
+    const svc = makeSvc(proxy);
+    jest.spyOn(svc as any, 'downloadFile').mockResolvedValue('/tmp/fake.tar.gz');
+    jest
+      .spyOn(svc as any, 'extractCore')
+      .mockResolvedValue({ corePath: '/tmp/x/sing-box', extractDir: '/tmp/x' });
+    jest.spyOn(svc as any, 'preflightValidate').mockResolvedValue({ ok: true, version: '1.13.14' });
+    jest.spyOn(svc as any, 'installCoreFromDir').mockRejectedValue(new Error('disk full'));
+    // restoreBackup 在 catch 兜底（已备份才调，此处 install 失败前未备份 → 不调）
+    const restoreSpy = jest.spyOn(svc as any, 'restoreBackup').mockResolvedValue(undefined);
+
+    await expect(svc.updateCore('https://x/sing-box.tar.gz')).rejects.toThrow('disk full');
+    // 关键不变量：异常路径 finally 仍清位
+    expect(calls).toEqual([true, false]);
+    expect(restoreSpy).not.toHaveBeenCalled(); // 未备份不误恢复陈旧 .bak
+  });
+
+  // --- tryApplyStaged：line 850-863 setCoreSwapInProgress(true) → try install → catch restore → finally false ---
+  it('tryApplyStaged：install 成功 → [true, false]', async () => {
+    const { proxy, calls } = makeProxyWithSpy();
+    const svc = makeSvc(proxy);
+    jest.spyOn(svc as any, 'loadAutoState').mockReturnValue({
+      staged: { version: '1.13.14', dir: stagedDir, stagedAt: 'now' },
+    });
+    jest.spyOn(svc as any, 'clearStaged').mockImplementation(() => {});
+    jest.spyOn(svc as any, 'emitAutoStatus').mockImplementation(() => {});
+    jest.spyOn(svc as any, 'getCurrentVersion').mockResolvedValue('1.13.13');
+    jest.spyOn(svc as any, 'isKnownBad').mockReturnValue(false);
+    jest.spyOn(svc as any, 'preflightValidate').mockResolvedValue({ ok: true, version: '1.13.14' });
+    jest.spyOn(svc as any, 'hasBackup').mockReturnValue(true);
+    const installSpy = jest.spyOn(svc as any, 'installCoreFromDir').mockResolvedValue(undefined);
+
+    const r = await svc.tryApplyStaged('proxy-stopped');
+    expect(r).toBe('applied');
+    expect(installSpy).toHaveBeenCalledTimes(1);
+    expect(calls).toEqual([true, false]);
+  });
+
+  it('tryApplyStaged：install 抛错（已备份）→ restoreBackup + finally 清位 [true, false]', async () => {
+    const { proxy, calls } = makeProxyWithSpy();
+    const svc = makeSvc(proxy);
+    jest.spyOn(svc as any, 'loadAutoState').mockReturnValue({
+      staged: { version: '1.13.14', dir: stagedDir, stagedAt: 'now' },
+    });
+    jest.spyOn(svc as any, 'clearStaged').mockImplementation(() => {});
+    jest.spyOn(svc as any, 'emitAutoStatus').mockImplementation(() => {});
+    jest.spyOn(svc as any, 'getCurrentVersion').mockResolvedValue('1.13.13');
+    jest.spyOn(svc as any, 'isKnownBad').mockReturnValue(false);
+    jest.spyOn(svc as any, 'preflightValidate').mockResolvedValue({ ok: true, version: '1.13.14' });
+    jest.spyOn(svc as any, 'installCoreFromDir').mockImplementation(async (...args: any[]) => {
+      const onBackupDone = args[2] as (() => void) | undefined;
+      onBackupDone?.(); // 备份完成
+      throw new Error('mid-copy fail');
+    });
+    const restoreSpy = jest.spyOn(svc as any, 'restoreBackup').mockResolvedValue(undefined);
+
+    const r = await svc.tryApplyStaged('proxy-stopped');
+    expect(r).toBe('failed');
+    expect(restoreSpy).toHaveBeenCalledTimes(1);
+    // 关键：异常路径 finally 仍清位
+    expect(calls).toEqual([true, false]);
+  });
+
+  // --- replaceManualCore：line 1213-1234 setCoreSwapInProgress(true) → try backup+写核 → finally false ---
+  it('replaceManualCore：写核成功 → [true, false]', async () => {
+    const { proxy, calls } = makeProxyWithSpy();
+    const svc = makeSvc(proxy);
+    jest.spyOn(svc as any, 'preflightValidate').mockResolvedValue({ ok: true, version: '1.13.14' });
+    jest.spyOn(svc as any, 'getCurrentVersion').mockResolvedValue('1.13.13');
+    jest.spyOn(svc as any, 'backupCurrentCore').mockResolvedValue(undefined);
+    // 非 macOS 走 writeManualCoreToBundle 腿
+    const writeSpy = jest.spyOn(svc as any, 'writeManualCoreToBundle').mockResolvedValue(undefined);
+    jest.spyOn(svc as any, 'armPendingValidation').mockImplementation(() => {});
+    jest.spyOn(svc as any, 'recordSuccessfulVersion').mockResolvedValue(undefined);
+
+    const r = await svc.replaceManualCore({ filePath: '/tmp/chosen-sing-box', force: true });
+    expect(r.ok).toBe(true);
+    expect(writeSpy).toHaveBeenCalledTimes(1);
+    expect(calls).toEqual([true, false]);
+  });
+
+  it('replaceManualCore：写核抛错 → finally 仍清位 [true, false]', async () => {
+    const { proxy, calls } = makeProxyWithSpy();
+    const svc = makeSvc(proxy);
+    jest.spyOn(svc as any, 'preflightValidate').mockResolvedValue({ ok: true, version: '1.13.14' });
+    jest.spyOn(svc as any, 'getCurrentVersion').mockResolvedValue('1.13.13');
+    jest.spyOn(svc as any, 'backupCurrentCore').mockResolvedValue(undefined);
+    jest.spyOn(svc as any, 'writeManualCoreToBundle').mockRejectedValue(new Error('write fail'));
+    jest.spyOn(svc as any, 'disarmPendingValidation').mockImplementation(() => {});
+    jest.spyOn(svc as any, 'restoreBackup').mockResolvedValue(undefined);
+
+    const r = await svc.replaceManualCore({ filePath: '/tmp/chosen-sing-box', force: true });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/write fail/);
+    expect(calls).toEqual([true, false]);
+  });
+
+  // --- rollbackCore：line 1082-1149 setCoreSwapInProgress(true) → try 写核 → finally false ---
+  it('rollbackCore：回滚成功 → [true, false]', async () => {
+    const { proxy, calls } = makeProxyWithSpy();
+    const svc = makeSvc(proxy);
+    jest.spyOn(svc as any, 'hasBackup').mockReturnValue(true);
+    jest.spyOn(svc as any, 'getBackupPath').mockReturnValue('/tmp/sing-box.bak');
+    // 非受保护目录分支（isProtectedCoreActive=false）→ 普通 copy
+    jest.spyOn(svc as any, 'isProtectedCoreActive').mockResolvedValue(false);
+    // copyFileSync 走真实 fs（备份路径不存在会抛）→ mock resourceManager 已返固定路径，改 spy fs.copyFileSync
+    const fs = require('fs');
+    const copySpy = jest.spyOn(fs, 'copyFileSync').mockImplementation(() => {});
+    const chmodSpy = jest.spyOn(fs, 'chmodSync').mockImplementation(() => {});
+    const unlinkSpy = jest.spyOn(fs, 'unlinkSync').mockImplementation(() => {});
+    jest.spyOn(svc as any, 'recordSuccessfulVersion').mockResolvedValue(undefined);
+    jest.spyOn(svc as any, 'getCurrentVersion').mockResolvedValue('1.13.13');
+    jest.spyOn(svc as any, 'saveAutoState').mockImplementation(() => {});
+
+    await svc.rollbackCore();
+    expect(copySpy).toHaveBeenCalledTimes(1);
+    expect(calls).toEqual([true, false]);
+    copySpy.mockRestore();
+    chmodSpy.mockRestore();
+    unlinkSpy.mockRestore();
+  });
+
+  it('rollbackCore：写核抛错 → finally 仍清位 [true, false]', async () => {
+    const { proxy, calls } = makeProxyWithSpy();
+    const svc = makeSvc(proxy);
+    jest.spyOn(svc as any, 'hasBackup').mockReturnValue(true);
+    jest.spyOn(svc as any, 'getBackupPath').mockReturnValue('/tmp/sing-box.bak');
+    jest.spyOn(svc as any, 'isProtectedCoreActive').mockResolvedValue(false);
+    const fs = require('fs');
+    // copyFileSync 抛错（模拟磁盘故障）
+    jest.spyOn(fs, 'copyFileSync').mockImplementation(() => {
+      throw new Error('disk full');
+    });
+    jest.spyOn(fs, 'chmodSync').mockImplementation(() => {});
+    jest.spyOn(fs, 'unlinkSync').mockImplementation(() => {});
+
+    await expect(svc.rollbackCore()).rejects.toThrow('disk full');
+    // 关键：异常路径 finally 仍清位
+    expect(calls).toEqual([true, false]);
+  });
+});

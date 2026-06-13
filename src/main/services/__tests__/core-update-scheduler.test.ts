@@ -32,9 +32,15 @@ jest.mock('../ResourceManager', () => ({
 }));
 
 import * as fs from 'fs';
+import { setTimeout as realSetTimeout } from 'timers';
 
 import { CoreUpdateScheduler } from '../CoreUpdateScheduler';
 import { CoreUpdateService } from '../CoreUpdateService';
+
+// M1 修复：jest30 + node26 组合下 useFakeTimers() 会删除 globalThis.setTimeout，且 useRealTimers() 不恢复
+// （typeof globalThis.setTimeout === 'undefined'）。applyStagedNow 内裸用 setTimeout(2000) 会 ReferenceError。
+// 修法：M1 测试在 useRealTimers() 后从 node 'timers' 模块钉回真实 setTimeout 到 globalThis；
+//   后续 test 的 beforeEach useFakeTimers() 会用 mocked 版替换它（非删除），不破坏 scheduler 其他 fake-timer 测试。
 
 function makeLogManager() {
   return { addLog: jest.fn() } as any;
@@ -353,6 +359,7 @@ describe('CoreUpdateService.tryApplyStaged / applyStagedNow', () => {
       buildPreflightConfigJson: () => null,
       hasNaiveNodes: () => false,
       setAutoRestartSuppressed: jest.fn(),
+      setCoreSwapInProgress: jest.fn(),
       stop: jest.fn().mockImplementation(async () => {
         isRunning = false;
       }),
@@ -514,6 +521,8 @@ describe('CoreUpdateService.tryApplyStaged / applyStagedNow', () => {
   });
 
   it('M1：applyStagedNow wasRunning + install 失败 → 仍恢复代理(start)，返回 failed', async () => {
+    jest.useRealTimers(); // applyStagedNow 内 setTimeout(2000) 需真实定时器
+    (globalThis as any).setTimeout = realSetTimeout; // 钉回真实 setTimeout（jest30 useRealTimers 不恢复 global）
     const { svc, proxy } = makeSvc({
       running: true,
       installImpl: async (_d, _v, onBackupDone) => {
@@ -528,6 +537,8 @@ describe('CoreUpdateService.tryApplyStaged / applyStagedNow', () => {
   });
 
   it('M1：applyStagedNow wasRunning + applied → 落位后重启代理', async () => {
+    jest.useRealTimers(); // 同上：applyStagedNow 内 setTimeout 需真实定时器
+    (globalThis as any).setTimeout = realSetTimeout; // 同上钉回
     const { svc, proxy } = makeSvc({ running: true });
     const r = await svc.applyStagedNow();
     expect(r).toBe('applied');

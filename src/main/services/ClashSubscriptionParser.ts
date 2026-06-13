@@ -677,7 +677,14 @@ export function applyOverride(servers: ServerConfig[], override: unknown): void 
     // 赋值语义：override 显式给出 skip-cert-verify 即覆盖（true→放行，false→强制校验），
     // 不再只在 ===true 时单向覆盖（否则机场 override:false 想收紧时被静默忽略）。
     if (skipCert !== undefined) {
-      s.tlsSettings = { ...(s.tlsSettings || {}), allowInsecure: skipCert };
+      // 仅对「TLS 节点」注入/合并 tlsSettings。判定与 ProtocolParser 一致：
+      // security ∈ {tls,reality}（reality 复用 TLS 传输层），或节点已带 tlsSettings/
+      // realitySettings（兼容存量/手动节点未显式写 security 的情况）。
+      // 非 TLS 节点（裸 vless/ss/socks/http/ssh）若注入空 tlsSettings，会产出
+      // {allowInsecure:...} 这种本不该出现的 TLS 特征，构成代理指纹噪音。
+      if (s.security === 'tls' || s.security === 'reality' || s.tlsSettings || s.realitySettings) {
+        s.tlsSettings = { ...(s.tlsSettings || {}), allowInsecure: skipCert };
+      }
     }
     if (s.protocol === 'hysteria2' && (up !== undefined || down !== undefined)) {
       const hy2 = { ...(s.hysteria2Settings || {}) };

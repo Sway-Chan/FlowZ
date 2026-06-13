@@ -800,8 +800,18 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           void (async () => {
             try {
               await this.allocateProbePorts(config);
-              const cfg = this.generateSingBoxConfig(config, resolvedServerIps);
-              await this.writeSingBoxConfig(cfg);
+              // T9：用已 prune 的 singboxConfig（捕获 startInternal :746 外层变量），不重新 generateSingBoxConfig
+              //     ——否则会丢掉 :754 checkAndPruneConfig 已就地剔除的坏节点，导致坏节点回流重撞 FATAL。
+              //     仅把新探针端口回填到对应 inbound.listen_port（allocateProbePorts 只改 this.probe*Port 字段，
+              //     不改 singboxConfig 对象；不回填则 sing-box 仍 bind 旧冲突端口）。
+              for (const ib of singboxConfig.inbounds) {
+                if (ib.tag === 'probe-direct-in' && this.probeDirectPort) {
+                  ib.listen_port = this.probeDirectPort;
+                } else if (ib.tag === 'probe-proxy-in' && this.probeProxyPort) {
+                  ib.listen_port = this.probeProxyPort;
+                }
+              }
+              await this.writeSingBoxConfig(singboxConfig);
             } catch {
               /* 忽略：下次尝试用现有配置 */
             }
@@ -882,7 +892,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       const targetId = this.currentConfig?.selectedServerId ?? config.selectedServerId;
       const tag = this.currentIdToTagMap?.get(targetId as string);
       if (!tag) break;
-      const res = await this.clashApiRequest('/proxies/proxy-selector', 'PUT', { name: tag });
+      const res =
+        (await this.clashApiClient?.request('/proxies/proxy-selector', 'PUT', { name: tag })) ??
+        ({ ok: false, status: 0 } as const);
       if (res.ok) break;
       // clash_api 未就绪/瞬时失败 → 短延迟后重试
       await new Promise((r) => setTimeout(r, 300));
@@ -892,9 +904,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
-   * 重载后 reassert 各 rule-sel 选择：按 currentConfig 的规则 targetServerId 重新 PUT。
-   * currentRuleTargetMap 提供 selectorTag；memberTag 从 currentIdToTagMap 按 currentConfig 规则目标重解析
-   * （启动窗口内用户热切规则目标的话，currentConfig 反映最新意图）。
+   * 重载后 reassert 各 rule-sel 选择：按 currentConfig 的规则 targetServerId 重新 PUT（启动窗口内用户热切规则
+   * 目标的话 currentConfig 反映最新意图）。恒优化后无 targetServerId 的 proxy 规则也生成 rule-sel（default=
+   * proxy-selector 跟全局，嵌套），但 sing-box 重载不擦 selector default、默认值靠生成时正确指向 + 嵌套跟随全局，
+   * 故本函数仍只 reassert 有 targetServerId 者（下方 put/循环 `!targetServerId continue` skip 无 target 者正合此语义）。
    */
   private async reassertRuleSelectors(config: UserConfig): Promise<void> {
     const map = this.currentRuleTargetMap;
@@ -908,7 +921,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       if (!entry) return;
       const memberTag = idToTag.get(targetServerId);
       if (!memberTag) return; // 目标被 gate 剔除/不存在 → 跳过（selector default 仍有效，不 FATAL）
-      void this.clashApiRequest(`/proxies/${entry.selectorTag}`, 'PUT', { name: memberTag });
+      void this.clashApiClient?.request(`/proxies/${entry.selectorTag}`, 'PUT', {
+        name: memberTag,
+      });
     };
 
     for (const rule of cur.customRules || []) {
@@ -1280,11 +1295,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       if (oldTarget === newTarget) return true; // 未变
       const entry = map.get(ruleKey);
       if (!entry) return true; // currentRuleTargetMap 无此条（启动时该规则未生成 rule-sel，如被 gate 剔除）→ 跳过
-      // 新目标必须解析得到且在 selector（结构等价前提下 = 启动时 servers；idToTagMap 已删 gate-invalid）
-      if (!newTarget) return false;
-      const memberTag = idToTag.get(newTarget);
-      if (!memberTag) return false;
-      puts.push({ selectorTag: entry.selectorTag, memberTag });
+      // 新目标有→解析节点 tag；无（节点切回默认/跟全局）→ proxy-selector（rule-sel 嵌套 default）
+      const memberTag = newTarget ? idToTag.get(newTarget) : 'proxy-selector';
+      if (newTarget && !memberTag) return false; // 新目标节点不在 selector → 退回重启
+      puts.push({ selectorTag: entry.selectorTag, memberTag: memberTag || 'proxy-selector' });
       return true;
     };
 
@@ -1353,18 +1367,28 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         return (c.customRules || [])
           .filter((r) => r.enabled)
           .map((r) => {
-            if (!extProjection || planCustomRule(r).kind === 'inline') {
+            if (!extProjection) {
+              // direct 模式：generateRuleSelectors 跳过（无 rule-sel），规则 outbound 直绑节点
+              // → targetServerId 在 route 消费、改值须重启 → 全量保留
               const copy: Record<string, unknown> = { ...r };
               delete copy.remarks;
+              return copy;
+            }
+            if (planCustomRule(r).kind === 'inline') {
+              // 非 direct 的 inline 规则：rule-sel 恒存在（default=target 节点或 proxy-selector 跟全局）。
+              // targetServerId 值变（换节点/节点↔默认）= rule-sel default 变（PUT 热切换）→ 移出 norm。
+              // 其余值（域名/IP 等）仍在 inline route 消费、改值须重启 → 保留全量结构。
+              const copy: Record<string, unknown> = { ...r };
+              delete copy.remarks;
+              delete copy.targetServerId;
               return copy;
             }
             return {
               __ext: 1, // 防与 inline 形态键集碰撞误判等价
               id: r.id, // 文件身份绑定 id；id 变=结构变=重启
               action: r.action,
-              // targetServerId 移出 norm（值热切换）：rule-sel 独立 selector 后，改规则目标节点 = clash_api
-              //   PUT /proxies/rule-sel-<id>、不重启。保留键位（null）防与 inline 形态键集碰撞；inline/direct
-              //   规则全量投影（值在 route inline 消费，值变须重启——与现状一致）。
+              // targetServerId 移出 norm（值热切换）：rule-sel 恒存在，default=target 节点或 proxy-selector
+              //   跟全局，值变=PUT rule-sel default 热切换、不重启。
               targetServerId: null,
               combineMode: r.combineMode ?? null,
               bypassFakeIP: !!r.bypassFakeIP,
@@ -1376,8 +1400,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
             };
           });
       })(),
-      // appRules 投影：targetServerId 移出 norm（值热切换，与 customRule ext 投影同因——rule-sel-app selector）；
-      //   保留 appId/action/enabled 结构位（增删/换 action/换 appId 仍重启，语义正确）。
+      // appRules 投影：targetServerId 移出 norm（rule-sel-app 恒存在，default=target 节点或 proxy-selector
+      //   跟全局，值变=PUT rule-sel-app default 热切换）；保留 appId/action/enabled 结构位（增删/换 action/换 appId 仍重启）。
       appRules: (c.appRules || []).map((a) => ({
         appId: a.appId,
         action: a.action,
@@ -1418,25 +1442,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     );
   }
 
-  /**
-   * 通过 clash_api `PUT /proxies/proxy-selector` 把 selector 切到目标节点（无需重启）。
-   * 成功返回 true；任何异常/非 2xx 返回 false（调用方退回重启）。
-   */
-  /** 经 ClashApiClient 发 clash_api(9090) 请求（T15：原 clashApiRequest/clashAuthHeaders 收口进 client）。
-   *  thin wrapper 保留——reassertSelectorSelection/hotSwitchNode/closeConnection 三处内部调用零改动。
-   *  不抛异常：超时/网络错统一以 { ok:false } 返回。杀核前 RST 由 destroyClashApiAgent→client.destroyAgent 收口。 */
-  private clashApiRequest(
-    pathName: string,
-    method: string,
-    body?: unknown,
-    timeoutMs = 2000
-  ): Promise<{ ok: boolean; status: number }> {
-    return (
-      this.clashApiClient?.request(pathName, method, body, timeoutMs) ??
-      Promise.resolve({ ok: false, status: 0 })
-    );
-  }
-
   /** destroy 并重建 clash_api agent（杀核前调，防 9090 root TIME_WAIT）。T15：delegate client.destroyAgent。 */
   private destroyClashApiAgent(): void {
     this.clashApiClient?.destroyAgent();
@@ -1448,13 +1453,16 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
-   * 关闭连接（连接信息页用）：复用 clashApiRequest（专属 agent + Bearer secret 内部封装，渲染端不持 secret）。
+   * 关闭连接（连接信息页用）：直调 ClashApiClient（专属 agent + Bearer secret 内部封装，渲染端不持 secret）。
    * id 给定 → DELETE /connections/{id}（关单条）；id 省略 → DELETE /connections（关全部 = CloseAllConnections + ResetNetwork）。
-   * 不抛异常，按 clashApiRequest 语义返回 { ok, status }（与 reassert/hotSwitch 同治）。
+   * 不抛异常，按 { ok, status } 语义返回（与 reassert/hotSwitch 同治）。
    */
   async closeConnection(id?: string): Promise<{ ok: boolean; status: number }> {
     const pathName = id ? `/connections/${encodeURIComponent(id)}` : '/connections';
-    return this.clashApiRequest(pathName, 'DELETE');
+    // T15：直调 client.request（原 clashApiRequest wrapper 已删）。client 未注入 → fallback {ok:false}。
+    return (
+      this.clashApiClient?.request(pathName, 'DELETE') ?? Promise.resolve({ ok: false, status: 0 })
+    );
   }
 
   /**
@@ -1464,7 +1472,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    */
   private async hotSwitchSelector(selectorTag: string, memberTag: string): Promise<boolean> {
     if (!memberTag) return false;
-    const res = await this.clashApiRequest(`/proxies/${selectorTag}`, 'PUT', { name: memberTag });
+    // T15：直调 client.request（原 clashApiRequest wrapper 已删）。client 未注入 → fallback {ok:false}。
+    const res =
+      (await this.clashApiClient?.request(`/proxies/${selectorTag}`, 'PUT', { name: memberTag })) ??
+      ({ ok: false, status: 0 } as const);
     if (!res.ok) {
       this.logToManager('warn', `clash_api 热切换 ${selectorTag} 失败（HTTP ${res.status}）`);
       return false;
@@ -2631,10 +2642,12 @@ done
         interrupt_exist_connections: config.interruptConnectionsOnSwitch === true,
       });
 
-      // rule-sel：为每条「proxy 且指定 targetServerId」的规则生成独立 selector（anti-drift：固定规则不经
-      // 共享 proxy-selector，热切全局节点后不漂走）。members 复用 proxy-selector 的可用 nodeTags（已排除
-      // naive 缺库 / gate-invalid / detour 死引用剔除的节点）；default 落规则目标 tag，目标无效/被 gate
-      // 剔除 → 落 nodeTags[0] 兜底（rule-sel 仍建、不 FATAL，与 fixRouteDeadReferences 兜底语义一致）。
+      // rule-sel：恒优化后「所有 proxy 规则」均生成独立 selector（无论 targetServerId 有无）。
+      //   有 target → default=目标节点（anti-drift：固定规则不经共享 proxy-selector，热切全局节点后不漂走）；
+      //   无 target → default=proxy-selector（跟全局，嵌套）。「节点↔默认」切换 = rule-sel default 变（PUT 热切换），
+      //   非 outbound 结构变（重启）。members 复用 proxy-selector 的可用 nodeTags（已排除 naive 缺库 / gate-invalid /
+      //   detour 死引用剔除的节点）；目标无效/被 gate 剔除/无 target → default 落 proxy-selector 兜底
+      //   （rule-sel 仍建、不 FATAL，与 fixRouteDeadReferences 兜底语义一致）。
       // direct 模式不生成（generateCustomRules/effectiveAppRules 在 direct 不产出 proxy 规则 → 无消费者）。
       if ((config.proxyMode || 'smart').toLowerCase() !== 'direct') {
         this.generateRuleSelectors(config, idToTagMap, nodeTags, outbounds);
@@ -2801,9 +2814,9 @@ done
   }
 
   /**
-   * 为每条「proxy 且指定 targetServerId」的 customRule / appRule 生成独立 rule-sel selector。
-   * members = 可用 nodeTags（与 proxy-selector 同源，已排除缺库/gate-invalid/detour 死引用节点）；
-   * default = 规则目标 tag，目标无效/被剔除 → nodeTags[0] 兜底（rule-sel 仍建、不 FATAL）。
+   * 为「所有 proxy 的 customRule / appRule」生成独立 rule-sel selector（恒优化：不再限有 targetServerId 者）。
+   * members = 可用 nodeTags（与 proxy-selector 同源，已排除缺库/gate-invalid/detour 死引用节点）+ proxy-selector（嵌套全局）；
+   *   default = 规则目标 tag（有）；无 target / 目标无效/被剔除 → proxy-selector（跟全局嵌套，rule-sel 仍建、不 FATAL）。
    * selectorTag 命名 `rule-sel-<ruleId>` / `rule-sel-app-<appId>`，与节点名撞车时加后缀去重（防启动 FATAL）。
    * 同步填充 currentRuleTargetMap 供热切换定位（key=`custom:<id>` / `app:<appId>`）。
    */
@@ -2818,6 +2831,9 @@ done
     // (selectorTag, memberTag) 收集，供 generateSingBoxConfig 末尾回填 currentRuleTargetMap。
     this.pendingRuleSelectors = [];
 
+    // rule-sel 恒存在（所有 proxy 规则，无论 targetServerId 有无）：members 含 proxy-selector（嵌套全局），
+    // default=target 节点（有）或 proxy-selector（无=跟全局）。使「节点↔默认」= rule-sel default 变化（PUT 热切换），
+    // 非 outbound 结构变（重启）。anti-drift 仍保留：固定节点规则 default=节点，不随全局漂。
     const emit = (ruleKey: string, selectorTag: string, targetServerId: string | undefined) => {
       // tag 防撞：节点名可能恰好叫 rule-sel-xxx → 加 (n) 后缀（与 getUniqueTag 同形）
       let tag = selectorTag;
@@ -2828,11 +2844,12 @@ done
       }
       existingTags.add(tag);
       const targetTag = targetServerId ? idToTagMap.get(targetServerId) : undefined;
-      const defaultTag = targetTag && nodeTags.includes(targetTag) ? targetTag : nodeTags[0];
+      // default：target 有效→节点 tag；target 无/无效→proxy-selector（跟全局，嵌套）
+      const defaultTag = targetTag && nodeTags.includes(targetTag) ? targetTag : 'proxy-selector';
       outbounds.push({
         type: 'selector',
         tag,
-        outbounds: [...nodeTags],
+        outbounds: [...nodeTags, 'proxy-selector'],
         default: defaultTag,
         interrupt_exist_connections: interrupt,
       });
@@ -2846,12 +2863,12 @@ done
 
     for (const rule of config.customRules || []) {
       if (!rule.enabled) continue;
-      if (rule.action !== 'proxy' || !rule.targetServerId) continue;
+      if (rule.action !== 'proxy') continue;
       emit(`custom:${rule.id}`, `rule-sel-${rule.id}`, rule.targetServerId);
     }
     for (const appRule of this.effectiveAppRules(config)) {
       if (!appRule.enabled) continue;
-      if (appRule.action !== 'proxy' || !appRule.targetServerId) continue;
+      if (appRule.action !== 'proxy') continue;
       // appRule 按 appId 去重（effectiveAppRules），用 appId 作 key；selectorTag 加 app- 前缀避免与 customRule 混淆。
       emit(`app:${appRule.appId}`, `rule-sel-app-${appRule.appId}`, appRule.targetServerId);
     }
@@ -3111,6 +3128,7 @@ done
       outbound.tls = {
         enabled: true,
         server_name: server.tlsSettings?.serverName || undefined,
+        insecure: server.tlsSettings?.allowInsecure || false,
         utls: {
           enabled: true,
           fingerprint: server.tlsSettings?.fingerprint || 'chrome',
@@ -3255,7 +3273,11 @@ done
    * undefined/true → 现状。单一真值点，4 个消费点统一经此，保证关闭=appRules[] 逐字节等价。
    */
   private effectiveAppRules(config: UserConfig): import('../../shared/types').AppRule[] {
-    return config.appRoutingEnabled === false ? [] : config.appRules || [];
+    // direct 模式：appRules 不进 route 生成（与 generateCustomRules 的 `proxyMode !== 'direct'` 门控对称）；
+    // generateRuleSelectors 在 direct 跳过（无 rule-sel），此处返回 [] 避免 generateRouteConfig emit 死引用 outbound。
+    if (config.appRoutingEnabled === false) return [];
+    if ((config.proxyMode || 'smart').toLowerCase() === 'direct') return [];
+    return config.appRules || [];
   }
 
   private generateRouteConfig(
@@ -3586,15 +3608,10 @@ done
         // 确定出站方式
         let outbound = 'direct';
         if (appRule.action === 'proxy') {
-          if (appRule.targetServerId) {
-            // anti-drift：指向独立 rule-sel-app-<appId> selector（customRule 同理见 applyRuleAction）。
-            // serverExists 仅决定是否生成 selector（generateRuleSelectors 已按 enabled+targetServerId 生成）；
-            // 此处恒指 rule-sel-app-<appId>，目标无效由 selector default=nodeTags[0] 兜底（fixRouteDeadReferences 不再生效——
-            // rule-sel selector 总会被生成， outbound 名实相符）。
-            outbound = `rule-sel-app-${appRule.appId}`;
-          } else {
-            outbound = selectedServerTag;
-          }
+          // rule-sel-app 恒存在（generateRuleSelectors 为所有 proxy appRule 生成）：outbound 恒指
+          // rule-sel-app-<appId>，「默认/跟全局」= default=proxy-selector（嵌套），「指定节点」= default=节点 tag。
+          // 使「节点↔默认」= rule-sel-app default 变（PUT 热切换），非 outbound 结构变（重启）。
+          outbound = `rule-sel-app-${appRule.appId}`;
         } else if (appRule.action === 'block') {
           outbound = 'block';
         }
@@ -4140,7 +4157,9 @@ done
       // clash_api PUT /proxies/rule-sel-<id> 热切换、且互不干扰。selector 由 generateRuleSelectors 预建；
       // 极端情况（selector 未生成，如降级/onRetry 中间态）→ 死引用由 fixRouteDeadReferences 兜底改写为
       // proxy-selector，启动不 FATAL。
-      if (targetServerId && ruleId) {
+      // rule-sel 恒存在（generateRuleSelectors 为所有 proxy 规则生成）：outbound 恒指 rule-sel-<ruleId>，
+      // 「默认/跟全局」= rule-sel default=proxy-selector（嵌套），「指定节点」= default=节点 tag。
+      if (ruleId) {
         singboxRule.outbound = `rule-sel-${ruleId}`;
       } else if (targetServerId) {
         const targetTag = idToTagMap?.get(targetServerId);
@@ -6510,12 +6529,12 @@ exit 0
 
       // 空消息不记录（如私有 IP 超时）
       if (friendlyMessage) {
-        this.logToManager(logInfo.level, friendlyMessage);
+        this.logToManager(logInfo.level, friendlyMessage, 'sing-box');
       }
     } else {
       // 无法解析的日志，尝试对原始行也进行标签转换
       const resolvedLine = this.resolveTagsToNames(line);
-      this.logToManager('info', resolvedLine);
+      this.logToManager('info', resolvedLine, 'sing-box');
     }
   }
 
@@ -6907,10 +6926,12 @@ exit 0
    */
   private logToManager(
     level: 'debug' | 'info' | 'warn' | 'error' | 'fatal',
-    message: string
+    message: string,
+    source: string = 'ProxyManager'
   ): void {
     if (this.logManager) {
-      this.logManager.addLog(level, message, 'sing-box');
+      // T6：编排维度默认 'ProxyManager'；sing-box 内核 stdout 经 parseAndLogLine 传 'sing-box' 区分。
+      this.logManager.addLog(level, message, source);
     }
   }
 

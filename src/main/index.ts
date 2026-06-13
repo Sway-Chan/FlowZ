@@ -900,7 +900,7 @@ if (gotTheLock) {
     proxyManager.setClashApiClient(clashApiClient);
 
     // 平台提权服务（T16：纯函数/无状态方法 + killOrphans 链迁出 ProxyManager/CoreUpdateService，delegate 后调用点零改动）。
-    // ctx.log 桥接两端 source：ProxyManager 侧 logToManager 固定 'sing-box'（默认），CoreUpdateService 侧透传 'CoreUpdateService'。
+    // ctx.log 桥接两端 source：ProxyManager 侧 logToManager 默认 'ProxyManager'（编排维度，内核 stdout 经 parseAndLogLine 传 'sing-box'），CoreUpdateService 侧透传 'CoreUpdateService'。
     // ctx 各只读回调指向 proxyManager 私有 getter（isTunMode/configPath/singboxPath/currentManagedPid/isProcessAlive/waitForNetworkCleanup），
     // service 不直接访问 ProxyManager 内部状态。
     // helperManager 可为 null（未装时 macOS 分支回退 osascript）。

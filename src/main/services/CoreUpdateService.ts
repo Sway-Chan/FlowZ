@@ -14,6 +14,7 @@ import { PlatformPrivilegeService } from './PlatformPrivilegeService';
 import { resourceManager } from './ResourceManager';
 
 import type { UserConfig } from '../../shared/types';
+import { APP_USER_AGENT } from '../../shared/constants';
 import { encodeMajorMinor, sameMajorMinor } from '../../shared/version';
 import coreManifest from '../../shared/core-manifest.json';
 import { IPC_CHANNELS } from '../../shared/ipc-channels';
@@ -1569,7 +1570,7 @@ export class CoreUpdateService {
         finish(new Error('检查更新超时（GitHub 不可达或被网络拦截）'));
       }, 15000);
 
-      request.setHeader('User-Agent', 'FlowZ-Electron');
+      request.setHeader('User-Agent', APP_USER_AGENT);
       request.setHeader('Accept', 'application/vnd.github.v3+json');
 
       request.on('response', (res) => {
@@ -1749,7 +1750,7 @@ export class CoreUpdateService {
       };
 
       const request = net.request({ url, session: sess });
-      request.setHeader('User-Agent', 'FlowZ-Electron');
+      request.setHeader('User-Agent', APP_USER_AGENT);
 
       request.on('response', (response) => {
         if (response.statusCode >= 400) {

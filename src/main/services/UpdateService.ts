@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { LogManager } from './LogManager';
 import type { UpdateInfo, UpdateCheckResult, UpdateProgress } from '../../shared/types/update';
+import { APP_USER_AGENT } from '../../shared/constants';
 import { getUserDataPath } from '../utils/paths';
 
 const GITHUB_OWNER = 'dododook';
@@ -560,7 +561,7 @@ open "${installerPath}"
         method: 'GET',
         url: `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases`,
       });
-      request.setHeader('User-Agent', 'FlowZ-Electron');
+      request.setHeader('User-Agent', APP_USER_AGENT);
       request.setHeader('Accept', 'application/vnd.github.v3+json');
 
       request.on('response', (res) => {
@@ -662,7 +663,7 @@ open "${installerPath}"
         url: url,
         method: 'GET',
       });
-      request.setHeader('User-Agent', 'FlowZ-Electron');
+      request.setHeader('User-Agent', APP_USER_AGENT);
 
       request.on('response', (response) => {
         if (response.statusCode === 302 || response.statusCode === 301) {
@@ -750,7 +751,7 @@ open "${installerPath}"
         url: url,
         method: 'GET',
       });
-      request.setHeader('User-Agent', 'FlowZ-Electron');
+      request.setHeader('User-Agent', APP_USER_AGENT);
 
       request.on('response', (response) => {
         if (response.statusCode === 302 || response.statusCode === 301) {

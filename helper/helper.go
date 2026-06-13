@@ -124,6 +124,20 @@ func installCore(srcDir, wantHash string) string {
 		}
 		_ = os.Chmod(dst, 0o755)
 	}
+	// A-m2：清理受保护目录多余文件（非本次 srcDir entries 的旧核残留），防 rollback 后残留陈旧配套。
+	srcNames := make(map[string]bool)
+	for _, e := range entries {
+		if !e.IsDir() {
+			srcNames[e.Name()] = true
+		}
+	}
+	if oldEntries, err := os.ReadDir(coreDir); err == nil {
+		for _, e := range oldEntries {
+			if !e.IsDir() && !srcNames[e.Name()] {
+				_ = os.Remove(filepath.Join(coreDir, e.Name()))
+			}
+		}
+	}
 	// macOS：清整个受保护目录 quarantine + 对主二进制 adhoc 签名（否则 Gatekeeper 对新放入未签名二进制 SIGKILL）
 	sb := filepath.Join(coreDir, "sing-box")
 	_ = exec.Command("/usr/bin/xattr", "-cr", coreDir).Run()

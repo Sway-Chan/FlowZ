@@ -117,9 +117,42 @@ export function parseRule(rule: string, rulePayload?: string): RuleView {
   const r = (rule || '').trim();
   const p = (rulePayload || '').trim();
   if (r.includes('=>')) {
-    const am = r.match(/=>\s*(?:route\s*\(\s*)?([^()=>]+?)\s*\)?\s*$/);
-    const action = am ? am[1].trim() : '';
-    const condPart = am ? r.slice(0, am.index) : r;
+    // 解析尾部 action，支持 action 内部含括号（如 route(nested(inner)) / route(proxy,ss)）。
+    // 旧正则 [^()=>]+? 把括号排除，遇到含括号 action 直接失配回退空，导致 badge 配色对但 action 显示丢。
+    // 改两段式：route(...) 形式贪婪取末尾 ) 内整体 + 括号平衡校验；否则回退裸 action（不含括号）。
+    let am = r.match(/=>\s*route\s*\(\s*(.*?)\s*\)\s*$/);
+    let action = '';
+    let condEnd = r.length;
+    if (am) {
+      // 校验 action 内部括号平衡：失衡（如 route(a(b)））视为格式异常，留空走兜底
+      let depth = 0;
+      let balanced = true;
+      for (const ch of am[1]) {
+        if (ch === '(') depth++;
+        else if (ch === ')') {
+          depth--;
+          if (depth < 0) {
+            balanced = false;
+            break;
+          }
+        }
+      }
+      if (balanced && depth === 0) {
+        action = am[1].trim();
+        condEnd = am.index ?? r.length;
+      } else {
+        am = null;
+      }
+    }
+    if (!am) {
+      // 回退：裸 action（无 route 包裹，如 '=> proxy'）；含括号视为格式异常留空
+      const am2 = r.match(/=>\s*([^()\s]+?)\s*$/);
+      if (am2) {
+        action = am2[1].trim();
+        condEnd = am2.index ?? r.length;
+      }
+    }
+    const condPart = r.slice(0, condEnd);
     // 限长防 ReDoS：字段名本就短，condPart 截断 256 + 量词上界 63，避免超长无分隔串触发 [\w-]* 灾难性回溯
     // （rule 来自 sing-box clash API、无长度保证；type 字段名在 condPart 前部，截断不影响提取）。
     const tm = condPart.slice(0, 256).match(/([a-zA-Z_][\w-]{0,63})\s*[=:]/);

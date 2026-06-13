@@ -208,9 +208,29 @@ describe('parseRule — 规则列展示拆解（方案 B）', () => {
   it('多个 => 取最后一段 action', () => {
     expect(parseRule('a=1 => b=2 => route(proxy)').action).toBe('proxy');
   });
-  it('嵌套括号 → action 解析不出、回退 full 不丢信息', () => {
+  it('嵌套括号 action → 正确解析（含括号不误截）', () => {
+    // B-m3：旧正则 [^()=>]+? 排除括号，含括号 action 失配；现支持括号平衡的嵌套 action
     const r = parseRule('domain=x => route(nested(inner))');
+    expect(r.action).toBe('nested(inner)');
+    expect(r.type).toBe('domain');
     expect(r.full).toContain('nested');
+  });
+  it('含逗号 action（proxy,ss 等边界）→ 正确解析', () => {
+    const r = parseRule('domain=x => route(proxy,ss)');
+    expect(r.action).toBe('proxy,ss');
+    expect(r.type).toBe('domain');
+  });
+  it('多层嵌套括号 action → 取整体括号平衡内容', () => {
+    const r = parseRule('domain=x => route(foo(bar(baz)))');
+    expect(r.action).toBe('foo(bar(baz))');
+  });
+  it('裸 action（无 route 包裹）→ 正确解析', () => {
+    expect(parseRule('a=1 => proxy').action).toBe('proxy');
+  });
+  it('括号失衡（格式异常）→ action 留空，full 不丢信息', () => {
+    const r = parseRule('=> route(a(b)');
+    expect(r.action).toBe('');
+    expect(r.full).toContain('route(a(b)');
   });
   it('rule=类型 / rulePayload=值（无 =>）→ 组合展示', () => {
     const r = parseRule('rule_set', 'geosite-cn');

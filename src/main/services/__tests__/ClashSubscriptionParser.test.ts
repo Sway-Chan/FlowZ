@@ -545,8 +545,26 @@ describe('filter / exclude-filter / 非法正则', () => {
 describe('applyOverride — 白名单 3 键', () => {
   it('skip-cert-verify → allowInsecure；up/down → hy2 限速', () => {
     const servers: ServerConfig[] = [
-      { id: '1', name: 'a', protocol: 'vless', address: 'x', port: 1, uuid: 'u' },
-      { id: '2', name: 'b', protocol: 'hysteria2', address: 'y', port: 2, password: 'p' },
+      // security: 'tls' 使该 vless 成为 TLS 节点，才有资格注入 tlsSettings
+      {
+        id: '1',
+        name: 'a',
+        protocol: 'vless',
+        address: 'x',
+        port: 1,
+        uuid: 'u',
+        security: 'tls',
+      },
+      {
+        id: '2',
+        name: 'b',
+        protocol: 'hysteria2',
+        address: 'y',
+        port: 2,
+        password: 'p',
+        // hysteria2 协议恒 TLS（与现实 parseHysteria2 产出一致）
+        security: 'tls',
+      },
     ];
     applyOverride(servers, { 'skip-cert-verify': true, up: 100, down: 500, 'not-allowed': 'x' });
     expect(servers[0].tlsSettings?.allowInsecure).toBe(true);
@@ -555,6 +573,179 @@ describe('applyOverride — 白名单 3 键', () => {
     expect(servers[1].hysteria2Settings?.downMbps).toBe(500);
     // 非白名单键不进入 config（无 not-allowed 落点）
     expect((servers[0] as any)['not-allowed']).toBeUndefined();
+  });
+});
+
+describe('B-m2 applyOverride — 非 TLS 节点不注入空 tlsSettings（指纹噪音）', () => {
+  it('非 TLS 节点（裸 vless，security 缺省）→ 不注入 tlsSettings', () => {
+    const servers: ServerConfig[] = [
+      { id: '1', name: 'plain-vless', protocol: 'vless', address: 'x', port: 1, uuid: 'u' },
+    ];
+    applyOverride(servers, { 'skip-cert-verify': true });
+    // 关键断言：非 TLS 节点不应被注入空/仅含 allowInsecure 的 tlsSettings（否则暴露代理特征）
+    expect(servers[0].tlsSettings).toBeUndefined();
+  });
+
+  it('security=none 节点（vmess 无 tls）→ 不注入 tlsSettings', () => {
+    const servers: ServerConfig[] = [
+      {
+        id: '2',
+        name: 'vmess-notls',
+        protocol: 'vmess',
+        address: 'x',
+        port: 80,
+        uuid: 'u',
+        security: 'none',
+      },
+    ];
+    applyOverride(servers, { 'skip-cert-verify': true });
+    expect(servers[0].tlsSettings).toBeUndefined();
+  });
+
+  it('非 TLS 协议族（ss/socks/http/ssh）→ 均不注入 tlsSettings', () => {
+    const servers: ServerConfig[] = [
+      {
+        id: 'ss',
+        name: 'ss',
+        protocol: 'shadowsocks',
+        address: 'a',
+        port: 1,
+        shadowsocksSettings: { method: 'aes-256-gcm', password: 'p' },
+      },
+      { id: 'socks', name: 'socks', protocol: 'socks', address: 'b', port: 2, username: 'u' },
+      { id: 'http', name: 'http', protocol: 'http', address: 'c', port: 3, username: 'u' },
+      {
+        id: 'ssh',
+        name: 'ssh',
+        protocol: 'ssh',
+        address: 'd',
+        port: 4,
+        sshSettings: { user: 'root', password: 'p' },
+      },
+    ];
+    applyOverride(servers, { 'skip-cert-verify': false });
+    for (const s of servers) {
+      expect(s.tlsSettings).toBeUndefined();
+    }
+  });
+
+  it('TLS 节点（security=tls）→ 正确合并 allowInsecure，保留既有 serverName', () => {
+    const servers: ServerConfig[] = [
+      {
+        id: '1',
+        name: 'vless-tls',
+        protocol: 'vless',
+        address: 'x',
+        port: 443,
+        uuid: 'u',
+        security: 'tls',
+        tlsSettings: { serverName: 'sni.example.com', fingerprint: 'chrome' },
+      },
+    ];
+    applyOverride(servers, { 'skip-cert-verify': true });
+    expect(servers[0].tlsSettings).toEqual({
+      serverName: 'sni.example.com',
+      fingerprint: 'chrome',
+      allowInsecure: true,
+    });
+  });
+
+  it('reality 节点（security=reality）→ 注入 allowInsecure（复用 TLS 传输层）', () => {
+    const servers: ServerConfig[] = [
+      {
+        id: '1',
+        name: 'vless-reality',
+        protocol: 'vless',
+        address: 'x',
+        port: 443,
+        uuid: 'u',
+        security: 'reality',
+        realitySettings: { publicKey: 'PUB' },
+      },
+    ];
+    applyOverride(servers, { 'skip-cert-verify': true });
+    expect(servers[0].tlsSettings?.allowInsecure).toBe(true);
+  });
+
+  it('恒 TLS 协议（hysteria2/trojan/tuic/anytls）→ 正确注入 allowInsecure', () => {
+    const servers: ServerConfig[] = [
+      {
+        id: 'hy2',
+        name: 'hy2',
+        protocol: 'hysteria2',
+        address: 'a',
+        port: 1,
+        password: 'p',
+        security: 'tls',
+      },
+      {
+        id: 'tj',
+        name: 'tj',
+        protocol: 'trojan',
+        address: 'b',
+        port: 2,
+        password: 'p',
+        security: 'tls',
+      },
+      {
+        id: 'tuic',
+        name: 'tuic',
+        protocol: 'tuic',
+        address: 'c',
+        port: 3,
+        uuid: 'u',
+        password: 'p',
+        security: 'tls',
+      },
+      {
+        id: 'anytls',
+        name: 'anytls',
+        protocol: 'anytls',
+        address: 'd',
+        port: 4,
+        password: 'p',
+        security: 'tls',
+      },
+    ];
+    applyOverride(servers, { 'skip-cert-verify': false });
+    for (const s of servers) {
+      expect(s.tlsSettings?.allowInsecure).toBe(false);
+    }
+  });
+
+  it('兼容：未写 security 但已带 tlsSettings 的存量节点 → 仍合并 allowInsecure', () => {
+    // 存量/手动节点可能省略 security 但携带 tlsSettings，此时不应因 security 缺省而漏注入。
+    const servers: ServerConfig[] = [
+      {
+        id: '1',
+        name: 'legacy',
+        protocol: 'vless',
+        address: 'x',
+        port: 443,
+        uuid: 'u',
+        tlsSettings: { serverName: 'sni.example.com' },
+      },
+    ];
+    applyOverride(servers, { 'skip-cert-verify': true });
+    expect(servers[0].tlsSettings?.allowInsecure).toBe(true);
+    expect(servers[0].tlsSettings?.serverName).toBe('sni.example.com');
+  });
+
+  it('未给 skip-cert-verify → TLS 节点既有 tlsSettings 原样不动', () => {
+    const servers: ServerConfig[] = [
+      {
+        id: '1',
+        name: 'vless-tls',
+        protocol: 'vless',
+        address: 'x',
+        port: 443,
+        uuid: 'u',
+        security: 'tls',
+        tlsSettings: { serverName: 'sni.example.com' },
+      },
+    ];
+    applyOverride(servers, { up: 100 });
+    expect(servers[0].tlsSettings).toEqual({ serverName: 'sni.example.com' });
   });
 });
 

@@ -16,7 +16,8 @@ import {
 
 /** 默认订阅 UA：纯中性 `FlowZ/<版本>`（去除 clash.meta/mihomo 标识，陈先生 2026-06-12 决策）。 */
 export function defaultSubscriptionUserAgent(): string {
-  // app.getVersion() 仅在打包后/有 app 上下文可用；测试侧不消费本函数（UA 拼接在 fetch 路径，已 mock）。
+  // 订阅伪装中性 UA（FlowZ/<版本>），规避机场拦截。**勿用于 GitHub API/资源下载**——带版本会泄漏，
+  // 用 shared/constants.ts 的 APP_USER_AGENT（应用自标识）。app.getVersion() 仅打包后可用；测试不消费本函数（UA 拼接在 fetch 路径，已 mock）。
   let version = '0.0.0';
   try {
     version = app.getVersion();
