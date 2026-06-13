@@ -8,7 +8,12 @@ import { useAppStore } from '../store/app-store';
 import { ErrorHandler, ErrorCategory, proxyErrorCategory } from '../lib/error-handler';
 import { toast } from 'sonner';
 import i18n from '../i18n';
-import type { TrafficStats, IpInfoSnapshot, ProxyErrorCode } from '../../shared/types';
+import type {
+  TrafficStats,
+  IpInfoSnapshot,
+  ProxyErrorCode,
+  InvalidNodeInfo,
+} from '../../shared/types';
 
 // 定义事件数据类型
 interface NativeEventData {
@@ -30,6 +35,7 @@ interface NativeEventData {
   proxyModeSwitched: { success: boolean; newMode: string };
   proxyModeSwitchFailed: { success: boolean; error: string };
   autoNodeSwitched: { reason: string; newServerName: string; latency: number };
+  invalidNodes: InvalidNodeInfo[];
 }
 
 type NativeEventListener<K extends keyof NativeEventData> = (data: NativeEventData[K]) => void;
@@ -63,6 +69,9 @@ export function useNativeEvent<K extends keyof NativeEventData>(
         break;
       case 'autoNodeSwitched':
         unsubscribe = api.proxy.onAutoNodeSwitched(callback as any);
+        break;
+      case 'invalidNodes':
+        unsubscribe = api.proxy.onInvalidNodes(callback as any);
         break;
       default:
         console.warn(`Unknown event: ${eventName}`);
@@ -156,6 +165,13 @@ function handleAutoNodeSwitched(data: NativeEventData['autoNodeSwitched']) {
   });
 }
 
+function handleInvalidNodes(data: NativeEventData['invalidNodes']) {
+  // 事件 payload 即本次启动 gate 剔除的全部非法节点（空数组=无/清陈旧）；整体覆盖 store map。
+  const map: Record<string, InvalidNodeInfo> = {};
+  for (const n of data || []) map[n.id] = n;
+  useAppStore.setState({ invalidNodes: map });
+}
+
 /**
  * Hook to listen to all native events and update store
  */
@@ -167,4 +183,5 @@ export function useNativeEventListeners() {
   useNativeEvent('statsUpdated', handleStatsUpdated);
   useNativeEvent('ipInfoUpdated', handleIpInfoUpdated);
   useNativeEvent('autoNodeSwitched', handleAutoNodeSwitched);
+  useNativeEvent('invalidNodes', handleInvalidNodes);
 }

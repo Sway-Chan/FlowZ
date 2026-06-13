@@ -34,6 +34,7 @@ import {
 import { createAutoStartManager } from './services/AutoStartManager';
 import { UpdateService } from './services/UpdateService';
 import { CoreUpdateService } from './services/CoreUpdateService';
+import { CoreUpdateScheduler } from './services/CoreUpdateScheduler';
 import { SpeedTestService } from './services/SpeedTestService';
 import { AutoSwitchService } from './services/AutoSwitchService';
 import { SubscriptionScheduler } from './services/SubscriptionScheduler';
@@ -43,11 +44,13 @@ import { RuleResourceManager } from './services/RuleResourceManager';
 import { seedBuiltinRuleSets } from './services/builtin-geo-rulesets';
 import { RuleResourceScheduler } from './services/RuleResourceScheduler';
 import { HelperManager } from './services/HelperManager';
-import type { HelperStatus, UserConfig } from '../shared/types';
+import type { HelperStatus, UserConfig, LogLevel } from '../shared/types';
 import { ipcEventEmitter } from './ipc/ipc-events';
 import { mainEventEmitter, MAIN_EVENTS } from './ipc/main-events';
 import { initUserDataPath } from './utils/paths';
 import { IPC_CHANNELS } from '../shared/ipc-channels';
+import { LOGIN_ITEMS_SETTINGS_URL } from '../shared/constants';
+import { effectiveLogLevel } from '../shared/log-level';
 
 // 初始化用户数据路径（必须在 app.requestSingleInstanceLock() 之前调用）
 // 以确保便携模式下，锁文件和所有 Electron 数据都重定向到正确的目录
@@ -102,6 +105,14 @@ export function getPrivacyMode(): boolean {
 export function setPrivacyMode(value: boolean): void {
   if (isPrivacyMode === value) return;
   isPrivacyMode = value;
+  // 隐私联动：app.log/UI 即时按隐私态收敛（≥warn 不记连接明细）；sing-box 连接日志级别在下次核心重启时按新隐私
+  // 态重新生成（不主动断流）。logManager/configManager 为模块级，早期调用可能尚未初始化 → 守空。
+  if (logManager) {
+    configManager
+      ?.loadConfig()
+      .then((cfg) => logManager.setLogLevel(effectiveLogLevel(cfg.logLevel || 'info', value)))
+      .catch(() => {});
+  }
   // 通知所有窗口同步此状态
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send(value ? 'event:enterPrivacyMode' : 'event:exitPrivacyMode');
@@ -159,6 +170,7 @@ let subscriptionService: SubscriptionService;
 let speedTestService: SpeedTestService;
 let autoSwitchService: AutoSwitchService;
 let subscriptionScheduler: SubscriptionScheduler;
+let coreUpdateScheduler: CoreUpdateScheduler | null = null;
 let statsService: StatsService | null = null;
 let ipInfoService: IpInfoService | null = null;
 let ruleResourceManager: RuleResourceManager | null = null;
@@ -182,29 +194,68 @@ async function promptHelperGate(
   }
   const zh = currentLanguage.toLowerCase().startsWith('zh');
   if (hs.backgroundDisabled) {
-    // 后台被系统禁用：install 大概率被 BTM 拦截 → 引导去系统设置 reenable，而非「安装」
+    // 「登录项与扩展 / 允许在后台」开关由 BTM（Background Task Management）管，与 launchctl enable/disable 是两个
+    // 独立层。用户关掉开关 = BTM disposition 置 disallowed。程序无法把它翻回开（Apple SMAppService 无写 disposition
+    // 的 API），唯一可靠恢复是用户去系统设置手动开。故三选项：
+    //  - 打开系统设置：深链到「登录项与扩展」，用户手动开启后回来重新启动即免授权（abort，保持干净停止态）。
+    //  - 本次直接启动：经 startSingBoxProcess 走 osascript root 看护脚本（弹一次密码框、不依赖 BTM、会话稳定）；每次启停需授权。
+    //  - 取消。
     const { response } = await dialog.showMessageBox({
       type: 'question',
       buttons: zh
-        ? ['打开系统设置', '用系统授权启动', '取消']
-        : ['Open System Settings', 'Use system auth', 'Cancel'],
+        ? ['打开系统设置', '本次直接启动', '取消']
+        : ['Open System Settings', 'Start this session', 'Cancel'],
       defaultId: 0,
       cancelId: 2,
-      message: zh ? '提权助手后台运行被系统关闭' : 'Helper background run disabled',
+      message: zh ? '提权助手的「允许在后台」被系统关闭' : 'Helper "Allow in Background" is off',
       detail: zh
-        ? '请在系统设置「登录项与扩展」重新开启本应用的「允许在后台」，否则 TUN 启停将每次弹系统授权。也可本次用系统授权启动。'
-        : 'Re-enable "Allow in the Background" for this app under System Settings → Login Items & Extensions; otherwise TUN start/stop prompts each time. Or start with system auth this time.',
+        ? '请在「系统设置 > 通用 > 登录项与扩展」重新打开 FlowZ 的「允许在后台」开关，然后回到 FlowZ 重新点击启动即可（届时免授权直接走提权助手）。\n「本次直接启动」会以系统管理员授权方式运行（弹一次密码框），不依赖后台开关；但之后每次启停都需授权，建议尽快去系统设置打开开关。'
+        : 'Open System Settings → General → Login Items & Extensions and turn the "Allow in Background" toggle back on for FlowZ, then return to FlowZ and start again (no authorization needed then).\n"Start this session" runs with system administrator authorization (one password prompt) and does not depend on the toggle; each start/stop will prompt afterwards, so re-enabling the toggle is recommended.',
+    });
+    if (response === 0) {
+      await shell.openExternal(LOGIN_ITEMS_SETTINGS_URL).catch(() => {});
+      return 'abort'; // 打开设置后中止本次启动；用户开好开关回来重启即免授权
+    }
+    if (response === 1) {
+      // 本次直接启动：不再 install-over-top —— 真机实测 install 拉起的 disallowed daemon 会被 BTM ~20s 后收割（代理
+      // 死、自动重启失败），且与随后 osascript 看护构成双弹窗。直接放行，由 startSingBoxProcess 在 backgroundDisabled
+      // 时走 osascript root 看护脚本（不受 BTM 管、单次授权、会话稳定）。
+      return 'proceed';
+    }
+    return 'abort'; // 取消
+  }
+  if (hs.needsRepair || hs.pathMismatch) {
+    // 需修复有两种成因，文案分流（避免 proto 升级也报「应用位置已变更」误导用户，L3）：
+    //  - pathMismatch：应用被移动，plist 烧录路径失效；
+    //  - 否则（!ready）：多为协议版本升级（如 v2→v3），已装 helper 需重装到新版本。
+    // 诚实化：此「修复」=重装，**不会**恢复系统设置里「允许在后台」开关；若开关被关需到系统设置手动开启（Bug2 文案）。
+    const noteOff = zh
+      ? '\n注意：若系统设置「允许在后台」开关已被关闭，此修复不会恢复该开关；请到「系统设置 > 通用 > 登录项与扩展」手动重新开启。'
+      : '\nNote: if the "Allow in Background" toggle was turned off in System Settings, this repair will NOT restore it; re-enable it manually under System Settings → General → Login Items & Extensions.';
+    const detail =
+      (zh
+        ? hs.pathMismatch
+          ? '检测到应用位置已变更，提权助手仍指向旧路径而无法生效。修复将重新登记当前路径，仅需授权一次；也可本次用系统授权启动。'
+          : '提权助手需要更新到新版本（功能改进）。修复将重新安装，仅需授权一次；也可本次用系统授权启动。'
+        : hs.pathMismatch
+          ? 'The app was moved and the helper still points to the old path. Repair re-registers the current path (one authorization); or start with system auth this time.'
+          : 'The privileged helper needs updating to a newer version. Repair reinstalls it (one authorization); or start with system auth this time.') +
+      noteOff;
+    const { response } = await dialog.showMessageBox({
+      type: 'question',
+      buttons: zh
+        ? ['修复并启动', '用系统授权启动', '取消']
+        : ['Repair & start', 'Use system auth', 'Cancel'],
+      defaultId: 0,
+      cancelId: 2,
+      message: zh ? '修复提权助手？' : 'Repair privileged helper?',
+      detail,
     });
     if (response === 2) return 'abort'; // 取消：不启动
-    if (response === 0) {
-      await shell
-        .openExternal('x-apple.systempreferences:com.apple.LoginItems-Settings.extension')
-        .catch(() => {});
-      return 'abort'; // 去设置修，本次不启动
-    }
-    return 'proceed'; // response 1 → osascript 回退
+    if (response === 0) await helperManager.install().catch(() => {}); // 重烧路径后 start 走 helper 零提权
+    return 'proceed';
   }
-  // 未安装 / 路径不符 → 安装并启动
+  // 未安装 → 安装并启动
   const { response } = await dialog.showMessageBox({
     type: 'question',
     buttons: zh
@@ -319,23 +370,23 @@ async function showWindow() {
 }
 
 // ── macOS 菜单栏常驻：关窗即摘 Dock 图标 ───────────────────────────────────
-// 机制（真机实测定论）：
-// 1) `app.setActivationPolicy('accessory')` 让 `app.dock.isVisible()`→false（系统已认定无图标）；
-// 2) 但仅改 policy 时 Dock 不刷新已显示的 tile → 图标视觉残留（前几次失败的真因，非 API 没生效）；
-// 3) 紧跟 `app.hide()` 把前台交还前一 app → 真实 app 切换 → Dock 重绘、移除 accessory tile。
-// 弃用 `app.dock.hide()`（底层 Carbon TransformProcessType 对 active app no-op + 1s 防抖，本就不可靠）。
+// 机制：setActivationPolicy('accessory') 令系统认定无 Dock 图标 + app.hide() 触发「前台交还/app 切换」促 Dock
+// 重绘移除 tile。**已知 macOS 限制**（用户实测 + Apple 论坛证实）：Dock「最近使用」区里未固定 app 少于 3 个时，
+// Dock 无法回填摘除 tile 留下的空位 → 图标视觉残留（systemAPI 已认无图标、dock.isVisible()→false，仅视觉未刷新）；
+// 最近 app 充足时正常消失。此为系统行为、app 层无可靠绕过。
+// 不用 app.dock.hide()：Electron 实现会对所有窗口 setCanHide:NO 且 DockShow 不恢复（electron#16093 wontfix）→
+// 关窗一次后 Cmd+H 永久失效；且收益（修上述残留）大概率 no-op（排在 accessory 之后无进程状态迁移）。
 let dockHidden = false; // 当前是否处于 accessory（菜单栏-only）
 
 function hideDockIfMenubarOnly() {
   if (process.platform !== 'darwin') return;
   if (isQuitting || dockHidden) return;
-  // 守卫：任一窗口仍可见（主窗 / 更新进度窗）则不摘 Dock——否则 app.hide() 会把它一并藏掉。
-  // 用「全部窗口」判定（含主窗）→ 函数对任何调用点都自保，不依赖调用方保证主窗已隐藏（如进度窗关闭后重评估）。
+  // 守卫：任一窗口仍可见（主窗 / 更新进度窗）则不摘 Dock。用「全部窗口」判定 → 对任何调用点自保。
   const anyVisible = BrowserWindow.getAllWindows().some((w) => !w.isDestroyed() && w.isVisible());
   if (anyVisible) return;
   app.setActivationPolicy('accessory');
   dockHidden = true;
-  app.hide(); // 触发 Dock 重绘以移除残留 tile（同步即时、无滞后）
+  app.hide(); // 触发「前台交还/app 切换」促 Dock 重绘移除 tile（受上述 macOS 最近-app 限制）。
 }
 
 /** 恢复 Dock 图标（accessory→regular）。必须在 show()/focus() 之前调用。 */
@@ -554,7 +605,7 @@ async function createWindow(forceShow = false) {
   // 经 activation policy 状态机（见 hideDockIfMenubarOnly/restoreDockPresence），覆盖所有显隐路径。
   if (process.platform === 'darwin') {
     mainWindow.on('hide', () => {
-      // setActivationPolicy('accessory') + app.hide() 摘 Dock 图标（实测机制见 hideDockIfMenubarOnly）。
+      // 经 accessory + app.hide() 摘 Dock 图标（机制与 macOS 限制见 hideDockIfMenubarOnly）。
       if (!isQuitting) hideDockIfMenubarOnly();
     });
     mainWindow.on('show', () => {
@@ -660,6 +711,7 @@ async function runCleanup(): Promise<void> {
       idleCheckInterval = null;
     }
     subscriptionScheduler?.stop();
+    coreUpdateScheduler?.stop();
     ruleResourceScheduler?.stop();
     autoSwitchService?.destroy();
 
@@ -740,6 +792,11 @@ if (gotTheLock) {
     coreUpdateService = new CoreUpdateService(logManager);
     subscriptionService = new SubscriptionService(protocolParser, logManager);
     speedTestService = new SpeedTestService(logManager);
+    // 批次 B：把日志 sink 注入「原本裸 console、不进 app.log」的服务，补排障盲区（系统代理/配置/资源/协议）
+    configManager.setLogManager(logManager);
+    protocolParser.setLogManager(logManager);
+    systemProxyManager.setLogManager(logManager);
+    resourceManager.setLogManager(logManager);
     // 记录应用启动日志
     logManager.addLog('info', 'Application started', 'Main');
 
@@ -791,6 +848,10 @@ if (gotTheLock) {
     // 加载配置并处理错误
     try {
       const config = await configManager.loadConfig();
+      // 让 config.logLevel 对 LogManager 生效：原本 LogManager 恒留默认 'info'，config 设的 FATAL 形同虚设
+      // （设置页改 logLevel 走 CONFIG_SAVE，从不调 setLogLevel；LOGS_SET_LEVEL 是死代码）→ 设 FATAL 仍刷屏非 FATAL。
+      // 经 effectiveLogLevel：隐私模式开时抬到 ≥warn，app.log 与 sing-box 一同收敛连接明细。
+      logManager.setLogLevel(effectiveLogLevel(config.logLevel || 'info', getPrivacyMode()));
       logManager.addLog('info', 'Configuration loaded successfully', 'Main');
 
       // 检查配置是否为默认配置（可能是因为加载失败）
@@ -813,13 +874,22 @@ if (gotTheLock) {
 
     // 初始化 ProxyManager（需要在窗口创建后）
     proxyManager = new ProxyManager(logManager, mainWindow || undefined);
+    // 隐私联动：隐私模式开 → sing-box 日志级别抬到 ≥warn（源头不记访问域名/SNI 到 singbox.log）
+    proxyManager.setPrivacyProvider(getPrivacyMode);
     coreUpdateService.setProxyManager(proxyManager);
     coreUpdateService.setConfigProvider(() => configManager.loadConfig());
+    // 内核自动更新状态/成功提示经事件推渲染端（staged 待生效 / 跨带提示 / 落位成功复用 banner）
+    coreUpdateService.setEventSender((channel, payload) =>
+      ipcEventEmitter.sendToAll(channel, payload)
+    );
 
     // macOS 提权 helper：装一次后 TUN 模式启停 sing-box 免提权；未装则回退 PR-M1 看护脚本。
     helperManager = new HelperManager(logManager);
     proxyManager.setHelperManager(helperManager);
+    coreUpdateService.setHelperManager(helperManager); // B 块：macOS 持久化内核更新经 helper v5 install-core
     proxyManager.setHelperGate(promptHelperGate);
+    // 系统代理单一写者：注入同一 singleton（上方 756 创建），enable/clear 统一收口 ProxyManager.start()/终态。
+    proxyManager.setSystemProxyManager(systemProxyManager);
 
     // 流量统计：代理运行时轮询 clash_api，经事件推渲染端展示（带 clash secret 鉴权）
     statsService = new StatsService(
@@ -827,6 +897,11 @@ if (gotTheLock) {
       () => proxyManager?.getClashApiSecret() ?? '',
       (snap) => ipcEventEmitter.sendToAll(IPC_CHANNELS.EVENT_CONNECTIONS_UPDATED, snap)
     );
+    // 杀核前静默 clash_api 客户端：停轮询 + 关到 9090 的 keep-alive 连接 → 9090 不进 TIME_WAIT（P0-2 治本）。
+    proxyManager.setQuiesceClashClients(() => {
+      statsService?.stop();
+      statsService?.closeConnections();
+    });
 
     // 出口 IP 信息：经探针 inbound 测本地直连出口 / 代理出口，事件驱动刷新（无周期轮询）
     ipInfoService = new IpInfoService(
@@ -883,6 +958,15 @@ if (gotTheLock) {
     );
     subscriptionScheduler.start();
 
+    // 内核自动更新调度器（仅兼容版本带内）：30s 启动检查 + 6h tick + 24h due；落位仅在代理停止态。
+    coreUpdateScheduler = new CoreUpdateScheduler(
+      configManager,
+      coreUpdateService,
+      logManager,
+      () => proxyManager?.getStatus().running ?? false
+    );
+    coreUpdateScheduler.start();
+
     // 自动空闲模式：powerMonitor 真实系统输入空闲轮询（app ready 后才可用），替代窗口 blur/hide 边沿武装
     idleCheckInterval = setInterval(() => void checkIdleAutoModes(), IDLE_POLL_MS);
 
@@ -916,23 +1000,9 @@ if (gotTheLock) {
         logManager.addLog('error', `自动回滚重启失败: ${rollbackErr}`, 'Main');
       }
 
-      // 2) 放弃自动恢复（重启已达上限）：清理系统代理，避免网络不可用（错误已由 ProxyManager 投递前端）
-      try {
-        const proxyStatus = await systemProxyManager.getProxyStatus();
-        if (proxyStatus.enabled) {
-          logManager.addLog('info', 'Disabling system proxy due to proxy error...', 'Main');
-          await systemProxyManager.disableProxy();
-          logManager.addLog('info', 'System proxy disabled after error', 'Main');
-        }
-      } catch (cleanupError) {
-        const errorMessage =
-          cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
-        logManager.addLog(
-          'warn',
-          `Failed to disable system proxy after error: ${errorMessage}`,
-          'Main'
-        );
-      }
+      // 2) 系统代理清理同样不在此监听器做：'error' 由 giveUpAutoRestart / handleProcessExit 终态分支发出，
+      // 它们在 emit 之前已**同步门控**地调过 ensureSystemProxyCleared（stopping=false 的真终态会清）。此处再调
+      // 因前面有 await（核心回滚）会越过 stopping 门控（H-1），且属重复，故删除。
 
       // 终态错误（放弃自动恢复）不一定走 'stopped' 事件 → 主动解绑主进程会话代理，否则 defaultSession
       // 仍指向已死的 http://127.0.0.1:<port>，更新检查/规则资源拉取一直失败。幂等：核心已死 → running=false → {mode:'system'}。
@@ -1001,22 +1071,15 @@ if (gotTheLock) {
       // 正常停止时，重置错误状态
       updateTrayMenuState(false, false);
 
-      // 确保系统代理被清理
-      try {
-        const proxyStatus = await systemProxyManager.getProxyStatus();
-        if (proxyStatus.enabled) {
-          await systemProxyManager.disableProxy();
-          logManager.addLog('info', 'System proxy disabled on stop', 'Main');
-        }
-      } catch (cleanupError) {
-        const errorMessage =
-          cleanupError instanceof Error ? cleanupError.message : String(cleanupError);
-        logManager.addLog(
-          'warn',
-          `Failed to disable system proxy on stop: ${errorMessage}`,
-          'Main'
-        );
-      }
+      // 系统代理清理不在此监听器内做：该回调含 await（applyMainSessionProxy），等执行到这里时 stop() 的
+      // finally 已把 stopping 复位，stopping 门控会被时序绕过 → 重启路径误清并删新会话 marker（C1 的 H-1 回归）。
+      // 所有「进程不再运行」的路径都已在 ProxyManager 内部**同步门控**地调过 ensureSystemProxyCleared：
+      // handleProcessExit（信号死/崩溃终态）、performHealthCheck（达上限）、giveUpAutoRestart、restart 的 start
+      // 腿失败、退避 abort；用户主动停止由 IPC/托盘在 stop() 前置清理。故此处删除，避免越过门控。
+
+      // 内核自动更新：代理停止 → 安全窗口，延 5s 双查后落位 staged 内核（规避 attemptAutoRestart/switchMode
+      // 的 stop→start 瞬时窗口）。调度器内部守 running===false，绝不在重启间隙落位（不断流硬不变量）。
+      coreUpdateScheduler?.onProxyStopped();
     });
 
     // 注册 IPC 处理器（需要在 ProxyManager 创建后）
@@ -1024,7 +1087,7 @@ if (gotTheLock) {
     registerPrivacyHandlers();
     registerServerHandlers(protocolParser, configManager);
     registerLogHandlers(logManager, proxyManager);
-    registerProxyHandlers(proxyManager, systemProxyManager, statsService);
+    registerProxyHandlers(proxyManager, statsService);
     registerIpInfoHandlers(ipInfoService);
     registerSystemHandlers();
     registerRuleResourceHandlers(ruleResourceManager);
@@ -1047,10 +1110,11 @@ if (gotTheLock) {
     registerBackupHandlers(configManager);
 
     // 注册提权 helper 处理器（macOS 免提权启停）
-    registerHelperHandlers(helperManager);
+    registerHelperHandlers(helperManager, proxyManager);
 
     // 同步自启动状态
     const autoStartManager = createAutoStartManager();
+    autoStartManager.setLogManager(logManager);
     const config = await configManager.loadConfig();
     await autoStartManager.setAutoStart(config.autoStart ?? false);
 
@@ -1065,6 +1129,9 @@ if (gotTheLock) {
 
     // 注册测速处理器
     registerSpeedTestHandlers(configManager, speedTestService);
+
+    // IPC 处理器全部注册完成（汇总一条，取代各 handler 模块的逐条启动日志）
+    logManager.addLog('info', 'IPC handlers 注册完成', 'Main');
 
     // 设置托盘状态更新回调
     setTrayStateCallback((isRunning: boolean, hasError?: boolean) => {
@@ -1087,17 +1154,8 @@ if (gotTheLock) {
           const config = await configManager.loadConfig();
           // helper 引导已收敛到 ProxyManager.start() 单点（promptHelperGate 注入），托盘启动自动覆盖。
           if (proxyManager) {
+            // 系统代理 enable/clear 已收口于 start()（拆双轨），托盘不再重复设置。
             await proxyManager.start(config);
-
-            // 系统代理模式：设置系统代理
-            const modeType = (config.proxyModeType || 'systemProxy').toLowerCase();
-            if (modeType === 'systemproxy') {
-              await systemProxyManager.enableProxy(
-                '127.0.0.1',
-                config.httpPort || 2080,
-                config.socksPort || 2081
-              );
-            }
 
             logManager.addLog('info', 'Proxy started from tray', 'Main');
             // 更新托盘菜单状态
@@ -1110,10 +1168,10 @@ if (gotTheLock) {
       },
       onStopProxy: async () => {
         try {
-          // 先禁用系统代理（不管当前状态如何，都尝试禁用）
-          await systemProxyManager.disableProxy();
-
+          // 用户主动停止：先清系统代理（stop() 前调，stopping 仍 false → 会真正清）。经 ensureSystemProxyCleared
+          // 的 marker + 指向门控，仅清 FlowZ 自己设置的，不 stomp 用户自配/TUN 模式（修 M4）。
           if (proxyManager) {
+            await proxyManager.ensureSystemProxyCleared().catch(() => {});
             await proxyManager.stop();
             logManager.addLog('info', 'Proxy stopped from tray', 'Main');
             // 更新托盘菜单状态
@@ -1162,10 +1220,9 @@ if (gotTheLock) {
           await configManager.saveConfig(config);
           logManager.addLog('info', `Proxy mode changed from tray: ${mode}`, 'Main');
 
-          // 如果代理正在运行，重启以应用新模式
+          // 如果代理正在运行，重启以应用新模式（走 restart()：start 腿失败会清残留系统代理，防死端口断网）
           if (proxyManager && proxyManager.getStatus().running) {
-            await proxyManager.stop();
-            await proxyManager.start(config);
+            await proxyManager.restart(config);
             logManager.addLog('info', 'Proxy restarted with new mode', 'Main');
           }
 
@@ -1188,10 +1245,10 @@ if (gotTheLock) {
           await configManager.saveConfig(config);
           logManager.addLog('info', `Takeover mode changed from tray: ${modeType}`, 'Main');
 
-          // 运行中则重启以应用新接管方式（TUN 模式若已装 helper，start 走零提权路径）
+          // 运行中则重启以应用新接管方式（走 restart()：start 腿失败清残留系统代理；成功则 start reconcile
+          // 按新模式 enable/clear——覆盖 systemProxy↔TUN 双向切换的系统代理一致性）
           if (proxyManager && proxyManager.getStatus().running) {
-            await proxyManager.stop();
-            await proxyManager.start(config);
+            await proxyManager.restart(config);
             logManager.addLog('info', 'Proxy restarted with new takeover mode', 'Main');
           }
 
@@ -1290,46 +1347,25 @@ if (gotTheLock) {
       try {
         const config = await configManager.loadConfig();
 
-        // 检查 sing-box 内核版本是否发生变化（检测更新是否破坏配置兼容性）
+        // 内核自动更新：App 启动序列的安全窗口（代理尚未 autoConnect）→ 先尝试落位上轮暂存的 staged 内核，
+        // 再做版本变更检测+autoConnect。落位仅在代理未运行时发生（此刻必然未连），不断流硬不变量。
         try {
-          const lastKnownVersion = coreUpdateService.getLastKnownGoodVersion();
-          const currentVersion = await coreUpdateService.getCurrentVersion();
-          if (
-            lastKnownVersion &&
-            currentVersion !== '未知' &&
-            lastKnownVersion !== currentVersion
-          ) {
-            logManager.addLog(
-              'warn',
-              `sing-box 内核版本已变更: ${lastKnownVersion} → ${currentVersion}，通知用户`,
-              'Main'
-            );
-            ipcEventEmitter.sendToAll(IPC_CHANNELS.EVENT_CORE_VERSION_CHANGED, {
-              previousVersion: lastKnownVersion,
-              currentVersion,
-              hasBackup: coreUpdateService.hasBackup(),
-            });
-          }
-        } catch (versionCheckError) {
-          logManager.addLog('warn', `版本检测失败: ${versionCheckError}`, 'Main');
+          await coreUpdateService.tryApplyStaged('startup');
+        } catch (stagedErr) {
+          logManager.addLog('warn', `启动期落位 staged 内核异常: ${stagedErr}`, 'Main');
         }
+
+        // 启动期「内核版本变更」横幅已移除：基线对齐缺收口 → 每次启动重复弹扰民（基线 core-version.json 与实际核不一致
+        // 时反复触发）。更新当下已有一次性反馈（applyStagedNow 的 EVENT_CORE_VERSION_CHANGED），回滚入口常驻内核管理设置，
+        // 故启动期不再主动弹。
 
         // 检查是否启用了启动时自动连接
         if (config.autoConnect && config.selectedServerId) {
           logManager.addLog('info', '启动时自动连接已启用，正在连接...', 'Main');
 
           if (proxyManager) {
+            // 系统代理 enable/clear 已收口于 start()（拆双轨），自动连接不再重复设置。
             await proxyManager.start(config);
-
-            // 系统代理模式：设置系统代理
-            const modeType = (config.proxyModeType || 'systemProxy').toLowerCase();
-            if (modeType === 'systemproxy') {
-              await systemProxyManager.enableProxy(
-                '127.0.0.1',
-                config.httpPort || 2080,
-                config.socksPort || 2081
-              );
-            }
 
             logManager.addLog('info', '启动时自动连接成功', 'Main');
             // 更新托盘菜单状态
@@ -1382,42 +1418,53 @@ if (gotTheLock) {
     // 取代旧的「启动后一次性 setTimeout 拉取」。详见 subscriptionScheduler.start() 调用处。
 
     // 监听配置变更事件，更新托盘菜单并自动重启代理
-    mainEventEmitter.on(MAIN_EVENTS.CONFIG_CHANGED, async () => {
-      // 1. 更新托盘菜单
-      const isRunning = proxyManager?.getStatus().running ?? false;
-      updateTrayMenuState(isRunning);
+    mainEventEmitter.on(
+      MAIN_EVENTS.CONFIG_CHANGED,
+      async (changedConfig?: { logLevel?: LogLevel }) => {
+        // 0. logLevel 热同步到 LogManager（设置页改日志级别即时生效，无需重启 app；与启动期 setLogLevel 对齐）
+        const lvl =
+          changedConfig?.logLevel ?? (await configManager.loadConfig().catch(() => null))?.logLevel;
+        logManager.setLogLevel(effectiveLogLevel(lvl || 'info', getPrivacyMode()));
 
-      // 2. 如果代理正在运行，应用新配置：仅切节点走 clash_api 热切换（不断流），其余重启（见 switchMode）
-      if (isRunning && proxyManager) {
-        try {
-          // 重新加载配置以确保使用最新值
-          const latestConfig = await configManager.loadConfig();
-          await proxyManager.switchMode(latestConfig);
-          logManager.addLog('info', 'Applied configuration change', 'Main');
+        // 1. 更新托盘菜单
+        const isRunning = proxyManager?.getStatus().running ?? false;
+        updateTrayMenuState(isRunning);
 
-          // 应用后再次更新托盘（以防状态有变）
-          updateTrayMenuState(proxyManager.getStatus().running);
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          logManager.addLog('error', `Failed to apply config change: ${errorMessage}`, 'Main');
-          // 应用失败，更新托盘状态为停止
-          updateTrayMenuState(false, true);
+        // 2. 如果代理正在运行，应用新配置：仅切节点走 clash_api 热切换（不断流），其余重启（见 switchMode）
+        if (isRunning && proxyManager) {
+          try {
+            // 重新加载配置以确保使用最新值
+            const latestConfig = await configManager.loadConfig();
+            await proxyManager.switchMode(latestConfig);
+            logManager.addLog('info', 'Applied configuration change', 'Main');
+
+            // 应用后再次更新托盘（以防状态有变）
+            updateTrayMenuState(proxyManager.getStatus().running);
+          } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            logManager.addLog('error', `Failed to apply config change: ${errorMessage}`, 'Main');
+            // 应用失败，更新托盘状态为停止
+            updateTrayMenuState(false, true);
+          }
         }
-      }
 
-      // 3. 同步自动换节点服务状态
-      if (autoSwitchService) {
-        const latestCfg = await configManager.loadConfig().catch(() => null);
-        if (latestCfg?.autoSwitchNode) {
-          autoSwitchService.enable();
-        } else {
-          autoSwitchService.disable();
+        // 3. 同步自动换节点服务状态
+        if (autoSwitchService) {
+          const latestCfg = await configManager.loadConfig().catch(() => null);
+          if (latestCfg?.autoSwitchNode) {
+            autoSwitchService.enable();
+          } else {
+            autoSwitchService.disable();
+          }
         }
-      }
 
-      // 4. 应用「更新检查走代理」总开关（mainSessionViaProxy 切换时热生效；幂等）
-      await applyMainSessionProxy();
-    });
+        // 4. 应用「更新检查走代理」总开关（mainSessionViaProxy 切换时热生效；幂等）
+        await applyMainSessionProxy();
+
+        // 5. 内核自动更新开关刚开 → kick 一次即时检查（无需等 6h tick）；未开/未 due 自然跳过，幂等
+        coreUpdateScheduler?.kick();
+      }
+    );
 
     // macOS/Linux 关机/重启早期钩子：powerMonitor 'shutdown'（win32 不发此事件，注销/关机走窗口级
     // 'session-end'，见 createWindow）。同步兜底：停代理 + marker 门控关系统代理（syncCleanupOnExit 内），

@@ -149,6 +149,9 @@ export interface SubscriptionConfig {
   autoUpdate: boolean;
   lastUpdated?: string;
   createdAt: string;
+  // 拉取订阅时的 User-Agent 覆盖（per-sub）。优先级：subscription.userAgent ?? config.subscriptionUserAgent ?? 默认。
+  // 默认 `FlowZ/<版本>`（纯中性）。订阅对话框「自定义 User-Agent」输入框可设置本字段。
+  userAgent?: string;
   // 订阅流量/到期信息（从 Subscription-UserInfo header 解析）
   userInfo?: {
     upload?: number; // 已上传字节
@@ -170,6 +173,11 @@ export interface ServerConfig {
 
   // 关联的订阅ID
   subscriptionId?: string;
+
+  // M1：节点归属的 Clash proxy-provider 名（仅经 proxy-providers 解析的节点有值；内联 proxies / 非 Clash
+  // 订阅 / 迁移前存量为 undefined）。用于订阅 partial 失败时按 provider 精确 merge-only——只保留失败 provider
+  // 名下的下架节点，成功 provider 的真下架正常删除。
+  providerName?: string;
 
   // VLESS 特定
   uuid?: string;
@@ -324,7 +332,15 @@ export interface TunModeConfig {
 export interface DnsConfig {
   domesticDns: string; // 国内 DNS，默认 https://doh.pub/dns-query
   foreignDns: string; // 海外 DNS，默认 https://dns.google/dns-query
-  enableFakeIp: boolean; // 是否启用 FakeIP（TUN 模式）
+  enableFakeIp: boolean; // 是否启用 FakeIP（systemProxy / TUN 统一生效，纯看此开关，见 usesFakeIp）
+  // FakeIP 开关统一一次性迁移标记：存量旧默认 enableFakeIp:false 多非用户意图，
+  // migrateFakeIpToggle 按迁移时刻 proxyModeType 写 effective 值（TUN/manual→true、systemProxy→保留）后置 true。
+  // undefined=未迁移（旧配置）；迁移幂等，置 true 后永不再改写，避免覆盖用户后续手动改的值。
+  fakeIpToggleMigrated?: boolean;
+  // 节点域名解析器（#57）：决定代理节点域名的 dial/rule1 解析走哪个 resolver。
+  // auto（缺省）=AliDNS IP-DoH（dns-bootstrap，零行为变化）/ dnspod=DNSPod IP-DoH（dns-node，1.12.12.12）/
+  // system=系统 DNS（dns-local；TUN 下 rule ctx 仍强制 IP-DoH 防递归）。旧配置无此字段 → 视为 auto。
+  nodeDomainResolver?: 'auto' | 'dnspod' | 'system';
 }
 
 // 自定义规则集（从 URL 导入）
@@ -370,6 +386,13 @@ export interface RuleResourceListItem extends RuleResource {
   referencedBy: number;
   /** 内置 geo 规则集（智能分流固定依赖）：不可删除、更新写回 <userData>/rules 热重载、可重置为出厂。id 形如 'builtin:geosite-cn'。 */
   builtin?: boolean;
+}
+
+/** 删除资源结果：被启用规则引用且未 force 时不删，回传 needConfirm + 引用规则明细（供前端展开确认列出）。 */
+export interface RuleResourceDeleteResult {
+  ok: boolean;
+  needConfirm?: boolean;
+  referencingRules?: { id: string; label: string }[];
 }
 
 /** 下载入参：catalogId（内置/动态项）或 url（手动，name 可选自动生成）。id/category 仅 redownload 内部用于保留原 id。 */
@@ -464,6 +487,8 @@ export interface UserConfig {
   autoUpdateSubscriptionOnStart: boolean; // 订阅自动更新总开关（启动补更陈旧订阅 + 运行期周期更新）
   subscriptionUpdateIntervalHours?: number; // 订阅自动更新周期/陈旧阈值（小时），默认 12
   subscriptionUpdateViaProxy?: boolean; // 订阅更新是否经代理（默认 false=直连，避免冷启动鸡生蛋 + 订阅地址被墙时再开）
+  // 全局订阅 UA（被 per-sub subscription.userAgent 覆盖；均缺省时用 `FlowZ/<版本>`）。本期无 UI，手编生效。
+  subscriptionUserAgent?: string;
   // 更新检查/规则资源等主进程请求是否经代理（默认 true=代理运行时借道，更新源全 GitHub、墙内借道更可靠）。
   // false → 主进程 defaultSession 走 {mode:'system'}。注：TUN 模式 OS 层捕获，false 不能完全直连（probe-direct 深修待真机）。
   mainSessionViaProxy?: boolean;
@@ -515,6 +540,10 @@ export interface UserConfig {
   // 核心更新：仅在配置生成器已验证的 sing-box minor 版本带内自动更新（默认 true）。关闭后允许自动
   // 更新跨越 minor（如 1.13→1.14），但跨 minor 的 schema 变更可能导致配置不兼容、需手动处理。
   restrictCoreUpdateToCompatibleMinor?: boolean;
+  // 内核自动更新总开关（默认 false；读取端 === true 判定，不进 createDefaultConfig）。开启后调度器周期检查、
+  // 仅在「同 major.minor 兼容版本带内」（如 1.13.x→1.13.y）自动下载+预检+落位；跨 minor 一律不自动，仅提示。
+  // 落位永远只在代理进程不存在时发生（运行中暂存 staged，延到停止/启动/用户点立即应用），绝不静默断流。
+  autoUpdateCore?: boolean;
   /** @deprecated 已迁移至 customRules（processName+direct）；仅保留兼容旧配置，ConfigManager 启动时清空迁移。 */
   bypassProcesses?: string[];
 
@@ -568,8 +597,10 @@ export enum ProxyErrorCode {
   // 配置类 → ErrorCategory.Config
   CONFIG_INVALID = 'CONFIG_INVALID', // 'invalid config'|'config error'、退出码 2
   PORT_IN_USE = 'PORT_IN_USE', // 'address already in use'
+  CLASH_API_PORT_RECYCLING = 'CLASH_API_PORT_RECYCLING', // 9090 处于 TIME_WAIT 回收中（瞬态，自动等待，非终态）
   // 权限/环境类 → ErrorCategory.System
   PERMISSION_DENIED = 'PERMISSION_DENIED', // 'permission denied'|'access denied'
+  SYSTEM_PROXY_FAILED = 'SYSTEM_PROXY_FAILED', // 核心已起但系统代理 networksetup/reg 设置失败（非终态提示）
   BINARY_NOT_EXECUTABLE = 'BINARY_NOT_EXECUTABLE', // 退出码 126
   BINARY_NOT_FOUND = 'BINARY_NOT_FOUND', // 退出码 127
   // 进程生命周期类 → ErrorCategory.Process
@@ -579,6 +610,7 @@ export enum ProxyErrorCode {
   AUTO_RESTARTING = 'AUTO_RESTARTING', // 自动重启中（瞬态）
   AUTO_RESTART_FAILED = 'AUTO_RESTART_FAILED', // 自动重启失败达上限
   RESTART_LIMIT_REACHED = 'RESTART_LIMIT_REACHED', // 健康检查发现死亡且重启耗尽
+  STOP_AUTH_CANCELLED = 'STOP_AUTH_CANCELLED', // 停止时用户取消提权授权、进程仍在运行（非终态）
   UNKNOWN = 'UNKNOWN',
 }
 
@@ -597,17 +629,46 @@ export interface ProxyErrorEvent {
   error?: string; // 【兼容·deprecated】原始 raw
 }
 
+/**
+ * 启动前配置校验 gate 剔除的非法节点（坏节点拖垮 sing-box 整体启动 FATAL → 启动前 check 剔除）。
+ * 仅会话内存语义：每次启动重判，换核自动复活；reason 区分「直接被 check 标中」/「detour 级联剔除」。
+ * 经 EVENT_PROXY_INVALID_NODES 推送渲染端，节点列表据此标灰 + tooltip（不禁用点击）。
+ */
+export interface InvalidNodeInfo {
+  id: string;
+  tag: string;
+  reason: string;
+}
+
 // ============================================================================
 // 连接快照（topology 统一供数：main 1s 轮询 clash_api /connections 留存裁剪后推送）
 // ============================================================================
 
-/** clash /connections 单条连接的 topology 所需子集（main 裁剪，丢弃流量/源信息等）。 */
+/**
+ * clash /connections 单条连接（main 裁剪后子集）。
+ * topology 只用 id/chains/rule/rulePayload/metadata{host,destinationIP}；连接信息页额外用扩展字段
+ * （network/type/sourceIP/sourcePort/destinationPort/processPath + upload/download/start）算速率/源/进程/时长。
+ * 扩展字段全 optional → 向后兼容 topology（拿到更多字段但只读原有的）；含 sourceIP/processPath 隐私字段，
+ * 故连接信息页须在隐私模式下屏蔽明细（见 connections-page）。
+ */
 export interface ConnectionEntry {
   id: string;
   chains: string[];
   rule: string;
   rulePayload: string;
-  metadata?: { host?: string; destinationIP?: string };
+  metadata?: {
+    host?: string;
+    destinationIP?: string;
+    network?: string; // tcp/udp
+    type?: string; // 入站类型（如 Tun/HTTP/Socks）
+    sourceIP?: string;
+    sourcePort?: string;
+    destinationPort?: string;
+    processPath?: string; // 发起连接的进程路径（隐私字段）
+  };
+  upload?: number; // 累计上行字节
+  download?: number; // 累计下行字节
+  start?: string; // 连接建立时刻（RFC3339）
 }
 
 /** 连接快照：经 EVENT_CONNECTIONS_UPDATED 推送 / CONNECTIONS_GET 回填。 */
@@ -625,15 +686,19 @@ export interface HelperStatus {
   supported: boolean;
   /** helper 二进制 + LaunchDaemon plist 是否在位 */
   installed: boolean;
-  /** socket ping 成功且协议版本匹配（可零提权驱动） */
+  /** socket ping 成功且协议版本 ≥ 最低可用（可零提权驱动 TUN） */
   ready: boolean;
+  /** 可用但有新版 helper（v5 install-core）：proto ≥ 最低可用但 < 期望 → 温和提示可升级（非故障，不强制重装） */
+  upgradeable: boolean;
   /** 协议版本（ping/version 返回），未就绪为 null */
   version: string | null;
   /** daemon 是否被 launchd 加载（launchctl print 退出码）；非 macOS / 未安装为 null */
   loaded: boolean | null;
   /** 已安装但无法就绪、协议版本不符、或烧录路径与当前 app 不符 → 建议重装修复 */
   needsRepair: boolean;
-  /** macOS「系统设置→登录项→允许在后台」被关：installed && !ready && loaded===false（去抖后）。needsRepair 的子集细分 */
+  /** macOS「系统设置→登录项→允许在后台」被关。判定链：SMAppService.statusForLegacyURL(=2) → BTM disposition 直读
+   *  → launchctl 去抖启发式（BTM .btm 目录受 TCC 完全磁盘访问保护、生产 GUI 读不到，故 SMAppService 为权威首通道）。
+   *  可与 ready=true 并存（install-over-top 混合态）。消费方契约：先判 backgroundDisabled 再判 needsRepair/pathMismatch。 */
   backgroundDisabled: boolean;
   /** 仅 macOS 打包版：plist 烧录的 sing-box 路径 ≠ 当前 app 路径（app 被移动过） */
   pathMismatch: boolean;

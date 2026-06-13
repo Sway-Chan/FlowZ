@@ -4,6 +4,7 @@ import { useAppStore } from './store/app-store';
 import { useNativeEventListeners } from './hooks/use-native-events';
 import { HomePage } from './pages/home-page';
 import { LogsPage } from './pages/logs-page';
+import { ConnectionsPage } from './pages/connections-page';
 import { ServerPage } from './pages/server-page';
 import { RulesPage } from './pages/rules-page';
 import { RuleResourcesPage } from './pages/rule-resources-page';
@@ -53,6 +54,7 @@ function App() {
       '/settings': 'settings',
       '/home': 'home',
       '/logs': 'logs',
+      '/connections': 'connections',
       '/server': 'server',
       '/ruleResources': 'ruleResources',
       '/rules': 'rules',
@@ -116,6 +118,7 @@ function App() {
       >
         {currentView === 'home' && <HomePage />}
         {currentView === 'logs' && <LogsPage />}
+        {currentView === 'connections' && <ConnectionsPage />}
         {currentView === 'server' && <ServerPage />}
         {currentView === 'appPolicy' && <AppPolicyPage />}
         {currentView === 'ruleResources' && <RuleResourcesPage />}

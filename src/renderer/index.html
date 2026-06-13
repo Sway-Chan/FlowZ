@@ -1,12 +1,27 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>FlowZ</title>
-</head>
-<body>
-  <div id="root"></div>
-  <script type="module" src="./main.tsx"></script>
-</body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>FlowZ</title>
+    <script>
+      // 冷启动早期主题（在 React/异步 config 之前同步执行，消除 FOUC 闪白）：用上次缓存的解析主题立即给根元素
+      // 上 class，无缓存则跟随系统配色。ThemeProvider 随后用真值 config 校正（通常一致、无可见切换）。
+      (function () {
+        try {
+          var t = localStorage.getItem('flowz-theme-resolved');
+          if (t !== 'dark' && t !== 'light') {
+            t = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+          }
+          document.documentElement.classList.add(t);
+        } catch (e) {
+          /* localStorage/matchMedia 不可用时静默，由 ThemeProvider 兜底 */
+        }
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./main.tsx"></script>
+  </body>
 </html>

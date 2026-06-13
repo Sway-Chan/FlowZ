@@ -6,7 +6,8 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { randomBytes } from 'crypto';
-import type { UserConfig, Rule, RuleCondition } from '../../shared/types';
+import type { UserConfig, Rule, RuleCondition, LogLevel } from '../../shared/types';
+import type { LogManager } from './LogManager';
 import { getConfigPath } from '../utils/paths';
 import { readPrivacyHash, writePrivacyHash, hashPasswordSync } from '../utils/privacy-lock';
 import {
@@ -29,6 +30,29 @@ export class ConfigManager implements IConfigManager {
   private configPath: string;
   private currentConfig: UserConfig | null = null;
   private tmpSwept = false;
+  private logManager?: LogManager;
+
+  /**
+   * 注入 LogManager（由主流程在 index.ts 统一注入）。ConfigManager 可能早于 LogManager 初始化，
+   * 故 logManager 为可选，注入前所有日志走 console fallback（见 this.log）。
+   */
+  setLogManager(lm: LogManager): void {
+    this.logManager = lm;
+  }
+
+  /**
+   * 统一日志出口：已注入 LogManager 则转发，否则按级别 fallback 到 console
+   * （ConfigManager 可能早于 LogManager 初始化）。
+   */
+  private log(level: LogLevel, message: string): void {
+    if (this.logManager) {
+      this.logManager.addLog(level, message, 'ConfigManager');
+      return;
+    }
+    if (level === 'error' || level === 'fatal') console.error(message);
+    else if (level === 'warn') console.warn(message);
+    else console.log(message);
+  }
 
   /**
    * 清扫 saveConfig 原子写遗留的孤儿 tmp（进程在 writeFile 成功后、rename 前被硬杀/断电；随机名不会被下次写覆盖自愈）。
@@ -99,7 +123,7 @@ export class ConfigManager implements IConfigManager {
         } catch {
           await fs
             .copyFile(this.configPath, backupPath)
-            .catch((e) => console.warn('备份旧配置失败（不阻断迁移）:', e));
+            .catch((e) => this.log('warn', `备份旧配置失败（不阻断迁移）: ${e}`));
         }
       }
 
@@ -110,7 +134,7 @@ export class ConfigManager implements IConfigManager {
       if (!config.clashApiSecret) {
         config.clashApiSecret = randomBytes(16).toString('hex');
         await this.saveConfig(config).catch((e) =>
-          console.warn('持久化 clashApiSecret 失败（不阻断）:', e)
+          this.log('warn', `持久化 clashApiSecret 失败（不阻断）: ${e}`)
         );
       }
 
@@ -123,12 +147,17 @@ export class ConfigManager implements IConfigManager {
         try {
           if (!readPrivacyHash()) writePrivacyHash(hashPasswordSync(legacyPlain));
           await this.saveConfig(config).catch((e) =>
-            console.warn('隐私密码迁移后落盘失败（不阻断）:', e)
+            this.log('warn', `隐私密码迁移后落盘失败（不阻断）: ${e}`)
           );
         } catch (e) {
-          console.warn('[ConfigManager] 隐私密码迁移失败（明文已从内存清除，下次加载重试）:', e);
+          this.log('warn', `隐私密码迁移失败（明文已从内存清除，下次加载重试）: ${e}`);
         }
       }
+
+      // FakeIP 开关统一一次性迁移（幂等、绝不抛）：存量旧默认 enableFakeIp:false 多非用户意图，
+      // usesFakeIp 改为纯看开关后，TUN 存量用户若不迁移会从「恒 FakeIP-on」静默掉到 off（机场拒 IP 风险）。
+      // 按迁移时刻 proxyModeType 写 effective 值，置标记防重复执行覆盖用户后续手动改的值。
+      this.migrateFakeIpToggle(config);
 
       // 缓存配置
       this.currentConfig = config;
@@ -137,17 +166,17 @@ export class ConfigManager implements IConfigManager {
     } catch (error) {
       // 文件不存在或解析失败，返回默认配置
       const errorMessage = error instanceof Error ? error.message : String(error);
-      console.warn('配置文件加载失败，使用默认配置:', errorMessage);
+      this.log('error', `配置文件加载失败，使用默认配置: ${errorMessage}`);
 
       // 记录详细错误信息
       if (error instanceof SyntaxError) {
-        console.error('配置文件 JSON 格式错误:', errorMessage);
+        this.log('error', `配置文件 JSON 格式错误: ${errorMessage}`);
       } else if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-        console.info('配置文件不存在，将创建默认配置');
+        this.log('info', '配置文件不存在，将创建默认配置');
       } else if ((error as NodeJS.ErrnoException).code === 'EACCES') {
-        console.error('配置文件权限不足，无法读取');
+        this.log('error', '配置文件权限不足，无法读取');
       } else {
-        console.error('配置验证失败:', errorMessage);
+        this.log('error', `配置验证失败: ${errorMessage}`);
       }
 
       const defaultConfig = this.createDefaultConfig();
@@ -156,9 +185,9 @@ export class ConfigManager implements IConfigManager {
       // 尝试保存默认配置
       try {
         await this.saveConfig(defaultConfig);
-        console.info('默认配置已保存到:', this.configPath);
+        this.log('info', `默认配置已保存到: ${this.configPath}`);
       } catch (saveError) {
-        console.error('保存默认配置失败:', saveError);
+        this.log('error', `保存默认配置失败: ${saveError}`);
         // 即使保存失败，也返回默认配置，让应用继续运行
       }
 
@@ -457,18 +486,21 @@ export class ConfigManager implements IConfigManager {
       throw new Error('tunConfig.strictRoute must be a boolean');
     }
 
-    // 校验 customRules（新 Rule shape）。**一律 console.warn 不 throw**：防单条脏数据触发整配置回落
+    // 校验 customRules（新 Rule shape）。**一律告警不 throw**：防单条脏数据触发整配置回落
     // 默认（loadConfig catch 会用默认配置覆盖保存 → 用户规则全丢）。结构非法的规则丢弃，值非法仅告警保留。
+    // 单条脏配置可批量出现 → 丢弃/sanitize 事件累计计数，循环结束后各汇总一条，防逐条刷屏。
     if (!Array.isArray(config.customRules)) {
       config.customRules = [];
     }
+    let droppedRules = 0; // 整条丢弃（无 id / 未知类型 / 结构非法）
+    let sanitizedIssues = 0; // 保留但 sanitize（值可能非法保留、conditions/combineMode 清洗）
     config.customRules = (config.customRules as Rule[]).filter((rule) => {
       if (!rule || typeof rule.id !== 'string' || !rule.id) {
-        console.warn('[ConfigManager] 丢弃无 id 的规则');
+        droppedRules++;
         return false;
       }
       if (!RULE_TYPE_IDS.includes(rule.type)) {
-        console.warn(`[ConfigManager] 丢弃未知类型规则: ${rule.id} type=${String(rule.type)}`);
+        droppedRules++;
         return false;
       }
       if (
@@ -476,16 +508,14 @@ export class ConfigManager implements IConfigManager {
         !['proxy', 'direct', 'block'].includes(rule.action) ||
         typeof rule.enabled !== 'boolean'
       ) {
-        console.warn(`[ConfigManager] 丢弃结构非法规则: ${rule.id}`);
+        droppedRules++;
         return false;
       }
       // 过滤非字符串 values 元素（旁路 config:save/备份导入可注入），防生成期 v.trim()/v.startsWith() 崩溃
       rule.values = rule.values.filter((v) => typeof v === 'string');
       for (const v of rule.values) {
         if (v.trim() && !validateRuleValue(rule.type, v)) {
-          console.warn(
-            `[ConfigManager] 规则值可能非法（保留）: ${rule.id} type=${rule.type} value=${v}`
-          );
+          sanitizedIssues++;
         }
       }
       // 多条件 conditions/combineMode sanitize（批J）：旁路注入可塞入非数组 conditions、非法
@@ -493,7 +523,7 @@ export class ConfigManager implements IConfigManager {
       // 的整条 conditions 丢弃（退化为单条件 type/values），值非法仅告警保留（同 values 策略）。
       if (rule.conditions !== undefined) {
         if (!Array.isArray(rule.conditions)) {
-          console.warn(`[ConfigManager] 规则 conditions 非数组，丢弃 conditions: ${rule.id}`);
+          sanitizedIssues++;
           delete rule.conditions;
         } else {
           const cleaned: RuleCondition[] = [];
@@ -503,9 +533,7 @@ export class ConfigManager implements IConfigManager {
               typeof cond !== 'object' ||
               !RULE_TYPE_IDS.includes((cond as RuleCondition).type)
             ) {
-              console.warn(
-                `[ConfigManager] 丢弃非法 condition: ${rule.id} type=${String((cond as RuleCondition)?.type)}`
-              );
+              sanitizedIssues++;
               continue;
             }
             const c = cond as RuleCondition;
@@ -513,14 +541,12 @@ export class ConfigManager implements IConfigManager {
               ? c.values.filter((v) => typeof v === 'string')
               : [];
             if (vals.length === 0) {
-              console.warn(`[ConfigManager] 丢弃空值 condition: ${rule.id} type=${c.type}`);
+              sanitizedIssues++;
               continue;
             }
             for (const v of vals) {
               if (v.trim() && !validateRuleValue(c.type, v)) {
-                console.warn(
-                  `[ConfigManager] condition 值可能非法（保留）: ${rule.id} type=${c.type} value=${v}`
-                );
+                sanitizedIssues++;
               }
             }
             cleaned.push({ type: c.type, values: vals });
@@ -542,11 +568,18 @@ export class ConfigManager implements IConfigManager {
         rule.combineMode !== 'and' &&
         rule.combineMode !== 'or'
       ) {
-        console.warn(`[ConfigManager] 规则 combineMode 非法，重置为默认: ${rule.id}`);
+        sanitizedIssues++;
         delete rule.combineMode;
       }
       return true;
     });
+    // 汇总告警（替代逐条），防单份脏配置批量刷屏
+    if (droppedRules > 0) {
+      this.log('warn', `[ConfigManager] 丢弃 ${droppedRules} 条非法规则`);
+    }
+    if (sanitizedIssues > 0) {
+      this.log('warn', `[ConfigManager] 清洗 ${sanitizedIssues} 处规则非法字段（已保留/重置默认）`);
+    }
 
     // 验证布尔值字段
     if (typeof config.autoStart !== 'boolean') {
@@ -562,7 +595,7 @@ export class ConfigManager implements IConfigManager {
     // appRoutingEnabled 新增字段：undefined=开启（兼容老配置，不回填以减少 config 写放大；gate 用 !== false）。
     // 纯开关字段非法值 sanitize 而非 throw——throw 在 loadConfig 路径会触发默认配置覆盖落盘致全丢，不值当。
     if (config.appRoutingEnabled !== undefined && typeof config.appRoutingEnabled !== 'boolean') {
-      console.warn('appRoutingEnabled must be a boolean; resetting to default (enabled)');
+      this.log('warn', 'appRoutingEnabled must be a boolean; resetting to default (enabled)');
       delete config.appRoutingEnabled;
     }
     // builtinGeoMeta 非法类型 sanitize 而非 throw（读取侧全容错、无爆炸半径，与 appRoutingEnabled 同型）
@@ -572,7 +605,7 @@ export class ConfigManager implements IConfigManager {
         config.builtinGeoMeta === null ||
         Array.isArray(config.builtinGeoMeta))
     ) {
-      console.warn('builtinGeoMeta must be an object; resetting to default');
+      this.log('warn', 'builtinGeoMeta must be an object; resetting to default');
       delete config.builtinGeoMeta;
     }
     // mainSessionViaProxy 新增字段：非法类型 sanitize（undefined=true 兼容老配置，gate 用 !== false）
@@ -580,7 +613,7 @@ export class ConfigManager implements IConfigManager {
       config.mainSessionViaProxy !== undefined &&
       typeof config.mainSessionViaProxy !== 'boolean'
     ) {
-      console.warn('mainSessionViaProxy must be a boolean; resetting to default (enabled)');
+      this.log('warn', 'mainSessionViaProxy must be a boolean; resetting to default (enabled)');
       delete config.mainSessionViaProxy;
     }
     if (typeof config.autoConnect !== 'boolean') {
@@ -641,6 +674,58 @@ export class ConfigManager implements IConfigManager {
   }
 
   /**
+   * FakeIP 开关统一一次性迁移（幂等、绝不抛、不阻断启动）。
+   *
+   * 背景：usesFakeIp 由「非 systemProxy 恒开 / systemProxy 看开关」统一为「纯看 enableFakeIp，缺省 true」。
+   * 存量配置普遍是旧默认 enableFakeIp:false（非用户主动关）——若不迁移，TUN 存量用户会从「恒 FakeIP-on」
+   * 静默掉到 off，节点收到真实 IP，部分防滥用严格机场拒连（不变量被破坏）。
+   *
+   * 迁移规则（按【迁移时刻】proxyModeType 冻结 effective 值）：
+   *  - tun / manual → enableFakeIp=true（保住改前恒开行为，机场兼容零回归）；
+   *  - systemProxy  → 保留现值（改前后都看开关，零变化；FakeIP 在 systemProxy 下近 no-op）。
+   * 缺 dnsConfig → 直接补一份「迁移完成」默认（enableFakeIp 按上述模式，标记 true），容错不抛。
+   *
+   * 幂等：fakeIpToggleMigrated===true 即跳过（含新装——createDefaultConfig 已置 true）。置标记后永不再改写，
+   * 避免每次启动覆盖用户迁移后手动改的值。落盘 best-effort fire-and-forget（不 await：本方法为同步 void，
+   * 不阻断 loadConfig；与 F29 仅「best-effort、失败下次重试、标记未持久化即未迁移」语义同标准，
+   * 但 F29 是 await saveConfig().catch、本处不 await）。
+   */
+  private migrateFakeIpToggle(config: UserConfig): void {
+    try {
+      // 缺 dnsConfig：补默认并按模式冻结 effective 值，标记完成（与 createDefaultConfig 同语义但 enableFakeIp 按模式）。
+      if (!config.dnsConfig) {
+        const modeType = (config.proxyModeType || 'systemProxy').toLowerCase();
+        config.dnsConfig = {
+          domesticDns: 'https://doh.pub/dns-query',
+          foreignDns: 'https://dns.google/dns-query',
+          enableFakeIp: modeType !== 'systemproxy', // tun/manual → true；systemProxy → false（无现值可保留，回落开关默认）
+          fakeIpToggleMigrated: true,
+        };
+      } else if (config.dnsConfig.fakeIpToggleMigrated !== true) {
+        const modeType = (config.proxyModeType || 'systemProxy').toLowerCase();
+        // tun/manual 写 true（保住改前恒开）。
+        // systemProxy 冻结改前 effective：旧语义 !!enableFakeIp，故 undefined/false → false、true → true。
+        //   不冻结则 enableFakeIp 缺失（undefined）会被新 usesFakeIp 的「?? true」缺省翻成 on，
+        //   与「缺 dnsConfig（systemProxy）显式写 false」自相矛盾。冻结后 systemProxy 零变化、两分支语义一致。
+        if (modeType !== 'systemproxy') {
+          config.dnsConfig.enableFakeIp = true;
+        } else {
+          config.dnsConfig.enableFakeIp = config.dnsConfig.enableFakeIp === true;
+        }
+        config.dnsConfig.fakeIpToggleMigrated = true;
+      } else {
+        return; // 已迁移（含新装）：幂等跳过，不落盘
+      }
+      // best-effort 落盘标记；失败不阻断（下次加载重试，期间标记未持久 = 未迁移语义一致）。
+      this.saveConfig(config).catch((e) =>
+        this.log('warn', `FakeIP 开关迁移后落盘失败（不阻断，下次重试）: ${e}`)
+      );
+    } catch (e) {
+      this.log('warn', `FakeIP 开关迁移失败（吞掉，不影响启动）: ${e}`);
+    }
+  }
+
+  /**
    * 创建默认配置
    */
   private createDefaultConfig(): UserConfig {
@@ -676,7 +761,8 @@ export class ConfigManager implements IConfigManager {
       dnsConfig: {
         domesticDns: 'https://doh.pub/dns-query',
         foreignDns: 'https://dns.google/dns-query',
-        enableFakeIp: false,
+        enableFakeIp: true, // 新装默认开（usesFakeIp 已统一为纯看开关；存量经 migrateFakeIpToggle 一次性迁移）
+        fakeIpToggleMigrated: true, // 新装无需迁移：直接落 effective 默认，标记防 migrate 再改写
       },
 
       customRuleSets: [], // 默认空

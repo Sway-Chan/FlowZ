@@ -3,20 +3,19 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Separator } from '@/components/ui/separator';
 import { toast } from 'sonner';
-import { ExternalLink, Loader2, Download, FolderUp } from 'lucide-react';
+import { ExternalLink, Loader2, Download } from 'lucide-react';
 import {
   getVersionInfo,
   checkForUpdates,
   downloadUpdate,
   installUpdate,
   openExternal,
-  checkCoreUpdate,
-  updateCore,
 } from '@/bridge/api-wrapper';
 import { api } from '@/ipc/api-client';
 import type { UpdateProgress } from '@/ipc/api-client';
 import { useTranslation } from 'react-i18next';
 import { CoreVersionBanner } from './core-version-banner';
+import { CoreManagementCard } from './core-management-card';
 import { AppUpdateBanner } from './app-update-banner';
 import { useAppStore } from '@/store/app-store';
 
@@ -36,9 +35,7 @@ export function AboutSettings() {
   const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
-  const [checkingCoreUpdate, setCheckingCoreUpdate] = useState(false);
   const [downloading, setDownloading] = useState(false);
-  const [updatingCore, setUpdatingCore] = useState(false);
   const [downloadProgress, setDownloadProgress] = useState(0);
   const progressUnsubscribeRef = useRef<(() => void) | null>(null);
   const { t } = useTranslation();
@@ -174,101 +171,6 @@ export function AboutSettings() {
     }
   };
 
-  const handleCheckCoreUpdate = async () => {
-    try {
-      setCheckingCoreUpdate(true);
-      toast.info(t('settings.about.checkingCoreUpdate'));
-
-      const response = await checkCoreUpdate();
-
-      if (!response || !response.success) {
-        toast.error(t('settings.about.checkCoreUpdateFail'), {
-          description: response?.error || t('settings.about.cannotConnectServer'),
-        });
-        return;
-      }
-
-      const data = response.data;
-
-      if (!data) return;
-
-      if (data.hasUpdate && data.latestVersion && data.downloadUrl) {
-        toast.success(t('settings.about.foundCoreUpdate', { version: data.latestVersion }), {
-          description: t('settings.about.clickToUpdate'),
-          action: {
-            label: t('settings.about.clickToUpdate'),
-            onClick: () => handleUpdateCore(data.downloadUrl!, data.latestVersion!),
-          },
-          duration: 8000,
-        });
-      } else if (data.error) {
-        toast.error(t('settings.about.checkCoreUpdateFail'), { description: data.error });
-      } else {
-        toast.success(t('settings.about.coreAlreadyLatest'), {
-          description: t('settings.about.currentVersion', { version: data.currentVersion }),
-        });
-      }
-    } catch (error) {
-      console.error('Failed to check for core updates:', error);
-      const errorMessage = error instanceof Error ? error.message : String(error);
-      toast.error(t('settings.about.checkCoreUpdateFail'), {
-        description: errorMessage || t('settings.about.unknownError'),
-      });
-    } finally {
-      setCheckingCoreUpdate(false);
-    }
-  };
-
-  const handleUpdateCore = async (downloadUrl: string, version: string) => {
-    try {
-      setUpdatingCore(true);
-      toast.info(t('settings.about.updatingCore', { version }), {
-        description: t('settings.about.doNotClose'),
-      });
-
-      const response = await updateCore(downloadUrl);
-
-      if (response && response.success && response.data) {
-        toast.success(t('settings.about.coreUpdateSuccess'), {
-          description: t('settings.about.newCoreActive'),
-        });
-        // 重新加载版本信息
-        loadVersionInfo();
-      } else {
-        toast.error(t('settings.about.coreUpdateFail'), {
-          description: response?.error || t('settings.about.unknownError'),
-        });
-      }
-    } catch (error) {
-      toast.error(t('settings.about.coreUpdateFail'), {
-        description: error instanceof Error ? error.message : String(error),
-      });
-    } finally {
-      setUpdatingCore(false);
-    }
-  };
-
-  const handleReplaceManualCore = async () => {
-    try {
-      setUpdatingCore(true);
-      const result = await api.coreUpdate.replaceManual();
-      // 如果 result 为 true，说明用户选择了文件并且替换在主进程执行完成
-      if (result) {
-        toast.success(t('settings.about.coreManualReplaceSuccess', '手动替换核心成功'), {
-          description: t('settings.about.newCoreActive', '新核心已生效'),
-        });
-        // 重新加载版本信息
-        loadVersionInfo();
-      }
-    } catch (error) {
-      toast.error(t('settings.about.coreUpdateFail', '核心更新失败'), {
-        description: error instanceof Error ? error.message : String(error),
-      });
-    } finally {
-      setUpdatingCore(false);
-    }
-  };
-
   const handleOpenGitHub = async () => {
     const url = versionInfo?.repositoryUrl || 'https://github.com/dododook/FlowZ';
     await openExternal(url);
@@ -288,6 +190,8 @@ export function AboutSettings() {
     <div className="space-y-4">
       <CoreVersionBanner />
 
+      <CoreManagementCard />
+
       {availableAppUpdate && (
         <AppUpdateBanner
           updateInfo={availableAppUpdate}
@@ -306,46 +210,6 @@ export function AboutSettings() {
               <p className="text-lg font-semibold">
                 {versionInfo?.appName || 'FlowZ'} v{versionInfo?.appVersion || '—'}
               </p>
-            </div>
-
-            <Separator />
-
-            <div>
-              <h4 className="text-sm font-medium text-muted-foreground">
-                sing-box {t('settings.about.version')}
-              </h4>
-              <div className="flex items-center gap-4">
-                <p className="text-lg font-semibold">{versionInfo?.singBoxVersion || 'Unknown'}</p>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleCheckCoreUpdate}
-                  disabled={checkingCoreUpdate || updatingCore}
-                >
-                  {(checkingCoreUpdate || updatingCore) && (
-                    <Loader2 className="mr-2 h-3 w-3 animate-spin" />
-                  )}
-                  {updatingCore
-                    ? t('settings.about.updating')
-                    : checkingCoreUpdate
-                      ? t('settings.about.checking')
-                      : t('settings.about.checkUpdate')}
-                </Button>
-                <Button
-                  variant="ghost"
-                  size="icon"
-                  onClick={handleReplaceManualCore}
-                  disabled={checkingCoreUpdate || updatingCore}
-                  className="h-8 w-8 text-muted-foreground hover:text-foreground"
-                  title={t('settings.about.manualReplace', '手动替换核心')}
-                >
-                  {updatingCore ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <FolderUp className="h-4 w-4" />
-                  )}
-                </Button>
-              </div>
             </div>
 
             <Separator />

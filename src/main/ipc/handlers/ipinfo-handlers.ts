@@ -15,6 +15,4 @@ export function registerIpInfoHandlers(ipInfoService: IpInfoService): void {
     async (_event: IpcMainInvokeEvent, args?: { force?: boolean }) =>
       ipInfoService.refresh(args?.force ?? false)
   );
-
-  console.log('[IpInfo Handlers] Registered ipinfo IPC handlers');
 }

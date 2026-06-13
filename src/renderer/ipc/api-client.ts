@@ -19,11 +19,13 @@ import type {
   HelperStatus,
   IpInfoSnapshot,
   SystemProcessInfo,
+  RuleResourceDeleteResult,
   RuleResourceListItem,
   RuleResourceDownloadItem,
   RuleResourceDownloadResult,
   RuleResourceProgress,
   RuleResourceCatalogResult,
+  InvalidNodeInfo,
 } from '../../shared/types';
 
 /**
@@ -101,6 +103,13 @@ export const proxyApi = {
     listener: (data: { reason: string; newServerName: string; latency: number }) => void
   ): () => void {
     return ipcClient.on(IPC_CHANNELS.EVENT_AUTO_NODE_SWITCHED, listener);
+  },
+
+  /**
+   * 监听启动前配置校验 gate 剔除的非法节点（空数组=本次启动无非法节点/清陈旧标灰）。
+   */
+  onInvalidNodes(listener: (data: InvalidNodeInfo[]) => void): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_PROXY_INVALID_NODES, listener);
   },
 };
 
@@ -368,6 +377,14 @@ export const connectionsApi = {
   onUpdated(listener: (snap: ConnectionsSnapshot) => void): () => void {
     return ipcClient.on(IPC_CHANNELS.EVENT_CONNECTIONS_UPDATED, listener);
   },
+  /** 关单条连接（main 经 9090 DELETE /connections/{id}；渲染端无 secret）。 */
+  async close(id: string): Promise<{ ok: boolean }> {
+    return ipcClient.invoke(IPC_CHANNELS.CONNECTIONS_CLOSE, { id });
+  },
+  /** 关全部连接（main 经 9090 DELETE /connections，触发 ResetNetwork）。 */
+  async closeAll(): Promise<{ ok: boolean }> {
+    return ipcClient.invoke(IPC_CHANNELS.CONNECTIONS_CLOSE_ALL);
+  },
 };
 
 /**
@@ -393,8 +410,8 @@ export const ruleResourcesApi = {
   redownload(id: string): Promise<RuleResourceDownloadResult> {
     return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_REDOWNLOAD, { id });
   },
-  delete(id: string): Promise<{ ok: boolean }> {
-    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_DELETE, { id });
+  delete(id: string, force?: boolean): Promise<RuleResourceDeleteResult> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_DELETE, { id, force });
   },
   setGhProxy(prefix: string): Promise<{ ok: boolean; value?: string; error?: string }> {
     return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_SET_GH_PROXY, { prefix });
@@ -581,23 +598,25 @@ export const coreUpdateApi = {
     latestVersion?: string;
     downloadUrl?: string;
     releaseNotes?: string;
+    /** latestVersion 是否跨当前 minor 带（如 1.13.x→1.14.x）；true 时 UI 标注跨大版本风险。 */
+    crossBand?: boolean;
     error?: string;
   }> {
-    return ipcClient.invoke('core-update:check');
+    return ipcClient.invoke(IPC_CHANNELS.CORE_UPDATE_CHECK);
   },
 
   /**
    * 更新核心
    */
   async update(downloadUrl: string): Promise<boolean> {
-    return ipcClient.invoke('core-update:update', downloadUrl);
+    return ipcClient.invoke(IPC_CHANNELS.CORE_UPDATE_RUN, downloadUrl);
   },
 
   /**
    * 获取核心版本
    */
   async getVersion(): Promise<string> {
-    return ipcClient.invoke('core-update:get-version');
+    return ipcClient.invoke(IPC_CHANNELS.CORE_UPDATE_GET_VERSION);
   },
 
   /**
@@ -633,10 +652,62 @@ export const coreUpdateApi = {
   },
 
   /**
-   * 手动替换核心（打开文件选择器，用户选择 sing-box 二进制）
+   * 手动替换核心。
+   * - 无参：弹文件选择器 + 预检 + 同版本检测。目标与当前同版本时返回
+   *   `{ ok:false, needConfirm:true, sameVersion, filePath }`，由 UI 弹确认框；否则直接换核返回 `{ ok:true }`。
+   * - 传 `{ filePath, force:true }`：跳过同版本确认，直接换该文件。
+   * 用户取消文件选择器时主进程返回 `{ ok:false }`（无 needConfirm），UI 静默不提示。
    */
-  async replaceManual(): Promise<boolean> {
-    return ipcClient.invoke(IPC_CHANNELS.CORE_REPLACE_MANUAL);
+  async replaceManual(opts?: {
+    filePath?: string;
+    force?: boolean;
+  }): Promise<
+    | { ok: true }
+    | { ok: false; needConfirm?: boolean; sameVersion?: string; filePath?: string; error?: string }
+  > {
+    return ipcClient.invoke(IPC_CHANNELS.CORE_REPLACE_MANUAL, opts);
+  },
+
+  /**
+   * B6：重置内核到出厂版本（恢复为随 App 出厂的内核）。
+   */
+  async resetFactory(): Promise<{ ok: boolean; error?: string }> {
+    return ipcClient.invoke(IPC_CHANNELS.CORE_RESET_FACTORY);
+  },
+
+  /**
+   * 内核自动更新状态（lastCheckAt / staged 待生效 / 跨带提示）
+   */
+  async getAutoStatus(): Promise<{
+    autoUpdateEnabled: boolean;
+    lastCheckAt: number | null;
+    staged: { version: string; stagedAt: string } | null;
+    crossBandLatest: string | null;
+  }> {
+    return ipcClient.invoke(IPC_CHANNELS.CORE_UPDATE_GET_AUTO_STATUS);
+  },
+
+  /**
+   * 用户点「立即应用」：停代理→换核→重启（唯一允许主动断流）。
+   * 返回落位结果枚举（applied→成功 / failed→失败 / discarded→已作废 / deferred→仍待生效 / noop→无暂存），
+   * 供 UI 分情况反馈（与主进程 StagedApplyResult 同形，inline 避免跨进程类型 import）。
+   */
+  async applyStaged(): Promise<'applied' | 'discarded' | 'deferred' | 'failed' | 'noop'> {
+    return ipcClient.invoke(IPC_CHANNELS.CORE_UPDATE_APPLY_STAGED);
+  },
+
+  /**
+   * 监听内核自动更新状态变更事件（staged 待生效 / 跨带提示）
+   */
+  onAutoStatusChanged(
+    listener: (data: {
+      // autoUpdateEnabled 不随事件推送（主进程同步 emit 算不出真值）；真值由 getAutoStatus 快照提供。
+      lastCheckAt: number | null;
+      staged: { version: string; stagedAt: string } | null;
+      crossBandLatest: string | null;
+    }) => void
+  ): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_CORE_AUTO_UPDATE_STATUS, listener);
   },
 };
 
@@ -724,8 +795,8 @@ export const backupApi = {
  */
 export const helperApi = {
   /** 查询 helper 安装/就绪状态 */
-  async getStatus(): Promise<HelperStatus> {
-    return ipcClient.invoke(IPC_CHANNELS.HELPER_GET_STATUS);
+  async getStatus(force = false): Promise<HelperStatus> {
+    return ipcClient.invoke(IPC_CHANNELS.HELPER_GET_STATUS, force);
   },
 
   /** 安装/修复 helper（弹一次管理员授权框） */
@@ -736,6 +807,18 @@ export const helperApi = {
   /** 卸载 helper（弹一次管理员授权框） */
   async uninstall(): Promise<{ success: boolean; error?: string; status: HelperStatus }> {
     return ipcClient.invoke(IPC_CHANNELS.HELPER_UNINSTALL);
+  },
+};
+
+/**
+ * 应用级 API（生命周期 / 卸载等）
+ */
+export const appApi = {
+  /**
+   * B6：完全卸载 FlowZ（清除提权 helper、受保护目录内核、用户配置、应用本体）。
+   */
+  async uninstallAll(): Promise<{ ok: boolean; error?: string }> {
+    return ipcClient.invoke(IPC_CHANNELS.APP_UNINSTALL_ALL);
   },
 };
 
@@ -762,6 +845,7 @@ export const api = {
   subscription: subscriptionApi,
   backup: backupApi,
   helper: helperApi,
+  app: appApi,
 };
 
 /**

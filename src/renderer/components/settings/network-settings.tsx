@@ -3,6 +3,23 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
 import { useAppStore } from '@/store/app-store';
 import { parseDnsServerSpec } from '@shared/dns';
 import { toast } from 'sonner';
@@ -11,6 +28,7 @@ import { SettingsRow } from './settings-row';
 import { HelperManagementCard } from './helper-management-card';
 
 const isMac = window.electron?.platform === 'darwin';
+const isLinux = window.electron?.platform === 'linux';
 
 const DNS_DEFAULTS = {
   domesticDns: 'https://doh.pub/dns-query',
@@ -33,6 +51,8 @@ export function NetworkSettings() {
     config?.mixedPort && config.mixedPort > 0 ? config.mixedPort.toString() : '7890'
   );
   const [isLoading, setIsLoading] = useState(false);
+  // TUN 模式下 FakeIP ON→OFF 一次性风险确认弹窗开关（机场拒纯 IP 不可预判、无法客户端缓解）。
+  const [fakeIpOffConfirmOpen, setFakeIpOffConfirmOpen] = useState(false);
   const [subInterval, setSubInterval] = useState(
     config?.subscriptionUpdateIntervalHours?.toString() || '12'
   );
@@ -97,11 +117,22 @@ export function NetworkSettings() {
       updated.dnsConfig = {
         domesticDns: 'https://doh.pub/dns-query',
         foreignDns: 'https://dns.google/dns-query',
-        enableFakeIp: false,
+        enableFakeIp: true, // 与新装默认一致（usesFakeIp 已统一为纯看开关）
       };
     }
     updated.dnsConfig = { ...updated.dnsConfig, ...patch };
     saveConfig(updated).catch(() => toast.error(t('common.saveFailed')));
+  };
+
+  // FakeIP 开关切换：TUN 模式下 ON→OFF 先弹一次性风险确认（节点将收真实 IP，部分机场可能拒连，客户端无法缓解）；
+  // 其它情况（开启、或非 TUN 关闭）直接落盘。
+  const handleFakeIpToggle = (checked: boolean) => {
+    const isTun = config.proxyModeType?.toLowerCase() === 'tun';
+    if (!checked && isTun) {
+      setFakeIpOffConfirmOpen(true);
+      return;
+    }
+    updateDns({ enableFakeIp: checked });
   };
 
   // F1：DNS 改为提交时保存（onBlur），而非逐键 saveConfig（代理运行时逐键会触发全量重启 + 受控回显竞态）。
@@ -224,9 +255,56 @@ export function NetworkSettings() {
             description={t('settings.advanced.fakeIpDesc')}
           >
             <Switch
-              checked={config.dnsConfig?.enableFakeIp || false}
-              onCheckedChange={(checked) => updateDns({ enableFakeIp: checked })}
+              checked={config.dnsConfig?.enableFakeIp ?? true}
+              onCheckedChange={handleFakeIpToggle}
             />
+          </SettingsRow>
+          <AlertDialog open={fakeIpOffConfirmOpen} onOpenChange={setFakeIpOffConfirmOpen}>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>
+                  {t('settings.advanced.fakeIpTunOffConfirmTitle')}
+                </AlertDialogTitle>
+                <AlertDialogDescription>
+                  {t('settings.advanced.fakeIpTunOffConfirmDesc')}
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>{t('common.cancel')}</AlertDialogCancel>
+                <AlertDialogAction onClick={() => updateDns({ enableFakeIp: false })}>
+                  {t('settings.advanced.fakeIpTunOffConfirmOk')}
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+          <SettingsRow
+            label={t('settings.advanced.nodeDomainResolver')}
+            description={t('settings.advanced.nodeDomainResolverDesc')}
+          >
+            <Select
+              value={config.dnsConfig?.nodeDomainResolver ?? 'auto'}
+              onValueChange={(v) =>
+                updateDns({
+                  nodeDomainResolver: v as NonNullable<
+                    typeof config.dnsConfig
+                  >['nodeDomainResolver'],
+                })
+              }
+            >
+              <SelectTrigger className="h-8 w-[160px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="auto">{t('settings.advanced.nodeResolverAuto')}</SelectItem>
+                <SelectItem value="dnspod">{t('settings.advanced.nodeResolverDnspod')}</SelectItem>
+                <SelectItem value="system">
+                  {t('settings.advanced.nodeResolverSystem')}
+                  {isLinux && config.proxyModeType === 'tun'
+                    ? ` (${t('settings.advanced.nodeResolverExperimental')})`
+                    : ''}
+                </SelectItem>
+              </SelectContent>
+            </Select>
           </SettingsRow>
           <SettingsRow
             label={t('settings.advanced.mainSessionViaProxy', '更新检查走代理')}
@@ -267,11 +345,16 @@ export function NetworkSettings() {
             label={t('settings.advanced.mixedPort')}
             description={t('settings.advanced.mixedPortDesc')}
           >
-            <div className="flex items-center gap-2">
-              {mixedPortEnabled && numInput(mixedPort, setMixedPort, 'w-[100px]')}
-              <Switch checked={mixedPortEnabled} onCheckedChange={setMixedPortEnabled} />
-            </div>
+            <Switch checked={mixedPortEnabled} onCheckedChange={setMixedPortEnabled} />
           </SettingsRow>
+          {mixedPortEnabled && (
+            <SettingsRow
+              label={t('settings.advanced.mixedPortValue')}
+              description={`${t('settings.advanced.default')}: 7890`}
+            >
+              {numInput(mixedPort, setMixedPort)}
+            </SettingsRow>
+          )}
           <div className="pt-3">
             <Button onClick={handleSavePorts} disabled={isLoading}>
               {isLoading ? t('settings.advanced.saving') : t('settings.advanced.savePortSettings')}

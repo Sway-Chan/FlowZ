@@ -50,6 +50,4 @@ export function registerPrivacyHandlers(): void {
   registerIpcHandler<void, boolean>(IPC_CHANNELS.PRIVACY_HAS_PASSWORD, async () =>
     hasPrivacyPassword()
   );
-
-  console.log('[Privacy Handlers] Registered privacy IPC handlers');
 }

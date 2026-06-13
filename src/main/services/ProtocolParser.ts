@@ -17,7 +17,9 @@ import type {
   Hysteria2Settings,
   Hysteria2Network,
   AnyTlsSettings,
+  LogLevel,
 } from '../../shared/types';
+import type { LogManager } from './LogManager';
 
 export interface IProtocolParser {
   /**
@@ -37,6 +39,28 @@ export interface IProtocolParser {
 }
 
 export class ProtocolParser implements IProtocolParser {
+  private logManager?: LogManager;
+
+  /**
+   * 注入 LogManager（由主流程在 index.ts 统一注入）。注入前日志走 console fallback。
+   */
+  setLogManager(lm: LogManager): void {
+    this.logManager = lm;
+  }
+
+  /**
+   * 统一日志出口：已注入 LogManager 则转发，否则按级别 fallback 到 console。
+   */
+  private log(level: LogLevel, message: string): void {
+    if (this.logManager) {
+      this.logManager.addLog(level, message, 'ProtocolParser');
+      return;
+    }
+    if (level === 'error' || level === 'fatal') console.error(message);
+    else if (level === 'warn') console.warn(message);
+    else console.log(message);
+  }
+
   /**
    * 检查 URL 是否为支持的协议
    */
@@ -609,7 +633,7 @@ export class ProtocolParser implements IProtocolParser {
           }
         }
       } catch (e) {
-        console.error('Failed to parse shadow-tls Base64 JSON parameter:', e);
+        this.log('error', `解析 shadow-tls Base64 JSON 参数失败: ${e}`);
       }
     }
 

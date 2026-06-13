@@ -26,8 +26,18 @@ function Flag({ cc }: { cc?: string }) {
   );
 }
 
+/** countryCode → 本地化国家名（跟随界面语言，如 zh→「美国」/ en→「United States」）。失败/无码返 undefined。 */
+function countryNameOf(cc: string | undefined, lang: string): string | undefined {
+  if (!cc) return undefined;
+  try {
+    return new Intl.DisplayNames([lang], { type: 'region' }).of(cc.toUpperCase());
+  } catch {
+    return undefined; // 非法 region code / 环境不支持 → 兜底无名（仍显示国旗 + IP）
+  }
+}
+
 export function NetworkInfoCard() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const ipInfo = useAppStore((s) => s.ipInfo);
   const stats = useAppStore((s) => s.stats);
   const connectionStatus = useAppStore((s) => s.connectionStatus);
@@ -79,9 +89,13 @@ export function NetworkInfoCard() {
     return <span className="text-sm text-muted-foreground">{emptyText}</span>;
   };
 
-  // IP 单元格副值（国家 / 状态）
+  // IP 单元格副值（国家 / 状态）。country 名优先用接口给的（ip-api/ipip），
+  // 缺失时（如 trace 只给 countryCode）由 countryCode 经 Intl.DisplayNames 按界面语言派生。
   const renderIpSub = (info: IpInfo | null, fallback: string) => {
-    if (info?.country && !masked) return `${info.country}`;
+    if (info && !masked) {
+      const name = info.country ?? countryNameOf(info.countryCode, i18n.language);
+      if (name) return name;
+    }
     if (info) return fallback;
     return '';
   };

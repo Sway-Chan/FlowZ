@@ -76,3 +76,21 @@ resources/*/libcronet.*
 
 # macOS 提权 helper 二进制（由 npm run build:helper 交叉编译；构建产物不入库，CI 现编现打）
 resources/*/com.flowz.helper
+
+# ── 误落到 repo 根的产物 / 运行时临时文件（不入库；gitignore 不支持行内注释，注释独立成行）──
+# 运行时 PID 文件（py.pid / sb2.pid 等）
+*.pid
+# 临时 sing-box 测试配置 / rule set 测试文件
+/cfg2.json
+/rsf.json
+# 误编译到根目录的产物（源码在 src/main/services/*.ts；jest.config.js 等合法根 .js 不受影响）
+/HelperManager.js
+/ProxyManager.js
+
+# ── 本地设计文档（含 Obsidian wikilink / 内部过程，本地保留不入 PR）──────
+docs/design/
+# 本地真机验证清单（同 design 性质：含内部过程，不入 PR）
+docs/validation-checklist.md
+
+# tsc 增量编译产物（防 tsc 增量后再次变 untracked 误提交）
+*.tsbuildinfo

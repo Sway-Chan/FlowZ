@@ -1,8 +1,30 @@
 import { randomUUID } from 'crypto';
-import { net, session, type Session } from 'electron';
+import { app, net, session, type Session } from 'electron';
 import type { ServerConfig, SubscriptionConfig } from '../../shared/types';
 import { ProtocolParser } from './ProtocolParser';
 import { LogManager } from './LogManager';
+import { promises as dnsPromises } from 'dns';
+import { isIP } from 'net';
+import {
+  CLASH_PROBE_RE,
+  tryLoadClashDoc,
+  parseClashProxies,
+  resolveProxyProviders,
+  normalizeDuration,
+  type ClashDoc,
+} from './ClashSubscriptionParser';
+
+/** 默认订阅 UA：纯中性 `FlowZ/<版本>`（去除 clash.meta/mihomo 标识，陈先生 2026-06-12 决策）。 */
+export function defaultSubscriptionUserAgent(): string {
+  // app.getVersion() 仅在打包后/有 app 上下文可用；测试侧不消费本函数（UA 拼接在 fetch 路径，已 mock）。
+  let version = '0.0.0';
+  try {
+    version = app.getVersion();
+  } catch {
+    // app 不可用（极早期/非 electron 上下文）兜底
+  }
+  return `FlowZ/${version}`;
+}
 
 export interface SubscriptionUpdateResult {
   success: boolean;
@@ -74,6 +96,13 @@ type SingboxOutbound = {
 };
 
 export class SubscriptionService {
+  // 响应体积上限：超大响应直接 OOM（兼缓解 YAML 锚点炸弹的输入面）。content-length 预检 + 读取后字节校验双闸。
+  private static readonly MAX_BODY_BYTES = 10 * 1024 * 1024; // 10MB
+  // 重定向链最大跳数：每跳 Location 重跑 SSRF guard（含 DNS 解析），超过即拒（防无限跳/绕 guard）。
+  private static readonly MAX_REDIRECTS = 5;
+  // 主订阅 fetch 超时（比 provider 15s 宽）：防 slow-loris 挂死、scheduler isRunning 永真卡死后续更新。
+  private static readonly MAIN_FETCH_TIMEOUT_MS = 30_000;
+
   private protocolParser: ProtocolParser;
   private logManager: LogManager;
   // 直连会话：强制 mode:'direct'，无视默认会话/系统代理，供 viaProxy=false 的订阅拉取使用
@@ -167,6 +196,7 @@ export class SubscriptionService {
           delete copy.id;
           delete copy.createdAt;
           delete copy.updatedAt;
+          delete copy.providerName; // M1：归属元数据非节点连接内容，不计入比较（否则加该字段会让存量节点首次升级误刷 updatedAt）
           return JSON.stringify(copy);
         };
         kept.push({
@@ -186,6 +216,25 @@ export class SubscriptionService {
     for (const bucket of oldBuckets.values()) leftover.push(...bucket);
     const deletedIds = new Set(leftover.map((s) => s.id));
     return { servers: kept, added, updated, deleted: leftover.length, deletedIds };
+  }
+
+  /**
+   * M1：partial 失败时的 merge-only leftover（provider 级精确）。被删旧节点中只保留「失败 provider 名下」的
+   * （防该 provider 临时故障穿仓），成功 provider 的真下架节点不在此列、正常删除。providerName=undefined 的
+   * 旧节点（迁移前存量 / 内联 proxies / 非 Clash 订阅）无归属信息 → 保守保留，不冒误删风险。failedProviders
+   * 缺失/空（rejected 兜底等 partial 但失败名未知）→ 全部保守保留，退回旧的整订阅级 merge-only。
+   */
+  static leftoverToKeep(
+    oldServers: ServerConfig[],
+    deletedIds: Set<string>,
+    failedProviders?: string[]
+  ): ServerConfig[] {
+    const failed = failedProviders && failedProviders.length > 0 ? new Set(failedProviders) : null;
+    return oldServers.filter(
+      (s) =>
+        deletedIds.has(s.id) &&
+        (failed === null || s.providerName === undefined || failed.has(s.providerName))
+    );
   }
 
   /**
@@ -382,7 +431,9 @@ export class SubscriptionService {
               ServerConfig['tuicSettings']
             >['udpRelayMode'];
           if (ob.zero_rtt_handshake !== undefined) ts.zeroRttHandshake = ob.zero_rtt_handshake;
-          if (ob.heartbeat) ts.heartbeat = ob.heartbeat;
+          // heartbeat 规整：纯数字(毫秒)补 ms，否则透传 → 防 sing-box ParseDuration "missing unit"。
+          const hb = normalizeDuration(ob.heartbeat);
+          if (hb) ts.heartbeat = hb;
           if (Object.keys(ts).length > 0) tuic.tuicSettings = ts;
           servers.push(tuic);
         } else if (ob.type === 'anytls') {
@@ -410,161 +461,615 @@ export class SubscriptionService {
     return servers;
   }
 
-  /** 订阅地址主机是否指向本机/内网/link-local（字面 IP 兜底，拦云元数据/回环/内网）。 */
-  private isBlockedSubscriptionHost(hostname: string): boolean {
-    const h = hostname.replace(/^\[|\]$/g, '').toLowerCase(); // 去 IPv6 方括号
-    if (h === 'localhost') return true;
-    const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-    if (m) {
+  /**
+   * 单个字面 IP 是否属内网/回环/link-local/CGNAT 等不可达外网的危险段。
+   * 覆盖 IPv4：0/8、127/8、10/8、172.16/12、192.168/16、169.254/16(含云元数据 169.254.169.254)、100.64/10(CGNAT)；
+   * IPv6：::1、::、fc00::/7(ULA)、fe80::/10(link-local，含 fe80–febf)、以及 IPv4-mapped(::ffff:x.x.x.x，
+   *   点分/hex、压缩/展开各种写法统一规范化后取低 32 位递归判 IPv4)。
+   * 仅接受 net.isIP 认定的字面 IP；非 IP 返回 false（调用方对域名先做 DNS 解析再逐 IP 套用本判定）。
+   */
+  private static isPrivateIp(ip: string): boolean {
+    const h = ip.replace(/^\[|\]$/g, '').toLowerCase();
+    const kind = isIP(h);
+    if (kind === 4) {
+      const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+      if (!m) return true; // 形似但 isIP 已认定为 4，保守拒
       const a = parseInt(m[1], 10);
       const b = parseInt(m[2], 10);
-      if (a === 0 || a === 127) return true; // 本机/通配
+      if (a === 0 || a === 127) return true; // 通配 / 本机回环
       if (a === 10) return true; // 私网
       if (a === 192 && b === 168) return true; // 私网
       if (a === 172 && b >= 16 && b <= 31) return true; // 私网
       if (a === 169 && b === 254) return true; // link-local / 云元数据 169.254.169.254
       if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+      return false;
     }
-    // IPv6 字面量必含冒号——用它把主机名（如 fcm.googleapis.com / fd-cdn.net）排除在 fc/fd ULA 判断外
-    if (h.includes(':')) {
+    if (kind === 6) {
       if (h === '::1' || h === '::') return true; // 回环 / 通配
-      if (h.startsWith('fe80:') || h.startsWith('fc') || h.startsWith('fd')) return true; // link-local / ULA
+      // 规范化展开成 8 段 16-bit 数值（处理 :: 压缩、点分内嵌 IPv4）。isIP 已确认合法。
+      const seg = SubscriptionService.expandIpv6(h);
+      if (seg) {
+        // IPv4-mapped（::ffff:x.x.x.x）：前 5 段 0、第 6 段 ffff → 取低 32 位拼回 IPv4 递归判定。
+        // 覆盖点分/hex、压缩/展开全部写法（如 ::ffff:7f00:1 / 0:0:0:0:0:ffff:127.0.0.1），防绕过。
+        if (
+          seg[0] === 0 &&
+          seg[1] === 0 &&
+          seg[2] === 0 &&
+          seg[3] === 0 &&
+          seg[4] === 0 &&
+          seg[5] === 0xffff
+        ) {
+          const a = seg[6] >> 8;
+          const b = seg[6] & 0xff;
+          const c = seg[7] >> 8;
+          const d = seg[7] & 0xff;
+          return SubscriptionService.isPrivateIp(`${a}.${b}.${c}.${d}`);
+        }
+        // fe80::/10（link-local）：首段 16-bit 高 10 位为 1111111010，即 0xfe80–0xfebf（含 fe90/fea0/feb0）。
+        if (seg[0] >= 0xfe80 && seg[0] <= 0xfebf) return true;
+      }
+      // fc00::/7（ULA）：首字节 fc/fd。这里是已确认的字面 IPv6，不会误伤主机名
+      // （主机名先经 DNS 解析成数值 IP 再进本判定）。
+      if (h.startsWith('fc') || h.startsWith('fd')) return true;
+      return false;
     }
-    return false;
+    return false; // 非字面 IP
+  }
+
+  /**
+   * 把一个 isIP 已认定合法的 IPv6 字符串规范化展开成 8 个 16-bit 段数值。
+   * 处理 `::` 压缩与末尾内嵌点分 IPv4（如 ::ffff:127.0.0.1）。非法/解析失败返回 null。
+   */
+  private static expandIpv6(h: string): number[] | null {
+    // 末尾内嵌点分 IPv4 → 转成两段 16-bit hex，统一按纯 hex 处理。
+    let s = h;
+    const v4 = s.match(/(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+    if (v4) {
+      const o = [v4[1], v4[2], v4[3], v4[4]].map((x) => parseInt(x, 10));
+      if (o.some((n) => n > 255)) return null;
+      const hi = ((o[0] << 8) | o[1]).toString(16);
+      const lo = ((o[2] << 8) | o[3]).toString(16);
+      s = s.slice(0, s.length - v4[0].length) + hi + ':' + lo;
+    }
+    const parts = s.split('::');
+    if (parts.length > 2) return null;
+    const head = parts[0] ? parts[0].split(':') : [];
+    const tail = parts.length === 2 ? (parts[1] ? parts[1].split(':') : []) : null;
+    let segs: string[];
+    if (tail === null) {
+      segs = head;
+    } else {
+      const fill = 8 - head.length - tail.length;
+      if (fill < 0) return null;
+      segs = [...head, ...Array(fill).fill('0'), ...tail];
+    }
+    if (segs.length !== 8) return null;
+    const out = segs.map((x) => parseInt(x || '0', 16));
+    if (out.some((n) => Number.isNaN(n) || n < 0 || n > 0xffff)) return null;
+    return out;
+  }
+
+  /**
+   * H1（DNS rebinding）核心：对订阅/Provider URL 的 hostname 做 SSRF guard。
+   * - 限 http(s)；字面 localhost 直接拒。
+   * - hostname 是字面 IP → 直接套 isPrivateIp。
+   * - hostname 是域名 → dns.lookup(all) 解析后逐 IP 套 isPrivateIp，任一命中内网即拒
+   *   （拦「域名解析到 127.0.0.1 / 169.254.169.254 / 10.x」的 rebinding 绕过）。
+   * 命中即 throw（错误只含 hostname，不回显完整 url，防 token 泄露）。
+   *
+   * 残余风险（TOCTOU rebinding）：本 guard 校验的是「此刻」解析结果，Electron net.fetch 不暴露
+   * 「pin 已校验 IP 去连接」的钩子，故 guard 通过后 fetch 内部会再次解析，理论上存在
+   * 解析结果在两次 lookup 间被改写的窗口。本批取舍：优先拒绝内网解析结果（覆盖绝大多数静态投毒），
+   * pin-IP 连接留待后续（需改用 net.request 自管 socket，取舍过大）。重定向链每跳复检见 H2。
+   */
+  private async assertHostAllowed(urlObj: URL): Promise<void> {
+    const host = urlObj.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+    if (host === 'localhost') {
+      throw new Error(`订阅地址指向本机/内网/link-local，已拒绝: ${urlObj.hostname}`);
+    }
+    if (isIP(host)) {
+      if (SubscriptionService.isPrivateIp(host)) {
+        throw new Error(`订阅地址指向本机/内网/link-local，已拒绝: ${urlObj.hostname}`);
+      }
+      return;
+    }
+    // 域名：解析后逐 IP 判定（DNS rebinding 防护）。
+    let resolved: { address: string }[];
+    try {
+      resolved = await dnsPromises.lookup(host, { all: true });
+    } catch (e: any) {
+      throw new Error(
+        `订阅地址解析失败，已拒绝: ${urlObj.hostname}（${e?.code ?? e?.message ?? e}）`
+      );
+    }
+    if (resolved.length === 0) {
+      throw new Error(`订阅地址无法解析到任何 IP，已拒绝: ${urlObj.hostname}`);
+    }
+    for (const r of resolved) {
+      if (SubscriptionService.isPrivateIp(r.address)) {
+        throw new Error(
+          `订阅地址解析到本机/内网/link-local，已拒绝: ${urlObj.hostname} → ${r.address}`
+        );
+      }
+    }
+  }
+
+  /** URL query 脱敏（去整段 query，常含 ?token=），仅用于日志，防 token 落 app.log。 */
+  private static redactUrl(url: string): string {
+    try {
+      const u = new URL(url);
+      return u.search ? `${u.origin}${u.pathname}?<redacted>` : `${u.origin}${u.pathname}`;
+    } catch {
+      // 非法 URL：截断到 ? 前，兜底去 query
+      const q = url.indexOf('?');
+      return q >= 0 ? `${url.slice(0, q)}?<redacted>` : url;
+    }
+  }
+
+  /** 同指纹去重（Map 首见保留）：内联在前、provider 按声明序在后 → 同节点多源留内联那份。
+   *  收口放 Service 侧（防 Parser→Service 反向 import 成环）。 */
+  private dedupeByFingerprint(servers: ServerConfig[]): ServerConfig[] {
+    const seen = new Map<string, ServerConfig>();
+    for (const s of servers) {
+      const key = SubscriptionService.serverFingerprint(s);
+      if (!seen.has(key)) seen.set(key, s);
+    }
+    return [...seen.values()];
+  }
+
+  /**
+   * 第一层（网络）：拉取订阅文本。含 SSRF guard + 会话选择 + ok 校验。
+   * 抽出供 proxy-providers 编排复用——provider url 来自订阅正文(远端可控)，复用同一 fetch 路径
+   * 天然继承 SSRF guard（这是"必须复用"的安全硬理由）。
+   * @returns { text, userInfo }（仅主订阅消费 userInfo；provider 调用忽略）。
+   */
+  private async fetchSubscriptionText(
+    url: string,
+    viaProxy: boolean,
+    httpPort: number | undefined,
+    userAgent: string,
+    signal?: AbortSignal
+  ): Promise<{ text: string; userInfo?: SubscriptionConfig['userInfo'] }> {
+    // 解析初始 URL：限 http(s)。
+    const parse = (u: string): URL => {
+      let urlObj: URL | null = null;
+      try {
+        urlObj = new URL(u);
+      } catch {
+        urlObj = null;
+      }
+      if (!urlObj || (urlObj.protocol !== 'http:' && urlObj.protocol !== 'https:')) {
+        throw new Error(
+          `订阅地址协议不支持（仅允许 http/https）: ${SubscriptionService.redactUrl(u)}`
+        );
+      }
+      return urlObj;
+    };
+
+    // viaProxy=true 用 pin 到本机代理端口的独立会话（不受 mainSessionViaProxy 总开关影响）；
+    // 缺 httpPort 时退回默认会话（向后兼容）。viaProxy=false → 强制直连会话。
+    let fetchImpl: typeof net.fetch;
+    if (viaProxy) {
+      if (httpPort) {
+        const ps = await this.getProxiedSession(httpPort);
+        fetchImpl = ps.fetch.bind(ps);
+      } else {
+        fetchImpl = net.fetch;
+      }
+    } else {
+      const ds = await this.getDirectSession();
+      fetchImpl = ds.fetch.bind(ds);
+    }
+
+    // H2：redirect:'manual' 自管重定向链——每跳 Location 重跑 SSRF guard（含 H1 DNS 解析），
+    // 通过才续跳，最多 MAX_REDIRECTS 跳。默认 follow 会让首跳过 guard 后跳到内网不复检。
+    let currentUrl = url;
+    await this.assertHostAllowed(parse(currentUrl)); // H1：初始 URL 解析后逐 IP 校验
+
+    let response: GlobalResponse | null = null;
+    for (let hop = 0; hop <= SubscriptionService.MAX_REDIRECTS; hop++) {
+      response = await fetchImpl(currentUrl, {
+        headers: { 'User-Agent': userAgent },
+        redirect: 'manual',
+        ...(signal ? { signal } : {}),
+      });
+
+      // 30x：取 Location，重跑 guard 后续跳。
+      if (response.status >= 300 && response.status < 400 && response.headers.get('location')) {
+        if (hop >= SubscriptionService.MAX_REDIRECTS) {
+          throw new Error(`订阅重定向次数超过上限（${SubscriptionService.MAX_REDIRECTS}），已拒绝`);
+        }
+        const loc = response.headers.get('location')!;
+        // 相对 Location 以当前 URL 为基准解析；再校验协议 + 解析后 IP。
+        let nextObj: URL;
+        try {
+          nextObj = new URL(loc, currentUrl);
+        } catch {
+          throw new Error('订阅重定向目标非法，已拒绝');
+        }
+        if (nextObj.protocol !== 'http:' && nextObj.protocol !== 'https:') {
+          throw new Error('订阅重定向目标协议不支持（仅允许 http/https），已拒绝');
+        }
+        await this.assertHostAllowed(nextObj); // 重定向目标过同一 guard（含 DNS 解析）
+        // 释放上一跳响应体，避免泄漏。
+        try {
+          await response.body?.cancel();
+        } catch {
+          // ignore
+        }
+        currentUrl = nextObj.toString();
+        continue;
+      }
+
+      break; // 非 30x（或无 Location）→ 终态响应
+    }
+
+    if (!response) {
+      throw new Error('订阅拉取未获得响应');
+    }
+    if (!response.ok) {
+      throw new Error(`HTTP Error: ${response.status} ${response.statusText}`);
+    }
+
+    // M2：content-length 预检（早拒超大响应）。
+    const cl = response.headers.get('content-length');
+    if (cl) {
+      const n = parseInt(cl, 10);
+      if (Number.isFinite(n) && n > SubscriptionService.MAX_BODY_BYTES) {
+        try {
+          await response.body?.cancel();
+        } catch {
+          // ignore
+        }
+        throw new Error(
+          `订阅响应体积 ${n} 字节超过上限 ${SubscriptionService.MAX_BODY_BYTES}，已拒绝`
+        );
+      }
+    }
+
+    const userInfo = this.parseUserInfo(response.headers.get('subscription-userinfo'));
+    // M2：流式读取并按字节累计上限（content-length 可缺失/撒谎，读取侧硬校验兜底）。
+    const text = await this.readBodyCapped(response);
+    return { text, userInfo };
+  }
+
+  /**
+   * 流式读取响应体，累计字节超 MAX_BODY_BYTES 即 abort + throw（防 OOM；缓解 YAML 锚点炸弹输入面）。
+   * 无 body（如某些 204）→ 退回 response.text()。
+   */
+  private async readBodyCapped(response: GlobalResponse): Promise<string> {
+    const max = SubscriptionService.MAX_BODY_BYTES;
+    const body = response.body;
+    if (!body) {
+      const t = await response.text();
+      if (Buffer.byteLength(t, 'utf-8') > max) {
+        throw new Error(`订阅响应体积超过上限 ${max}，已拒绝`);
+      }
+      return t;
+    }
+    const reader = body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        if (value) {
+          total += value.byteLength;
+          if (total > max) {
+            try {
+              await reader.cancel();
+            } catch {
+              // ignore
+            }
+            throw new Error(`订阅响应体积超过上限 ${max}，已拒绝`);
+          }
+          chunks.push(value);
+        }
+      }
+    } finally {
+      try {
+        reader.releaseLock();
+      } catch {
+        // ignore
+      }
+    }
+    return Buffer.concat(chunks.map((c) => Buffer.from(c))).toString('utf-8');
+  }
+
+  /**
+   * 第二层（解析）：trimmed 内容 → ServerConfig[]。四分支：
+   *   ① Sing-box JSON(outbounds) / JSON 编码 Clash(proxies / proxy-providers)
+   *   ② Clash YAML(proxies / proxy-providers)
+   *   ③ 明文 URL-list
+   *   ④ Base64 URL-list
+   * ctx.allowProviders：主订阅 true；provider 响应以 false 再入本函数 → 不递归 proxy-providers（深度硬封顶 2 层）。
+   * @returns servers + partial（任一 provider 失败 → 调用方 reconcile 改 merge-only 防穿仓）。
+   */
+  private async parseSubscriptionContent(
+    trimmed: string,
+    subscriptionId: string,
+    ctx: {
+      allowProviders: boolean;
+      viaProxy: boolean;
+      httpPort?: number;
+      userAgent: string;
+      // throwOnEmpty=false：provider 复用路径用（0 节点返回空集而非 throw，让 resolveProxyProviders
+      // 按 permanent 0-node 处理；真正的 YAML/JSON 结构错误仍由 tryLoadClashDoc 上抛）。默认 true。
+      throwOnEmpty?: boolean;
+    }
+  ): Promise<{ servers: ServerConfig[]; partial?: boolean; failedProviders?: string[] }> {
+    const throwOnEmpty = ctx.throwOnEmpty !== false;
+    // ── 1. JSON: sing-box outbounds 或 JSON 编码的 Clash ──────────────
+    // HIGH-1（数据穿仓）：try 只包 JSON.parse 本身，catch 仅消化「非 JSON」(SyntaxError) 以 fall through；
+    // 分流调用（parseSingboxOutbounds/handleClashDoc）移出 catch 作用域 —— 否则 handleClashDoc 的
+    // 「0 节点必须 throw」会被这个 catch 吞掉，fall through 到 Base64 返回空集，reconcile 删光节点。
+    let json: unknown;
+    let isJson = false;
+    try {
+      json = JSON.parse(trimmed);
+      isJson = true;
+    } catch {
+      // 非 JSON（SyntaxError）→ fall through 到 YAML / URL-list 分支
+    }
+    if (isJson && json && typeof json === 'object') {
+      const obj = json as Record<string, unknown>;
+      if (Array.isArray(obj.outbounds)) {
+        this.logManager.addLog(
+          'info',
+          '检测到 sing-box JSON 格式，解析 outbounds...',
+          'Subscription'
+        );
+        const servers = this.parseSingboxOutbounds(obj.outbounds, subscriptionId);
+        // M5：0 节点必须 throw（与 Clash 分支对齐），不返回空集 → 防 reconcile 删光存量 + 清 selectedServerId。
+        if (servers.length === 0) {
+          if (throwOnEmpty) throw new Error('sing-box 订阅解析得到 0 个可用节点');
+          return { servers: [] };
+        }
+        this.logManager.addLog(
+          'info',
+          `成功从 sing-box 订阅解析了 ${servers.length} 个节点`,
+          'Subscription'
+        );
+        return { servers };
+      }
+      if (
+        Array.isArray(obj.proxies) ||
+        (obj['proxy-providers'] && typeof obj['proxy-providers'] === 'object')
+      ) {
+        this.logManager.addLog(
+          'info',
+          '检测到 JSON 编码的 Clash 配置，解析 proxies...',
+          'Subscription'
+        );
+        // handleClashDoc 的 0 节点 throw 在此正常上抛（不再被 catch 吞）。
+        return await this.handleClashDoc(obj as ClashDoc, subscriptionId, ctx);
+      }
+    }
+
+    // ── 2. Clash YAML（命中 proxies: 或 proxy-providers:）─────────────
+    if (CLASH_PROBE_RE.test(trimmed)) {
+      this.logManager.addLog('info', '检测到 Clash YAML 格式，解析 proxies...', 'Subscription');
+      const doc = tryLoadClashDoc(trimmed); // 解析失败上抛，不静默落 Base64
+      const hasProxies = Array.isArray(doc.proxies);
+      const hasProviders = !!doc['proxy-providers'] && typeof doc['proxy-providers'] === 'object';
+      if (!hasProxies && !hasProviders) {
+        throw new Error('检测到 Clash 订阅特征，但 proxies/proxy-providers 结构异常');
+      }
+      return await this.handleClashDoc(doc, subscriptionId, ctx);
+    }
+
+    // ── 3/4. URL list (plain or Base64-encoded) ──────────────────────
+    let decodedContent = trimmed;
+    if (!decodedContent.includes('://')) {
+      try {
+        decodedContent = Buffer.from(decodedContent, 'base64').toString('utf-8');
+      } catch {
+        this.logManager.addLog('warn', '尝试 Base64 解码失败，可能原本就是明文', 'Subscription');
+      }
+    }
+
+    const lines = decodedContent.split(/\r?\n/).filter((line) => line.trim().length > 0);
+    const servers: ServerConfig[] = [];
+    const now = new Date().toISOString();
+
+    for (const line of lines) {
+      if (this.protocolParser.isSupported(line)) {
+        try {
+          const server = this.protocolParser.parseUrl(line);
+          server.subscriptionId = subscriptionId;
+          server.createdAt = now;
+          server.updatedAt = now;
+          servers.push(server);
+        } catch (e: any) {
+          this.logManager.addLog('warn', `解析订阅中的节点失败: ${e.message}`, 'Subscription');
+        }
+      }
+    }
+
+    if (servers.length === 0) {
+      // M5：URL-list/Base64 分支 0 节点也必须 throw（与 Clash/sing-box 对齐），不返回空集 →
+      // 防 reconcile 删光存量节点 + 清 selectedServerId（正常订阅不会 0 节点）。
+      const hadUrlLines = lines.some((l) => l.includes('://'));
+      if (throwOnEmpty) {
+        throw new Error(
+          hadUrlLines
+            ? '订阅中的节点 URL 均无法解析（协议不支持或格式错误），解析得到 0 个可用节点'
+            : '无法识别订阅格式：既非 sing-box JSON，也未发现可解析的节点 URL（可能 Base64 解码失败或格式不受支持）'
+        );
+      }
+      return { servers: [] };
+    }
+    this.logManager.addLog('info', `成功从订阅解析了 ${servers.length} 个节点`, 'Subscription');
+    return { servers };
+  }
+
+  /**
+   * Clash 文档统一收口：解析内联 proxies + 编排 proxy-providers + 合并去重。
+   * 合计 0 节点必须 throw（防穿仓：空数组经 reconcile 会删光该订阅节点）。
+   * @returns partial=true 当任一 provider 失败（调用方 reconcile 改 merge-only 不删 leftover）。
+   */
+  private async handleClashDoc(
+    doc: ClashDoc,
+    subscriptionId: string,
+    ctx: {
+      allowProviders: boolean;
+      viaProxy: boolean;
+      httpPort?: number;
+      userAgent: string;
+      throwOnEmpty?: boolean;
+    }
+  ): Promise<{ servers: ServerConfig[]; partial?: boolean; failedProviders?: string[] }> {
+    const now = new Date().toISOString();
+
+    // 内联 proxies
+    const inline = parseClashProxies(doc.proxies, subscriptionId, now);
+    for (const w of inline.warnings) this.logManager.addLog('warn', w, 'Subscription');
+
+    let providerServers: ServerConfig[] = [];
+    let partial = false;
+    let failedProviders: string[] = [];
+
+    const providers = doc['proxy-providers'];
+    if (providers && typeof providers === 'object') {
+      if (!ctx.allowProviders) {
+        // 深度硬封顶 2 层：provider 内容再含 proxy-providers → 只取内联 + warn。
+        this.logManager.addLog(
+          'warn',
+          'provider 内容再嵌套 proxy-providers，已忽略（不递归，深度封顶 2 层）',
+          'Subscription'
+        );
+      } else {
+        const result = await resolveProxyProviders(providers, {
+          fetchText: async (url, signal) => {
+            const { text } = await this.fetchSubscriptionText(
+              url,
+              ctx.viaProxy,
+              ctx.httpPort,
+              ctx.userAgent,
+              signal
+            );
+            return text;
+          },
+          parseContent: async (text) => {
+            // LOW-1：provider 响应复用主解析（allowProviders:false → 不递归 providers；触发 handleClashDoc
+            // 的「再嵌套 proxy-providers → warn 不递归」活分支）。throwOnEmpty:false → 0 节点返回空集，
+            // 交由 resolveProxyProviders 按 permanent 0-node 处理（不消失成功节点、不误判 transient）。
+            const r = await this.parseSubscriptionContent(text, subscriptionId, {
+              allowProviders: false,
+              viaProxy: ctx.viaProxy,
+              httpPort: ctx.httpPort,
+              userAgent: ctx.userAgent,
+              throwOnEmpty: false,
+            });
+            return { servers: r.servers, skipped: 0, failed: 0, warnings: [] };
+          },
+          log: (level, message) => this.logManager.addLog(level, message, 'Subscription'),
+          subscriptionId,
+          now,
+          maxProviders: 8,
+          fetchTimeoutMs: 15_000,
+        });
+        providerServers = result.servers;
+        partial = result.anyFailed;
+        failedProviders = result.failedProviders;
+        for (const w of result.warnings) this.logManager.addLog('warn', w, 'Subscription');
+      }
+    }
+
+    // 内联在前、provider 在后 → 去重留内联那份。
+    const merged = this.dedupeByFingerprint([...inline.servers, ...providerServers]);
+
+    if (merged.length === 0) {
+      // 防穿仓：Clash 分支(内联+provider)合计 0 必须 throw，不静默落 Base64。
+      // throwOnEmpty=false（provider 复用路径）时返回空集，交由 resolveProxyProviders 按 permanent 0-node 处理。
+      if (ctx.throwOnEmpty !== false) {
+        throw new Error(
+          `Clash 订阅解析得到 0 个可用节点（跳过 ${inline.skipped}、失败 ${inline.failed}）`
+        );
+      }
+      return {
+        servers: [],
+        partial: partial || undefined,
+        failedProviders: failedProviders.length ? failedProviders : undefined,
+      };
+    }
+
+    this.logManager.addLog(
+      'info',
+      `Clash 订阅解析完成：内联 ${inline.servers.length} + provider ${providerServers.length} → 去重后 ${merged.length} 个节点${partial ? '（部分 provider 失败，本次将 merge-only 防穿仓）' : ''}`,
+      'Subscription'
+    );
+    return {
+      servers: merged,
+      partial: partial || undefined,
+      failedProviders: failedProviders.length ? failedProviders : undefined,
+    };
   }
 
   /**
    * 拉取并解析订阅 URL，返回 ServerConfig 列表。
-   * 支持三种格式:
+   * 支持格式:
    *   1. Sing-box JSON (带 outbounds 数组) — GlaDOS /singbox/ 等
-   *   2. 明文 URL 列表 (每行一个 vless:// / ss:// / trojan:// ...)
-   *   3. Base64 编码的 URL 列表
+   *   2. Clash / mihomo YAML（proxies / proxy-providers）
+   *   3. 明文 URL 列表 (每行一个 vless:// / ss:// / trojan:// ...)
+   *   4. Base64 编码的 URL 列表
+   * @param userAgent 可选 UA（per-sub ?? 全局 ?? 默认）；缺省时用 defaultSubscriptionUserAgent()。
+   * @returns partial=true 当 Clash provider 部分失败 → 调用方 reconcile 改 merge-only 防穿仓。
    */
   async fetchSubscription(
     url: string,
     subscriptionId: string,
     viaProxy: boolean = false,
-    httpPort?: number
-  ): Promise<{ servers: ServerConfig[]; userInfo?: SubscriptionConfig['userInfo'] }> {
+    httpPort?: number,
+    userAgent?: string
+  ): Promise<{
+    servers: ServerConfig[];
+    userInfo?: SubscriptionConfig['userInfo'];
+    partial?: boolean;
+    failedProviders?: string[];
+  }> {
     try {
+      // M6：url 常含 ?token=，日志脱敏（去 query）防 token 落 app.log。
       this.logManager.addLog(
         'info',
-        `正在拉取订阅: ${url}（${viaProxy ? '经代理' : '直连'}）`,
+        `正在拉取订阅: ${SubscriptionService.redactUrl(url)}（${viaProxy ? '经代理' : '直连'}）`,
         'Subscription'
       );
 
-      // SSRF 防护：订阅地址来自用户/分享，限 http(s)、拒指向本机/内网/link-local 的字面 IP
-      // （拦 file://、http://169.254.169.254 云元数据、内网回环等）。基于主机名的 DNS 旁路仍存在，
-      // 此处仅做字面 IP 兜底。
-      const urlObj = (() => {
-        try {
-          return new URL(url);
-        } catch {
-          return null;
-        }
-      })();
-      if (!urlObj || (urlObj.protocol !== 'http:' && urlObj.protocol !== 'https:')) {
-        throw new Error(`订阅地址协议不支持（仅允许 http/https）: ${url}`);
-      }
-      if (this.isBlockedSubscriptionHost(urlObj.hostname)) {
-        throw new Error(`订阅地址指向本机/内网/link-local，已拒绝: ${urlObj.hostname}`);
-      }
-
-      // viaProxy=true 用 pin 到本机代理端口的独立会话（不受 mainSessionViaProxy 总开关影响）；
-      // 缺 httpPort 时退回默认会话（向后兼容）。viaProxy=false → 强制直连会话。
-      let fetchImpl: typeof net.fetch;
-      if (viaProxy) {
-        if (httpPort) {
-          const ps = await this.getProxiedSession(httpPort);
-          fetchImpl = ps.fetch.bind(ps);
-        } else {
-          fetchImpl = net.fetch;
-        }
-      } else {
-        const ds = await this.getDirectSession();
-        fetchImpl = ds.fetch.bind(ds);
-      }
-      const response = await fetchImpl(url, {
-        headers: { 'User-Agent': 'FlowZ-Client' },
-      });
-
-      if (!response.ok) {
-        throw new Error(`HTTP Error: ${response.status} ${response.statusText}`);
-      }
-
-      const userInfo = this.parseUserInfo(response.headers.get('subscription-userinfo'));
+      const ua = userAgent?.trim() || defaultSubscriptionUserAgent();
+      // M3：主订阅 fetch 加超时（30s，比 provider 15s 宽）→ 防 slow-loris 挂死 scheduler.isRunning 永真。
+      const { text, userInfo } = await this.fetchSubscriptionText(
+        url,
+        viaProxy,
+        httpPort,
+        ua,
+        AbortSignal.timeout(SubscriptionService.MAIN_FETCH_TIMEOUT_MS)
+      );
       if (userInfo) {
         this.logManager.addLog('info', '订阅流量信息已获取', 'Subscription');
       }
 
-      const text = await response.text();
       const trimmed = text.trim();
-
-      // ── 1. Sing-box JSON format ──────────────────────────────────────
-      try {
-        const json = JSON.parse(trimmed);
-        if (json && Array.isArray(json.outbounds)) {
-          this.logManager.addLog(
-            'info',
-            '检测到 sing-box JSON 格式，解析 outbounds...',
-            'Subscription'
-          );
-          const servers = this.parseSingboxOutbounds(json.outbounds, subscriptionId);
-          this.logManager.addLog(
-            'info',
-            `成功从 sing-box 订阅解析了 ${servers.length} 个节点`,
-            'Subscription'
-          );
-          return { servers, userInfo };
+      const { servers, partial, failedProviders } = await this.parseSubscriptionContent(
+        trimmed,
+        subscriptionId,
+        {
+          allowProviders: true,
+          viaProxy,
+          httpPort,
+          userAgent: ua,
         }
-      } catch {
-        // Not JSON — fall through to URL list parsing
-      }
+      );
 
-      // ── 2. URL list (plain or Base64-encoded) ───────────────────────
-      let decodedContent = trimmed;
-      if (!decodedContent.includes('://')) {
-        try {
-          decodedContent = Buffer.from(decodedContent, 'base64').toString('utf-8');
-        } catch {
-          this.logManager.addLog('warn', '尝试 Base64 解码失败，可能原本就是明文', 'Subscription');
-        }
-      }
-
-      const lines = decodedContent.split(/\r?\n/).filter((line) => line.trim().length > 0);
-      const servers: ServerConfig[] = [];
-
-      for (const line of lines) {
-        if (this.protocolParser.isSupported(line)) {
-          try {
-            const server = this.protocolParser.parseUrl(line);
-            server.subscriptionId = subscriptionId;
-            const now = new Date().toISOString();
-            server.createdAt = now;
-            server.updatedAt = now;
-            servers.push(server);
-          } catch (e: any) {
-            this.logManager.addLog('warn', `解析订阅中的节点失败: ${e.message}`, 'Subscription');
-          }
-        }
-      }
-
-      if (servers.length === 0) {
-        // 区分「格式不识别」与「节点都解析失败」，避免 0 节点静默冒充成功（含 Base64 解码失败的情况）
-        const hadUrlLines = lines.some((l) => l.includes('://'));
-        this.logManager.addLog(
-          'warn',
-          hadUrlLines
-            ? '订阅中的节点 URL 均无法解析（协议不支持或格式错误）'
-            : '无法识别订阅格式：既非 sing-box JSON，也未发现可解析的节点 URL（可能 Base64 解码失败或格式不受支持）',
-          'Subscription'
-        );
-      } else {
-        this.logManager.addLog('info', `成功从订阅解析了 ${servers.length} 个节点`, 'Subscription');
-      }
-      return { servers, userInfo };
+      return { servers, userInfo, partial, failedProviders };
     } catch (error: any) {
-      this.logManager.addLog('error', `拉取订阅失败 (${url}): ${error.message}`, 'Subscription');
+      // M6：失败日志同样脱敏 url。
+      this.logManager.addLog(
+        'error',
+        `拉取订阅失败 (${SubscriptionService.redactUrl(url)}): ${error.message}`,
+        'Subscription'
+      );
       throw error;
     }
   }

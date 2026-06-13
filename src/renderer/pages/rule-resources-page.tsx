@@ -21,6 +21,16 @@ import {
   TableRow,
 } from '@/components/ui/table';
 import { Switch } from '@/components/ui/switch';
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog';
 import { SegmentedControl } from '@/components/ui/segmented-control';
 import { SettingsRow } from '@/components/settings/settings-row';
 import { Library, Link as LinkIcon, RotateCw, RotateCcw, RefreshCw, Trash2, X } from 'lucide-react';
@@ -53,6 +63,11 @@ export function RuleResourcesPage() {
   const [urlOpen, setUrlOpen] = useState(false);
   const [customMode, setCustomMode] = useState(false);
   const [customInput, setCustomInput] = useState('');
+  const [deleteConfirm, setDeleteConfirm] = useState<{
+    id: string;
+    name: string;
+    rules: { id: string; label: string }[];
+  } | null>(null);
 
   const refresh = useCallback(() => {
     api.ruleResources
@@ -125,20 +140,25 @@ export function RuleResourcesPage() {
 
   const handleDelete = async (item: RuleResourceListItem) => {
     if (item.builtin) return; // 内置不可删（兜底，UI 已隐藏入口）
-    if (item.referencedBy > 0) {
-      const ok = window.confirm(
-        t(
-          'ruleResources.deleteReferencedWarn',
-          '该资源正被 {{n}} 条规则引用，删除后这些规则将失效。确定删除？',
-          {
-            n: item.referencedBy,
-          }
-        )
-      );
-      if (!ok) return;
-    }
     try {
-      await api.ruleResources.delete(item.id);
+      // 未 force 删除：后端按当前 config 判断——被启用规则引用则回传 needConfirm + 引用明细（不删），否则直接删。
+      const res = await api.ruleResources.delete(item.id);
+      if (res.needConfirm && res.referencingRules) {
+        setDeleteConfirm({ id: item.id, name: item.name, rules: res.referencingRules });
+        return;
+      }
+      refresh(); // 无引用 → 已删
+    } catch {
+      toast.error(t('ruleResources.deleteFailed', '删除失败'));
+    }
+  };
+
+  const confirmDelete = async () => {
+    const target = deleteConfirm;
+    setDeleteConfirm(null);
+    if (!target) return;
+    try {
+      await api.ruleResources.delete(target.id, true); // force：确认后真正删除
     } catch {
       toast.error(t('ruleResources.deleteFailed', '删除失败'));
     }
@@ -496,6 +516,41 @@ export function RuleResourcesPage() {
         onDownload={handleDownload}
       />
       <ResourceUrlDialog open={urlOpen} onOpenChange={setUrlOpen} onDownload={handleDownload} />
+
+      <AlertDialog open={!!deleteConfirm} onOpenChange={(o) => !o && setDeleteConfirm(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>{t('ruleResources.deleteTitle', '删除规则资源')}</AlertDialogTitle>
+            <AlertDialogDescription asChild>
+              <div className="space-y-2">
+                <p>
+                  {t(
+                    'ruleResources.deleteReferencedDesc',
+                    '「{{name}}」正被以下 {{n}} 条规则引用，删除后这些规则将暂时失效（重新下载该资源后自动恢复）：',
+                    { name: deleteConfirm?.name, n: deleteConfirm?.rules.length ?? 0 }
+                  )}
+                </p>
+                <ul className="max-h-40 space-y-1 overflow-auto rounded-md border bg-muted/30 p-2 text-sm">
+                  {deleteConfirm?.rules.map((r) => (
+                    <li key={r.id} className="truncate text-muted-foreground">
+                      • {r.label}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>{t('common.cancel', '取消')}</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={confirmDelete}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {t('ruleResources.deleteAnyway', '仍要删除')}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

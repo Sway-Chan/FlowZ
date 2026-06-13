@@ -11,6 +11,7 @@ import {
   Network,
   ScrollText,
   FolderDown,
+  Activity,
 } from 'lucide-react';
 
 // 自定义的分流图标（完整连贯的 Y 型，不带断点）
@@ -49,6 +50,7 @@ interface SidebarProps {
 const mainNavItems = [
   { id: 'home', icon: Home },
   { id: 'logs', icon: ScrollText },
+  { id: 'connections', icon: Activity },
   { id: 'server', icon: Server },
   { id: 'appPolicy', icon: FlowSplitIcon },
   { id: 'ruleResources', icon: FolderDown },

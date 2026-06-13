@@ -70,6 +70,8 @@ export const IPC_CHANNELS = {
   // 统计信息
   STATS_GET: 'stats:get',
   CONNECTIONS_GET: 'connections:get',
+  CONNECTIONS_CLOSE: 'connections:close', // 关单条连接（main 经 9090 DELETE /connections/{id}）
+  CONNECTIONS_CLOSE_ALL: 'connections:closeAll', // 关全部连接（main 经 9090 DELETE /connections，触发 ResetNetwork）
 
   // 出口 IP 信息（本地直连出口 / 代理出口）
   IP_INFO_GET: 'ipinfo:get',
@@ -88,9 +90,16 @@ export const IPC_CHANNELS = {
   UPDATE_OPEN_RELEASES: 'update:openReleases',
 
   // 核心管理
+  CORE_UPDATE_CHECK: 'core-update:check',
+  CORE_UPDATE_RUN: 'core-update:update',
+  CORE_UPDATE_GET_VERSION: 'core-update:get-version',
   CORE_GET_VERSION_INFO: 'core:getVersionInfo',
   CORE_ROLLBACK: 'core:rollback',
   CORE_REPLACE_MANUAL: 'core:replaceManual',
+  CORE_UPDATE_GET_AUTO_STATUS: 'core:getAutoStatus', // 内核自动更新状态（lastCheckAt/staged/跨带提示）
+  CORE_UPDATE_APPLY_STAGED: 'core:applyStaged', // 用户点「立即应用」：停代理→换核→重启（唯一允许主动断流）
+  CORE_RESET_FACTORY: 'core-update:reset-factory', // B6：把内核恢复为随 App 出厂的版本
+  APP_UNINSTALL_ALL: 'app:uninstall-all', // B6：完全卸载 FlowZ（提权 helper / 受保护目录内核 / 用户配置 / 应用本体）
 
   // Shell 操作
   SHELL_OPEN_EXTERNAL: 'shell:openExternal',
@@ -116,7 +125,9 @@ export const IPC_CHANNELS = {
   EVENT_CONNECTIONS_UPDATED: 'event:connectionsUpdated',
   EVENT_ENTER_PRIVACY_MODE: 'event:enterPrivacyMode',
   EVENT_CORE_VERSION_CHANGED: 'event:coreVersionChanged',
+  EVENT_CORE_AUTO_UPDATE_STATUS: 'event:coreAutoUpdateStatus', // 内核自动更新状态变更（staged 待生效 / 跨带提示）
   EVENT_AUTO_NODE_SWITCHED: 'event:autoNodeSwitched', // 自动换节点成功通知
+  EVENT_PROXY_INVALID_NODES: 'proxy:invalid-nodes', // 启动 gate 剔除的非法节点（空数组=清陈旧标灰）
   EVENT_IP_INFO_UPDATED: 'event:ipInfoUpdated', // 出口 IP 信息更新
   EVENT_RULE_RESOURCE_PROGRESS: 'event:ruleResourceProgress', // 规则资源下载进度
 

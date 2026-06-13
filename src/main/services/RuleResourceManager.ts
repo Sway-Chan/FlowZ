@@ -88,11 +88,7 @@ export class RuleResourceManager {
     const userItems: RuleResourceListItem[] = resources.map((r) => ({
       ...r,
       fileExists: fssync.existsSync(path.join(this.dir(), r.fileName)),
-      referencedBy: (config.customRules || []).filter(
-        (rule) =>
-          rule.enabled &&
-          ruleConditions(rule).some((c) => c.type === 'ruleSet' && c.values.includes(`res:${r.id}`))
-      ).length,
+      referencedBy: this.referencingRules(config, r.id).length,
     }));
     // 内置 geo 规则集合成置顶（智能分流固定依赖；运行时落 <userData>/rules，与用户资源分目录）
     return [...this.listBuiltins(config), ...userItems];
@@ -246,10 +242,41 @@ export class RuleResourceManager {
     return results;
   }
 
-  async delete(id: string): Promise<{ ok: boolean }> {
+  /** 枚举「启用且经 ruleSet 条件引用该资源」的规则，返回 id + 人类可读 label（备注优先，否则首条件摘要）。
+   *  供 list 计数与删除确认展开列出复用（多条件经 ruleConditions 全覆盖）。 */
+  referencingRules(config: UserConfig, resId: string): { id: string; label: string }[] {
+    return (config.customRules || [])
+      .filter(
+        (rule) =>
+          rule.enabled &&
+          ruleConditions(rule).some(
+            (c) => c.type === 'ruleSet' && c.values.includes(`res:${resId}`)
+          )
+      )
+      .map((rule) => {
+        const c0 = ruleConditions(rule)[0];
+        const summary = c0 ? `${c0.type}: ${(c0.values[0] || '').slice(0, 24)}` : rule.type;
+        return { id: rule.id, label: (rule.remarks || '').trim() || summary };
+      });
+  }
+
+  async delete(
+    id: string,
+    force = false
+  ): Promise<{
+    ok: boolean;
+    needConfirm?: boolean;
+    referencingRules?: { id: string; label: string }[];
+  }> {
     if (isBuiltinId(id)) return { ok: false }; // 内置不可删（UI 已隐藏删除入口；防旁路 IPC）
     return this.withLock(async () => {
       const config = await this.configManager.loadConfig();
+      // 被启用规则引用且未确认 → 不删，回传引用规则明细供前端展开确认。删除后这些规则在 config 生成时被运行期 gate
+      // 自动失效（值缺失跳过 / AND 条件坍缩整条 fail-closed），重下该资源后自动恢复——故仅提示、不改任何规则。
+      if (!force) {
+        const refs = this.referencingRules(config, id);
+        if (refs.length > 0) return { ok: false, needConfirm: true, referencingRules: refs };
+      }
       const res = (config.ruleResources || []).find((r) => r.id === id);
       config.ruleResources = (config.ruleResources || []).filter((r) => r.id !== id);
       await this.configManager.saveConfig(config);

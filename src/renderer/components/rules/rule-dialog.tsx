@@ -59,6 +59,8 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
   const addCustomRule = useAppStore((state) => state.addCustomRule);
   const updateCustomRule = useAppStore((state) => state.updateCustomRule);
   const servers = useAppStore((state) => state.config?.servers || []);
+  // 全局 FakeIP 开关（usesFakeIp 已统一为纯看此开关，缺省 true）：关时本规则的「绕过 FakeIP」天然 no-op，UI 置灰提示。
+  const globalFakeIpEnabled = useAppStore((state) => state.config?.dnsConfig?.enableFakeIp ?? true);
 
   // 多条件模型：conditionTypes 是有序的「激活条件类型」列表（[0]=首条件，镜像到 rule.type/values）。
   // 匹配值仍按类型分桶存 valuesByType（天然多类型并行编辑、切换互不污染）；每类型至多一个条件。
@@ -220,7 +222,9 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
     }
 
     const tid = targetServerId === 'default' ? undefined : targetServerId;
-    const bypass = bypassApplicable ? bypassFakeIP : undefined;
+    // L2：持久化对齐 UI 的 checked（globalFakeIpEnabled && bypassFakeIP）——全局 FakeIP 关时该字段天然 no-op，
+    // 避免 UI 显 unchecked 却写入无效的 bypassFakeIP:true（数据卫生）。
+    const bypass = bypassApplicable ? globalFakeIpEnabled && bypassFakeIP : undefined;
     // 单条件 → 退化为 type/values（不写 conditions/combineMode，与历史规则逐字节等价）；
     // 多条件 → 首条件镜像到 type/values（回滚兼容），并写 conditions + combineMode。
     const first = conds[0];
@@ -476,8 +480,19 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
               <Switch checked={enabled} onCheckedChange={setEnabled} />
             </SettingsRow>
             {bypassApplicable && (
-              <SettingsRow label={t('rules.bypassFakeIp')} description={t('rules.bypassFakeIpTip')}>
-                <Switch checked={bypassFakeIP} onCheckedChange={setBypassFakeIP} />
+              <SettingsRow
+                label={t('rules.bypassFakeIp')}
+                description={
+                  globalFakeIpEnabled
+                    ? t('rules.bypassFakeIpTip')
+                    : t('rules.bypassFakeIpDisabledTip')
+                }
+              >
+                <Switch
+                  checked={globalFakeIpEnabled && bypassFakeIP}
+                  disabled={!globalFakeIpEnabled}
+                  onCheckedChange={setBypassFakeIP}
+                />
               </SettingsRow>
             )}
           </div>

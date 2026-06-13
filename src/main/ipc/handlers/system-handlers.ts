@@ -13,6 +13,4 @@ export function registerSystemHandlers(): void {
     IPC_CHANNELS.SYSTEM_LIST_PROCESSES,
     async (_event: IpcMainInvokeEvent) => listSystemProcesses()
   );
-
-  console.log('[System Handlers] Registered system IPC handlers');
 }

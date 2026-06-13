@@ -63,6 +63,7 @@
     "@radix-ui/react-switch": "^1.2.6",
     "@radix-ui/react-tabs": "^1.1.13",
     "@types/jest": "^30.0.0",
+    "@types/js-yaml": "^4.0.9",
     "@types/node": "^25.0.1",
     "@types/react": "^19.2.7",
     "@types/react-dom": "^19.2.3",
@@ -104,6 +105,8 @@
   },
   "dependencies": {
     "i18next": "^25.8.13",
+    "js-yaml": "^4.1.0",
+    "plist": "^3.1.0",
     "zustand": "^4.5.5"
   },
   "lint-staged": {

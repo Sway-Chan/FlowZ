@@ -6,6 +6,9 @@
 import { ipcMain, IpcMainInvokeEvent } from 'electron';
 import { ApiResponse } from '../../shared/types';
 
+/** 开发环境标识（与 index.ts 一致：仅 NODE_ENV=development 暴露堆栈等调试信息） */
+const isDevelopment = process.env.NODE_ENV === 'development';
+
 /**
  * IPC 处理器函数类型
  */
@@ -37,11 +40,7 @@ export class IpcHandlerRegistry {
       args: TArgs
     ): Promise<ApiResponse<TResult>> => {
       try {
-        console.log(`[IPC] Handling request for channel: ${channel}`, args);
-
         const result = await handler(event, args);
-
-        console.log(`[IPC] Request successful for channel: ${channel}`);
 
         return {
           success: true,
@@ -54,8 +53,8 @@ export class IpcHandlerRegistry {
         const errorCode = (error as any)?.code;
         const errorStack = error instanceof Error ? error.stack : undefined;
 
-        // 记录详细错误信息
-        if (errorStack) {
+        // 记录详细错误堆栈：仅开发环境输出，生产环境不暴露堆栈
+        if (isDevelopment && errorStack) {
           console.error(`[IPC] Stack trace:`, errorStack);
         }
 
@@ -69,8 +68,6 @@ export class IpcHandlerRegistry {
 
     this.handlers.set(channel, wrappedHandler);
     ipcMain.handle(channel, wrappedHandler);
-
-    console.log(`[IPC] Registered handler for channel: ${channel}`);
   }
 
   /**
@@ -81,7 +78,6 @@ export class IpcHandlerRegistry {
     if (this.handlers.has(channel)) {
       ipcMain.removeHandler(channel);
       this.handlers.delete(channel);
-      console.log(`[IPC] Unregistered handler for channel: ${channel}`);
     }
   }
 
@@ -93,7 +89,6 @@ export class IpcHandlerRegistry {
       ipcMain.removeHandler(channel);
     }
     this.handlers.clear();
-    console.log(`[IPC] Unregistered all handlers`);
   }
 
   /**

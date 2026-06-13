@@ -8,6 +8,7 @@ import { IPC_CHANNELS } from '../../../shared/ipc-channels';
 import type {
   RuleResourceCatalogResult,
   RuleResourceDownloadItem,
+  RuleResourceDeleteResult,
   RuleResourceDownloadResult,
   RuleResourceListItem,
 } from '../../../shared/types';
@@ -30,9 +31,10 @@ export function registerRuleResourceHandlers(manager: RuleResourceManager): void
     async (_e: IpcMainInvokeEvent, args: { id: string }) => manager.redownload(args.id)
   );
 
-  registerIpcHandler<{ id: string }, { ok: boolean }>(
+  registerIpcHandler<{ id: string; force?: boolean }, RuleResourceDeleteResult>(
     IPC_CHANNELS.RULE_RESOURCES_DELETE,
-    async (_e: IpcMainInvokeEvent, args: { id: string }) => manager.delete(args.id)
+    async (_e: IpcMainInvokeEvent, args: { id: string; force?: boolean }) =>
+      manager.delete(args.id, args.force === true)
   );
 
   registerIpcHandler<{ prefix: string }, { ok: boolean; value?: string; error?: string }>(
@@ -74,6 +76,4 @@ export function registerRuleResourceHandlers(manager: RuleResourceManager): void
     IPC_CHANNELS.RULE_RESOURCES_RESET_BUILTIN,
     async (_e: IpcMainInvokeEvent, args: { tag: string }) => manager.resetBuiltin(args.tag)
   );
-
-  console.log('[RuleResource Handlers] Registered rule-resource IPC handlers');
 }

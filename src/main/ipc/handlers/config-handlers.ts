@@ -118,6 +118,4 @@ export function registerConfigHandlers(configManager: ConfigManager): void {
       setPrivacyMode(value);
     }
   );
-
-  console.log('[Config Handlers] Registered all config IPC handlers');
 }

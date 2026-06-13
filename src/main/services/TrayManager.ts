@@ -564,7 +564,6 @@ export class TrayManager implements ITrayManager {
         // 手动触发 V8 GC（需要启动时已调用 v8.setFlagsFromString('--expose-gc')）
         if (typeof (global as any).gc === 'function') {
           (global as any).gc();
-          console.log('[LightweightMode] V8 GC triggered');
         }
       }, 500);
     }

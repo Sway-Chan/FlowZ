@@ -30,7 +30,7 @@ export function RealTimeLogs({
   const { t, i18n } = useTranslation();
   const [logs, setLogs] = useState<LogRow[]>([]);
   const [searchTerm, setSearchTerm] = useState('');
-  const [isAutoScroll, setIsAutoScroll] = useState(false); // 默认不自动滚动
+  const [isAutoScroll, setIsAutoScroll] = useState(true); // 默认自动滚动：打开日志页即跟随最新（上滚脱离、回底吸附逻辑不变）
   const [isUserScrolling, setIsUserScrolling] = useState(false);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const userScrollTimeoutRef = useRef<NodeJS.Timeout | null>(null);

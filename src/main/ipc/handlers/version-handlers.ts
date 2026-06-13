@@ -60,6 +60,4 @@ export function registerVersionHandlers(coreUpdateService?: CoreUpdateService): 
       return true;
     }
   );
-
-  console.log('[Version Handlers] Registered all version IPC handlers');
 }

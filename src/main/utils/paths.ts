@@ -120,14 +120,12 @@ export function initUserDataPath(): void {
       // 注意：这必须在 app.requestSingleInstanceLock() 之前调用
       try {
         app.setPath('userData', cachedUserDataPath);
-        console.log('[Paths] Portable mode detected. Redirected userData to:', cachedUserDataPath);
       } catch (e) {
         console.error('[Paths] Failed to set userData path:', e);
       }
     } else {
       // 在应用启动时（普通用户身份）缓存路径
       cachedUserDataPath = app.getPath('userData');
-      console.log('[Paths] User data path initialized:', cachedUserDataPath);
     }
   }
 }

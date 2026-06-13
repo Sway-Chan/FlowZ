@@ -164,6 +164,8 @@ export async function checkCoreUpdate(): Promise<
     latestVersion?: string;
     downloadUrl?: string;
     releaseNotes?: string;
+    /** latestVersion 是否跨当前 minor 带（如 1.13.x→1.14.x）；true 时 UI 标注跨大版本风险。 */
+    crossBand?: boolean;
     error?: string;
   }>
 > {

@@ -138,6 +138,4 @@ export function registerRulesHandlers(configManager: ConfigManager): void {
       console.log('[Rules Handlers] Rules reordered');
     }
   );
-
-  console.log('[Rules Handlers] Registered all rules IPC handlers');
 }

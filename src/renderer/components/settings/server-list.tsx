@@ -139,6 +139,8 @@ export function ServerList({
 }: ServerListProps) {
   const latencyMap = useAppStore((state) => state.latencyMap);
   const setLatencyMap = useAppStore((state) => state.setLatencyMap);
+  // 启动前配置校验 gate 剔除的非法节点：列表标灰 + tooltip（不禁用点击，用户仍可选/编辑/删除）。
+  const invalidNodes = useAppStore((state) => state.invalidNodes);
   const [isTestingSpeed, setIsTestingSpeed] = useState(false);
   const [testingServerIds, setTestingServerIds] = useState<Set<string>>(new Set());
   const { t } = useTranslation();
@@ -783,7 +785,16 @@ export function ServerList({
                 <CardHeader className={`pb-2 ${isSelecting ? 'pl-8' : ''}`}>
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0">
-                      <CardTitle className="text-sm truncate">{server.name}</CardTitle>
+                      <CardTitle
+                        className={`text-sm truncate ${invalidNodes[server.id] ? 'opacity-50' : ''}`}
+                        title={
+                          invalidNodes[server.id]
+                            ? `${t('servers.nodeInvalid')}: ${invalidNodes[server.id].reason}`
+                            : undefined
+                        }
+                      >
+                        {server.name}
+                      </CardTitle>
                       <CardDescription className="text-xs mt-0.5">
                         {server.address}:{server.port}
                       </CardDescription>
@@ -894,7 +905,16 @@ export function ServerList({
                 {/* 名称 + 地址 */}
                 <div className="flex-1 min-w-0 relative z-10">
                   <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium truncate">{server.name}</span>
+                    <span
+                      className={`text-sm font-medium truncate ${invalidNodes[server.id] ? 'opacity-50' : ''}`}
+                      title={
+                        invalidNodes[server.id]
+                          ? `${t('servers.nodeInvalid')}: ${invalidNodes[server.id].reason}`
+                          : undefined
+                      }
+                    >
+                      {server.name}
+                    </span>
                     <Badge
                       className={`text-[10px] h-4 px-1 flex-shrink-0 border ${getProtocolBadgeVariant(server.protocol)}`}
                     >

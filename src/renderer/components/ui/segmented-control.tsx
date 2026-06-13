@@ -44,7 +44,7 @@ export function SegmentedControl<T extends string>({
               'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
               'disabled:pointer-events-none disabled:opacity-50',
               active
-                ? 'bg-background text-foreground shadow-sm'
+                ? 'bg-white text-foreground shadow-sm dark:bg-card'
                 : 'text-muted-foreground hover:text-foreground'
             )}
           >

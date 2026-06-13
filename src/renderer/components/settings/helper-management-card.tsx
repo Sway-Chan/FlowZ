@@ -1,17 +1,19 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { useAppStore } from '@/store/app-store';
 import { openExternal } from '@/bridge/api-wrapper';
-import { LOGIN_ITEMS_SETTINGS_URL } from '@/components/home/helper-install-dialog';
 import { toast } from 'sonner';
 import { Loader2, ShieldCheck } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
+import { LOGIN_ITEMS_SETTINGS_URL } from '../../../shared/constants';
 
 /**
  * 提权助手管理卡（仅 macOS）：展示安装/就绪状态，提供安装/修复/卸载入口。
  * 与首页启动提示共享同一安装逻辑（store.installHelper / uninstallHelper）。
+ * 「允许在后台」被关时：检测到 backgroundDisabled → 提示 + 一键打开系统设置引导用户手动开启（程序无法翻动
+ * 用户关掉的 BTM allowed 位，Apple SMAppService 无此 API）。开关恢复后状态会在几秒内自动刷新（focus / 轮询触发）。
  */
 export function HelperManagementCard() {
   const { t } = useTranslation();
@@ -19,11 +21,43 @@ export function HelperManagementCard() {
   const refreshHelperStatus = useAppStore((s) => s.refreshHelperStatus);
   const installHelper = useAppStore((s) => s.installHelper);
   const uninstallHelper = useAppStore((s) => s.uninstallHelper);
-  const [busy, setBusy] = useState<'install' | 'uninstall' | 'recover' | null>(null);
+  const [busy, setBusy] = useState<'install' | 'uninstall' | null>(null);
 
+  const installed = helperStatus?.installed;
+  const needsRepair = helperStatus?.needsRepair;
+  const upgradeable = helperStatus?.upgradeable;
+  const backgroundDisabled = helperStatus?.backgroundDisabled;
+
+  // mount 强制刷新 + 窗口 focus（切回 FlowZ=刚在系统设置改过开关）强制 fresh 检测 + focus 后 3/6/9s 各补刷一次：
+  // 捕捉"开开关后 daemon 重新 bootstrap 完成"的滞后,使开开关后切回**一次**即在几秒内自动转「已安装就绪」。
+  // **不常驻轮询**——开关关/需修复是稳定态,靠 focus 检测即可、不持续耗资源;补刷是 focus 触发的有限重试,9s 内停。
   useEffect(() => {
-    refreshHelperStatus();
+    let timers: ReturnType<typeof setTimeout>[] = [];
+    const clearTimers = () => {
+      timers.forEach(clearTimeout);
+      timers = [];
+    };
+    const refreshAndCatchUp = () => {
+      clearTimers();
+      refreshHelperStatus(true);
+      timers = [3000, 6000, 9000].map((d) => setTimeout(() => refreshHelperStatus(true), d));
+    };
+    refreshAndCatchUp();
+    window.addEventListener('focus', refreshAndCatchUp);
+    return () => {
+      window.removeEventListener('focus', refreshAndCatchUp);
+      clearTimers();
+    };
   }, [refreshHelperStatus]);
+
+  // 恢复反馈闭环：backgroundDisabled 由 true → false → 提示用户「手动开启已生效」
+  const prevBgDisabled = useRef<boolean | undefined>(undefined);
+  useEffect(() => {
+    if (prevBgDisabled.current === true && backgroundDisabled === false) {
+      toast.success(t('helper.backgroundRestored', '「允许在后台」已恢复，提权助手可用'));
+    }
+    prevBgDisabled.current = backgroundDisabled;
+  }, [backgroundDisabled, t]);
 
   const handleInstall = async () => {
     setBusy('install');
@@ -47,27 +81,6 @@ export function HelperManagementCard() {
     }
   };
 
-  /** 「允许在后台」被关：尝试自动恢复 = 重装 helper（授权一次）；失败或装完仍未就绪 → 引导去系统设置。 */
-  const handleRecover = async () => {
-    setBusy('recover');
-    try {
-      const res = await installHelper();
-      const ready = useAppStore.getState().helperStatus?.ready === true;
-      if (res.success && ready) {
-        toast.success(t('helper.recoverSuccess'));
-      } else {
-        toast.error(t('helper.recoverFail'), {
-          description: res.error
-            ? `${res.error} — ${t('helper.recoverFailGoSettings')}`
-            : t('helper.recoverFailGoSettings'),
-        });
-        await openExternal(LOGIN_ITEMS_SETTINGS_URL);
-      }
-    } finally {
-      setBusy(null);
-    }
-  };
-
   // 状态徽章
   const statusBadge = () => {
     if (!helperStatus) return <Badge variant="secondary">{t('helper.statusChecking')}</Badge>;
@@ -85,12 +98,10 @@ export function HelperManagementCard() {
       );
     if (helperStatus.needsRepair)
       return <Badge variant="destructive">{t('helper.statusNeedsRepair')}</Badge>;
+    if (helperStatus.upgradeable)
+      return <Badge variant="secondary">{t('helper.statusUpgradeable', '可升级')}</Badge>;
     return <Badge variant="default">{t('helper.statusInstalled')}</Badge>;
   };
-
-  const installed = helperStatus?.installed;
-  const needsRepair = helperStatus?.needsRepair;
-  const backgroundDisabled = helperStatus?.backgroundDisabled;
 
   return (
     <Card>
@@ -106,7 +117,7 @@ export function HelperManagementCard() {
           <p className="text-sm text-destructive">
             {t(
               'helper.backgroundDisabledDesc',
-              '系统设置中本应用的「允许在后台」已被关闭，提权助手无法运行，TUN 启停将退回每次弹管理员授权框。请前往系统设置重新开启，或尝试自动恢复（需授权一次）。'
+              '系统设置中本应用的「允许在后台」已被关闭，提权助手无法运行，TUN 启停将退回每次弹管理员授权框。请点击下方「打开系统设置」，在「登录项与扩展」中重新开启 FlowZ 的「允许在后台」。开启后本页状态会在几秒内自动恢复。'
             )}
           </p>
         )}
@@ -115,6 +126,14 @@ export function HelperManagementCard() {
             {t(
               'helper.pathMismatchDesc',
               '提权助手登记的核心路径与当前应用不一致（应用可能被移动过），TUN 免授权启动将失效，请点击修复。'
+            )}
+          </p>
+        )}
+        {upgradeable && !needsRepair && !backgroundDisabled && (
+          <p className="text-sm text-muted-foreground">
+            {t(
+              'helper.upgradeableDesc',
+              '提权助手有新版本。当前版本 TUN 启停照常可用；升级后内核更新也将免授权（写入受保护目录）。可按需点击下方「升级」。'
             )}
           </p>
         )}
@@ -132,23 +151,20 @@ export function HelperManagementCard() {
             </Button>
           )}
           {installed && backgroundDisabled && (
-            <>
-              <Button
-                onClick={() => openExternal(LOGIN_ITEMS_SETTINGS_URL)}
-                disabled={busy !== null}
-              >
-                {t('helper.disabledOpenSettings', '打开系统设置')}
-              </Button>
-              <Button variant="outline" onClick={handleRecover} disabled={busy !== null}>
-                {busy === 'recover' && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-                {t('helper.disabledTryRecover', '尝试自动恢复（需授权一次）')}
-              </Button>
-            </>
+            <Button onClick={() => openExternal(LOGIN_ITEMS_SETTINGS_URL)} disabled={busy !== null}>
+              {t('helper.disabledOpenSettings', '打开系统设置')}
+            </Button>
           )}
           {installed && needsRepair && !backgroundDisabled && (
             <Button onClick={handleInstall} disabled={busy !== null}>
               {busy === 'install' && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
               {t('helper.repair')}
+            </Button>
+          )}
+          {installed && upgradeable && !needsRepair && !backgroundDisabled && (
+            <Button onClick={handleInstall} disabled={busy !== null}>
+              {busy === 'install' && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+              {t('helper.upgrade', '升级')}
             </Button>
           )}
           {installed && (

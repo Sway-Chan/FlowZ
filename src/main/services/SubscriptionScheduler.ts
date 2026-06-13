@@ -124,6 +124,8 @@ export class SubscriptionScheduler {
         name: string;
         servers: typeof config.servers;
         userInfo: (typeof subs)[number]['userInfo'];
+        partial?: boolean;
+        failedProviders?: string[];
       }> = [];
       for (const sub of subs) {
         if (!sub.autoUpdate) continue;
@@ -144,13 +146,16 @@ export class SubscriptionScheduler {
             sub.url,
             sub.id,
             viaProxy,
-            config.httpPort || 2080
+            config.httpPort || 2080,
+            sub.userAgent ?? config.subscriptionUserAgent
           );
           fetched.push({
             subId: sub.id,
             name: sub.name,
             servers: result.servers,
             userInfo: result.userInfo,
+            partial: result.partial,
+            failedProviders: result.failedProviders,
           });
           this.backoff.delete(sub.id);
         } catch (e: any) {
@@ -186,11 +191,27 @@ export class SubscriptionScheduler {
           f.servers,
           nowIso
         );
-        if (fresh.selectedServerId && deletedIds.has(fresh.selectedServerId)) {
+        // partial（Clash provider 部分失败）→ merge-only：M1 provider 级精确——只保留失败 provider 名下的
+        // 下架节点，成功 provider 的真下架正常删除。
+        let finalKept = kept;
+        if (f.partial && deletedIds.size > 0) {
+          const leftover = SubscriptionService.leftoverToKeep(
+            oldServers,
+            deletedIds,
+            f.failedProviders
+          );
+          finalKept = [...kept, ...leftover];
+        }
+        // selectedServerId 被删且未被 leftover 保留 → 清空
+        if (
+          fresh.selectedServerId &&
+          deletedIds.has(fresh.selectedServerId) &&
+          !finalKept.some((s) => s.id === fresh.selectedServerId)
+        ) {
           fresh.selectedServerId = null;
         }
         const others = fresh.servers.filter((s) => s.subscriptionId !== f.subId);
-        fresh.servers = [...others, ...kept];
+        fresh.servers = [...others, ...finalKept];
         sub.lastUpdated = nowIso;
         if (f.userInfo) sub.userInfo = f.userInfo;
         updated++;

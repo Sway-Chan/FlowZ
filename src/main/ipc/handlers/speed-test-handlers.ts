@@ -36,6 +36,4 @@ export function registerSpeedTestHandlers(
       return results;
     }
   );
-
-  console.log('[SpeedTest Handlers] Registered speed test IPC handlers');
 }

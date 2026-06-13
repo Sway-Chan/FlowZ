@@ -102,10 +102,10 @@ export function AdvancedSettings() {
         </CardContent>
       </Card>
 
-      {/* 日志 + 内核更新策略 */}
+      {/* 日志（内核更新策略已迁至「内核管理」卡片，见 core-management-card） */}
       <Card>
         <CardContent className="divide-y divide-border/60 pt-2">
-          <SettingsRow heading label={t('settings.network.logsAndCore', '日志与内核')} />
+          <SettingsRow heading label={t('settings.network.logs', '日志')} />
           <SettingsRow
             label={t('settings.advanced.logLevel')}
             description={t('settings.advanced.logLevelDesc')}
@@ -138,22 +138,6 @@ export function AdvancedSettings() {
               checked={config.disableLogFile === true}
               onCheckedChange={(c) =>
                 saveConfig({ ...config, disableLogFile: c }).catch(() =>
-                  toast.error(t('common.saveFailed'))
-                )
-              }
-            />
-          </SettingsRow>
-          <SettingsRow
-            label={t('settings.advanced.restrictCoreUpdate', '仅在兼容版本带内自动更新内核')}
-            description={t(
-              'settings.advanced.restrictCoreUpdateDesc',
-              '仅自动更新到与当前配置生成器兼容的 sing-box 版本带（如 1.13.x）；跨版本带不自动更新、转为提示随 App 升级。手动更新不受此限制。'
-            )}
-          >
-            <Switch
-              checked={config.restrictCoreUpdateToCompatibleMinor !== false}
-              onCheckedChange={(c) =>
-                saveConfig({ ...config, restrictCoreUpdateToCompatibleMinor: c }).catch(() =>
                   toast.error(t('common.saveFailed'))
                 )
               }

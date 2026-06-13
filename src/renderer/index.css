@@ -4,7 +4,7 @@
 
 @layer base {
   :root {
-    --background: 0 0% 100%;
+    --background: 210 40% 98%;
     --foreground: 222.2 84% 4.9%;
     --card: 0 0% 100%;
     --card-foreground: 222.2 84% 4.9%;
@@ -12,16 +12,16 @@
     --popover-foreground: 222.2 84% 4.9%;
     --primary: 217.2 91.2% 59.8%;
     --primary-foreground: 0 0% 100%;
-    --secondary: 214 95% 93%;
+    --secondary: 214 60% 85%;
     --secondary-foreground: 217.2 91.2% 59.8%;
-    --muted: 210 40% 96.1%;
+    --muted: 214 32% 91%;
     --muted-foreground: 215.4 16.3% 46.9%;
     --accent: 214 95% 93%;
     --accent-foreground: 217.2 91.2% 59.8%;
     --destructive: 0 84.2% 60.2%;
     --destructive-foreground: 210 40% 98%;
-    --border: 214.3 31.8% 91.4%;
-    --input: 214.3 31.8% 91.4%;
+    --border: 214 20% 84%;
+    --input: 214 22% 80%;
     --ring: 217.2 91.2% 59.8%;
     --radius: 0.5rem;
   }
@@ -35,16 +35,16 @@
     --popover-foreground: 0 0% 98%;
     --primary: 217.2 91.2% 59.8%;
     --primary-foreground: 0 0% 100%;
-    --secondary: 0 0% 14.9%;
+    --secondary: 0 0% 22%;
     --secondary-foreground: 0 0% 98%;
-    --muted: 0 0% 14.9%;
+    --muted: 0 0% 18%;
     --muted-foreground: 0 0% 63.9%;
     --accent: 0 0% 14.9%;
     --accent-foreground: 0 0% 98%;
     --destructive: 0 62.8% 30.6%;
     --destructive-foreground: 0 0% 98%;
-    --border: 0 0% 14.9%;
-    --input: 0 0% 14.9%;
+    --border: 0 0% 24%;
+    --input: 0 0% 27%;
     --ring: 0 0% 83.1%;
   }
 }
@@ -238,8 +238,10 @@
   }
 
   /* Main content card */
+  /* light: 用 --background(微灰 #f7f9fb) 作为内容区底，让内部白色 Card 浮起形成三层。
+     仅改非 vibrancy 的实色底；darwin/win/linux 的 sidebar/shell 透明或硬编码分支不在此规则内，未受影响。 */
   .main-content-card {
-    background-color: #ffffff;
+    background-color: hsl(var(--background));
     border-radius: 12px 0 0 12px;
     position: relative;
     transform: translateZ(0);

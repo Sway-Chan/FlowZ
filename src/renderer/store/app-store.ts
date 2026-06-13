@@ -9,6 +9,7 @@ import type {
   TrafficStats,
   HelperStatus,
   IpInfoSnapshot,
+  InvalidNodeInfo,
 } from '../../shared/types';
 import type { UpdateInfo } from '../../shared/types/update';
 import { api } from '../ipc';
@@ -17,6 +18,17 @@ import i18n from '../i18n';
 
 // 兼容旧的类型定义
 type ProxyMode = UserConfig['proxyMode'];
+
+/**
+ * 可用的内核更新（常驻入口数据源）。放 store 与 availableAppUpdate 对称：
+ * CoreManagementCard 随设置子节切换会卸载，本地 state 承载不了「toast 消失后入口仍在」。
+ */
+export interface AvailableCoreUpdate {
+  latestVersion: string;
+  downloadUrl: string;
+  /** 是否跨当前 minor 带（如 1.13.x→1.14.x）；true 时 UI 用警告色 + 风险文案。 */
+  crossBand?: boolean;
+}
 
 // loadConfig 单飞：防 configChanged 风暴 / 启动期重复拉取（替代原 isLoading 重入守卫）
 let loadConfigInflight: Promise<void> | null = null;
@@ -62,6 +74,10 @@ interface AppState {
   // Latency test results (persisted across view changes)
   latencyMap: Record<string, number>;
 
+  // 启动前配置校验 gate 剔除的非法节点（serverId → 信息）：节点列表据此标灰 + tooltip（不禁用点击）。
+  // 仅会话内存，由 EVENT_PROXY_INVALID_NODES 事件覆盖（空数组=清空）。
+  invalidNodes: Record<string, InvalidNodeInfo>;
+
   // Privacy Protection Mode
   isPrivacyMode: boolean;
 
@@ -71,12 +87,16 @@ interface AppState {
   // F28：可用的 App 更新（持久入口数据源；放 store 因 AboutSettings 随子节切换会卸载，本地 state 承载不了）
   availableAppUpdate: UpdateInfo | null;
 
+  // 可用的内核更新（常驻入口数据源；与 availableAppUpdate 同理放 store）
+  availableCoreUpdate: AvailableCoreUpdate | null;
+
   // Actions
   setCurrentView: (view: string) => void;
   setSettingsSection: (section: string) => void;
   setLatencyMap: (map: Record<string, number>) => void;
   setPrivacyMode: (value: boolean) => void;
   setAvailableAppUpdate: (info: UpdateInfo | null) => void;
+  setAvailableCoreUpdate: (info: AvailableCoreUpdate | null) => void;
 
   // Proxy Control Actions
   startProxy: () => Promise<void>;
@@ -102,7 +122,7 @@ interface AppState {
   commitRuleOrder: (orderedIds: string[]) => Promise<void>;
 
   // macOS 提权 helper Actions
-  refreshHelperStatus: () => Promise<void>;
+  refreshHelperStatus: (force?: boolean) => Promise<void>;
   installHelper: () => Promise<{ success: boolean; error?: string }>;
   uninstallHelper: () => Promise<{ success: boolean; error?: string }>;
 }
@@ -120,9 +140,11 @@ export const useAppStore = create<AppState>((set, get) => ({
   stats: null,
   ipInfo: null,
   latencyMap: {},
+  invalidNodes: {},
   isPrivacyMode: false,
   helperStatus: null,
   availableAppUpdate: null,
+  availableCoreUpdate: null,
 
   // UI Actions
   // 离开设置页时把子节重置回 general（保留原 App 行为）；导航到设置页则保留当前/外部指定的子节
@@ -137,6 +159,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   setSettingsSection: (section) => set({ settingsSection: section }),
   setLatencyMap: (map) => set({ latencyMap: map }),
   setAvailableAppUpdate: (info) => set({ availableAppUpdate: info }),
+  setAvailableCoreUpdate: (info) => set({ availableCoreUpdate: info }),
   setPrivacyMode: async (value) => {
     if (get().isPrivacyMode === value) return;
     set({ isPrivacyMode: value });
@@ -420,9 +443,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   },
 
   // macOS 提权 helper Actions
-  refreshHelperStatus: async () => {
+  refreshHelperStatus: async (force) => {
     try {
-      const helperStatus = await api.helper.getStatus();
+      const helperStatus = await api.helper.getStatus(force === true);
       set({ helperStatus });
     } catch (error) {
       console.error('[Store] Failed to refresh helper status:', error);

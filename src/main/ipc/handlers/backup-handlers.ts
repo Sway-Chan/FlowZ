@@ -159,6 +159,4 @@ export function registerBackupHandlers(configManager: ConfigManager): void {
       };
     }
   );
-
-  console.log('[Backup Handlers] Registered all backup IPC handlers');
 }

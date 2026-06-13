@@ -16,6 +16,7 @@ import { Loader2, Link as LinkIcon, Edit, Activity } from 'lucide-react';
 import type { SubscriptionConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 import { formatBytes } from '@/lib/format';
+import { getVersionInfo } from '@/bridge/api-wrapper';
 
 interface SubscriptionDialogProps {
   open: boolean;
@@ -34,7 +35,24 @@ export function SubscriptionDialog({
   const [name, setName] = useState('');
   const [url, setUrl] = useState('');
   const [autoUpdate, setAutoUpdate] = useState(true); // 新增订阅默认开启自动更新（否则「启动自动更新」总开关无意义）
+  const [userAgent, setUserAgent] = useState('');
+  const [appVersion, setAppVersion] = useState('');
   const [isSaving, setIsSaving] = useState(false);
+
+  // 取 app 版本以拼出默认 UA placeholder（FlowZ/<版本>），与主进程 defaultSubscriptionUserAgent() 保持一致。
+  useEffect(() => {
+    if (!open || appVersion) return;
+    getVersionInfo()
+      .then((res) => {
+        if (res.success && res.data?.appVersion) setAppVersion(res.data.appVersion);
+      })
+      .catch(() => {
+        /* 取版本失败：placeholder 退化为 FlowZ/<版本>，不影响保存 */
+      });
+  }, [open, appVersion]);
+
+  // 默认 UA placeholder：拿到版本用 FlowZ/<版本>，否则占位提示
+  const defaultUserAgent = appVersion ? `FlowZ/${appVersion}` : 'FlowZ/<版本>';
 
   useEffect(() => {
     if (open) {
@@ -42,10 +60,12 @@ export function SubscriptionDialog({
         setName(subscription.name);
         setUrl(subscription.url);
         setAutoUpdate(subscription.autoUpdate);
+        setUserAgent(subscription.userAgent ?? '');
       } else {
         setName('');
         setUrl('');
         setAutoUpdate(true); // 新增订阅默认开启自动更新（否则「启动自动更新」总开关无意义）
+        setUserAgent('');
       }
     }
   }, [open, subscription]);
@@ -62,10 +82,13 @@ export function SubscriptionDialog({
 
     try {
       setIsSaving(true);
+      const trimmedUa = userAgent.trim();
       await onSave({
         name: name.trim(),
         url: url.trim(),
         autoUpdate,
+        // 非空才写入 userAgent；空则不带该字段（落回全局/默认 UA）。
+        ...(trimmedUa ? { userAgent: trimmedUa } : {}),
       });
       onOpenChange(false);
     } catch {
@@ -116,6 +139,17 @@ export function SubscriptionDialog({
               value={url}
               onChange={(e) => setUrl(e.target.value)}
             />
+          </div>
+
+          <div className="space-y-2">
+            <Label htmlFor="sub-user-agent">{t('sub.userAgent')}</Label>
+            <Input
+              id="sub-user-agent"
+              placeholder={t('sub.userAgentPlaceholder', { ua: defaultUserAgent })}
+              value={userAgent}
+              onChange={(e) => setUserAgent(e.target.value)}
+            />
+            <div className="text-[0.8rem] text-muted-foreground">{t('sub.userAgentDesc')}</div>
           </div>
 
           {/* 流量和到期信息展示 */}

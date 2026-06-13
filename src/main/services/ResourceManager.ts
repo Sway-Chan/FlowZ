@@ -1,6 +1,8 @@
 import { app } from 'electron';
 import * as path from 'path';
 import * as fs from 'fs/promises';
+import type { LogLevel } from '../../shared/types';
+import type { LogManager } from './LogManager';
 
 /**
  * 资源文件管理器
@@ -10,10 +12,31 @@ export class ResourceManager {
   private _isDev?: boolean;
   private readonly platform: string;
   private readonly arch: string;
+  private logManager?: LogManager;
 
   constructor() {
     this.platform = process.platform;
     this.arch = process.arch;
+  }
+
+  /**
+   * 注入 LogManager（由主流程在 index.ts 统一注入）。注入前日志走 console fallback。
+   */
+  setLogManager(lm: LogManager): void {
+    this.logManager = lm;
+  }
+
+  /**
+   * 统一日志出口：已注入 LogManager 则转发，否则按级别 fallback 到 console。
+   */
+  private log(level: LogLevel, message: string): void {
+    if (this.logManager) {
+      this.logManager.addLog(level, message, 'ResourceManager');
+      return;
+    }
+    if (level === 'error' || level === 'fatal') console.error(message);
+    else if (level === 'warn') console.warn(message);
+    else console.log(message);
   }
 
   private get isDev(): boolean {
@@ -49,6 +72,19 @@ export class ResourceManager {
       }
     }
 
+    // macOS 内核持久化（B 块）：优先受保护目录下的内核（存在且可执行——持久化更新写入处），否则回落 bundle 出厂
+    // 内核。受保护目录惰性创建（仅首次内核更新时），未创建时此处自然 fallback，行为与改动前一致、永不 brick。
+    if (this.platform === 'darwin') {
+      const fs = require('fs');
+      const protectedCore = path.join(this.getProtectedCoreDir(), filename);
+      try {
+        fs.accessSync(protectedCore, fs.constants.X_OK);
+        return protectedCore;
+      } catch {
+        /* 受保护目录无内核/不可执行 → 用 bundle 出厂内核 */
+      }
+    }
+
     const platformDir = this.getPlatformResourceDir();
     const singboxPath = path.join(platformDir, filename);
 
@@ -72,6 +108,12 @@ export class ResourceManager {
       return path.join(app.getPath('userData'), 'core_update', filename);
     }
 
+    // macOS：fallback 写路径显式回 bundle（与 getSingBoxPath 受保护目录优先解耦）。受保护目录是 root-only，普通用户
+    // 写不了；持久化更新经 helper v5 install-core 由 root 写（CoreUpdateService 改道），非 helper-v5 路径才回落此 bundle 写。
+    if (this.platform === 'darwin') {
+      return this.getBundledSingBoxPath();
+    }
+
     return this.getSingBoxPath();
   }
 
@@ -82,6 +124,18 @@ export class ResourceManager {
    */
   getMacHelperPath(): string {
     return path.join(this.getPlatformResourceDir(), 'com.flowz.helper');
+  }
+
+  /** macOS 内核持久化的受保护目录（root-only 写，App 升级不覆盖；B 块）。helper 安装时经 --coredir 锁定它，
+   *  install-core 只写此目录。仅 macOS 有意义。 */
+  getProtectedCoreDir(): string {
+    return '/Library/Application Support/FlowZ/core';
+  }
+
+  /** 始终指向随 App 出厂的 bundle 内核（B 块 App 升级仲裁 / 受保护目录种子用，绕过受保护目录优先逻辑）。 */
+  getBundledSingBoxPath(): string {
+    const filename = this.platform === 'win32' ? 'sing-box.exe' : 'sing-box';
+    return path.join(this.getPlatformResourceDir(), filename);
   }
 
   /**
@@ -335,9 +389,7 @@ export class ResourceManager {
       // 复制失败不阻断启动（naive 不可用时 sing-box 会自报 cronet 错误），但必须告警而非静默吞掉：
       // 否则 dst 缺库会被 getCronetLibStatus 判为 'copy-failed'，需要这条日志定位 EACCES/磁盘满/AV 锁等真因。
       const msg = error instanceof Error ? error.message : String(error);
-      console.warn(
-        `[ResourceManager] libcronet 拷贝失败（naive 暂不可用）：${src} → ${dst}：${msg}`
-      );
+      this.log('warn', `libcronet 拷贝失败（naive 暂不可用）：${src} → ${dst}：${msg}`);
     }
   }
 

@@ -106,7 +106,8 @@ export function registerSubscriptionHandlers(
           subscription.url,
           subscription.id,
           config.subscriptionUpdateViaProxy === true,
-          config.httpPort || 2080
+          config.httpPort || 2080,
+          subscription.userAgent ?? config.subscriptionUserAgent
         );
         const fetchedServers = result.servers;
 
@@ -124,12 +125,31 @@ export function registerSubscriptionHandlers(
           new Date().toISOString()
         );
 
-        if (config.selectedServerId && deletedIds.has(config.selectedServerId)) {
+        // partial（Clash provider 部分失败）→ merge-only 防穿仓：M1 改为 provider 级精确——只保留「失败 provider
+        // 名下」的下架节点（防某 provider 临时 503 误删其托管存量，FlowZ 无本地 path 缓存兜底），成功 provider
+        // 的真下架正常删除。
+        let finalKeep = newServersToKeep;
+        let finalDeleted = deleted;
+        if (result.partial && deletedIds.size > 0) {
+          const leftover = SubscriptionService.leftoverToKeep(
+            oldServers,
+            deletedIds,
+            result.failedProviders
+          );
+          finalKeep = [...newServersToKeep, ...leftover];
+          finalDeleted = deleted - leftover.length;
+        }
+        // selectedServerId 被删且未被 leftover 保留 → 清空（partial 精确删除后也可能删掉选中节点）
+        if (
+          config.selectedServerId &&
+          deletedIds.has(config.selectedServerId) &&
+          !finalKeep.some((s) => s.id === config.selectedServerId)
+        ) {
           config.selectedServerId = null;
         }
 
         const otherServers = config.servers.filter((s) => s.subscriptionId !== subscription.id);
-        config.servers = [...otherServers, ...newServersToKeep];
+        config.servers = [...otherServers, ...finalKeep];
 
         // 更新订阅的最后更新时间和流量信息
         subscription.lastUpdated = new Date().toISOString();
@@ -143,7 +163,7 @@ export function registerSubscriptionHandlers(
           success: true,
           addedServers: added,
           updatedServers: updated,
-          deletedServers: deleted,
+          deletedServers: finalDeleted,
           userInfo: result.userInfo,
         };
       } catch (error: any) {
@@ -159,6 +179,4 @@ export function registerSubscriptionHandlers(
   );
 
   // 启动补更/周期更新已由 SubscriptionScheduler 接管（含退避+防丢更新两阶段），此处不再注册 UPDATE_ALL
-
-  console.log('[Subscription Handlers] Registered all subscription IPC handlers');
 }

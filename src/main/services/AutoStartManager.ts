@@ -1,17 +1,42 @@
 import { app } from 'electron';
+import type { LogLevel } from '../../shared/types';
+import type { LogManager } from './LogManager';
 
 export interface IAutoStartManager {
   setAutoStart(enabled: boolean): Promise<boolean>;
   isAutoStartEnabled(): Promise<boolean>;
+  setLogManager(lm: LogManager): void;
 }
 
-class ElectronAutoStart implements IAutoStartManager {
+/**
+ * 两个实现共用的日志混入：注入 LogManager（由主流程在 index.ts 统一注入）；
+ * 注入前走 console fallback。Source 固定 'AutoStart'。
+ */
+abstract class AutoStartLogBase {
+  protected logManager?: LogManager;
+
+  setLogManager(lm: LogManager): void {
+    this.logManager = lm;
+  }
+
+  protected log(level: LogLevel, message: string): void {
+    if (this.logManager) {
+      this.logManager.addLog(level, message, 'AutoStart');
+      return;
+    }
+    if (level === 'error' || level === 'fatal') console.error(message);
+    else if (level === 'warn') console.warn(message);
+    else console.log(message);
+  }
+}
+
+class ElectronAutoStart extends AutoStartLogBase implements IAutoStartManager {
   async setAutoStart(enabled: boolean): Promise<boolean> {
     app.setLoginItemSettings({
       openAtLogin: enabled,
       path: app.getPath('exe'),
     });
-    console.log(`[AutoStart] Set openAtLogin: ${enabled}`);
+    this.log('info', `Set openAtLogin: ${enabled}`);
     return true;
   }
 
@@ -21,7 +46,7 @@ class ElectronAutoStart implements IAutoStartManager {
   }
 }
 
-class LinuxAutoStart implements IAutoStartManager {
+class LinuxAutoStart extends AutoStartLogBase implements IAutoStartManager {
   private get autostartDir(): string {
     const home = process.env.HOME || '';
     return require('path').join(home, '.config', 'autostart');
@@ -58,7 +83,7 @@ X-GNOME-Autostart-enabled=true
       }
       return true;
     } catch (error) {
-      console.error('[AutoStart] Failed to set Linux autostart:', error);
+      this.log('error', `Failed to set Linux autostart: ${error}`);
       return false;
     }
   }

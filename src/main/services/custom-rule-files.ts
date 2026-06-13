@@ -179,11 +179,13 @@ export function customRuleFileBase(id: string): string {
   return `custom-rule-h${createHash('sha1').update(id).digest('hex').slice(0, 12)}`;
 }
 
-/** 是否启用 FakeIP（与 generateDnsConfig 的 enableFakeIp 同源）：非 systemProxy 恒开；systemProxy 看用户开关。 */
+/**
+ * 是否启用 FakeIP（与 generateDnsConfig 的 enableFakeIp 同源，单一真值）：纯看开关，不分模式。
+ * 缺省 true（新装默认开 + 存量经一次性迁移写入 effective 值，见 ConfigManager.migrateFakeIpToggle）。
+ * 改前曾按 proxyModeType 分模式（非 systemProxy 恒开）——已统一到开关，TUN/systemProxy 行为一致。
+ */
 export function usesFakeIp(config: UserConfig): boolean {
-  return config.proxyModeType?.toLowerCase() !== 'systemproxy'
-    ? true
-    : !!config.dnsConfig?.enableFakeIp;
+  return config.dnsConfig?.enableFakeIp ?? true;
 }
 
 /**

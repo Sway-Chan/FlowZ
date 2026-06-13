@@ -3,17 +3,19 @@
  * 负责检查 Sing-box 核心更新、下载并替换
  */
 
-import { app, net, dialog } from 'electron';
+import { app, net, dialog, session, Session } from 'electron';
 import * as fs from 'fs';
 import * as path from 'path';
 
 import { LogManager } from './LogManager';
 import { ProxyManager } from './ProxyManager';
+import type { HelperManager } from './HelperManager';
 import { resourceManager } from './ResourceManager';
 
 import type { UserConfig } from '../../shared/types';
-import { encodeMajorMinor } from '../../shared/version';
+import { encodeMajorMinor, sameMajorMinor } from '../../shared/version';
 import coreManifest from '../../shared/core-manifest.json';
+import { IPC_CHANNELS } from '../../shared/ipc-channels';
 
 export interface CoreUpdateCheckResult {
   hasUpdate: boolean;
@@ -21,6 +23,7 @@ export interface CoreUpdateCheckResult {
   latestVersion?: string;
   downloadUrl?: string;
   releaseNotes?: string;
+  crossBand?: boolean; // latestVersion 是否跨当前 minor 带（restrict 关闭时让 UI 标「跨大版本、风险更高」）
   error?: string;
 }
 
@@ -31,17 +34,52 @@ export interface CoreVersionInfo {
   lastKnownVersion: string | null;
 }
 
+/** 已下载预检通过、待落位的内核（代理运行中暂存，延到安全窗口落位）。 */
+export interface StagedCoreInfo {
+  version: string;
+  dir: string; // userData/core-staged，含解压后的 sing-box + 配套文件
+  stagedAt: string; // ISO
+}
+
+/** 内核自动更新持久状态（userData/core-update-state.json，不进 config，避免每次 check 触发配置原子写）。 */
+export interface CoreAutoUpdateState {
+  lastCheckAt?: number;
+  staged?: StagedCoreInfo;
+  crossBandNotifiedVersion?: string; // 已就此跨带版本提示过，避免每轮重复弹
+  // B0：已成功稳定运行、实证兼容过的最高版本带（编码）。棘轮：成功运行抬高、回滚重置到回滚后带。参与有效兼容上限。
+  verifiedCeiling?: number;
+}
+
 /**
- * FlowZ 配置生成器已验证适配的 sing-box 版本带上限，编码为 major*1000+minor（1013 = 1.13）。
- * 跨越此版本带（如 1.14）可能因 sing-box 配置 schema 破坏性变更导致生成的配置无法解析；默认不
- * 自动跨带更新（可在设置关闭）。用整数编码比较，避免 parseFloat 把 "1.20" 误判为 1.2 < 1.13 而
- * 漏放跨带更新。sing-box 升级并验证配置生成兼容后，应调高此值（统一在 core-manifest.json 维护）。
+ * tryApplyStaged 落位结果枚举（供 applyStagedNow / UI 区分反馈）：
+ * - applied:   已换核落位成功（installCoreFromDir 完成、staged 已清）
+ * - discarded: staged 已不适用被作废（不再领先 / known-bad / 缺文件 / 重预检失败），未换核
+ * - deferred:  代理运行中暂不落位，保持 staged（待安全窗口生效）；或开关已关不自动落位
+ * - failed:    落位中途异常（已尽力 restoreBackup），staged 保留待重试
+ * - noop:      无 staged 可落位 / isUpdating 重入 → 无操作
  */
-const COMPATIBLE_CEILING = coreManifest.compatibleCeiling;
+export type StagedApplyResult = 'applied' | 'discarded' | 'deferred' | 'failed' | 'noop';
+
+/** 推渲染端的内核自动更新状态快照（UI：待生效行 / 跨带提示行）。 */
+export interface CoreAutoStatus {
+  autoUpdateEnabled: boolean;
+  lastCheckAt: number | null;
+  staged: { version: string; stagedAt: string } | null;
+  crossBandLatest: string | null; // 检测到但跨 minor、不自动的最新版本
+}
+
+/**
+ * 兼容版本带「地板」= 随 App 出厂的内核版本带（编码 major*1000+minor，1.13.13→1013）。出厂内核必经 FlowZ
+ * 配置生成器验证，故其版本带即官方背书的兼容下限，**从出厂内核动态推导、不再独立硬编码**（去掉了 manifest 的
+ * compatibleCeiling 字段，消除「两字段手动同步」隐患）。有效兼容上限 = max(地板, 当前实跑带, verifiedCeiling)，
+ * 见 checkUpdate；跨越有效上限默认不自动更新（可在设置关闭）。
+ */
+const BUNDLED_CEILING = encodeMajorMinor(coreManifest.bundledCoreVersion);
 
 export class CoreUpdateService {
   private logManager: LogManager;
   private proxyManager: ProxyManager | null = null;
+  private helperManager: HelperManager | null = null; // B 块：macOS 经 helper v5 install-core 写受保护目录
   private isUpdating: boolean = false;
   // 更新后等待「首次成功运行」验证的新版本号；首启成功→清除并删备份，首启失败→自动回滚
   private pendingUpdateVersion: string | null = null;
@@ -51,6 +89,12 @@ export class CoreUpdateService {
   // 到期解除自动重启抑制，避免抑制闩永久挂起。
   private pendingFallbackTimer: ReturnType<typeof setTimeout> | null = null;
   private configProvider: (() => Promise<UserConfig>) | null = null;
+  // 推渲染端的自动更新状态事件发送器（注入，仿 configProvider；不直接 import electron ipc 便于隔离）
+  private eventSender: ((channel: string, payload: unknown) => void) | null = null;
+  // 检查更新/下载用的专用会话：强制 direct——default session 在 mainSessionViaProxy(默认 on) 下被 pin 到 sing-box
+  // http 入站（实测 net.request × http 入站挂死 50s），direct session 让 net.request 直连、由 TUN 透明捕获进 naive
+  // （同 curl 与订阅 getDirectSession，实测可达）；系统代理模式下直连 GitHub 也通。
+  private updateDirectSession: Session | null = null;
   // 新核心首启成功后需"稳定运行"此时长（无 error）才删旧备份——防 'started'(仅1s存活) 假成功删掉回滚网。
   // 不变量：必须 > ProxyManager 健康检查间隔(10s)，否则 TUN 模式下崩溃在轮询检测到之前就被判稳定、误删备份。
   private static readonly STABILITY_DWELL_MS = 30000;
@@ -65,9 +109,19 @@ export class CoreUpdateService {
     this.proxyManager = proxyManager;
   }
 
+  /** B 块：注入 helper（macOS 持久化内核更新经 helper v5 install-core 写受保护目录）。 */
+  setHelperManager(helperManager: HelperManager): void {
+    this.helperManager = helperManager;
+  }
+
   /** 注入配置读取器（用于读取"仅兼容版本带内更新"开关）。 */
   setConfigProvider(provider: () => Promise<UserConfig>): void {
     this.configProvider = provider;
+  }
+
+  /** 注入渲染端事件发送器（推内核自动更新状态：staged 待生效 / 跨带提示）。 */
+  setEventSender(fn: (channel: string, payload: unknown) => void): void {
+    this.eventSender = fn;
   }
 
   /**
@@ -116,13 +170,19 @@ export class CoreUpdateService {
           };
         }
 
-        // 版本带闸门：默认不自动跨越配置生成器已验证的版本带上限（防 schema 破坏导致无法解析）
+        // 版本带闸门：默认不自动跨越「有效兼容上限」（防 schema 破坏导致无法解析）。有效上限 =
+        // max(出厂内核带, 当前实跑带, verifiedCeiling)——出厂带是官方背书地板；当前实跑带 + verifiedCeiling 是
+        // 「已成功运行实证兼容」的带，使手动跨带成功后不被锁在首版、放行同带补丁；preflightValidate 每次仍兜底，
+        // 与自动闸 sameMajorMinor 的 current 基准统一。地板守住「首次跨带仍需用户主动」。
         if (await this.isRestrictToCompatibleMinor()) {
           const latest = encodeMajorMinor(latestVersion);
-          if (!isNaN(latest) && latest > COMPATIBLE_CEILING) {
+          const curEnc = encodeMajorMinor(currentVersion);
+          const verified = this.loadAutoState().verifiedCeiling ?? 0;
+          const effectiveCeiling = Math.max(BUNDLED_CEILING, isNaN(curEnc) ? 0 : curEnc, verified);
+          if (!isNaN(latest) && latest > effectiveCeiling) {
             this.logManager.addLog(
               'info',
-              `最新版本 ${latestVersion} 跨越兼容版本带(>1.13)，不自动更新`,
+              `最新版本 ${latestVersion} 跨越当前兼容版本带，不自动更新`,
               'CoreUpdateService'
             );
             return {
@@ -143,6 +203,8 @@ export class CoreUpdateService {
             latestVersion,
             downloadUrl: asset.browser_download_url,
             releaseNotes: latestRelease.body,
+            // 跨当前 minor 带（如 1.13→1.14）→ UI 标风险。能走到这说明带内或 restrict 关闭，跨带必是 restrict 关闭所致。
+            crossBand: !sameMajorMinor(latestVersion, currentVersion),
           };
           this.logManager.addLog(
             'info',
@@ -214,97 +276,11 @@ export class CoreUpdateService {
         }
       }
 
-      // 4. 备份旧核心
-      await this.backupCurrentCore();
-      backupMade = true;
-
-      // 5. 替换核心
-      this.logManager.addLog('info', '正在替换核心文件...', 'CoreUpdateService');
-      const targetPath = resourceManager.getSingBoxUpdateTargetPath();
-
-      // 确保目标目录存在
-      const targetDir = path.dirname(targetPath);
-      if (!fs.existsSync(targetDir)) {
-        fs.mkdirSync(targetDir, { recursive: true });
-      }
-
-      // 复制新核心及配套文件到目标位置
-      const sourceDir = path.dirname(corePath);
-      const files = fs.readdirSync(sourceDir);
-
-      for (const file of files) {
-        const srcFile = path.join(sourceDir, file);
-        const destFile = path.join(targetDir, file);
-
-        // 只复制文件，不复制目录
-        if (fs.statSync(srcFile).isFile()) {
-          this.logManager.addLog('info', `正在复制: ${file}`, 'CoreUpdateService');
-          if (process.platform === 'win32') {
-            await this.copyFileElevatedWindows(srcFile, destFile);
-          } else {
-            await this.copyFileWithRetry(srcFile, destFile);
-          }
-        }
-      }
-
-      // 设置执行权限 (macOS/Linux)
-      if (process.platform !== 'win32') {
-        fs.chmodSync(targetPath, 0o755);
-      }
-
-      // 核心单独更新后，确保 NaiveProxy 库 libcronet 与新核心同目录（官方 sing-box 包不含 libcronet，
-      // naive 仍依赖随 app 打包的那个；purego 从核心同目录加载）。
-      await resourceManager.ensureCronetBeside(targetDir);
-
-      // macOS: 清除下载隔离标记并重新 ad-hoc 签名
-      // 原因: macOS Gatekeeper 对新放入的未公证二进制会拦截执行 (SIGKILL)
-      // xattr -cr 清除 quarantine 标记, codesign --force -s - 重新 ad-hoc 签名使其被系统接受
-      if (process.platform === 'darwin') {
-        try {
-          const { execSync } = require('child_process');
-          execSync(`xattr -cr "${targetPath}"`, { stdio: 'pipe' });
-          execSync(`codesign --force --deep -s - "${targetPath}"`, { stdio: 'pipe' });
-          this.logManager.addLog('info', '已完成 macOS Gatekeeper 签名处理', 'CoreUpdateService');
-        } catch (signError: any) {
-          this.logManager.addLog(
-            'warn',
-            `macOS 签名处理失败 (可能需要手动运行 sudo codesign --force -s -): ${signError.message}`,
-            'CoreUpdateService'
-          );
-        }
-      }
-
-      this.logManager.addLog('info', '核心文件替换成功', 'CoreUpdateService');
-
-      // naive 依赖随 app 打包的 libcronet（匹配出厂核心的 cronet-go 版本）。单独更新核心——尤其跨版本——
-      // 可能与打包库 ABI 漂移；该漂移在 dlopen 前不可见，sing-box check 预检无法发现。有 naive 节点则提示。
-      if (this.proxyManager?.hasNaiveNodes()) {
-        this.logManager.addLog(
-          'warn',
-          'naive 节点依赖随 app 打包的 libcronet；本次核心更新后如遇 naive 不可用，请回滚核心或等待 app 整体更新',
-          'CoreUpdateService'
-        );
-      }
-
-      // 标记"待首启验证"：稳定运行→删备份（稳定即弃）；首启失败→自动回滚（见 index 'error' 钩子）。
-      // 同时抑制 ProxyManager 自动重启——让新核心首次异常退出立即上报，而非在坏核心上空转重试。
-      this.pendingUpdateVersion = preflight.version;
-      this.pendingUpdateAt = Date.now();
-      this.proxyManager?.setAutoRestartSuppressed(true);
-      // 兜底：到期仍未被 'started'/'error' 解决，则清待验证态并解除抑制（避免抑制闩永久挂起）。
-      if (this.pendingFallbackTimer) clearTimeout(this.pendingFallbackTimer);
-      this.pendingFallbackTimer = setTimeout(() => {
-        this.pendingFallbackTimer = null;
-        if (this.pendingUpdateVersion) {
-          this.logManager.addLog(
-            'info',
-            '核心更新待验证窗口超时未见首启事件，解除自动重启抑制',
-            'CoreUpdateService'
-          );
-          this.pendingUpdateVersion = null;
-          this.proxyManager?.setAutoRestartSuppressed(false);
-        }
-      }, CoreUpdateService.PENDING_MAX_AGE_MS);
+      // 4-5. 备份→替换核心→签名→待验证闩（抽到 installCoreFromDir，手动/自动落位共用，行为零变）。
+      // onBackupDone 在 backupCurrentCore() 成功后同点回调，保持原 backupMade 语义（预检前失败不误恢复陈旧 .bak）。
+      await this.installCoreFromDir(path.dirname(corePath), preflight.version, () => {
+        backupMade = true;
+      });
 
       // 6. 清理临时文件
       try {
@@ -316,18 +292,23 @@ export class CoreUpdateService {
         }
       } catch (err) {
         // 忽略清理错误
-        console.error('Cleanup failed:', err);
+        this.logManager.addLog('warn', `清理临时解压目录失败: ${err}`, 'CoreUpdateService');
       }
 
-      // 7. 重启代理 (如果之前在运行)
+      // 7. 重启代理（之前在运行才重启）。照 applyStagedNow：configProvider() 拿当前 config → proxyManager.start。
+      //    早期此处是空壳占位（只打日志不启动），导致手动「检查更新→更新」换核后代理永不自动拉起 → 断网（P0-1）。
       if (wasRunning && this.proxyManager) {
         this.logManager.addLog('info', '正在重启代理服务...', 'CoreUpdateService');
-        // 需要重新加载配置? 通常不需要，config没变
-        // 但需要获取当前的配置
-        // 由于 ProxyManager.start 需要 config 参数，这里可能有点麻烦
-        // 我们可以尝试触发一个事件或者让用户手动启动
-        // 或者我们假设 Index.ts 会处理重启?
-        // 简单起见，我们通知用户手动重启或由上层调用者处理
+        const cfg = this.configProvider ? await this.configProvider() : null;
+        if (cfg) {
+          await this.proxyManager.start(cfg);
+        } else {
+          this.logManager.addLog(
+            'warn',
+            '无法获取配置，代理未自动重启，请在主界面手动连接',
+            'CoreUpdateService'
+          );
+        }
       }
 
       return true;
@@ -342,6 +323,584 @@ export class CoreUpdateService {
     } finally {
       this.isUpdating = false;
     }
+  }
+
+  /**
+   * 落位：备份旧核心 → 把 sourceDir 下的核心+配套文件复制到目标位置 → chmod → ensureCronetBeside →
+   * macOS 签名 → naive 警告 → 置「待首启验证」闩+抑制自动重启+兜底解除 timer。
+   * 从 updateCore 抽出（手动更新与自动 staged 落位共用），行为逐字节零变。
+   * 不变量：**调用方须保证此刻代理进程不存在**（updateCore 已停代理、tryApplyStaged 仅在 !running 时进入）。
+   * @param onBackupDone backupCurrentCore() 成功后立即回调（让调用方在同一时点置 backupMade，保留原失败恢复语义）。
+   */
+  private async installCoreFromDir(
+    sourceDir: string,
+    version: string | null,
+    onBackupDone?: () => void
+  ): Promise<void> {
+    // B 块：macOS + helper v5 → 整个核心目录经 install-core 由 root 写入受保护目录（含 libcronet：先 ensureCronetBeside
+    // 把配套放进 sourceDir，再整目录交 helper）。不经普通用户 fs.copy（受保护目录 root-only）。受保护目录回滚靠 B5。
+    if (process.platform === 'darwin' && this.helperManager) {
+      const st = await this.helperManager.getStatus();
+      if (st.ready && !st.upgradeable) {
+        await this.backupCurrentCore(); // 备份现役(受保护目录可读)→userData，供首启失败回滚（[HIGH-1]）
+        onBackupDone?.();
+        await resourceManager.ensureCronetBeside(sourceDir);
+        const res = await this.helperManager.installCore(sourceDir);
+        if (!res.ok) throw new Error(`内核写入受保护目录失败：${res.error}`);
+        this.armPendingValidation(version); // 待首启验证闩：首启 crash → autoRollback（经 helper，见 rollbackCore）
+        return;
+      }
+    }
+
+    // 4. 备份旧核心
+    await this.backupCurrentCore();
+    onBackupDone?.();
+
+    // 5. 替换核心
+    this.logManager.addLog('info', '正在替换核心文件...', 'CoreUpdateService');
+    const targetPath = resourceManager.getSingBoxUpdateTargetPath();
+
+    // 确保目标目录存在
+    const targetDir = path.dirname(targetPath);
+    if (!fs.existsSync(targetDir)) {
+      fs.mkdirSync(targetDir, { recursive: true });
+    }
+
+    // 复制新核心及配套文件到目标位置（只取文件，不递归目录）
+    const files = fs
+      .readdirSync(sourceDir)
+      .filter((f) => fs.statSync(path.join(sourceDir, f)).isFile());
+
+    if (process.platform === 'win32') {
+      // Windows: 目标在 Program Files（UAC 保护），逐文件 elevated 覆盖；无简单原子 rename，保持原行为。
+      for (const file of files) {
+        this.logManager.addLog('info', `正在复制: ${file}`, 'CoreUpdateService');
+        await this.copyFileElevatedWindows(path.join(sourceDir, file), path.join(targetDir, file));
+      }
+    } else {
+      // M2：非 Windows 原子落位——先把全部文件复制到同目录临时名（.flowz-new），全部成功后逐个原子 rename
+      // 就位。复制阶段任一失败（磁盘满等）→ 删临时文件、抛错，现役核心目录完全未动（杜绝「新核心 + 旧/坏
+      // libcronet」半替换混搭——原逐文件直接覆盖在中途失败时会留下此混搭，而 restoreBackup 仅回滚主二进制救不回）。
+      const stagedRenames: Array<{ tmp: string; dest: string }> = [];
+      try {
+        for (const file of files) {
+          this.logManager.addLog('info', `正在复制: ${file}`, 'CoreUpdateService');
+          const dest = path.join(targetDir, file);
+          const tmp = `${dest}.flowz-new`;
+          await this.copyFileWithRetry(path.join(sourceDir, file), tmp);
+          stagedRenames.push({ tmp, dest });
+        }
+        // 全部复制成功 → 逐个原子 rename 就位（同目录 rename 为原子 syscall，不占新磁盘空间，几乎不失败）
+        for (const { tmp, dest } of stagedRenames) {
+          fs.renameSync(tmp, dest);
+        }
+      } catch (e) {
+        for (const { tmp } of stagedRenames) {
+          try {
+            if (fs.existsSync(tmp)) fs.unlinkSync(tmp);
+          } catch {
+            /* ignore */
+          }
+        }
+        throw e;
+      }
+    }
+
+    // 设置执行权限 (macOS/Linux)
+    if (process.platform !== 'win32') {
+      fs.chmodSync(targetPath, 0o755);
+    }
+
+    // 核心单独更新后，确保 NaiveProxy 库 libcronet 与新核心同目录（官方 sing-box 包不含 libcronet，
+    // naive 仍依赖随 app 打包的那个；purego 从核心同目录加载）。
+    await resourceManager.ensureCronetBeside(targetDir);
+
+    // macOS: 清除下载隔离标记并重新 ad-hoc 签名
+    // 原因: macOS Gatekeeper 对新放入的未公证二进制会拦截执行 (SIGKILL)
+    // xattr -cr 清除 quarantine 标记, codesign --force -s - 重新 ad-hoc 签名使其被系统接受
+    if (process.platform === 'darwin') {
+      try {
+        const { execSync } = require('child_process');
+        execSync(`xattr -cr "${targetPath}"`, { stdio: 'pipe' });
+        execSync(`codesign --force --deep -s - "${targetPath}"`, { stdio: 'pipe' });
+        this.logManager.addLog('info', '已完成 macOS Gatekeeper 签名处理', 'CoreUpdateService');
+      } catch (signError: any) {
+        this.logManager.addLog(
+          'warn',
+          `macOS 签名处理失败 (可能需要手动运行 sudo codesign --force -s -): ${signError.message}`,
+          'CoreUpdateService'
+        );
+      }
+    }
+
+    this.logManager.addLog('info', '核心文件替换成功', 'CoreUpdateService');
+
+    // naive 依赖随 app 打包的 libcronet（匹配出厂核心的 cronet-go 版本）。单独更新核心——尤其跨版本——
+    // 可能与打包库 ABI 漂移；该漂移在 dlopen 前不可见，sing-box check 预检无法发现。有 naive 节点则提示。
+    if (this.proxyManager?.hasNaiveNodes()) {
+      this.logManager.addLog(
+        'warn',
+        'naive 节点依赖随 app 打包的 libcronet；本次核心更新后如遇 naive 不可用，请回滚核心或等待 app 整体更新',
+        'CoreUpdateService'
+      );
+    }
+
+    // 标记"待首启验证"：稳定运行→删备份（稳定即弃）；首启失败→自动回滚（见 index 'error' 钩子）。
+    this.armPendingValidation(version);
+  }
+
+  /** 置「待首启验证」闩 + 抑制自动重启 + 超时兜底。bundle 落位与 macOS install-core 落位共用，保证两条路径都有
+   *  「首启 crash → autoRollback」保护网（修 [HIGH-2]：install-core 分支原本早退跳过此闩）。 */
+  private armPendingValidation(version: string | null): void {
+    // 同时抑制 ProxyManager 自动重启——让新核心首次异常退出立即上报，而非在坏核心上空转重试。
+    this.pendingUpdateVersion = version;
+    this.pendingUpdateAt = Date.now();
+    this.proxyManager?.setAutoRestartSuppressed(true);
+    // 兜底：到期仍未被 'started'/'error' 解决，则清待验证态并解除抑制（避免抑制闩永久挂起）。
+    if (this.pendingFallbackTimer) clearTimeout(this.pendingFallbackTimer);
+    this.pendingFallbackTimer = setTimeout(() => {
+      this.pendingFallbackTimer = null;
+      if (this.pendingUpdateVersion) {
+        this.logManager.addLog(
+          'info',
+          '核心更新待验证窗口超时未见首启事件，解除自动重启抑制',
+          'CoreUpdateService'
+        );
+        this.pendingUpdateVersion = null;
+        this.proxyManager?.setAutoRestartSuppressed(false);
+      }
+    }, CoreUpdateService.PENDING_MAX_AGE_MS);
+  }
+
+  /** 撤销待首启验证闩（arm 后 start 同步失败 / 改以原核重启前调，避免原核首启被当作新版本观察/记录）。 */
+  private disarmPendingValidation(): void {
+    this.pendingUpdateVersion = null;
+    this.proxyManager?.setAutoRestartSuppressed(false);
+    if (this.pendingFallbackTimer) {
+      clearTimeout(this.pendingFallbackTimer);
+      this.pendingFallbackTimer = null;
+    }
+  }
+
+  /** B 块 macOS：把单个 sing-box 二进制 src 经 helper install-core 持久化写入受保护目录（连带打包的 libcronet）。
+   *  调用方须先确认 darwin + helper v5（ready && !upgradeable）。replaceManualCore / rollbackCore / restoreBackup 共用。 */
+  private async installSingleCoreViaHelper(src: string): Promise<void> {
+    if (!this.helperManager) throw new Error('helper 不可用');
+    const tmpDir = fs.mkdtempSync(path.join(app.getPath('temp'), 'flowz-core-'));
+    try {
+      fs.copyFileSync(src, path.join(tmpDir, 'sing-box'));
+      fs.chmodSync(path.join(tmpDir, 'sing-box'), 0o755);
+      await resourceManager.ensureCronetBeside(tmpDir);
+      const res = await this.helperManager.installCore(tmpDir);
+      if (!res.ok) throw new Error(`内核写入受保护目录失败：${res.error}`);
+    } finally {
+      try {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+      } catch {
+        /* ignore */
+      }
+    }
+  }
+
+  /** B 块 macOS：当前是否启用受保护目录持久化（helper v5 在位且 ready）。回滚/恢复据此决定经 helper 还是普通写。 */
+  private async isProtectedCoreActive(): Promise<boolean> {
+    if (process.platform !== 'darwin' || !this.helperManager) return false;
+    const st = await this.helperManager.getStatus();
+    return st.ready && !st.upgradeable;
+  }
+
+  // === 内核自动更新（仅兼容版本带内）：持久状态 / staged 落位 / 周期检查 ===
+
+  private getAutoStatePath(): string {
+    return path.join(app.getPath('userData'), 'core-update-state.json');
+  }
+
+  /** 读自动更新持久状态（损坏/缺失→空对象，失败安全）。 */
+  private loadAutoState(): CoreAutoUpdateState {
+    try {
+      const p = this.getAutoStatePath();
+      if (!fs.existsSync(p)) return {};
+      const d = JSON.parse(fs.readFileSync(p, 'utf-8'));
+      return d && typeof d === 'object' ? (d as CoreAutoUpdateState) : {};
+    } catch {
+      return {};
+    }
+  }
+
+  /** 合并写入自动更新持久状态（仅覆盖传入字段）。 */
+  private saveAutoState(patch: Partial<CoreAutoUpdateState>): void {
+    try {
+      const next = { ...this.loadAutoState(), ...patch };
+      // M4：原子写——先写临时文件再 rename 就位，避免进程在 writeFileSync 中途崩溃留半截 JSON（下次 loadAutoState
+      // 读到坏档→catch 返回 {} 丢全部 staged 状态）。注：单次 saveAutoState 的 load+write 是同步块（无 await、JS
+      // 单线程不被打断），不存在并发 lost-update；此处仅解决「写盘被打断」的崩溃一致性。
+      const p = this.getAutoStatePath();
+      const tmp = `${p}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(next, null, 2), 'utf-8');
+      fs.renameSync(tmp, p);
+    } catch (e) {
+      this.logManager.addLog('warn', `写入内核自动更新状态失败: ${e}`, 'CoreUpdateService');
+    }
+  }
+
+  /** 清除 staged 暂存（落位成功/作废后调用）：删元数据 + 删暂存目录。 */
+  private clearStaged(): void {
+    const st = this.loadAutoState();
+    const dir = st.staged?.dir;
+    this.saveAutoState({ staged: undefined });
+    if (dir) {
+      try {
+        if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+      } catch (e) {
+        // L3：删暂存目录失败不致命（下次 stageCore 会 rmSync 重建覆盖），但记一条便于排查残留磁盘垃圾。
+        this.logManager.addLog('warn', `清除 staged 暂存目录失败: ${e}`, 'CoreUpdateService');
+      }
+    }
+  }
+
+  private getStagedDir(): string {
+    return path.join(app.getPath('userData'), 'core-staged');
+  }
+
+  private emitAutoStatus(extra?: { crossBandLatest?: string | null }): void {
+    if (!this.eventSender) return;
+    try {
+      const st = this.loadAutoState();
+      // M3：事件 payload 不含 autoUpdateEnabled——其真值需 await configProvider（同步 emit 拿不到），旧实现发
+      // 占位 false 会在渲染端覆盖 getAutoStatus 拉到的真值。真值仅由 getAutoStatus 快照提供（UI 另读 config）。
+      const payload: Omit<CoreAutoStatus, 'autoUpdateEnabled'> = {
+        lastCheckAt: st.lastCheckAt ?? null,
+        staged: st.staged ? { version: st.staged.version, stagedAt: st.staged.stagedAt } : null,
+        crossBandLatest:
+          extra && 'crossBandLatest' in extra
+            ? (extra.crossBandLatest ?? null)
+            : (st.crossBandNotifiedVersion ?? null),
+      };
+      this.eventSender(IPC_CHANNELS.EVENT_CORE_AUTO_UPDATE_STATUS, payload);
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /** UI 拉取的内核自动更新状态快照。 */
+  async getAutoStatus(): Promise<CoreAutoStatus> {
+    const st = this.loadAutoState();
+    let enabled = false;
+    try {
+      const cfg = this.configProvider ? await this.configProvider() : null;
+      enabled = cfg?.autoUpdateCore === true;
+    } catch {
+      /* ignore */
+    }
+    return {
+      autoUpdateEnabled: enabled,
+      lastCheckAt: st.lastCheckAt ?? null,
+      staged: st.staged ? { version: st.staged.version, stagedAt: st.staged.stagedAt } : null,
+      crossBandLatest: st.crossBandNotifiedVersion ?? null,
+    };
+  }
+
+  /** 把解压目录（含核心+配套文件）复制到 userData/core-staged 暂存，写元数据。返回 staged 信息。 */
+  private stageCore(sourceDir: string, version: string): StagedCoreInfo {
+    const dir = this.getStagedDir();
+    // 清掉旧暂存目录，避免不同版本文件残留混入
+    try {
+      if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true });
+    } catch {
+      /* ignore */
+    }
+    fs.mkdirSync(dir, { recursive: true });
+    for (const file of fs.readdirSync(sourceDir)) {
+      const src = path.join(sourceDir, file);
+      if (fs.statSync(src).isFile()) {
+        fs.copyFileSync(src, path.join(dir, file));
+      }
+    }
+    const staged: StagedCoreInfo = { version, dir, stagedAt: new Date().toISOString() };
+    this.saveAutoState({ staged });
+    this.logManager.addLog(
+      'info',
+      `新内核 ${version} 已下载预检通过，暂存待代理停止后落位`,
+      'CoreUpdateService'
+    );
+    return staged;
+  }
+
+  /**
+   * 内核自动更新一轮：检查→（带内）下载+预检+暂存/落位；跨带仅发事件不下载。
+   * 唯一入口由 CoreUpdateScheduler.cycleIfDue 调用；isUpdating 防重入。
+   * 不变量：自动路径恒强制 sameMajorMinor（跨 minor 绝不自动），不受 restrictCoreUpdateToCompatibleMinor 影响。
+   */
+  async runAutoUpdateCycle(): Promise<void> {
+    if (this.isUpdating) return;
+    // H1：入口同步持闸（与 isUpdating 检查间无 await，原子），覆盖 check→下载→解压→预检→暂存→落位全程，
+    // 防与手动 updateCore 并发双换核（原仅末尾 tryApplyStaged 持闸，数十秒下载/暂存段 isUpdating=false 留并发
+    // 窗口，两条链同写 core-staged/目标目录/*.bak 互相覆盖、备份取自半替换核心、回滚失真）。内部 tryApplyStaged
+    // 传 lockHeld=true 复用本闸、不二次检查/置/复位。autoUpdateCore 关时短暂持闸即经 finally 复位，无害。
+    this.isUpdating = true;
+    try {
+      const cfg = this.configProvider ? await this.configProvider() : null;
+      if (cfg?.autoUpdateCore !== true) return;
+
+      const check = await this.checkUpdate();
+      this.saveAutoState({ lastCheckAt: Date.now() });
+      const latest = check.latestVersion;
+
+      const current = check.currentVersion;
+      // M3：用户手动升级追上/越过曾提示的跨带版本后，清除残留跨带提示（否则只写不清，旧提示常驻 UI）。
+      // current >= notified 或已同带（current 升到 notified 所在 minor）即视为已消化该跨带版本。
+      {
+        const st = this.loadAutoState();
+        const notified = st.crossBandNotifiedVersion;
+        if (
+          notified &&
+          current &&
+          current !== '未知' &&
+          (this.compareVersions(current, notified) >= 0 || sameMajorMinor(current, notified))
+        ) {
+          this.saveAutoState({ crossBandNotifiedVersion: undefined });
+          this.logManager.addLog(
+            'info',
+            `当前内核 ${current} 已追上跨带提示版本 ${notified}，清除跨带提示`,
+            'CoreUpdateService'
+          );
+          this.emitAutoStatus({ crossBandLatest: null });
+        }
+      }
+
+      // 无更新 / 检查失败 / 无可用更新：本轮结束（check 内部已处理 known-bad/ceiling/asset）
+      if (!latest) return;
+      // 兼容带硬闸：自动路径仅在同 major.minor 内继续；跨带绝不下载/落位，仅发提示事件（每版本只提示一次）
+      if (!sameMajorMinor(current, latest)) {
+        const crossable = this.compareVersions(latest, current) > 0 && !this.isKnownBad(latest);
+        const st = this.loadAutoState();
+        if (crossable && st.crossBandNotifiedVersion !== latest) {
+          this.saveAutoState({ crossBandNotifiedVersion: latest });
+          this.logManager.addLog(
+            'info',
+            `检测到跨版本带新版 ${latest}（当前 ${current}），不自动更新，已提示用户手动处理`,
+            'CoreUpdateService'
+          );
+          this.emitAutoStatus({ crossBandLatest: latest });
+        }
+        return;
+      }
+
+      // 带内：若已有相同版本 staged，直接尝试落位（避免重复下载）
+      const staged = this.loadAutoState().staged;
+      if (staged && staged.version === latest) {
+        await this.tryApplyStaged('staged-same-version', true);
+        return;
+      }
+
+      // check.hasUpdate=true 才有 downloadUrl；带内但 hasUpdate=false（已是最新）则无可下
+      if (!check.hasUpdate || !check.downloadUrl) return;
+
+      // 下载 → 解压 → 预检（全复用现有手动路径逻辑，零新增回滚代码）
+      let tempPath: string | null = null;
+      let extractDir: string | null = null;
+      try {
+        tempPath = await this.downloadFile(check.downloadUrl);
+        const extracted = await this.extractCore(tempPath);
+        extractDir = extracted.extractDir;
+        const preflight = await this.preflightValidate(extracted.corePath);
+        if (!preflight.ok) {
+          if (preflight.version) this.markKnownBad(preflight.version);
+          this.logManager.addLog(
+            'warn',
+            `自动更新预检失败，放弃 ${latest}：${preflight.reason}`,
+            'CoreUpdateService'
+          );
+          return;
+        }
+        // 暂存（从解压目录复制到 core-staged，因临时目录随后清理）
+        this.stageCore(path.dirname(extracted.corePath), preflight.version ?? latest);
+        this.emitAutoStatus();
+        // 下载后立即尝试落位（代理未运行→直接换；运行中→保持 staged，延到安全窗口）
+        await this.tryApplyStaged('post-download', true);
+      } finally {
+        try {
+          if (tempPath) fs.unlinkSync(tempPath);
+        } catch {
+          /* ignore */
+        }
+        try {
+          if (extractDir && fs.existsSync(extractDir)) {
+            fs.rmSync(extractDir, { recursive: true, force: true });
+          }
+        } catch {
+          /* ignore */
+        }
+      }
+    } finally {
+      this.isUpdating = false;
+    }
+  }
+
+  /**
+   * 尝试落位 staged 内核：**仅在代理进程不存在时真正换核**（不断流硬不变量）。
+   * 运行中 → 保持 staged、发「待生效」事件、不动现役核心。无 staged / isUpdating → 直接返回 noop。
+   *
+   * 返回 StagedApplyResult，供 applyStagedNow / UI 区分反馈（修 M1：原 void 返回让调用方只能靠
+   * 「staged 是否还在」二值推断，把 discarded/deferred/failed 一律误判，UI 误报「已应用」）。
+   *
+   * @param trigger 触发来源；非 'manual-apply' 的自动触发（startup / proxy-stopped / tick /
+   *   post-download / staged-same-version）须经 autoUpdateCore 守门（修 M4：撤回同意后已暂存内核
+   *   不应自动换核；保留 staged，用户重开开关或点「立即应用」即生效）。
+   */
+  async tryApplyStaged(trigger: string, lockHeld = false): Promise<StagedApplyResult> {
+    // L1：入口同步置 applying 闸（与 isUpdating 检查间无 await），防并发 tryApplyStaged 双通过。
+    // lockHeld=true（runAutoUpdateCycle 内调）→ 复用外层已持的 isUpdating 闸，不二次检查/置/复位（H1）。
+    if (!lockHeld && this.isUpdating) return 'noop';
+    if (!lockHeld) this.isUpdating = true;
+    try {
+      const staged = this.loadAutoState().staged;
+      if (!staged) return 'noop';
+
+      // M4：自动触发（非用户「立即应用」）须开关开启才落位；关则保持 staged、不动现役核心。
+      if (trigger !== 'manual-apply') {
+        let autoEnabled = false;
+        try {
+          const cfg = this.configProvider ? await this.configProvider() : null;
+          autoEnabled = cfg?.autoUpdateCore === true;
+        } catch {
+          /* 读配置失败 → 失败安全：视作未开启，不自动落位 */
+        }
+        if (!autoEnabled) {
+          this.logManager.addLog(
+            'info',
+            `自动更新已关闭，内核 ${staged.version} 保持暂存不自动落位（${trigger}）`,
+            'CoreUpdateService'
+          );
+          this.emitAutoStatus();
+          return 'deferred';
+        }
+      }
+
+      // staged 已不再领先当前 / 已知坏：作废清理
+      const current = await this.getCurrentVersion();
+      if (this.compareVersions(staged.version, current) <= 0 || this.isKnownBad(staged.version)) {
+        this.logManager.addLog(
+          'info',
+          `staged 内核 ${staged.version} 不再适用（当前 ${current}），清理暂存`,
+          'CoreUpdateService'
+        );
+        this.clearStaged();
+        this.emitAutoStatus();
+        return 'discarded';
+      }
+
+      // 代理运行中 → 绝不落位（只下载+暂存，绝不静默断流）。发「待生效」事件供 UI 提示。
+      if (this.proxyManager?.getStatus().running) {
+        this.logManager.addLog(
+          'info',
+          `代理运行中，内核 ${staged.version} 暂不落位，待停止后生效（${trigger}）`,
+          'CoreUpdateService'
+        );
+        this.emitAutoStatus();
+        return 'deferred';
+      }
+
+      // 落位（代理未运行）：重预检（下载到落位间 config 可能变）→ installCoreFromDir
+      const corePath = path.join(
+        staged.dir,
+        process.platform === 'win32' ? 'sing-box.exe' : 'sing-box'
+      );
+      if (!fs.existsSync(corePath)) {
+        this.logManager.addLog(
+          'warn',
+          `staged 暂存核心缺失，清理：${corePath}`,
+          'CoreUpdateService'
+        );
+        this.clearStaged();
+        this.emitAutoStatus();
+        return 'discarded';
+      }
+      const preflight = await this.preflightValidate(corePath);
+      if (!preflight.ok) {
+        if (preflight.version) this.markKnownBad(preflight.version);
+        this.logManager.addLog(
+          'warn',
+          `落位前重预检失败，放弃 staged ${staged.version}：${preflight.reason}`,
+          'CoreUpdateService'
+        );
+        this.clearStaged();
+        this.emitAutoStatus();
+        return 'discarded';
+      }
+      // M2：跟踪本次是否已备份；installCoreFromDir 中途失败（复制半截/磁盘满）时回滚半替换核心，
+      // 对齐 updateCore 的 catch restoreBackup（否则留半替换核心，下次启动失败也不 autoRollback）。
+      let backupMade = false;
+      try {
+        await this.installCoreFromDir(staged.dir, preflight.version ?? staged.version, () => {
+          backupMade = true;
+        });
+      } catch (installErr) {
+        if (backupMade) await this.restoreBackup();
+        throw installErr;
+      }
+      this.clearStaged();
+      this.logManager.addLog(
+        'info',
+        `内核已自动更新落位至 ${staged.version}（${trigger}）`,
+        'CoreUpdateService'
+      );
+      // 复用 banner 作成功提示 + 回滚入口
+      this.eventSender?.(IPC_CHANNELS.EVENT_CORE_VERSION_CHANGED, {
+        previousVersion: current,
+        currentVersion: staged.version,
+        hasBackup: this.hasBackup(),
+      });
+      this.emitAutoStatus();
+      return 'applied';
+    } catch (e) {
+      this.logManager.addLog('error', `staged 落位失败: ${e}`, 'CoreUpdateService');
+      this.emitAutoStatus();
+      return 'failed';
+    } finally {
+      if (!lockHeld) this.isUpdating = false;
+    }
+  }
+
+  /**
+   * 用户点「立即应用」：唯一允许主动断流的路径。运行中则停代理→等2s→落位→重启代理（首启走稳定观察/自动回滚）。
+   * 返回 tryApplyStaged 的枚举结果，供 UI 区分反馈（applied→成功 / failed→失败 / discarded→已作废 /
+   * deferred→仍待生效）。修 M1：原 boolean「staged 是否清空」会把 discarded（已换过/known-bad）当成功、
+   * 把 failed（install 失败、staged 保留）当成功（UI 误报「已应用」），且 wasRunning 在非 applied 分支不恢复
+   * 代理，留停止态无反馈。
+   */
+  async applyStagedNow(): Promise<StagedApplyResult> {
+    const staged = this.loadAutoState().staged;
+    if (!staged) return 'noop';
+
+    const wasRunning = this.proxyManager?.getStatus().running === true;
+    if (wasRunning && this.proxyManager) {
+      this.logManager.addLog(
+        'info',
+        '用户点「立即应用」，停止代理以落位新内核...',
+        'CoreUpdateService'
+      );
+      await this.proxyManager.stop();
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+    }
+
+    const result = await this.tryApplyStaged('manual-apply');
+
+    // 不变量：wasRunning 时无论落位结果都恢复代理，绝不留停止态（修 M1：install 失败/作废/重预检失败
+    // 等非 applied 分支此前不恢复，代理被静默留停）。applied 走稳定观察/自动回滚链路（首启成功→
+    // recordSuccessfulVersion+稳定观察；失败→'error'→autoRollbackIfPendingUpdate），其余分支以旧核心重启。
+    if (wasRunning && this.proxyManager) {
+      this.logManager.addLog(
+        'info',
+        result === 'applied' ? '新内核已落位，正在重启代理...' : '落位未生效，以原内核重启代理...',
+        'CoreUpdateService'
+      );
+      const cfg = this.configProvider ? await this.configProvider() : null;
+      if (cfg) {
+        await this.proxyManager.start(cfg);
+      }
+    }
+    return result;
   }
 
   /*
@@ -411,6 +970,12 @@ export class CoreUpdateService {
 
       // 该版本成功运行 → 从问题版本名单移除（曾因瞬时原因误标记的版本恢复自动更新资格）
       this.clearKnownBad(version);
+
+      // B0：成功运行即「实证兼容」该版本带 → 棘轮抬高 verifiedCeiling，让兼容带闸放行该带内后续更新。
+      const enc = encodeMajorMinor(version);
+      if (!isNaN(enc) && enc > (this.loadAutoState().verifiedCeiling ?? 0)) {
+        this.saveAutoState({ verifiedCeiling: enc });
+      }
 
       // 若处于"更新后待验证"窗口：'started' 仅代表存活 1s、可能假成功，不立即删备份；改启动稳定
       // 观察期，期内无 error 才判稳定→删备份（详见 startStabilityWatch / 修 review #3 假成功删备份）
@@ -490,9 +1055,24 @@ export class CoreUpdateService {
       }
     }
 
-    const currentPath = resourceManager.getSingBoxUpdateTargetPath();
     const backupPath = this.getBackupPath();
+    // B 块 macOS（helper v5）：受保护目录 root-only，经 helper install-core 把 backup 写回（连带 libcronet）。普通
+    // fs.copy 写不了；且读路径优先受保护目录，必须写那里，否则「写了读不到」（修 [HIGH-1]）。
+    if (await this.isProtectedCoreActive()) {
+      await this.installSingleCoreViaHelper(backupPath);
+      try {
+        fs.unlinkSync(backupPath);
+      } catch {
+        /* ignore */
+      }
+      this.logManager.addLog('info', '核心回滚成功（写回受保护目录）', 'CoreUpdateService');
+      await this.recordSuccessfulVersion();
+      const rolledEnc = encodeMajorMinor(await this.getCurrentVersion());
+      if (!isNaN(rolledEnc)) this.saveAutoState({ verifiedCeiling: rolledEnc });
+      return;
+    }
 
+    const currentPath = resourceManager.getSingBoxUpdateTargetPath();
     this.logManager.addLog(
       'info',
       `正在回滚核心: ${backupPath} → ${currentPath}`,
@@ -533,73 +1113,145 @@ export class CoreUpdateService {
 
     // 更新版本记录
     await this.recordSuccessfulVersion();
+
+    // B0：回滚 = 被回滚版本带验证失败 → 把 verifiedCeiling 重置到回滚后实跑带（撤销更高带的「已验证」，兼容带闸
+    // 不再放行那个出问题的更高带）。recordSuccessfulVersion 的棘轮 max 不会下降，故此处显式覆盖。
+    const rolledEnc = encodeMajorMinor(await this.getCurrentVersion());
+    if (!isNaN(rolledEnc)) this.saveAutoState({ verifiedCeiling: rolledEnc });
   }
 
   /**
    * 用户手动选择本地 sing-box 二进制并替换当前核心
    * 通过系统文件选择器让用户选取文件
    */
-  async replaceManualCore(): Promise<void> {
-    // 打开系统文件选择器
-    const result = await dialog.showOpenDialog({
-      title: '选择 sing-box 可执行文件',
-      filters:
-        process.platform === 'win32'
-          ? [{ name: 'Executable', extensions: ['exe'] }]
-          : [{ name: 'All Files', extensions: ['*'] }],
-      properties: ['openFile'],
-    });
-
-    if (result.canceled || result.filePaths.length === 0) {
-      return; // 用户取消
+  async replaceManualCore(opts?: { filePath?: string; force?: boolean }): Promise<{
+    ok: boolean;
+    needConfirm?: boolean;
+    sameVersion?: string;
+    filePath?: string;
+    error?: string;
+  }> {
+    // 源文件：确认流程二次调用显式传入 filePath，否则弹系统文件选择器
+    let sourcePath = opts?.filePath;
+    if (!sourcePath) {
+      const result = await dialog.showOpenDialog({
+        title: '选择 sing-box 可执行文件',
+        filters:
+          process.platform === 'win32'
+            ? [{ name: 'Executable', extensions: ['exe'] }]
+            : [{ name: 'All Files', extensions: ['*'] }],
+        properties: ['openFile'],
+      });
+      if (result.canceled || result.filePaths.length === 0) {
+        return { ok: false }; // 用户取消
+      }
+      sourcePath = result.filePaths[0];
     }
 
-    const sourcePath = result.filePaths[0];
+    // 预检源文件（可执行 + 解析当前配置）——在停代理前，预检失败时现役核心继续运行、不动。
+    const preSrc = await this.preflightValidate(sourcePath);
+    if (!preSrc.ok) {
+      return {
+        ok: false,
+        error: `所选文件未通过核心预检（${preSrc.reason}）。\nMac 用户请注意：\n1. 请先双击解压下载的 .tar.gz，选择解压出的名为 sing-box 的 UNIX 可执行文件。\n2. 请确保架构 (arm64/amd64) 与当前 Mac 匹配。`,
+      };
+    }
 
-    // 停止代理（如果正在运行）
+    // 同版本短路（提示确认）：目标版本与当前完全一致且未 force → 返回 needConfirm 由前端弹确认框，保留「换不同
+    // build / 重签修损坏核」的能力，又避免误操作的无谓替换。
+    const currentVersion = await this.getCurrentVersion();
+    if (!opts?.force && preSrc.version && preSrc.version === currentVersion) {
+      return { ok: false, needConfirm: true, sameVersion: preSrc.version, filePath: sourcePath };
+    }
+
+    // 停止代理（记录 wasRunning 供落位后重启——统一不变量：停了就在落位后恢复，不留停止态致断网）
+    let wasRunning = false;
     if (this.proxyManager) {
       const status = this.proxyManager.getStatus();
       if (status.running) {
         this.logManager.addLog('info', '手动替换核心：停止代理服务...', 'CoreUpdateService');
         await this.proxyManager.stop();
+        wasRunning = true;
         await new Promise((resolve) => setTimeout(resolve, 1500));
       }
     }
 
-    // 备份当前核心
-    await this.backupCurrentCore();
+    let backupMade = false;
+    try {
+      // 备份现役核心（统一：两条写入路径都先备份，失败可 restoreBackup 回滚）
+      await this.backupCurrentCore();
+      backupMade = true;
 
+      // 写入新核心：macOS + helper v5 → install-core 进受保护目录；否则 → bundle 写入腿（含签名 + 落位后预检）。
+      // 源已 preSrc 预检过；install-core 内 sha256 校验保证落位字节 == 预检源，无需二次预检。
+      if (process.platform === 'darwin' && this.helperManager) {
+        const st = await this.helperManager.getStatus();
+        if (st.ready && !st.upgradeable) {
+          await this.installSingleCoreViaHelper(sourcePath);
+          this.logManager.addLog('info', '手动替换核心已写入受保护目录', 'CoreUpdateService');
+        } else {
+          await this.writeManualCoreToBundle(sourcePath);
+        }
+      } else {
+        await this.writeManualCoreToBundle(sourcePath);
+      }
+
+      // 待验证闩 + 重启：之前运行 → arm（新版本），重启后由首启 'started' 记录版本+稳定观察、'error'（运行时首启崩溃）
+      // → autoRollbackIfPendingUpdate 自动回滚（对齐 updateCore，手动换坏核运行时崩溃也有回滚网，修 M-1）；之前未运行
+      // → 无首启可验证，直接 record。
+      if (wasRunning && this.proxyManager) {
+        this.armPendingValidation(preSrc.version);
+        this.logManager.addLog('info', '手动替换完成，正在重启代理服务...', 'CoreUpdateService');
+        const cfg = this.configProvider ? await this.configProvider() : null;
+        if (cfg) await this.proxyManager.start(cfg);
+      } else {
+        await this.recordSuccessfulVersion();
+      }
+      return { ok: true };
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      this.logManager.addLog('error', `手动替换核心失败: ${msg}`, 'CoreUpdateService');
+      // 撤销可能已 arm 的待验证闩（防下面以原核重启被首启钩子当新核记录/观察）
+      this.disarmPendingValidation();
+      // 失败回滚：恢复备份的原核心；之前在运行则尽力以原核心重启代理恢复网络
+      if (backupMade) await this.restoreBackup();
+      if (wasRunning && this.proxyManager) {
+        try {
+          const cfg = this.configProvider ? await this.configProvider() : null;
+          if (cfg) await this.proxyManager.start(cfg);
+        } catch {
+          /* 尽力恢复，不掩盖原错误 */
+        }
+      }
+      return { ok: false, error: msg };
+    }
+  }
+
+  /** 手动换核的 bundle 写入腿（非 macOS-v5）：copy → 签名 → 落位后预检。失败抛出由 replaceManualCore 外层 catch 回滚。 */
+  private async writeManualCoreToBundle(sourcePath: string): Promise<void> {
     const targetPath = resourceManager.getSingBoxUpdateTargetPath();
     const targetDir = path.dirname(targetPath);
-
     if (!fs.existsSync(targetDir)) {
       fs.mkdirSync(targetDir, { recursive: true });
     }
-
     this.logManager.addLog(
       'info',
       `手动替换核心: ${sourcePath} → ${targetPath}`,
       'CoreUpdateService'
     );
-
     if (process.platform === 'win32') {
       await this.copyFileElevatedWindows(sourcePath, targetPath);
     } else {
       fs.copyFileSync(sourcePath, targetPath);
       fs.chmodSync(targetPath, 0o755);
     }
-
-    // 手动替换核心后，确保 libcronet 与新核心同目录（naive 依赖随 app 打包的库；修 review M4，
-    // 与自动核心更新路径一致）
+    // naive 依赖：libcronet 与新核心同目录（linux/win dlopen；macOS 静态编入为 no-op）
     await resourceManager.ensureCronetBeside(targetDir);
-
-    // macOS: 清除隔离标记并重新签名
     if (process.platform === 'darwin') {
       try {
         const { execSync } = require('child_process');
         execSync(`xattr -cr "${targetPath}"`, { stdio: 'pipe' });
         execSync(`codesign --force --deep -s - "${targetPath}"`, { stdio: 'pipe' });
-        this.logManager.addLog('info', '手动替换：已完成 macOS 签名处理', 'CoreUpdateService');
       } catch (signError: any) {
         this.logManager.addLog(
           'warn',
@@ -608,32 +1260,24 @@ export class CoreUpdateService {
         );
       }
     }
-
-    // 验证新核心是否可运行，防止用户错选了 .tar.gz 压缩包或者选错了架构 (amd64 vs arm64)
-    try {
-      const { exec } = require('child_process');
-      const util = require('util');
-      const execAsync = util.promisify(exec);
-      const { stdout } = await execAsync(`"${targetPath}" version`);
-      if (!stdout.includes('version')) {
-        throw new Error('执行结果不是有效的 sing-box');
-      }
-    } catch (e) {
-      this.logManager.addLog(
-        'error',
-        `所选文件无法执行。已自动回滚。错误详情: ${e}`,
-        'CoreUpdateService'
-      );
-      // 恢复备份
-      await this.restoreBackup();
-      throw new Error(
-        '您选择的文件无法被系统执行。Mac 用户请注意：\n1. 请务必先双击解压下载的 .tar.gz 压缩包，然后选择解压出来的名为 sing-box 的 UNIX 可执行文件。\n2. 请确保下载的架构 (arm64/amd64) 与您当前的 Mac 匹配。'
-      );
+    // 落位 + 签名后预检（确认落位核能跑）；失败抛出 → 外层 catch restoreBackup。
+    const preflight = await this.preflightValidate(targetPath);
+    if (!preflight.ok) {
+      throw new Error(`落位后核心预检失败（${preflight.reason}）`);
     }
+    // record 不在此做——由 replaceManualCore 统一处理（wasRunning ? 待验证闩+首启钩子 : 直接 record）
+  }
 
-    // 记录新版本
-    await this.recordSuccessfulVersion();
-    this.logManager.addLog('info', '手动替换核心成功', 'CoreUpdateService');
+  /** 重置内核到出厂版本：把随 App 出厂的 bundled 核 force 落位回受保护目录（macOS-v5）/bundle，复用 replaceManualCore
+   *  的统一不变量（停代理→备份→写入→重启→失败回滚）；force 跳过同版本短路（出厂核常与现役同版本，重置仍要覆盖回去）。 */
+  async resetCoreToFactory(): Promise<{ ok: boolean; error?: string }> {
+    this.logManager.addLog('info', '重置内核到出厂版本...', 'CoreUpdateService');
+    const bundlePath = resourceManager.getBundledSingBoxPath();
+    const r = await this.replaceManualCore({ filePath: bundlePath, force: true });
+    if (r.ok) {
+      this.logManager.addLog('info', '内核已重置到出厂版本', 'CoreUpdateService');
+    }
+    return { ok: r.ok, error: r.error };
   }
 
   // === 核心更新健壮性：预检 / 问题版本跳过 / 备份生命周期 / 自动回滚 ===
@@ -849,12 +1493,45 @@ export class CoreUpdateService {
 
   // --- 私有辅助方法 ---
 
+  /** 检查更新/下载的专用会话：强制 direct（复用 SubscriptionService 直连拉订阅的成熟模式）。
+   *  default session 在 mainSessionViaProxy(默认 on) 下会被 pin 到 sing-box http 入站——实测 net.request × http 入站
+   *  挂死 50s；改用 direct session 让 net.request 直连，TUN 模式由 OS 层透明捕获进 naive（同 curl，实测可达），
+   *  系统代理模式则直连 GitHub（你实测直连也通）。下载 asset 的 302 redirect 由 net.request 自动跟随。 */
+  private async getUpdateSession(): Promise<Session> {
+    if (this.updateDirectSession) return this.updateDirectSession;
+    const s = session.fromPartition('flowz-core-update-direct');
+    await s.setProxy({ mode: 'direct' });
+    this.updateDirectSession = s;
+    return s;
+  }
+
   private async fetchReleases(): Promise<any[]> {
+    const sess = await this.getUpdateSession();
     return new Promise((resolve, reject) => {
+      let settled = false;
       const request = net.request({
         method: 'GET',
         url: 'https://api.github.com/repos/SagerNet/sing-box/releases',
+        session: sess,
       });
+      // 单点收口：防 request/response 双错误源重复 settle；clear timeout；之后任何回调都 no-op。
+      const finish = (err: Error | null, val?: any[]) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (err) reject(err);
+        else resolve(val as any[]);
+      };
+      // 兜底超时：net.request 在连接被中间设备静默吞掉时可能长时间不触发 error → 前端永久转圈。15s 后主动 abort+reject。
+      const timer = setTimeout(() => {
+        try {
+          request.abort();
+        } catch {
+          /* ignore */
+        }
+        finish(new Error('检查更新超时（GitHub 不可达或被网络拦截）'));
+      }, 15000);
+
       request.setHeader('User-Agent', 'FlowZ-Electron');
       request.setHeader('Accept', 'application/vnd.github.v3+json');
 
@@ -862,21 +1539,24 @@ export class CoreUpdateService {
         let data = '';
         res.on('data', (chunk) => (data += chunk.toString()));
         res.on('end', () => {
-          try {
-            if (res.statusCode === 200) {
-              resolve(JSON.parse(data));
-            } else if (res.statusCode === 403) {
-              reject(new Error('GitHub API 访问频率限制 (403)，请稍后再试或使用代理'));
-            } else {
-              reject(new Error(`GitHub API Error: ${res.statusCode}`));
+          if (res.statusCode === 200) {
+            try {
+              finish(null, JSON.parse(data));
+            } catch {
+              finish(new Error('解析 GitHub 响应失败'));
             }
-          } catch {
-            reject(new Error('Failed to parse GitHub response'));
+          } else if (res.statusCode === 403) {
+            finish(new Error('GitHub API 访问频率限制 (403)，请稍后再试或使用代理'));
+          } else {
+            finish(new Error(`GitHub API 错误: ${res.statusCode}`));
           }
         });
+        // 关键：response 阶段断连（ERR_CONNECTION_CLOSED 等）从 res emit 'error'，缺此 handler 会逃逸成
+        // 主进程 uncaughtException，且 Promise 永不 settle → checkUpdate await 永挂 → 前端检查更新永久转圈。
+        res.on('error', (err: Error) => finish(err));
       });
 
-      request.on('error', reject);
+      request.on('error', (err: Error) => finish(err));
       request.end();
     });
   }
@@ -973,7 +1653,7 @@ export class CoreUpdateService {
         }
       }
     } catch (e) {
-      console.error('Failed to parse URL for extension:', e);
+      this.logManager.addLog('warn', `解析下载 URL 后缀失败: ${e}`, 'CoreUpdateService');
     }
 
     // 如果是 Windows，且后缀不是 .zip，强制使用 .zip (因为 Sing-box Windows 构建通常是 zip)
@@ -984,9 +1664,35 @@ export class CoreUpdateService {
 
     const tempPath = path.join(app.getPath('temp'), `sing-box-core-update-${Date.now()}${ext}`);
     const file = fs.createWriteStream(tempPath);
+    const sess = await this.getUpdateSession();
 
     return new Promise((resolve, reject) => {
+      let settled = false;
+      let idleTimer: ReturnType<typeof setTimeout> | null = null;
+      const clearIdle = () => {
+        if (idleTimer) {
+          clearTimeout(idleTimer);
+          idleTimer = null;
+        }
+      };
+      // 停滞超时：连接/下载 30s 无进展（无 data）即视为卡死 → abort + handleError（github 链接会自动换镜像重试一次）。
+      // 防下载挂起致 updateCore 永不 resolve → 前端「更新」按钮永久转圈。正常下载持续有 data、不断重置、不会误触发。
+      const armIdle = () => {
+        clearIdle();
+        idleTimer = setTimeout(() => {
+          try {
+            request.abort();
+          } catch {
+            /* ignore */
+          }
+          handleError(new Error('下载停滞超时（30s 无数据，网络中断或被拦截）'));
+        }, 30000);
+      };
+
       const handleError = (err: any) => {
+        if (settled) return;
+        settled = true;
+        clearIdle();
         file.close();
         fs.unlink(tempPath, () => {});
 
@@ -1005,11 +1711,14 @@ export class CoreUpdateService {
         reject(err);
       };
 
-      const request = net.request(url);
+      const request = net.request({ url, session: sess });
       request.setHeader('User-Agent', 'FlowZ-Electron');
 
       request.on('response', (response) => {
         if (response.statusCode >= 400) {
+          if (settled) return;
+          settled = true;
+          clearIdle();
           file.close();
           fs.unlink(tempPath, () => {});
           reject(new Error(`Download failed: ${response.statusCode}`));
@@ -1025,11 +1734,13 @@ export class CoreUpdateService {
         let receivedBytes = 0;
 
         response.on('data', (chunk) => {
+          armIdle(); // 每收到数据重置停滞计时
           receivedBytes += chunk.length;
           file.write(chunk);
         });
 
         response.on('end', () => {
+          clearIdle();
           file.close(() => {
             if (!isNaN(expectedBytes) && receivedBytes !== expectedBytes) {
               // 截断的 GitHub 下载会经 handleError 自动换镜像重试一次
@@ -1040,6 +1751,8 @@ export class CoreUpdateService {
               );
               return;
             }
+            if (settled) return;
+            settled = true;
             resolve(tempPath);
           });
         });
@@ -1049,6 +1762,7 @@ export class CoreUpdateService {
 
       request.on('error', handleError);
 
+      armIdle(); // 连接阶段也启动停滞计时（连接挂起 30s 超时）
       request.end();
     });
   }
@@ -1123,12 +1837,18 @@ export class CoreUpdateService {
     if (process.platform === 'win32') {
       return path.join(app.getPath('userData'), 'sing-box.exe.bak');
     }
+    // macOS：B 块受保护目录是 root-only，.bak 不能落那 → 统一放 userData（用户可写）；备份内容从 getSingBoxPath
+    // （受保护目录或 bundle，均可读）复制来。Linux 原同 bundle，这里一并归并到 userData 更稳。
+    if (process.platform === 'darwin') {
+      return path.join(app.getPath('userData'), 'core-backup', 'sing-box.bak');
+    }
     return resourceManager.getSingBoxPath() + '.bak';
   }
 
   private async backupCurrentCore(): Promise<void> {
     const currentPath = resourceManager.getSingBoxPath();
     const backupPath = this.getBackupPath();
+    fs.mkdirSync(path.dirname(backupPath), { recursive: true });
 
     if (fs.existsSync(currentPath)) {
       if (process.platform === 'win32') {
@@ -1142,21 +1862,25 @@ export class CoreUpdateService {
   }
 
   private async restoreBackup(): Promise<void> {
-    const currentPath = resourceManager.getSingBoxUpdateTargetPath();
     const backupPath = this.getBackupPath();
-
-    if (fs.existsSync(backupPath)) {
-      try {
-        if (process.platform === 'win32') {
-          await this.copyFileElevatedWindows(backupPath, currentPath);
-        } else {
-          fs.copyFileSync(backupPath, currentPath);
-          fs.chmodSync(currentPath, 0o755);
-        }
-        this.logManager.addLog('info', '已从备份恢复核心', 'CoreUpdateService');
-      } catch {
-        this.logManager.addLog('error', '恢复备份失败', 'CoreUpdateService');
+    if (!fs.existsSync(backupPath)) return;
+    try {
+      // B 块 macOS（helper v5）：经 helper install-core 把 backup 写回受保护目录（与 rollbackCore 同源，[HIGH-1]）。
+      if (await this.isProtectedCoreActive()) {
+        await this.installSingleCoreViaHelper(backupPath);
+        this.logManager.addLog('info', '已从备份恢复核心（受保护目录）', 'CoreUpdateService');
+        return;
       }
+      const currentPath = resourceManager.getSingBoxUpdateTargetPath();
+      if (process.platform === 'win32') {
+        await this.copyFileElevatedWindows(backupPath, currentPath);
+      } else {
+        fs.copyFileSync(backupPath, currentPath);
+        fs.chmodSync(currentPath, 0o755);
+      }
+      this.logManager.addLog('info', '已从备份恢复核心', 'CoreUpdateService');
+    } catch {
+      this.logManager.addLog('error', '恢复备份失败', 'CoreUpdateService');
     }
   }
 

@@ -9,6 +9,7 @@
  * 事件驱动刷新（无周期轮询）：省第三方配额、不持续暴露行为。60s TTL + in-flight 去重；失败保留旧值。
  */
 import * as http from 'http';
+import { isIP } from 'net';
 import type { IpInfo, IpInfoSnapshot } from '../../shared/types';
 
 const TTL_MS = 60_000;
@@ -17,18 +18,27 @@ const REQ_TIMEOUT_MS = 5000;
 interface ProbeEndpoint {
   host: string;
   path: string;
+  /** 响应体解析方式：'json'（ip-api/ipip/ipify）/ 'trace'（Cloudflare /cdn-cgi/trace 纯文本 key=value）。 */
+  parse: 'json' | 'trace';
 }
 // 本地出口主用国内接口：旁路由/软路由透明分流会把国外目标劫持走境外出口，导致 ip-api 把本地出口误标为
 // 境外节点 IP；国内接口走真实大陆出口，是这类环境下唯一能测对本地出口的办法（也更快、不触 ip-api 限流）。
-const EP_IPIP: ProbeEndpoint = { host: 'myip.ipip.net', path: '/json' };
+const EP_IPIP: ProbeEndpoint = { host: 'myip.ipip.net', path: '/json', parse: 'json' };
 const EP_IPAPI: ProbeEndpoint = {
   host: 'ip-api.com',
   path: '/json/?fields=status,query,country,countryCode',
+  parse: 'json',
 };
-const EP_IPIFY: ProbeEndpoint = { host: 'api.ipify.org', path: '/?format=json' };
-// 代理出口：境外节点访国外接口快且对任意国家都有 ISO countryCode（国旗）；ipify 与 ip-api 限流无关联兜底；
-// ipip 末位仅作路径分集保底（境外入境最不稳）。
-const PROXY_CHAIN: ProbeEndpoint[] = [EP_IPAPI, EP_IPIFY, EP_IPIP];
+const EP_IPIFY: ProbeEndpoint = { host: 'api.ipify.org', path: '/?format=json', parse: 'json' };
+// Cloudflare trace：纯文本 key=value，apex 域 :80 absolute-form 实测直出 200 无重定向（陈先生定 apex 非 www）。
+// 仅用于代理出口链（境外节点访问准确、低延迟）；绝不进直连链——旁路由透明分流会把它劫走代理误标直连出口。
+const EP_CF_TRACE: ProbeEndpoint = {
+  host: 'cloudflare.com',
+  path: '/cdn-cgi/trace',
+  parse: 'trace',
+};
+// 代理出口：trace 为主（境外节点访问快、对任意国家给 ISO loc→countryCode 国旗）；ip-api / ipify 限流无关联兜底降级。
+const PROXY_CHAIN: ProbeEndpoint[] = [EP_CF_TRACE, EP_IPAPI, EP_IPIFY];
 
 /** ipip 无 ISO 国别码：中国→cn（港澳台细分），其余 undefined（渲染端 Globe 兜底）。 */
 function ccFromIpipLocation(loc: readonly string[]): string | undefined {
@@ -37,6 +47,28 @@ function ccFromIpipLocation(loc: readonly string[]): string | undefined {
   if (loc[1] === '澳门') return 'mo';
   if (loc[1] === '台湾') return 'tw';
   return 'cn';
+}
+
+/**
+ * 解析 Cloudflare /cdn-cgi/trace 纯文本响应（多行 `key=value`）。仅取 ip + countryCode（不取 colo）：
+ *  - ip：经 net.isIP 校验（!==0 才算合法 IPv4/IPv6），劫持页/portal 的假响应或截断响应 → 校验失败返 null 走 fallback；
+ *  - loc：大写后须匹配 /^[A-Z]{2}$/ 且 != 'XX'（CF 对未知地区返 XX）才作 countryCode，否则 undefined（渲染端 Globe 兜底）。
+ * 国家名不在此派生（trace 不给国家名）→ 渲染端由 countryCode 经 Intl.DisplayNames 派生。
+ */
+export function parseTrace(body: string): IpInfo | null {
+  const kv: Record<string, string> = {};
+  for (const line of body.split('\n')) {
+    const t = line.trim();
+    if (!t) continue; // 忽略空行
+    const i = t.indexOf('=');
+    if (i <= 0) continue; // 无 '=' 或以 '=' 开头（无 key）→ 跳过
+    kv[t.slice(0, i)] = t.slice(i + 1).trim();
+  }
+  const ip = kv['ip'];
+  if (!ip || isIP(ip) === 0) return null; // 防劫持页/截断响应假响应
+  const loc = kv['loc']?.toUpperCase();
+  const countryCode = loc && /^[A-Z]{2}$/.test(loc) && loc !== 'XX' ? loc : undefined;
+  return { ip, countryCode };
 }
 
 export class IpInfoService {
@@ -156,9 +188,9 @@ export class IpInfoService {
     this.onUpdate(this.getSnapshot());
   }
 
-  /** 经探针 HTTP 代理端口 absolute-form 请求端点。 */
+  /** 经探针 HTTP 代理端口 absolute-form 请求端点，按 ep.parse 解析。 */
   private viaProbe(proxyPort: number, ep: ProbeEndpoint): Promise<IpInfo | null> {
-    return this.httpJson({
+    return this.fetchEndpoint(ep, {
       hostname: '127.0.0.1',
       port: proxyPort,
       path: `http://${ep.host}${ep.path}`,
@@ -166,14 +198,24 @@ export class IpInfoService {
     });
   }
 
-  /** 主进程裸直连请求端点。 */
+  /** 主进程裸直连请求端点，按 ep.parse 解析。 */
   private bare(ep: ProbeEndpoint): Promise<IpInfo | null> {
-    return this.httpJson({
+    return this.fetchEndpoint(ep, {
       hostname: ep.host,
       port: 80,
       path: ep.path,
       headers: { Host: ep.host, Connection: 'close' },
     });
+  }
+
+  /** 传输（httpText）+ 解析分发（ep.parse: json → parseJson / trace → parseTrace）。传输失败或解析失败均返 null。 */
+  private async fetchEndpoint(
+    ep: ProbeEndpoint,
+    options: http.RequestOptions
+  ): Promise<IpInfo | null> {
+    const body = await this.httpText(options);
+    if (body === null) return null;
+    return ep.parse === 'trace' ? parseTrace(body) : parseJson(body);
   }
 
   /**
@@ -205,16 +247,26 @@ export class IpInfoService {
     return this.queryDirectChain((ep) => this.bare(ep));
   }
 
-  private httpJson(options: http.RequestOptions): Promise<IpInfo | null> {
+  /**
+   * 传输层：取响应体纯文本。保留原有兜底（提前关闭/oversize destroy/timeout/error 均返 null，防 promise 永挂
+   * 死整条刷新链——review P1）；新增 statusCode!==200 即返 null（顺手对所有端点加固：301/403/5xx 直接降级，
+   * 不再单靠 parse 失败兜底）。
+   */
+  private httpText(options: http.RequestOptions): Promise<string | null> {
     return new Promise((resolve) => {
       let settled = false;
-      const done = (v: IpInfo | null) => {
+      const done = (v: string | null) => {
         if (settled) return;
         settled = true;
         resolve(v);
       };
 
       const req = http.get({ ...options, timeout: REQ_TIMEOUT_MS }, (res) => {
+        if (res.statusCode !== 200) {
+          res.resume(); // 排空丢弃，释放 socket
+          done(null);
+          return;
+        }
         let body = '';
         res.setEncoding('utf8');
         // 任何提前关闭（含下面 oversize destroy）都兜底 done(null)，防 promise 永挂死整条刷新链
@@ -225,44 +277,7 @@ export class IpInfoService {
           // error/end 事件 → done 永不调用 → enqueue 的 inflight 永挂、IP 卡永久转圈（review P1）。
           if (body.length > 8192) req.destroy(new Error('oversize'));
         });
-        res.on('end', () => {
-          try {
-            const j = JSON.parse(body) as Record<string, unknown>;
-            // ip-api：{status:'success', query, country, countryCode}
-            if (j && j.status === 'success' && typeof j.query === 'string') {
-              done({
-                ip: j.query,
-                country: typeof j.country === 'string' ? j.country : undefined,
-                countryCode: typeof j.countryCode === 'string' ? j.countryCode : undefined,
-              });
-              return;
-            }
-            // ipip：{ret:'ok', data:{ip, location:[国,省,市,区,ISP]}}
-            if (j && j.ret === 'ok' && j.data && typeof j.data === 'object') {
-              const d = j.data as { ip?: unknown; location?: unknown };
-              if (typeof d.ip === 'string') {
-                const raw = Array.isArray(d.location)
-                  ? d.location.filter((s): s is string => typeof s === 'string')
-                  : [];
-                const parts = raw.filter((s) => s.length > 0);
-                done({
-                  ip: d.ip,
-                  country: parts.length ? parts.join(' ') : undefined,
-                  countryCode: ccFromIpipLocation(raw),
-                });
-                return;
-              }
-            }
-            // ipify：{ip}
-            if (j && typeof j.ip === 'string') {
-              done({ ip: j.ip });
-              return;
-            }
-            done(null);
-          } catch {
-            done(null);
-          }
-        });
+        res.on('end', () => done(body));
       });
 
       req.on('error', () => done(null));
@@ -271,5 +286,42 @@ export class IpInfoService {
         done(null);
       });
     });
+  }
+}
+
+/** JSON 端点解析（ip-api / ipip / ipify）。解析失败或字段缺失返 null（走 fallback）。 */
+function parseJson(body: string): IpInfo | null {
+  try {
+    const j = JSON.parse(body) as Record<string, unknown>;
+    // ip-api：{status:'success', query, country, countryCode}
+    if (j && j.status === 'success' && typeof j.query === 'string') {
+      return {
+        ip: j.query,
+        country: typeof j.country === 'string' ? j.country : undefined,
+        countryCode: typeof j.countryCode === 'string' ? j.countryCode : undefined,
+      };
+    }
+    // ipip：{ret:'ok', data:{ip, location:[国,省,市,区,ISP]}}
+    if (j && j.ret === 'ok' && j.data && typeof j.data === 'object') {
+      const d = j.data as { ip?: unknown; location?: unknown };
+      if (typeof d.ip === 'string') {
+        const raw = Array.isArray(d.location)
+          ? d.location.filter((s): s is string => typeof s === 'string')
+          : [];
+        const parts = raw.filter((s) => s.length > 0);
+        return {
+          ip: d.ip,
+          country: parts.length ? parts.join(' ') : undefined,
+          countryCode: ccFromIpipLocation(raw),
+        };
+      }
+    }
+    // ipify：{ip}
+    if (j && typeof j.ip === 'string') {
+      return { ip: j.ip };
+    }
+    return null;
+  } catch {
+    return null;
   }
 }

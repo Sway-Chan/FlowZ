@@ -80,13 +80,21 @@ export function CoreVersionBanner() {
     try {
       setIsReplacing(true);
       const result = await api.coreUpdate.replaceManual();
-      // 如果替换成功，主进程已执行完替换流程
-      if (result) {
+      if (result.ok) {
+        // 替换成功：主进程已执行完替换流程
         toast.success(t('settings.about.coreManualReplaceSuccess'), {
           description: t('settings.about.newCoreActive'),
         });
         setDismissed(true);
+      } else if (result.needConfirm && result.sameVersion && result.filePath) {
+        // 同版本需确认：本横幅不承载确认框，引导用户去内核管理卡处理
+        toast.info(t('settings.coreManagement.sameVersionConfirmTitle'), {
+          description: t('settings.coreVersion.sameVersionGoManage'),
+        });
+      } else if (result.error) {
+        toast.error(t('settings.about.coreUpdateFail'), { description: result.error });
       }
+      // ok:false 且无 needConfirm/error → 用户取消文件选择器，静默
     } catch (error) {
       toast.error(t('settings.about.coreUpdateFail'), {
         description: error instanceof Error ? error.message : String(error),

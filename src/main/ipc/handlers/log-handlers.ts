@@ -46,6 +46,4 @@ export function registerLogHandlers(logManager: LogManager, proxyManager?: Proxy
   logManager.on('log', (log: LogEntry) => {
     broadcastEvent(IPC_CHANNELS.EVENT_LOG_RECEIVED, log);
   });
-
-  console.log('[Log Handlers] Registered all log IPC handlers and event forwarding');
 }

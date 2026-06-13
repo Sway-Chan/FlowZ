@@ -166,8 +166,10 @@ export function proxyErrorCategory(code: unknown): ErrorCategory | null {
       return ErrorCategory.Connection;
     case ProxyErrorCode.CONFIG_INVALID:
     case ProxyErrorCode.PORT_IN_USE:
+    case ProxyErrorCode.CLASH_API_PORT_RECYCLING:
       return ErrorCategory.Config;
     case ProxyErrorCode.PERMISSION_DENIED:
+    case ProxyErrorCode.SYSTEM_PROXY_FAILED:
     case ProxyErrorCode.BINARY_NOT_EXECUTABLE:
     case ProxyErrorCode.BINARY_NOT_FOUND:
       return ErrorCategory.System;
@@ -177,6 +179,7 @@ export function proxyErrorCategory(code: unknown): ErrorCategory | null {
     case ProxyErrorCode.AUTO_RESTARTING:
     case ProxyErrorCode.AUTO_RESTART_FAILED:
     case ProxyErrorCode.RESTART_LIMIT_REACHED:
+    case ProxyErrorCode.STOP_AUTH_CANCELLED:
       return ErrorCategory.Process;
     default:
       return null; // UNKNOWN
