@@ -71,6 +71,7 @@
     "close": "关闭连接",
     "closeAll": "全部关闭",
     "closeFailed": "关闭连接失败",
+    "closeAllFailed": "关闭全部连接失败",
     "closeAllDone": "已关闭全部连接",
     "closeAllTitle": "关闭全部连接？",
     "closeAllWarn": "将断开所有活动连接（ResetNetwork），进行中的传输会被中断。",

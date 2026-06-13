@@ -6,7 +6,7 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { randomBytes } from 'crypto';
-import type { UserConfig, Rule, RuleCondition, LogLevel } from '../../shared/types';
+import type { UserConfig, Rule, RuleCondition, LogLevel, Protocol } from '../../shared/types';
 import type { LogManager } from './LogManager';
 import { getConfigPath } from '../utils/paths';
 import { readPrivacyHash, writePrivacyHash, hashPasswordSync } from '../utils/privacy-lock';
@@ -16,6 +16,25 @@ import {
   migrateCustomRules,
   customRulesNeedMigration,
 } from '../../shared/rules';
+
+/**
+ * 合法服务器协议白名单（单一来源，T5）。
+ * 从 shared/types.ts Protocol 联合类型派生——新增协议只改 types.ts，此处自动同步，
+ * 消除「数组抄一遍 + 错误串再抄一遍」双重维护漂移（曾出现数组含某协议、错误串漏列的情况）。
+ */
+const ALLOWED_PROTOCOLS: readonly Protocol[] = [
+  'vless',
+  'vmess',
+  'trojan',
+  'hysteria2',
+  'shadowsocks',
+  'anytls',
+  'tuic',
+  'naive',
+  'socks',
+  'http',
+  'ssh',
+];
 
 export interface IConfigManager {
   loadConfig(): Promise<UserConfig>;
@@ -157,7 +176,7 @@ export class ConfigManager implements IConfigManager {
       // FakeIP 开关统一一次性迁移（幂等、绝不抛）：存量旧默认 enableFakeIp:false 多非用户意图，
       // usesFakeIp 改为纯看开关后，TUN 存量用户若不迁移会从「恒 FakeIP-on」静默掉到 off（机场拒 IP 风险）。
       // 按迁移时刻 proxyModeType 写 effective 值，置标记防重复执行覆盖用户后续手动改的值。
-      this.migrateFakeIpToggle(config);
+      await this.migrateFakeIpToggle(config);
 
       // 缓存配置
       this.currentConfig = config;
@@ -341,25 +360,8 @@ export class ConfigManager implements IConfigManager {
         throw new Error('Server name is required and must be a string');
       }
       const protocolLower = server.protocol?.toLowerCase();
-      if (
-        !protocolLower ||
-        ![
-          'vless',
-          'vmess',
-          'trojan',
-          'hysteria2',
-          'shadowsocks',
-          'anytls',
-          'tuic',
-          'naive',
-          'socks',
-          'http',
-          'ssh',
-        ].includes(protocolLower)
-      ) {
-        throw new Error(
-          'Server protocol must be vless, vmess, trojan, hysteria2, shadowsocks, anytls, tuic, naive, socks, http, or ssh'
-        );
+      if (!protocolLower || !ALLOWED_PROTOCOLS.includes(protocolLower as Protocol)) {
+        throw new Error(`Server protocol must be one of: ${ALLOWED_PROTOCOLS.join(', ')}`);
       }
       if (!server.address || typeof server.address !== 'string') {
         throw new Error('Server address is required and must be a string');
@@ -686,11 +688,10 @@ export class ConfigManager implements IConfigManager {
    * 缺 dnsConfig → 直接补一份「迁移完成」默认（enableFakeIp 按上述模式，标记 true），容错不抛。
    *
    * 幂等：fakeIpToggleMigrated===true 即跳过（含新装——createDefaultConfig 已置 true）。置标记后永不再改写，
-   * 避免每次启动覆盖用户迁移后手动改的值。落盘 best-effort fire-and-forget（不 await：本方法为同步 void，
-   * 不阻断 loadConfig；与 F29 仅「best-effort、失败下次重试、标记未持久化即未迁移」语义同标准，
-   * 但 F29 是 await saveConfig().catch、本处不 await）。
+   * 避免每次启动覆盖用户迁移后手动改的值。落盘 await saveConfig().catch（与 F29 同标准：best-effort、失败下次重试、
+   * 标记未持久化即未迁移；await 确定迁移与落盘顺序，消除 fire-and-forget 期 currentConfig 读取的理论窗口）。
    */
-  private migrateFakeIpToggle(config: UserConfig): void {
+  private async migrateFakeIpToggle(config: UserConfig): Promise<void> {
     try {
       // 缺 dnsConfig：补默认并按模式冻结 effective 值，标记完成（与 createDefaultConfig 同语义但 enableFakeIp 按模式）。
       if (!config.dnsConfig) {
@@ -717,7 +718,7 @@ export class ConfigManager implements IConfigManager {
         return; // 已迁移（含新装）：幂等跳过，不落盘
       }
       // best-effort 落盘标记；失败不阻断（下次加载重试，期间标记未持久 = 未迁移语义一致）。
-      this.saveConfig(config).catch((e) =>
+      await this.saveConfig(config).catch((e) =>
         this.log('warn', `FakeIP 开关迁移后落盘失败（不阻断，下次重试）: ${e}`)
       );
     } catch (e) {

@@ -10,6 +10,7 @@ import * as path from 'path';
 import { LogManager } from './LogManager';
 import { ProxyManager } from './ProxyManager';
 import type { HelperManager } from './HelperManager';
+import { PlatformPrivilegeService } from './PlatformPrivilegeService';
 import { resourceManager } from './ResourceManager';
 
 import type { UserConfig } from '../../shared/types';
@@ -80,6 +81,7 @@ export class CoreUpdateService {
   private logManager: LogManager;
   private proxyManager: ProxyManager | null = null;
   private helperManager: HelperManager | null = null; // B 块：macOS 经 helper v5 install-core 写受保护目录
+  private privilegeService: PlatformPrivilegeService | null = null; // T16：copyFileElevatedWindows delegate
   private isUpdating: boolean = false;
   // 更新后等待「首次成功运行」验证的新版本号；首启成功→清除并删备份，首启失败→自动回滚
   private pendingUpdateVersion: string | null = null;
@@ -112,6 +114,11 @@ export class CoreUpdateService {
   /** B 块：注入 helper（macOS 持久化内核更新经 helper v5 install-core 写受保护目录）。 */
   setHelperManager(helperManager: HelperManager): void {
     this.helperManager = helperManager;
+  }
+
+  /** T16：注入平台提权服务（copyFileElevatedWindows delegate → service.copyFileElevated）。 */
+  setPrivilegeService(service: PlatformPrivilegeService): void {
+    this.privilegeService = service;
   }
 
   /** 注入配置读取器（用于读取"仅兼容版本带内更新"开关）。 */
@@ -278,9 +285,16 @@ export class CoreUpdateService {
 
       // 4-5. 备份→替换核心→签名→待验证闩（抽到 installCoreFromDir，手动/自动落位共用，行为零变）。
       // onBackupDone 在 backupCurrentCore() 成功后同点回调，保持原 backupMade 语义（预检前失败不误恢复陈旧 .bak）。
-      await this.installCoreFromDir(path.dirname(corePath), preflight.version, () => {
-        backupMade = true;
-      });
+      // core-swap 手动轴门控：标记「二进制替换窗口」开启——installCoreFromDir 执行期间拒绝手动 start/restart/switchMode
+      // （防撞半替换核 FATAL）。try/finally 精确覆盖 installCoreFromDir；清位后下方 proxyManager.start 放行。
+      this.proxyManager?.setCoreSwapInProgress(true);
+      try {
+        await this.installCoreFromDir(path.dirname(corePath), preflight.version, () => {
+          backupMade = true;
+        });
+      } finally {
+        this.proxyManager?.setCoreSwapInProgress(false);
+      }
 
       // 6. 清理临时文件
       try {
@@ -831,13 +845,21 @@ export class CoreUpdateService {
       // M2：跟踪本次是否已备份；installCoreFromDir 中途失败（复制半截/磁盘满）时回滚半替换核心，
       // 对齐 updateCore 的 catch restoreBackup（否则留半替换核心，下次启动失败也不 autoRollback）。
       let backupMade = false;
+      // core-swap 手动轴门控：标记「二进制替换窗口」开启——installCoreFromDir 执行期间拒绝手动 start/restart/switchMode
+      // （防撞半替换核 FATAL）。finally 清位；applyStagedNow 在 tryApplyStaged 返回后的 start（coreSwapInProgress 已清）放行。
+      this.proxyManager?.setCoreSwapInProgress(true);
       try {
         await this.installCoreFromDir(staged.dir, preflight.version ?? staged.version, () => {
           backupMade = true;
         });
       } catch (installErr) {
+        // N-1：restoreBackup 在 finally 清位前执行（此刻 coreSwapInProgress 仍 true）——但 restoreBackup 仅写核文件、
+        // 不调 start/switchMode（不触门控），故无害。与 updateCore/replaceManualCore（restoreBackup 在清位后）略不一致，
+        // 系 try/catch/finally 语义所致；后人若给 restoreBackup 加重启逻辑须先清位。
         if (backupMade) await this.restoreBackup();
         throw installErr;
+      } finally {
+        this.proxyManager?.setCoreSwapInProgress(false);
       }
       this.clearStaged();
       this.logManager.addLog(
@@ -1055,69 +1077,76 @@ export class CoreUpdateService {
       }
     }
 
-    const backupPath = this.getBackupPath();
-    // B 块 macOS（helper v5）：受保护目录 root-only，经 helper install-core 把 backup 写回（连带 libcronet）。普通
-    // fs.copy 写不了；且读路径优先受保护目录，必须写那里，否则「写了读不到」（修 [HIGH-1]）。
-    if (await this.isProtectedCoreActive()) {
-      await this.installSingleCoreViaHelper(backupPath);
+    // core-swap 手动轴门控（补 F-1 缺口）：rollbackCore 经 installSingleCoreViaHelper/普通 copy 写核，不经
+    // installCoreFromDir，需独立置位。无恢复性 start（写核后 record+return），try/finally 仅保证清位防闩挂死。
+    this.proxyManager?.setCoreSwapInProgress(true);
+    try {
+      const backupPath = this.getBackupPath();
+      // B 块 macOS（helper v5）：受保护目录 root-only，经 helper install-core 把 backup 写回（连带 libcronet）。普通
+      // fs.copy 写不了；且读路径优先受保护目录，必须写那里，否则「写了读不到」（修 [HIGH-1]）。
+      if (await this.isProtectedCoreActive()) {
+        await this.installSingleCoreViaHelper(backupPath);
+        try {
+          fs.unlinkSync(backupPath);
+        } catch {
+          /* ignore */
+        }
+        this.logManager.addLog('info', '核心回滚成功（写回受保护目录）', 'CoreUpdateService');
+        await this.recordSuccessfulVersion();
+        const rolledEnc = encodeMajorMinor(await this.getCurrentVersion());
+        if (!isNaN(rolledEnc)) this.saveAutoState({ verifiedCeiling: rolledEnc });
+        return;
+      }
+
+      const currentPath = resourceManager.getSingBoxUpdateTargetPath();
+      this.logManager.addLog(
+        'info',
+        `正在回滚核心: ${backupPath} → ${currentPath}`,
+        'CoreUpdateService'
+      );
+
+      if (process.platform === 'win32') {
+        await this.copyFileElevatedWindows(backupPath, currentPath);
+      } else {
+        fs.copyFileSync(backupPath, currentPath);
+        fs.chmodSync(currentPath, 0o755);
+      }
+
+      // macOS: 重新签名
+      if (process.platform === 'darwin') {
+        try {
+          const { execSync } = require('child_process');
+          execSync(`xattr -cr "${currentPath}"`, { stdio: 'pipe' });
+          execSync(`codesign --force --deep -s - "${currentPath}"`, { stdio: 'pipe' });
+          this.logManager.addLog('info', '回滚：已完成 macOS 签名处理', 'CoreUpdateService');
+        } catch (signError: any) {
+          this.logManager.addLog(
+            'warn',
+            `回滚签名处理失败: ${signError.message}`,
+            'CoreUpdateService'
+          );
+        }
+      }
+
+      this.logManager.addLog('info', '核心回滚成功', 'CoreUpdateService');
+
+      // 删除备份（回滚后备份不再有意义）
       try {
         fs.unlinkSync(backupPath);
       } catch {
-        /* ignore */
+        // ignore
       }
-      this.logManager.addLog('info', '核心回滚成功（写回受保护目录）', 'CoreUpdateService');
+
+      // 更新版本记录
       await this.recordSuccessfulVersion();
+
+      // B0：回滚 = 被回滚版本带验证失败 → 把 verifiedCeiling 重置到回滚后实跑带（撤销更高带的「已验证」，兼容带闸
+      // 不再放行那个出问题的更高带）。recordSuccessfulVersion 的棘轮 max 不会下降，故此处显式覆盖。
       const rolledEnc = encodeMajorMinor(await this.getCurrentVersion());
       if (!isNaN(rolledEnc)) this.saveAutoState({ verifiedCeiling: rolledEnc });
-      return;
+    } finally {
+      this.proxyManager?.setCoreSwapInProgress(false);
     }
-
-    const currentPath = resourceManager.getSingBoxUpdateTargetPath();
-    this.logManager.addLog(
-      'info',
-      `正在回滚核心: ${backupPath} → ${currentPath}`,
-      'CoreUpdateService'
-    );
-
-    if (process.platform === 'win32') {
-      await this.copyFileElevatedWindows(backupPath, currentPath);
-    } else {
-      fs.copyFileSync(backupPath, currentPath);
-      fs.chmodSync(currentPath, 0o755);
-    }
-
-    // macOS: 重新签名
-    if (process.platform === 'darwin') {
-      try {
-        const { execSync } = require('child_process');
-        execSync(`xattr -cr "${currentPath}"`, { stdio: 'pipe' });
-        execSync(`codesign --force --deep -s - "${currentPath}"`, { stdio: 'pipe' });
-        this.logManager.addLog('info', '回滚：已完成 macOS 签名处理', 'CoreUpdateService');
-      } catch (signError: any) {
-        this.logManager.addLog(
-          'warn',
-          `回滚签名处理失败: ${signError.message}`,
-          'CoreUpdateService'
-        );
-      }
-    }
-
-    this.logManager.addLog('info', '核心回滚成功', 'CoreUpdateService');
-
-    // 删除备份（回滚后备份不再有意义）
-    try {
-      fs.unlinkSync(backupPath);
-    } catch {
-      // ignore
-    }
-
-    // 更新版本记录
-    await this.recordSuccessfulVersion();
-
-    // B0：回滚 = 被回滚版本带验证失败 → 把 verifiedCeiling 重置到回滚后实跑带（撤销更高带的「已验证」，兼容带闸
-    // 不再放行那个出问题的更高带）。recordSuccessfulVersion 的棘轮 max 不会下降，故此处显式覆盖。
-    const rolledEnc = encodeMajorMinor(await this.getCurrentVersion());
-    if (!isNaN(rolledEnc)) this.saveAutoState({ verifiedCeiling: rolledEnc });
   }
 
   /**
@@ -1178,22 +1207,30 @@ export class CoreUpdateService {
 
     let backupMade = false;
     try {
-      // 备份现役核心（统一：两条写入路径都先备份，失败可 restoreBackup 回滚）
-      await this.backupCurrentCore();
-      backupMade = true;
+      // core-swap 手动轴门控：标记「二进制替换窗口」开启——手动替换核心写入期间拒绝手动 start/restart/switchMode
+      // （防撞半替换核 FATAL）。补 T1 覆盖缺口：replaceManualCore 走 installSingleCoreViaHelper/writeManualCoreToBundle，
+      // 不经 installCoreFromDir，需独立置位。内层 try/finally 精确覆盖置位+backup+写核；清位后下方恢复性 start 放行（同 updateCore）。
+      try {
+        this.proxyManager?.setCoreSwapInProgress(true);
+        // 备份现役核心（统一：两条写入路径都先备份，失败可 restoreBackup 回滚）
+        await this.backupCurrentCore();
+        backupMade = true;
 
-      // 写入新核心：macOS + helper v5 → install-core 进受保护目录；否则 → bundle 写入腿（含签名 + 落位后预检）。
-      // 源已 preSrc 预检过；install-core 内 sha256 校验保证落位字节 == 预检源，无需二次预检。
-      if (process.platform === 'darwin' && this.helperManager) {
-        const st = await this.helperManager.getStatus();
-        if (st.ready && !st.upgradeable) {
-          await this.installSingleCoreViaHelper(sourcePath);
-          this.logManager.addLog('info', '手动替换核心已写入受保护目录', 'CoreUpdateService');
+        // 写入新核心：macOS + helper v5 → install-core 进受保护目录；否则 → bundle 写入腿（含签名 + 落位后预检）。
+        // 源已 preSrc 预检过；install-core 内 sha256 校验保证落位字节 == 预检源，无需二次预检。
+        if (process.platform === 'darwin' && this.helperManager) {
+          const st = await this.helperManager.getStatus();
+          if (st.ready && !st.upgradeable) {
+            await this.installSingleCoreViaHelper(sourcePath);
+            this.logManager.addLog('info', '手动替换核心已写入受保护目录', 'CoreUpdateService');
+          } else {
+            await this.writeManualCoreToBundle(sourcePath);
+          }
         } else {
           await this.writeManualCoreToBundle(sourcePath);
         }
-      } else {
-        await this.writeManualCoreToBundle(sourcePath);
+      } finally {
+        this.proxyManager?.setCoreSwapInProgress(false);
       }
 
       // 待验证闩 + 重启：之前运行 → arm（新版本），重启后由首启 'started' 记录版本+稳定观察、'error'（运行时首启崩溃）
@@ -1889,6 +1926,9 @@ export class CoreUpdateService {
    * 解决将文件写入 C:\Program Files (UAC 保护目录) 时的 EPERM 问题
    */
   private async copyFileElevatedWindows(src: string, dest: string): Promise<void> {
+    // delegate → PlatformPrivilegeService.copyFileElevated（T16 子 commit 1：PowerShell RunAs 逻辑原样保留，
+    // this.logManager.addLog → ctx.log）；未注入时保留原实现兜底。
+    if (this.privilegeService) return this.privilegeService.copyFileElevated(src, dest);
     const { execSync } = require('child_process') as typeof import('child_process');
 
     // Escape single quotes in paths for PowerShell

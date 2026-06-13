@@ -3,7 +3,6 @@ import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Badge } from '@/components/ui/badge';
-import { ScrollArea } from '@/components/ui/scroll-area';
 import { Plus, X } from 'lucide-react';
 import { toast } from 'sonner';
 import { api } from '@/ipc/api-client';
@@ -69,7 +68,7 @@ export function ResourcePicker({ value, onChange, onRequestClose }: ResourcePick
           </Button>
         </div>
       ) : (
-        <ScrollArea className="max-h-40 rounded-md border">
+        <div className="max-h-40 overflow-auto rounded-md border">
           <div className="divide-y divide-border/60">
             {resources.map((r) => (
               <label
@@ -84,7 +83,7 @@ export function ResourcePicker({ value, onChange, onRequestClose }: ResourcePick
                 {!r.fileExists && (
                   <Badge
                     variant="outline"
-                    className="border-transparent bg-red-600/15 text-xs text-red-600 dark:text-red-300"
+                    className="border-transparent bg-destructive/15 text-xs text-destructive"
                   >
                     {t('ruleResources.missing', '文件缺失')}
                   </Badge>
@@ -95,7 +94,7 @@ export function ResourcePicker({ value, onChange, onRequestClose }: ResourcePick
               </label>
             ))}
           </div>
-        </ScrollArea>
+        </div>
       )}
 
       {/* 添加远程 URL */}
@@ -124,7 +123,7 @@ export function ResourcePicker({ value, onChange, onRequestClose }: ResourcePick
               <span
                 key={v}
                 className={`inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs ${
-                  deleted ? 'border-red-500/40 text-red-600 dark:text-red-300' : 'bg-muted'
+                  deleted ? 'border-destructive/40 text-destructive' : 'bg-muted'
                 }`}
               >
                 <span className="max-w-[180px] truncate">

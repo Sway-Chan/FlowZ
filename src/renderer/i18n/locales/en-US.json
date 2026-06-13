@@ -71,6 +71,7 @@
     "close": "Close connection",
     "closeAll": "Close All",
     "closeFailed": "Failed to close connection",
+    "closeAllFailed": "Failed to close all connections",
     "closeAllDone": "All connections closed",
     "closeAllTitle": "Close all connections?",
     "closeAllWarn": "This disconnects all active connections (ResetNetwork). In-flight transfers will be interrupted.",

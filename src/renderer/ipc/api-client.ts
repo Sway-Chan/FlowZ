@@ -317,13 +317,6 @@ export const logsApi = {
   },
 
   /**
-   * 设置日志级别
-   */
-  async setLevel(level: LogEntry['level']): Promise<void> {
-    return ipcClient.invoke(IPC_CHANNELS.LOGS_SET_LEVEL, { level });
-  },
-
-  /**
    * 监听日志接收事件
    */
   onReceived(listener: (log: LogEntry) => void): () => void {
@@ -610,13 +603,6 @@ export const coreUpdateApi = {
    */
   async update(downloadUrl: string): Promise<boolean> {
     return ipcClient.invoke(IPC_CHANNELS.CORE_UPDATE_RUN, downloadUrl);
-  },
-
-  /**
-   * 获取核心版本
-   */
-  async getVersion(): Promise<string> {
-    return ipcClient.invoke(IPC_CHANNELS.CORE_UPDATE_GET_VERSION);
   },
 
   /**

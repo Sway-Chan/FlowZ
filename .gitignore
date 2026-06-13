@@ -94,3 +94,11 @@ docs/validation-checklist.md
 
 # tsc 增量编译产物（防 tsc 增量后再次变 untracked 误提交）
 *.tsbuildinfo
+
+# 构建时注入的构建日期常量（scripts/gen-build-info.js 生成；每次 build 覆写，不入库）
+src/shared/build-info.ts
+
+# ── 误落到 repo 根的本地文件（Obsidian 临时画布 / daily note / 误编译 helper 产物）──
+/Untitled.canvas
+/2026-06-13.md
+/helper/flowzhelper

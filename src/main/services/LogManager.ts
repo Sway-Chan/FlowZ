@@ -189,8 +189,6 @@ export class LogManager extends EventEmitter implements ILogManager {
           }
         }
       }
-
-      console.log('All log files cleared');
     } catch (error) {
       console.error('Failed to clear log files:', error);
     }
@@ -220,7 +218,7 @@ export class LogManager extends EventEmitter implements ILogManager {
   private formatLogEntry(entry: LogEntry): string {
     const timestamp = entry.timestamp; // 已经是 ISO 字符串
     const level = entry.level.toUpperCase().padEnd(5);
-    const source = entry.source.padEnd(20);
+    const source = entry.source.slice(0, 20).padEnd(20);
     let line = `[${timestamp}] [${level}] [${source}] ${entry.message}`;
 
     if (entry.stack) {

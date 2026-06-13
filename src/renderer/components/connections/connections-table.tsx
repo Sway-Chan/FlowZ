@@ -217,10 +217,10 @@ export function ConnectionsTable() {
         setSpeeds(new Map());
         toast.success(t('connections.closeAllDone'));
       } else {
-        toast.error(t('connections.closeFailed'));
+        toast.error(t('connections.closeAllFailed'));
       }
     } catch {
-      toast.error(t('connections.closeFailed'));
+      toast.error(t('connections.closeAllFailed'));
     }
   };
 
@@ -358,8 +358,8 @@ export function ConnectionsTable() {
                       {chainOf(c)}
                     </TableCell>
                     <TableCell className="whitespace-nowrap py-2 text-xs">
-                      <span className="text-green-500">↓ {formatBytes(s.down)}/s</span>
-                      <span className="ml-2 text-blue-500">↑ {formatBytes(s.up)}/s</span>
+                      <span className="text-success">↓ {formatBytes(s.down)}/s</span>
+                      <span className="ml-2 text-info">↑ {formatBytes(s.up)}/s</span>
                     </TableCell>
                     <TableCell className="whitespace-nowrap py-2 text-xs text-muted-foreground">
                       ↓ {formatBytes(c.download ?? 0)} / ↑ {formatBytes(c.upload ?? 0)}

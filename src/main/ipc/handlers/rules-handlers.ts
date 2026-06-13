@@ -53,7 +53,6 @@ export function registerRulesHandlers(configManager: ConfigManager): void {
       ipcEventEmitter.sendToAll('event:configChanged', { newValue: config });
       mainEventEmitter.emit(MAIN_EVENTS.CONFIG_CHANGED, config);
 
-      console.log('[Rules Handlers] Rule added:', newRule.id);
       return newRule;
     }
   );
@@ -80,8 +79,6 @@ export function registerRulesHandlers(configManager: ConfigManager): void {
       // 广播和触发事件
       ipcEventEmitter.sendToAll('event:configChanged', { newValue: config });
       mainEventEmitter.emit(MAIN_EVENTS.CONFIG_CHANGED, config);
-
-      console.log('[Rules Handlers] Rule updated:', rule.id);
     }
   );
 
@@ -106,8 +103,6 @@ export function registerRulesHandlers(configManager: ConfigManager): void {
       // 广播和触发事件
       ipcEventEmitter.sendToAll('event:configChanged', { newValue: config });
       mainEventEmitter.emit(MAIN_EVENTS.CONFIG_CHANGED, config);
-
-      console.log('[Rules Handlers] Rule deleted:', args.ruleId);
     }
   );
 
@@ -134,8 +129,6 @@ export function registerRulesHandlers(configManager: ConfigManager): void {
 
       ipcEventEmitter.sendToAll('event:configChanged', { newValue: config });
       mainEventEmitter.emit(MAIN_EVENTS.CONFIG_CHANGED, config);
-
-      console.log('[Rules Handlers] Rules reordered');
     }
   );
 }

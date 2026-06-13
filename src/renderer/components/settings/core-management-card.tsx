@@ -388,14 +388,14 @@ export function CoreManagementCard() {
             className={[
               'mt-3 rounded-lg border p-4 transition-shadow',
               availableCoreUpdate.crossBand
-                ? 'border-amber-500/40 bg-amber-500/10'
+                ? 'border-warning/40 bg-warning/10'
                 : 'border-primary/40 bg-primary/10',
               entryHighlight ? 'ring-2 ring-primary/60' : '',
             ].join(' ')}
           >
             <div className="flex items-start gap-3">
               {availableCoreUpdate.crossBand ? (
-                <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-amber-500" />
+                <AlertTriangle className="mt-0.5 h-5 w-5 shrink-0 text-warning" />
               ) : (
                 <ArrowUpCircle className="mt-0.5 h-5 w-5 shrink-0 text-primary" />
               )}
@@ -403,9 +403,7 @@ export function CoreManagementCard() {
                 <p
                   className={[
                     'text-sm font-semibold',
-                    availableCoreUpdate.crossBand
-                      ? 'text-amber-600 dark:text-amber-400'
-                      : 'text-primary',
+                    availableCoreUpdate.crossBand ? 'text-warning' : 'text-primary',
                   ].join(' ')}
                 >
                   {t('settings.coreManagement.updateAvailable', {
@@ -413,7 +411,7 @@ export function CoreManagementCard() {
                   })}
                 </p>
                 {availableCoreUpdate.crossBand && (
-                  <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+                  <p className="mt-1 text-xs text-warning">
                     {t('settings.coreManagement.crossBandRisk')}
                   </p>
                 )}
@@ -517,8 +515,8 @@ export function CoreManagementCard() {
         )}
 
         {autoStatus?.crossBandLatest && (
-          <div className="mt-2 flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs text-muted-foreground">
-            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-500" />
+          <div className="mt-2 flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 p-3 text-xs text-muted-foreground">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
             <span>
               {t('settings.coreManagement.crossBandFound', {
                 version: autoStatus.crossBandLatest,

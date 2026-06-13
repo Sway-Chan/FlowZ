@@ -288,7 +288,7 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
           onBlur={() => setFocusedType((prev) => (prev === ct ? null : prev))}
           placeholder={t(`rules.types.${ct}.placeholder`, RULE_TYPE_PLACEHOLDER[ct])}
           className={`${SHORT_VALUE_TYPES.includes(ct) ? 'min-h-[60px]' : 'min-h-[100px]'} font-mono text-sm ${
-            invalid.length > 0 ? 'border-red-500/60 focus-visible:ring-red-500/40' : ''
+            invalid.length > 0 ? 'border-destructive/60 focus-visible:ring-destructive/40' : ''
           }`}
         />
         <p className="text-xs text-muted-foreground">
@@ -296,7 +296,7 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
           {PROCESS_TYPES.includes(ct) && ` · ${t('rules.processHint')}`}
         </p>
         {invalid.length > 0 && (
-          <p className="text-xs text-red-600 dark:text-red-400">
+          <p className="text-xs text-destructive">
             {t('rules.invalidInline', {
               values: `${invalid.slice(0, 3).join(', ')}${invalid.length > 3 ? ' …' : ''}`,
             })}

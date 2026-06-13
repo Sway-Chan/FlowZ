@@ -61,7 +61,6 @@ export const IPC_CHANNELS = {
   // 日志管理
   LOGS_GET: 'logs:get',
   LOGS_CLEAR: 'logs:clear',
-  LOGS_SET_LEVEL: 'logs:setLevel',
 
   // 自启动管理
   AUTO_START_SET: 'autoStart:set',
@@ -92,7 +91,6 @@ export const IPC_CHANNELS = {
   // 核心管理
   CORE_UPDATE_CHECK: 'core-update:check',
   CORE_UPDATE_RUN: 'core-update:update',
-  CORE_UPDATE_GET_VERSION: 'core-update:get-version',
   CORE_GET_VERSION_INFO: 'core:getVersionInfo',
   CORE_ROLLBACK: 'core:rollback',
   CORE_REPLACE_MANUAL: 'core:replaceManual',

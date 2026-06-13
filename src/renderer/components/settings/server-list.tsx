@@ -218,16 +218,16 @@ export function ServerList({
   const getLatencyColor = (latency: number | undefined) => {
     if (latency === undefined) return 'text-muted-foreground';
     if (latency === -1) return 'text-destructive';
-    if (latency < 100) return 'text-green-500';
-    if (latency < 300) return 'text-yellow-500';
+    if (latency < 100) return 'text-success';
+    if (latency < 300) return 'text-warning';
     return 'text-destructive';
   };
 
   const getLatencyBg = (latency: number | undefined) => {
     if (latency === undefined) return '';
     if (latency === -1) return 'bg-destructive/10';
-    if (latency < 100) return 'bg-green-500/10';
-    if (latency < 300) return 'bg-yellow-500/10';
+    if (latency < 100) return 'bg-success/10';
+    if (latency < 300) return 'bg-warning/10';
     return 'bg-destructive/10';
   };
 
@@ -754,7 +754,7 @@ export function ServerList({
                   selectedServerId === server.id
                     ? 'ring-2 ring-primary bg-primary/5'
                     : 'hover:bg-muted/50'
-                } ${isSelecting && selectedIds.has(server.id) ? 'ring-2 ring-blue-400 bg-blue-50/10' : ''}`}
+                } ${isSelecting && selectedIds.has(server.id) ? 'ring-2 ring-primary bg-primary/10' : ''}`}
                 onClick={() =>
                   isSelecting
                     ? toggleSelect(server.id, { stopPropagation: () => {} } as any)
@@ -854,7 +854,7 @@ export function ServerList({
                 key={server.id}
                 className={`relative overflow-hidden flex items-center gap-3 px-4 py-2.5 cursor-pointer transition-colors ${
                   selectedServerId === server.id ? 'bg-primary/5' : 'hover:bg-muted/50'
-                } ${isSelecting && selectedIds.has(server.id) ? 'bg-blue-50/10' : ''}`}
+                } ${isSelecting && selectedIds.has(server.id) ? 'bg-primary/10' : ''}`}
                 onClick={() => {
                   if (isSelecting) {
                     setSelectedIds((prev) => {

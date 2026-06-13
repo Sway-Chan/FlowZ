@@ -31,6 +31,7 @@ import {
   registerSystemHandlers,
   registerRuleResourceHandlers,
 } from './ipc/handlers';
+import { setIpcLogger } from './ipc/ipc-handler';
 import { createAutoStartManager } from './services/AutoStartManager';
 import { UpdateService } from './services/UpdateService';
 import { CoreUpdateService } from './services/CoreUpdateService';
@@ -39,6 +40,8 @@ import { SpeedTestService } from './services/SpeedTestService';
 import { AutoSwitchService } from './services/AutoSwitchService';
 import { SubscriptionScheduler } from './services/SubscriptionScheduler';
 import { StatsService } from './services/StatsService';
+import { ClashApiClient } from './services/ClashApiClient';
+import { PlatformPrivilegeService } from './services/PlatformPrivilegeService';
 import { IpInfoService } from './services/IpInfoService';
 import { RuleResourceManager } from './services/RuleResourceManager';
 import { seedBuiltinRuleSets } from './services/builtin-geo-rulesets';
@@ -849,7 +852,7 @@ if (gotTheLock) {
     try {
       const config = await configManager.loadConfig();
       // 让 config.logLevel 对 LogManager 生效：原本 LogManager 恒留默认 'info'，config 设的 FATAL 形同虚设
-      // （设置页改 logLevel 走 CONFIG_SAVE，从不调 setLogLevel；LOGS_SET_LEVEL 是死代码）→ 设 FATAL 仍刷屏非 FATAL。
+      // （设置页改 logLevel 走 CONFIG_SAVE，从不经 IPC 调 setLogLevel；原 LOGS_SET_LEVEL IPC 链路已作为死代码移除）→ 设 FATAL 仍刷屏非 FATAL。
       // 经 effectiveLogLevel：隐私模式开时抬到 ≥warn，app.log 与 sing-box 一同收敛连接明细。
       logManager.setLogLevel(effectiveLogLevel(config.logLevel || 'info', getPrivacyMode()));
       logManager.addLog('info', 'Configuration loaded successfully', 'Main');
@@ -891,16 +894,54 @@ if (gotTheLock) {
     // 系统代理单一写者：注入同一 singleton（上方 756 创建），enable/clear 统一收口 ProxyManager.start()/终态。
     proxyManager.setSystemProxyManager(systemProxyManager);
 
-    // 流量统计：代理运行时轮询 clash_api，经事件推渲染端展示（带 clash secret 鉴权）
+    // clash_api(9090) 专属客户端（T15：ProxyManager 与 StatsService 共用单一 keep-alive agent，消除两处 plumbing 重复）。
+    // secret 经 getter 回调读 currentConfig.clashApiSecret（reload 后自动读最新）。
+    const clashApiClient = new ClashApiClient(() => proxyManager?.getClashApiSecret() ?? '');
+    proxyManager.setClashApiClient(clashApiClient);
+
+    // 平台提权服务（T16：纯函数/无状态方法 + killOrphans 链迁出 ProxyManager/CoreUpdateService，delegate 后调用点零改动）。
+    // ctx.log 桥接两端 source：ProxyManager 侧 logToManager 固定 'sing-box'（默认），CoreUpdateService 侧透传 'CoreUpdateService'。
+    // ctx 各只读回调指向 proxyManager 私有 getter（isTunMode/configPath/singboxPath/currentManagedPid/isProcessAlive/waitForNetworkCleanup），
+    // service 不直接访问 ProxyManager 内部状态。
+    // helperManager 可为 null（未装时 macOS 分支回退 osascript）。
+    const privilegeService = new PlatformPrivilegeService(
+      {
+        log: (level, message, source) => logManager.addLog(level, message, source ?? 'sing-box'),
+        isTunMode: () => proxyManager?.isTunModeNow() ?? false,
+        isInteractive: () => proxyManager?.isStartInteractive() ?? true,
+        configPath: () => proxyManager?.getConfigPath() ?? '',
+        singboxPath: () => proxyManager?.getSingboxPath() ?? '',
+        currentManagedPid: () => proxyManager?.getCurrentManagedPid() ?? null,
+        isProcessAlive: (pid) => proxyManager?.isProcessAlive(pid) ?? false,
+        waitForNetworkCleanup: async () => {
+          await proxyManager?.waitForNetworkCleanup();
+        },
+        // T16 子 commit 3：stopElevated 用
+        startedViaHelper: () => proxyManager?.isStartedViaHelper() ?? false,
+        stopFlagPath: () => proxyManager?.getStopFlagPath() ?? '',
+        waitForProcessExit: (pid, timeout) =>
+          proxyManager?.waitForProcessExit(pid, timeout) ?? Promise.resolve(true),
+        onStopAuthCancelled: () => {
+          // 镜像原 forceKillOrReportCancelled 内联的 sendEventToRenderer(STOP_AUTH_CANCELLED)：
+          // service 不持 IPC 通道，经回调把「取消授权→发非终态提示」交还 ProxyManager。
+          proxyManager?.notifyStopAuthCancelled();
+        },
+      },
+      helperManager
+    );
+    proxyManager.setPrivilegeService(privilegeService);
+    coreUpdateService.setPrivilegeService(privilegeService);
+
+    // 流量统计：代理运行时轮询 clash_api（经 ClashApiClient），经事件推渲染端展示
     statsService = new StatsService(
       (stats) => ipcEventEmitter.sendToAll(IPC_CHANNELS.EVENT_STATS_UPDATED, stats),
-      () => proxyManager?.getClashApiSecret() ?? '',
+      clashApiClient,
       (snap) => ipcEventEmitter.sendToAll(IPC_CHANNELS.EVENT_CONNECTIONS_UPDATED, snap)
     );
-    // 杀核前静默 clash_api 客户端：停轮询 + 关到 9090 的 keep-alive 连接 → 9090 不进 TIME_WAIT（P0-2 治本）。
+    // 杀核前静默 clash_api 客户端：停 StatsService 轮询（client.agent 的 RST 由 stopSingBoxProcess 的
+    // destroyClashApiAgent→client.destroyAgent 统一负责，单一 destroy 路径，P0-2 治本不变）。
     proxyManager.setQuiesceClashClients(() => {
       statsService?.stop();
-      statsService?.closeConnections();
     });
 
     // 出口 IP 信息：经探针 inbound 测本地直连出口 / 代理出口，事件驱动刷新（无周期轮询）
@@ -1081,6 +1122,9 @@ if (gotTheLock) {
       // 的 stop→start 瞬时窗口）。调度器内部守 running===false，绝不在重启间隙落位（不断流硬不变量）。
       coreUpdateScheduler?.onProxyStopped();
     });
+
+    // 注入 LogManager 供 IPC 注册器在生产环境记录「同名 channel 重复注册」等异常（须在任意 register* 之前）
+    setIpcLogger(logManager);
 
     // 注册 IPC 处理器（需要在 ProxyManager 创建后）
     registerConfigHandlers(configManager);

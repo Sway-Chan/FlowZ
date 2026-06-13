@@ -24,13 +24,6 @@ export function registerCoreUpdateHandlers() {
     return await coreUpdateService.updateCore(downloadUrl);
   });
 
-  registerIpcHandler(IPC_CHANNELS.CORE_UPDATE_GET_VERSION, async () => {
-    if (!coreUpdateService) {
-      throw new Error('CoreUpdateService not initialized');
-    }
-    return await coreUpdateService.getCurrentVersion();
-  });
-
   registerIpcHandler(IPC_CHANNELS.CORE_GET_VERSION_INFO, async () => {
     if (!coreUpdateService) {
       throw new Error('CoreUpdateService not initialized');

@@ -1,4 +1,4 @@
-const { spawn } = require('child_process');
+const { spawn, execSync } = require('child_process');
 const { createServer } = require('vite');
 const path = require('path');
 const waitOn = require('wait-on');
@@ -25,6 +25,8 @@ async function startDev() {
 
   // 3. 编译主进程代码
   console.log('🔨 编译主进程代码...');
+  // 先注入构建日期常量（B-1：about 页 buildDate 取构建时刻，非运行时 new Date）
+  execSync('node scripts/gen-build-info.js', { stdio: 'inherit' });
   const tsc = spawn('npx', ['tsc', '-p', 'tsconfig.main.json'], {
     shell: true,
     stdio: 'inherit',

@@ -90,6 +90,11 @@ export class RuleResourceManager {
       fileExists: fssync.existsSync(path.join(this.dir(), r.fileName)),
       referencedBy: this.referencingRules(config, r.id).length,
     }));
+    // 用户资源按名称排序（中文拼音 / 英文字母 / 数字自然序，忽略大小写）；仅排展示副本，
+    // config.ruleResources 存储顺序不动。内置 geo 不参与排序，固定置顶。
+    userItems.sort((a, b) =>
+      a.name.localeCompare(b.name, 'zh-Hans-CN', { numeric: true, sensitivity: 'base' })
+    );
     // 内置 geo 规则集合成置顶（智能分流固定依赖；运行时落 <userData>/rules，与用户资源分目录）
     return [...this.listBuiltins(config), ...userItems];
   }

@@ -7,10 +7,10 @@
   "scripts": {
     "prepare": "husky",
     "dev": "node scripts/dev.js",
-    "dev:main": "cross-env NODE_ENV=development tsc -p tsconfig.main.json && electron .",
+    "dev:main": "node scripts/gen-build-info.js && cross-env NODE_ENV=development tsc -p tsconfig.main.json && electron .",
     "dev:renderer": "vite",
     "build": "npm run build:main && npm run build:renderer",
-    "build:main": "tsc -p tsconfig.main.json",
+    "build:main": "node scripts/gen-build-info.js && tsc -p tsconfig.main.json",
     "build:renderer": "vite build",
     "build:helper": "bash scripts/build-helper.sh",
     "package": "npm run build && electron-builder",

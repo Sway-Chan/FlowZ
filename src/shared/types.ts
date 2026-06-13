@@ -611,6 +611,7 @@ export enum ProxyErrorCode {
   AUTO_RESTART_FAILED = 'AUTO_RESTART_FAILED', // 自动重启失败达上限
   RESTART_LIMIT_REACHED = 'RESTART_LIMIT_REACHED', // 健康检查发现死亡且重启耗尽
   STOP_AUTH_CANCELLED = 'STOP_AUTH_CANCELLED', // 停止时用户取消提权授权、进程仍在运行（非终态）
+  CORE_UPDATE_IN_PROGRESS = 'CORE_UPDATE_IN_PROGRESS', // 内核二进制替换窗口中，手动 start/restart/switchMode 被拒（瞬态，非终态）
   UNKNOWN = 'UNKNOWN',
 }
 

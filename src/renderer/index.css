@@ -20,6 +20,13 @@
     --accent-foreground: 217.2 91.2% 59.8%;
     --destructive: 0 84.2% 60.2%;
     --destructive-foreground: 210 40% 98%;
+    /* 语义色：与 --primary/--muted/--destructive 同模式，供 badge/速率/告警/协议标识统一引用 */
+    --success: 142.1 70.6% 35.3%;
+    --success-foreground: 0 0% 100%;
+    --warning: 32.1 94.6% 43.7%;
+    --warning-foreground: 0 0% 100%;
+    --info: 217.2 91.2% 59.8%;
+    --info-foreground: 0 0% 100%;
     --border: 214 20% 84%;
     --input: 214 22% 80%;
     --ring: 217.2 91.2% 59.8%;
@@ -43,6 +50,13 @@
     --accent-foreground: 0 0% 98%;
     --destructive: 0 62.8% 30.6%;
     --destructive-foreground: 0 0% 98%;
+    /* 语义色（暗）：饱和度降、亮度提，与暗 destructive 同梯度 */
+    --success: 142.1 65% 42%;
+    --success-foreground: 0 0% 100%;
+    --warning: 32.1 90% 50%;
+    --warning-foreground: 0 0% 10%;
+    --info: 217.2 91.2% 65%;
+    --info-foreground: 0 0% 10%;
     --border: 0 0% 24%;
     --input: 0 0% 27%;
     --ring: 0 0% 83.1%;

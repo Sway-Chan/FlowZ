@@ -180,6 +180,7 @@ export function proxyErrorCategory(code: unknown): ErrorCategory | null {
     case ProxyErrorCode.AUTO_RESTART_FAILED:
     case ProxyErrorCode.RESTART_LIMIT_REACHED:
     case ProxyErrorCode.STOP_AUTH_CANCELLED:
+    case ProxyErrorCode.CORE_UPDATE_IN_PROGRESS:
       return ErrorCategory.Process;
     default:
       return null; // UNKNOWN
