@@ -22,6 +22,7 @@
     "dist:win": "npm run build && electron-builder --win --publish never",
     "dist:mac": "npm run build:helper && npm run build && electron-builder --mac --publish never",
     "dist:linux": "npm run build && electron-builder --linux --x64 --publish never",
+    "pretest": "node scripts/gen-build-info.js",
     "test": "jest --passWithNoTests",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
