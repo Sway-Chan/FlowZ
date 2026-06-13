@@ -97,7 +97,7 @@
         }
       ],
       "final": "dns-domestic",
-      "strategy": "ipv4_only"
+      "strategy": "prefer_ipv4"
     },
     "routeRules": [
       {
@@ -429,7 +429,7 @@
         }
       ],
       "final": "dns-domestic",
-      "strategy": "ipv4_only"
+      "strategy": "prefer_ipv4"
     },
     "routeRules": [
       {
@@ -738,7 +738,7 @@
         }
       ],
       "final": "dns-domestic",
-      "strategy": "ipv4_only"
+      "strategy": "prefer_ipv4"
     },
     "routeRules": [
       {

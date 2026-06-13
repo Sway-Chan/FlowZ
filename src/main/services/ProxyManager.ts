@@ -2004,9 +2004,10 @@ done
       rules: [],
       // 默认使用国内 DNS 解析
       final: 'dns-domestic',
-      // strategy 仅控制 A/AAAA 偏好（IPv6 启用或 macOS 走 prefer_ipv4），与 FakeIP 无关：
-      // usesFakeIp 无平台分支，三平台 enableFakeIp 时一致走 FakeIP（旧注释「macOS=RealIP/嗅探」已过时，实为恒 FakeIP）。
-      strategy: process.platform === 'darwin' || config.enableIPv6 ? 'prefer_ipv4' : 'ipv4_only',
+      // strategy 仅控制 A/AAAA 偏好，与 FakeIP 无关：统一 prefer_ipv4（sing-box 官方默认行为，三平台一致）。
+      // 原 ipv4_only 分支会抑制 AAAA 查询，伤 CDN 优选域名 / IPv6-only 目标的解析（#57）；prefer_ipv4 在无 IPv6 时
+      // 仍优先用 A，安全无副作用。usesFakeIp 无平台分支，三平台 enableFakeIp 时一致走 FakeIP（旧注释已过时，实为恒 FakeIP）。
+      strategy: 'prefer_ipv4',
       // 关 FakeIP：补 reverse_mapping，让无 SNI/ECH 的连接也能用 DNS 反查域名做路由匹配（不改节点收 IP 事实，见设计 T3）。
       // 开 FakeIP 时不加（FakeIP 本身已提供域名↔假 IP 的双向映射）。
       ...(enableFakeIp ? {} : { reverse_mapping: true }),
