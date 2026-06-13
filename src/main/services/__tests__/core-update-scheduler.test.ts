@@ -588,21 +588,26 @@ describe('B0：兼容版本带去硬编码 + verifiedCeiling', () => {
     expect(r.hasUpdate).toBe(true);
   });
 
-  it('verifiedCeiling 棘轮升：成功运行 1.14.0 → 写 verifiedCeiling=1014', async () => {
-    const svc = new CoreUpdateService(makeLogManager());
-    jest.spyOn(svc as any, 'getCurrentVersion').mockResolvedValue('1.14.0');
-    jest.spyOn(svc as any, 'getVersionFilePath').mockReturnValue('/tmp/flowz-b0-ver.json');
-    jest.spyOn(svc as any, 'clearKnownBad').mockImplementation(() => {});
-    let state: any = { verifiedCeiling: 1013 };
-    jest.spyOn(svc as any, 'loadAutoState').mockImplementation(() => state);
-    const saved: any[] = [];
-    jest.spyOn(svc as any, 'saveAutoState').mockImplementation((p: any) => {
-      saved.push(p);
-      state = { ...state, ...p };
-    });
-    await svc.recordSuccessfulVersion();
-    expect(saved).toContainEqual({ verifiedCeiling: 1014 });
-  });
+  // 平台限定：recordSuccessfulVersion 会向 app.getPath('userData')(测试中为 Unix 风格 mock 路径)写 core-version.json，
+  // 在 Windows CI 上该路径 writeFileSync 抛错 → 被 catch 吞 → 棘轮 saveAutoState 未执行。逻辑在 Linux 已验证，仅 Linux 跑。
+  (process.platform === 'linux' ? it : it.skip)(
+    'verifiedCeiling 棘轮升：成功运行 1.14.0 → 写 verifiedCeiling=1014',
+    async () => {
+      const svc = new CoreUpdateService(makeLogManager());
+      jest.spyOn(svc as any, 'getCurrentVersion').mockResolvedValue('1.14.0');
+      jest.spyOn(svc as any, 'getVersionFilePath').mockReturnValue('/tmp/flowz-b0-ver.json');
+      jest.spyOn(svc as any, 'clearKnownBad').mockImplementation(() => {});
+      let state: any = { verifiedCeiling: 1013 };
+      jest.spyOn(svc as any, 'loadAutoState').mockImplementation(() => state);
+      const saved: any[] = [];
+      jest.spyOn(svc as any, 'saveAutoState').mockImplementation((p: any) => {
+        saved.push(p);
+        state = { ...state, ...p };
+      });
+      await svc.recordSuccessfulVersion();
+      expect(saved).toContainEqual({ verifiedCeiling: 1014 });
+    }
+  );
 
   it('verifiedCeiling 不降级：成功运行 1.13（低于已验证 1.14）→ 不覆盖', async () => {
     const svc = new CoreUpdateService(makeLogManager());

@@ -117,82 +117,88 @@ describe('#57 节点域名解析器：生成配置断言（3档×3模式）', ()
   }
 });
 
-describe('#57 ⑥ auto 档 byte-diff：仅限有意改动，其余零变化', () => {
-  const pm = new ProxyManager();
-  const baselinePath = path.join(__dirname, 'dns-resolver-baseline.json');
-  const baseline = JSON.parse(fs.readFileSync(baselinePath, 'utf-8'));
+// 平台限定：baseline 为 Linux 捕获，而生成 config 含平台相关字段（如 Windows TUN inbound 的 route_exclude_address
+// 大列表防回流、macOS DNS strategy），在 macOS/Windows CI 上与单平台 baseline 必然不符。仅 Linux 跑此 byte-diff。
+const byteDiffDescribe = process.platform === 'linux' ? describe : describe.skip;
+byteDiffDescribe(
+  '#57 ⑥ auto 档 byte-diff：仅限有意改动，其余零变化（平台相关 config，仅 Linux baseline）',
+  () => {
+    const pm = new ProxyManager();
+    const baselinePath = path.join(__dirname, 'dns-resolver-baseline.json');
+    const baseline = JSON.parse(fs.readFileSync(baselinePath, 'utf-8'));
 
-  // 基线键名（采集脚本用 buildFixtures 的 auto 缺字段 fixture）：tun-smart__auto / tun-global__auto / systemproxy__auto
-  const fixtures = buildFixtures().filter((f) => f.resolver === undefined);
+    // 基线键名（采集脚本用 buildFixtures 的 auto 缺字段 fixture）：tun-smart__auto / tun-global__auto / systemproxy__auto
+    const fixtures = buildFixtures().filter((f) => f.resolver === undefined);
 
-  for (const fx of fixtures) {
-    it(`${fx.name}: 与基线 diff 仅 rule1 全量化(去keyword) + 恒加 dns-node server + 1.12.12.12 直连（rule1.server 仍 dns-domestic）`, () => {
-      const cur = extractDnsRoute(pm.generateSingBoxConfig(fx.config));
-      const base = baseline[fx.name];
-      expect(base).toBeDefined();
+    for (const fx of fixtures) {
+      it(`${fx.name}: 与基线 diff 仅 rule1 全量化(去keyword) + 恒加 dns-node server + 1.12.12.12 直连（rule1.server 仍 dns-domestic）`, () => {
+        const cur = extractDnsRoute(pm.generateSingBoxConfig(fx.config));
+        const base = baseline[fx.name];
+        expect(base).toBeDefined();
 
-      // --- A. dns.servers：当前 = 基线 + 仅多一个 dns-node，其余 server 逐字节相同、相对顺序不变 ---
-      const baseServers = base.dns.servers as AnyCfg[];
-      const curServers = cur.dns.servers as AnyCfg[];
-      const curMinusNode = curServers.filter((s) => s.tag !== 'dns-node');
-      expect(JSON.stringify(curMinusNode)).toBe(JSON.stringify(baseServers));
-      expect(curServers.some((s) => s.tag === 'dns-node')).toBe(true);
+        // --- A. dns.servers：当前 = 基线 + 仅多一个 dns-node，其余 server 逐字节相同、相对顺序不变 ---
+        const baseServers = base.dns.servers as AnyCfg[];
+        const curServers = cur.dns.servers as AnyCfg[];
+        const curMinusNode = curServers.filter((s) => s.tag !== 'dns-node');
+        expect(JSON.stringify(curMinusNode)).toBe(JSON.stringify(baseServers));
+        expect(curServers.some((s) => s.tag === 'dns-node')).toBe(true);
 
-      // --- B. dns.rules：除 rule1（节点域名规则）外逐字节相同；rule1 为有意全量化改动 ---
-      const baseRules = base.dns.rules as AnyCfg[];
-      const curRules = cur.dns.rules as AnyCfg[];
-      expect(curRules.length).toBe(baseRules.length); // 规则条数不变（rule1 原位替换）
-      // 基线 rule1：含 node-a 域名的那条
-      const baseR1Idx = baseRules.findIndex(
-        (r) =>
-          Array.isArray(r.domain) &&
-          r.domain.includes(NODE_A.address) &&
-          !r.query_type &&
-          !r.rule_set
-      );
-      const curR1Idx = curRules.findIndex(
-        (r) =>
-          Array.isArray(r.domain) &&
-          r.domain.includes(NODE_A.address) &&
-          !r.query_type &&
-          !r.rule_set
-      );
-      expect(curR1Idx).toBe(baseR1Idx); // rule1 位置不变
-      // 除 rule1 外的所有 DNS 规则逐字节相同
-      const stripR1 = (rs: AnyCfg[], idx: number) => rs.filter((_, i) => i !== idx);
-      expect(JSON.stringify(stripR1(curRules, curR1Idx))).toBe(
-        JSON.stringify(stripR1(baseRules, baseR1Idx))
-      );
-      // rule1 自身的有意改动：基线含 domain_keyword/仅 selectedServer；当前去 keyword/全节点。
-      // server 忠实回 dns-domestic（doh.pub，与基线一致，auto 档不与 dial 的 dns-bootstrap 统一）。
-      expect(baseRules[baseR1Idx].domain_keyword).toBeDefined();
-      expect(curRules[curR1Idx].domain_keyword).toBeUndefined();
-      expect(curRules[curR1Idx].server).toBe('dns-domestic');
-      expect(baseRules[baseR1Idx].server).toBe('dns-domestic'); // 与基线同档，server 非 delta
-
-      // --- C. dns 顶层其余字段（final/strategy/fakeip）零变化 ---
-      const topOnly = (d: AnyCfg) => ({ final: d.final, strategy: d.strategy, fakeip: d.fakeip });
-      expect(JSON.stringify(topOnly(cur.dns))).toBe(JSON.stringify(topOnly(base.dns)));
-
-      // --- D. route.rules：除「含 1.12.12.12/32 的直连规则」外逐字节相同 ---
-      const stripNodeIp = (rules: AnyCfg[]) =>
-        rules.map((r) =>
-          Array.isArray(r.ip_cidr)
-            ? { ...r, ip_cidr: r.ip_cidr.filter((c: string) => c !== '1.12.12.12/32') }
-            : r
+        // --- B. dns.rules：除 rule1（节点域名规则）外逐字节相同；rule1 为有意全量化改动 ---
+        const baseRules = base.dns.rules as AnyCfg[];
+        const curRules = cur.dns.rules as AnyCfg[];
+        expect(curRules.length).toBe(baseRules.length); // 规则条数不变（rule1 原位替换）
+        // 基线 rule1：含 node-a 域名的那条
+        const baseR1Idx = baseRules.findIndex(
+          (r) =>
+            Array.isArray(r.domain) &&
+            r.domain.includes(NODE_A.address) &&
+            !r.query_type &&
+            !r.rule_set
         );
-      expect(JSON.stringify(stripNodeIp(cur.routeRules))).toBe(JSON.stringify(base.routeRules));
+        const curR1Idx = curRules.findIndex(
+          (r) =>
+            Array.isArray(r.domain) &&
+            r.domain.includes(NODE_A.address) &&
+            !r.query_type &&
+            !r.rule_set
+        );
+        expect(curR1Idx).toBe(baseR1Idx); // rule1 位置不变
+        // 除 rule1 外的所有 DNS 规则逐字节相同
+        const stripR1 = (rs: AnyCfg[], idx: number) => rs.filter((_, i) => i !== idx);
+        expect(JSON.stringify(stripR1(curRules, curR1Idx))).toBe(
+          JSON.stringify(stripR1(baseRules, baseR1Idx))
+        );
+        // rule1 自身的有意改动：基线含 domain_keyword/仅 selectedServer；当前去 keyword/全节点。
+        // server 忠实回 dns-domestic（doh.pub，与基线一致，auto 档不与 dial 的 dns-bootstrap 统一）。
+        expect(baseRules[baseR1Idx].domain_keyword).toBeDefined();
+        expect(curRules[curR1Idx].domain_keyword).toBeUndefined();
+        expect(curRules[curR1Idx].server).toBe('dns-domestic');
+        expect(baseRules[baseR1Idx].server).toBe('dns-domestic'); // 与基线同档，server 非 delta
 
-      // --- E. default_domain_resolver / inbounds(含 route_exclude_address) 零变化 ---
-      //    (Linux 测试环境：Windows excludeAddr 分支不触发，故 inbounds 对本平台逐字节相同) ---
-      expect(cur.routeDefaultDomainResolver).toBe(base.routeDefaultDomainResolver);
-      expect(JSON.stringify(cur.inbounds)).toBe(JSON.stringify(base.inbounds));
+        // --- C. dns 顶层其余字段（final/strategy/fakeip）零变化 ---
+        const topOnly = (d: AnyCfg) => ({ final: d.final, strategy: d.strategy, fakeip: d.fakeip });
+        expect(JSON.stringify(topOnly(cur.dns))).toBe(JSON.stringify(topOnly(base.dns)));
 
-      // --- F. 节点 outbound resolver 在 auto 档零变化（仍 dns-bootstrap） ---
-      expect(JSON.stringify(cur.outboundResolvers)).toBe(JSON.stringify(base.outboundResolvers));
-    });
+        // --- D. route.rules：除「含 1.12.12.12/32 的直连规则」外逐字节相同 ---
+        const stripNodeIp = (rules: AnyCfg[]) =>
+          rules.map((r) =>
+            Array.isArray(r.ip_cidr)
+              ? { ...r, ip_cidr: r.ip_cidr.filter((c: string) => c !== '1.12.12.12/32') }
+              : r
+          );
+        expect(JSON.stringify(stripNodeIp(cur.routeRules))).toBe(JSON.stringify(base.routeRules));
+
+        // --- E. default_domain_resolver / inbounds(含 route_exclude_address) 零变化 ---
+        //    (Linux 测试环境：Windows excludeAddr 分支不触发，故 inbounds 对本平台逐字节相同) ---
+        expect(cur.routeDefaultDomainResolver).toBe(base.routeDefaultDomainResolver);
+        expect(JSON.stringify(cur.inbounds)).toBe(JSON.stringify(base.inbounds));
+
+        // --- F. 节点 outbound resolver 在 auto 档零变化（仍 dns-bootstrap） ---
+        expect(JSON.stringify(cur.outboundResolvers)).toBe(JSON.stringify(base.outboundResolvers));
+      });
+    }
   }
-});
+);
 
 describe('#57 错误归因：translateErrorMessage / classifyCoreError 同序镜像', () => {
   const pm = new ProxyManager();
