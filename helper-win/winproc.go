@@ -35,14 +35,78 @@ func startSingbox(singboxBin, cfg, logPath string) (*exec.Cmd, *os.File, error) 
 	if err := c.Start(); err != nil {
 		return nil, logFile, err
 	}
+	// 防孤儿安全网（H1）：确保常驻 job 存在，并把刚起的 child assign 进去。
+	// 必须在 Start 成功后（此刻 child 必活、pid 必指向本 child，无复用窗口）；best-effort 不阻断 start。
+	if err := ensureJob(); err == nil && c.Process != nil {
+		assignToJob(c.Process.Pid)
+	}
 	return c, logFile, nil
 }
 
-// sendCtrlBreak：向指定进程组（pid 为组长，见 CREATE_NEW_PROCESS_GROUP）投递 CTRL_BREAK_EVENT，触发 sing-box
-// 优雅退出（拆 wintun/路由/DNS）。镜像 macOS SIGTERM 的「优雅信号」语义。
-// 失败（进程已退出/非组长）返回 err，由 terminateChild 的 5s 超时 + TerminateProcess 兜底。
+// sendCtrlBreak：向指定进程组（pid 为组长，见 CREATE_NEW_PROCESS_GROUP）投递 CTRL_BREAK_EVENT，尝试触发
+// sing-box 优雅退出（拆 wintun/路由/DNS）。镜像 macOS SIGTERM 的「优雅信号」语义。
+// 重要限制：GenerateConsoleCtrlEvent 只路由给与调用者**共享 console** 的进程。本 helper 作为 session 0 的
+// LocalSystem 服务**无 console**，且 child 以 CREATE_NEW_PROCESS_GROUP 启动（不分配新 console）→ 服务模式下
+// 此调用是 no-op，CTRL_BREAK 永远投递不到。仅在 --console dev 模式（有 console）下有效。
+// 失败（进程已退出/非组长/服务模式无 console）返回 err，由 terminateChild 的超时 + TerminateProcess 硬杀兜底。
 func sendCtrlBreak(pid int) error {
 	return windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, uint32(pid))
+}
+
+// ---- Job Object：防孤儿安全网（H1）----
+//
+// 服务模式 CTRL_BREAK 失效（见 sendCtrlBreak），且若 helper 进程异常死亡（崩溃 / SCM 未净收割就杀），
+// 那些 watchParent 不及覆盖的路径会留下 LocalSystem 孤儿 sing-box 继续占 9090/TUN（无普通用户能清）。
+// Windows Job Object + JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE 提供内核级安全网：所有 child 都 assign 进一个随
+// helper 生命周期常驻的 job，helper 进程一死 → job 句柄被内核关闭 → 内核自动连坐杀光 job 内所有进程。
+//
+// 职责分工：
+//   - watchParent 管「GUI app 死、helper 还活」（父死看护，主动收割）。
+//   - Job Object 管「helper 自己死」（被动安全网，内核连坐）。二者互补，覆盖各自的孤儿场景。
+var hJob windows.Handle
+
+// ensureJob：惰性创建常驻 job 并设 KILL_ON_JOB_CLOSE。幂等（已建则直接返回成功）。
+// 只在持 mu 的 start 路径调用（与 child 摘挂同临界区，无需额外锁保护 hJob）。
+func ensureJob() error {
+	if hJob != 0 {
+		return nil
+	}
+	h, err := windows.CreateJobObject(nil, nil) // 匿名 job（无名、默认安全描述符）
+	if err != nil {
+		return err
+	}
+	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+	info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+	if _, err := windows.SetInformationJobObject(
+		h,
+		windows.JobObjectExtendedLimitInformation,
+		uintptr(unsafe.Pointer(&info)),
+		uint32(unsafe.Sizeof(info)),
+	); err != nil {
+		windows.CloseHandle(h)
+		return err
+	}
+	hJob = h
+	return nil
+}
+
+// assignToJob：把 child 进程 assign 进常驻 job，使其受 KILL_ON_JOB_CLOSE 连坐保护。
+// AssignProcessToJobObject 要 child 的进程 **HANDLE**（非 pid）且需 PROCESS_SET_QUOTA|PROCESS_TERMINATE 权限。
+// Go 1.24 的 os.Process 不再暴露公开的 Handle 字段（内部 handle 私有），故就地 OpenProcess(pid) 取一个有足够
+// 权限的句柄；用完即关。
+// PID 复用安全：调用点在 c.Start() 成功后立即执行，此刻 c.Process 仍持有 child（尚未 Wait 收割）→ child 必活、
+// 该 pid 必指向本 child，不存在「pid 被复用到别的进程」的窗口。
+// best-effort：OpenProcess/assign 失败不阻断 start（watchParent + 收割仍是孤儿防护主路径，job 是额外安全网）。
+func assignToJob(pid int) {
+	if hJob == 0 || pid <= 0 {
+		return
+	}
+	h, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(pid))
+	if err != nil {
+		return
+	}
+	defer windows.CloseHandle(h)
+	_ = windows.AssignProcessToJobObject(hJob, h)
 }
 
 // processAlive：判 ppid 是否存活。OpenProcess(SYNCHRONIZE|QUERY_LIMITED_INFORMATION) 成功且
@@ -241,7 +305,16 @@ func listenPidsForPort(port uint16) ([]uint32, error) {
 		pid  uint32
 		port uint16
 	} {
+		// 空表防越界：Windows 在「无 LISTEN」时返回 size=4（仅 dwNumEntries=0 这 4 字节头，无行数组）。
+		// 必须先校验 len>=4 再读行数 n；n==0 时直接返回，绝不在空表上求值 &table[4]（越界 panic）。
+		// freeport 任何持 token 的本地用户可触发，绝不能 panic。
+		if len(table) < 4 {
+			return nil
+		}
 		n := *(*uint32)(unsafe.Pointer(&table[0]))
+		if n == 0 {
+			return nil
+		}
 		rows := unsafe.Slice((*mibTCPRowOwnerPID)(unsafe.Pointer(&table[4])), int(n))
 		res := make([]struct {
 			pid  uint32
@@ -266,7 +339,14 @@ func listenPidsForPort(port uint16) ([]uint32, error) {
 		pid  uint32
 		port uint16
 	} {
+		// 空表防越界：同 IPv4 路径——size=4（仅 dwNumEntries=0 头）时 &table[4] 越界 panic，先校验 len/n。
+		if len(table) < 4 {
+			return nil
+		}
 		n := *(*uint32)(unsafe.Pointer(&table[0]))
+		if n == 0 {
+			return nil
+		}
 		rows := unsafe.Slice((*mibTCP6RowOwnerPID)(unsafe.Pointer(&table[4])), int(n))
 		res := make([]struct {
 			pid  uint32
@@ -289,20 +369,23 @@ func listenPidsForPort(port uint16) ([]uint32, error) {
 	return out, nil
 }
 
-// enableIPForwarding：allowLan/IP 转发的最小 Windows 实现。
-// 设 HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\IPEnableRouter=1（DWORD）。
-// best-effort：失败不阻塞 start。真机必验项 —— 注册表生效通常需重启「Routing and Remote Access」服务或重启系统，
-//
-//	单设注册表未必即时转发。完整实现应另启用/配置 RRAS 或用 netsh，留待真机验证后补。
+// enableIPForwarding：allowLan/IP 转发的最小 Windows 实现，镜像 macOS start 的 IPv4+IPv6 双开
+//（macOS: net.inet.ip.forwarding=1 + net.inet6.ip6.forwarding=1）。
+// IPv4：设 HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\IPEnableRouter=1（DWORD）。
+// IPv6：netsh interface ipv6 set global forwarding=enabled（运行时即时生效，等价 IPv4 注册表的对侧补足）。
+// best-effort：两路均失败不阻塞 start。真机必验项 —— IPv4 注册表生效通常需重启「Routing and Remote Access」服务或
+// 重启系统，单设注册表未必即时转发；完整实现应另启用/配置 RRAS，留待真机验证后补。
 func enableIPForwarding() {
-	k, _, err := registry.CreateKey(
+	// IPv4：注册表副作用。已知限制（review M3）：这是**持久**写入，stop/卸载本 helper 不还原 IPEnableRouter
+	// —— 与 macOS sysctl（重启即失效的运行时开关）语义不同；如需还原须额外清理逻辑，当前镜像 IPv4 现状不做。
+	if k, _, err := registry.CreateKey(
 		registry.LOCAL_MACHINE,
 		`SYSTEM\CurrentControlSet\Services\Tcpip\Parameters`,
 		registry.SET_VALUE,
-	)
-	if err != nil {
-		return
+	); err == nil {
+		_ = k.SetDWordValue("IPEnableRouter", 1)
+		k.Close()
 	}
-	defer k.Close()
-	_ = k.SetDWordValue("IPEnableRouter", 1)
+	// IPv6：best-effort，错误忽略（镜像 IPv4 路径不阻塞 start）。netsh 是运行时开关，无需重启即生效。
+	_ = exec.Command("netsh", "interface", "ipv6", "set", "global", "forwarding=enabled").Run()
 }

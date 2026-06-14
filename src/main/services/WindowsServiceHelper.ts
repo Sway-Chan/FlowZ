@@ -187,6 +187,9 @@ export class WindowsServiceHelper implements IPrivilegedHelper {
       needsRepair: installed && !ready,
       // 以下为 macOS 专属字段，Windows 恒默认值（消费方契约：先判 backgroundDisabled 再判 needsRepair）。
       backgroundDisabled: false,
+      // 已知限制（review TS-H2，待真机/后续）：Windows 核更新（Portable 模式写 userData/core_update）后，服务 binPath
+      // 仍指向安装时锁定的 sing-box，此处不检测漂移（恒 false）→ 不触发修复 gate。后续可比对服务 ImagePath 的 --singbox
+      // 段 vs 当前 getSingBoxPath() 实现之；当前 Windows 核更新走 app 侧、非 helper，影响有限。
       pathMismatch: false,
       installedSingboxPath: null,
     };
@@ -264,7 +267,11 @@ export class WindowsServiceHelper implements IPrivilegedHelper {
    */
   async install(): Promise<{ success: boolean; error?: string; status: HelperStatus }> {
     if (!this.supported) {
-      return { success: false, error: '仅 Windows 支持提权服务', status: await this.computeStatus() };
+      return {
+        success: false,
+        error: '仅 Windows 支持提权服务',
+        status: await this.computeStatus(),
+      };
     }
     this.mutationInFlight = true;
     try {
@@ -319,7 +326,11 @@ export class WindowsServiceHelper implements IPrivilegedHelper {
   /** 卸载服务：UAC 提权跑 sc stop + sc delete + 删 token；并删客户端 token 副本。 */
   async uninstall(): Promise<{ success: boolean; error?: string; status: HelperStatus }> {
     if (!this.supported) {
-      return { success: false, error: '仅 Windows 支持提权服务', status: await this.computeStatus() };
+      return {
+        success: false,
+        error: '仅 Windows 支持提权服务',
+        status: await this.computeStatus(),
+      };
     }
     this.mutationInFlight = true;
     try {
@@ -348,9 +359,10 @@ export class WindowsServiceHelper implements IPrivilegedHelper {
   }
 
   /**
-   * 安装脚本（UAC 内以管理员跑）：写受保护 token（ACL：SYSTEM + Administrators，去继承）→ 幂等清旧服务 →
-   * sc create（binPath 锁定 exe + --singbox/--confdir/--support，start=auto，obj=LocalSystem）→ sc start。
-   * binPath 内层路径用 \" 转义（sc 把整个 binPath= 后的引号串当一个值）。
+   * 安装脚本体（在 runElevatedPowerShell 的 $ErrorActionPreference=Stop + try/catch 包裹内跑）：写受保护 token
+   * （ACL：SYSTEM + Administrators，去继承）→ 幂等清旧服务并**轮询等其真正消失** → New-Service **1072 退避重试**
+   * 创建（BinaryPathName 单一 .NET 字符串直达 CreateService，真双引号锁定 exe + 三参，默认 LocalSystem，Automatic
+   * 开机自启）→ sc start。
    */
   private buildInstallScript(
     exe: string,
@@ -358,51 +370,74 @@ export class WindowsServiceHelper implements IPrivilegedHelper {
     confDir: string,
     token: string
   ): string {
-    // sc binPath= 值：外层由 sc 的 "..." 包裹，内层各含空格路径用 \" 包裹。
-    const binPath =
-      `\\"${exe}\\" --singbox \\"${singboxPath}\\" --confdir \\"${confDir}\\" --support \\"${SUPPORT_DIR}\\"`;
+    // BinaryPathName(ImagePath)：各含空格路径用**真双引号**包裹，经 New-Service 单一字符串直达 Win32 CreateService。
+    // 不可用 `sc.exe create binPath= "\"..\""`：PS 原样把 `\"` 传给 sc → 服务启动经 CommandLineToArgvW 时 `\"`
+    // 退化为字面引号 → 含空格安装路径（默认 C:\Program Files\FlowZ）下 argv 碎裂、flag 值带字面引号 → 服务侧
+    // singboxBin/confDir/supportDir 全污染（isLockedSingbox/cfgAllowed/tokenValue 全失效）。
+    const binPath = `"${exe}" --singbox "${singboxPath}" --confdir "${confDir}" --support "${SUPPORT_DIR}"`;
     const tokenFile = path.join(SUPPORT_DIR, 'helper.token');
     return [
-      "$ErrorActionPreference = 'Stop'",
       `$support = '${this.psq(SUPPORT_DIR)}'`,
       `$tokenFile = '${this.psq(tokenFile)}'`,
+      `$bp = '${this.psq(binPath)}'`,
       'New-Item -ItemType Directory -Force -Path $support | Out-Null',
       // 写 token（无 BOM ASCII），随后设 ACL：去继承、仅 SYSTEM + Administrators 读
       `Set-Content -Path $tokenFile -Value '${this.psq(token)}' -NoNewline -Encoding ascii`,
       'icacls $tokenFile /inheritance:r | Out-Null',
       'icacls $tokenFile /grant:r "SYSTEM:(R)" "Administrators:(R)" | Out-Null',
-      // 幂等：若服务已存在，先停再删（忽略错误），再重建到当前路径/版本
+      // 幂等重装：停 + 删旧服务（按名）
       `& sc.exe stop ${SERVICE_NAME} 2>$null | Out-Null`,
       `& sc.exe delete ${SERVICE_NAME} 2>$null | Out-Null`,
-      'Start-Sleep -Milliseconds 300',
-      `& sc.exe create ${SERVICE_NAME} binPath= "${binPath}" start= auto obj= LocalSystem | Out-Null`,
+      // sc delete 是异步「标记删除」（须等所有句柄关闭 + 进程停才移除）→ 轮询等服务真消失，否则 New-Service 撞
+      // 1072 ERROR_SERVICE_MARKED_FOR_DELETE（重装真机高概率命中）。
+      '$deadline = (Get-Date).AddSeconds(15)',
+      `while ((Get-Service -Name ${SERVICE_NAME} -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }`,
+      // New-Service 退避重试兜底（删除标记态 1072 窗口期）：BinaryPathName 单一字符串直达 CreateService；
+      // 默认账户即 LocalSystem；-StartupType Automatic = 开机自启常驻（app 全程只发管道命令、不 start/stop 服务）。
+      '$created = $false',
+      'for ($i = 0; $i -lt 10 -and -not $created; $i++) {',
+      `  try { New-Service -Name ${SERVICE_NAME} -BinaryPathName $bp -StartupType Automatic | Out-Null; $created = $true }`,
+      '  catch { Start-Sleep -Milliseconds 500 }',
+      '}',
+      "if (-not $created) { throw 'New-Service 失败：服务仍处于删除标记态(1072)，请稍候或重启后重试安装' }",
       `& sc.exe start ${SERVICE_NAME} | Out-Null`,
     ].join('\n');
   }
 
-  /** 卸载脚本（UAC 内以管理员跑）：停 + 删服务 + 删受保护 token/目录。 */
+  /** 卸载脚本体（在 runElevatedPowerShell 的 Stop + try/catch 包裹内跑）：停 + 删服务 + 删受保护 token/目录。
+   *  对「服务/目录不存在」容错（sc 外部命令不受 Stop 影响、不抛；Remove-Item 显式 SilentlyContinue）。 */
   private buildUninstallScript(): string {
     return [
-      "$ErrorActionPreference = 'SilentlyContinue'",
       `& sc.exe stop ${SERVICE_NAME} 2>$null | Out-Null`,
       'Start-Sleep -Milliseconds 300',
       `& sc.exe delete ${SERVICE_NAME} 2>$null | Out-Null`,
       `Remove-Item -Recurse -Force -Path '${this.psq(SUPPORT_DIR)}' -ErrorAction SilentlyContinue`,
-      'exit 0',
     ].join('\n');
   }
 
   /**
-   * 以一次 UAC 跑 PowerShell 脚本：写临时 .ps1 → 外层 Start-Process -Verb RunAs -Wait 触发 UAC →
-   * 内层脚本结尾把 $LASTEXITCODE 写 flag 文件，外层据此判成败；UAC 取消 → Start-Process 抛错 → 外层 exit 1。
-   * ⚠️ 真机必验：UAC 弹窗/取消、-Wait 完成语义、flag 回写时序。
+   * 以一次 UAC 跑 PowerShell 脚本：写临时 .ps1 → 外层 Start-Process -Verb RunAs -Wait 触发 UAC。
+   * 内层以 $ErrorActionPreference=Stop + try/catch 包裹脚本体：成功写 flag "0"；失败把**异常信息**写 .err + flag "1"，
+   * 供 app 回传具体失败原因（对齐「失败须带原因」——否则只见「退出码 N」无法区分 1072 竞态 / 路径错 / ACL 失败）。
+   * UAC 取消 → Start-Process 抛错 → 外层 exit 1。
+   * ⚠️ 真机必验：UAC 弹窗/取消、-Wait 完成语义、flag/err 回写时序、sc delete→New-Service 重装竞态命中率。
    */
   private runElevatedPowerShell(inner: string): Promise<{ success: boolean; error?: string }> {
     return new Promise((resolve) => {
       const stamp = randomBytes(6).toString('hex');
       const scriptPath = path.join(os.tmpdir(), `flowz-helper-${stamp}.ps1`);
       const flagPath = path.join(os.tmpdir(), `flowz-helper-${stamp}.done`);
-      const script = `${inner}\n"$LASTEXITCODE" | Out-File -FilePath '${this.psq(flagPath)}' -Encoding ascii\n`;
+      const errPath = path.join(os.tmpdir(), `flowz-helper-${stamp}.err`);
+      const script = [
+        "$ErrorActionPreference = 'Stop'",
+        'try {',
+        inner,
+        `  "0" | Out-File -FilePath '${this.psq(flagPath)}' -Encoding ascii`,
+        '} catch {',
+        `  $_.Exception.Message | Out-File -FilePath '${this.psq(errPath)}' -Encoding utf8`,
+        `  "1" | Out-File -FilePath '${this.psq(flagPath)}' -Encoding ascii`,
+        '}',
+      ].join('\n');
       try {
         fs.writeFileSync(scriptPath, script, 'utf8');
       } catch (e) {
@@ -422,23 +457,32 @@ export class WindowsServiceHelper implements IPrivilegedHelper {
           if (err) {
             error = 'UAC 取消或提权失败';
           } else {
+            let code = '';
             try {
-              const code = fs.readFileSync(flagPath, 'utf8').trim();
-              success = code === '' || code === '0';
-              if (!success) error = `提权脚本退出码 ${code}`;
+              code = fs.readFileSync(flagPath, 'utf8').trim();
             } catch {
-              error = '提权脚本未写回结果（可能被取消）';
+              /* 未写回 */
+            }
+            if (code === '0') {
+              success = true;
+            } else {
+              let detail = '';
+              try {
+                detail = fs.readFileSync(errPath, 'utf8').trim();
+              } catch {
+                /* 无具体原因 */
+              }
+              error =
+                detail ||
+                (code === '' ? '提权脚本未写回结果（可能被取消）' : `提权脚本失败（码 ${code}）`);
             }
           }
-          try {
-            fs.unlinkSync(scriptPath);
-          } catch {
-            /* ignore */
-          }
-          try {
-            fs.unlinkSync(flagPath);
-          } catch {
-            /* ignore */
+          for (const p of [scriptPath, flagPath, errPath]) {
+            try {
+              fs.unlinkSync(p);
+            } catch {
+              /* ignore */
+            }
           }
           resolve({ success, error });
         }

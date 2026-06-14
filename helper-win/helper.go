@@ -76,25 +76,33 @@ func cfgAllowed(cfg string) bool {
 	return strings.HasPrefix(strings.ToLower(clean), strings.ToLower(base))
 }
 
-// terminateChild：优雅停（CTRL_BREAK→等≤5s→TerminateProcess）收割 child sing-box。镜像 macOS terminateChild
+// terminateChild：优雅停（CTRL_BREAK→等≤2s→TerminateProcess）收割 child sing-box。镜像 macOS terminateChild
 // （SIGTERM→等≤5s→SIGKILL）的纪律：
-//   - 必须不持 mu 调用（最长阻塞 5s，持锁会饿死所有管道命令）。
+//   - 必须不持 mu 调用（最长阻塞 ~2s，持锁会饿死所有管道命令）。
 //   - 调用方须先在持锁状态把 child 摘成 nil（收割权独占）。
 //   - 经 c.Process / done channel 做 PID 复用安全：Wait() 收割后再发信号天然无害（进程句柄已 release）。
 //
 // Windows delta：无 SIGTERM。优雅路径 = GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid)（要求 child 以
 // CREATE_NEW_PROCESS_GROUP 启动，见 startSingbox）；硬路径 = TerminateProcess（c.Process.Kill）。
-// 真机必验项：sing-box 在 CTRL_BREAK vs 硬杀下是否清理 wintun 适配器/路由（硬杀可能残留 wintun 适配器）。
+//
+// 关键现实（H1）：CTRL_BREAK 在**服务模式是 no-op** —— GenerateConsoleCtrlEvent 只投递给与调用者共享 console
+// 的进程，而本 helper 是 session 0 无 console 的 LocalSystem 服务（见 sendCtrlBreak）。故服务模式下优雅路径
+// 永远不生效，硬杀（TerminateProcess）是**预期**收割手段。仅 --console dev 模式有 console，CTRL_BREAK 才有效。
+// 因此把等待窗口从 5s 缩到 2s：服务模式 5s 纯属空等（信号根本没投出去），2s 给 dev 模式 console 下 sing-box
+// 优雅拆栈留余量即可。
+// 残留风险：硬杀可能残留 wintun 适配器/路由（真机必验项，sing-box 硬杀是否自清适配器）；但 Job Object
+// （KILL_ON_JOB_CLOSE，见 winproc.go）+ Wait 收割保证不留**孤儿进程**——即使硬杀也无 root 进程残留占 9090/TUN。
 func terminateChild(c *exec.Cmd, done <-chan struct{}) {
 	if c == nil || c.Process == nil {
 		return
 	}
-	// 优雅信号：向 child 进程组发 CTRL_BREAK。失败（如进程已退出）无害，由后续超时/done 兜底。
+	// 优雅信号：向 child 进程组发 CTRL_BREAK（仅 --console dev 模式有效；服务模式 no-op，由下方硬杀兜底）。
+	// 失败（进程已退出/服务模式无 console）无害，由后续超时/done 兜底。
 	_ = sendCtrlBreak(c.Process.Pid)
 	select {
-	case <-done: // 已被 Wait 收割（优雅退出），免硬杀
-	case <-time.After(5 * time.Second):
-		_ = c.Process.Kill() // TerminateProcess；若恰已退出则 ErrProcessDone，无害
+	case <-done: // 已被 Wait 收割（dev 模式优雅退出），免硬杀
+	case <-time.After(2 * time.Second):
+		_ = c.Process.Kill() // TerminateProcess（服务模式的预期收割手段）；若恰已退出则 ErrProcessDone，无害
 	}
 }
 

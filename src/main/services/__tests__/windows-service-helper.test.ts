@@ -56,15 +56,19 @@ describe('WindowsServiceHelper', () => {
         'C:\\Users\\doveh\\AppData\\Roaming\\FlowZ',
         'deadbeefdeadbeef'
       );
-      // sc create：锁定 binPath（exe + 三参），auto-start，LocalSystem
-      expect(script).toContain('sc.exe create FlowZHelper binPath=');
-      expect(script).toContain('--singbox');
-      expect(script).toContain('--confdir');
+      // New-Service（非 sc create binPath=）：BinaryPathName 单一字符串直达 CreateService，绕开 CommandLineToArgvW 碎裂
+      expect(script).toContain('New-Service -Name FlowZHelper -BinaryPathName $bp');
+      expect(script).toContain('-StartupType Automatic');
+      expect(script).not.toContain('binPath='); // 不得再用 sc create binPath= 的脆弱引号路径
+      expect(script).not.toContain('-Credential'); // 锁定默认账户=LocalSystem 不变量（防误加凭据改成 NetworkService）
+      // MED-1：sc delete 异步「标记删除」→ 轮询等服务消失 + New-Service 1072 退避重试
+      expect(script).toContain('Get-Service');
+      expect(script).toContain('1072');
+      // 各含空格路径用**真双引号**包裹（非 \"），锁定 exe + 三参
+      expect(script).toContain('"C:\\Program Files\\FlowZ\\com.flowz.helper.exe"');
+      expect(script).toContain('--singbox "C:\\Program Files\\FlowZ\\sing-box.exe"');
+      expect(script).toContain('--confdir "C:\\Users\\doveh\\AppData\\Roaming\\FlowZ"');
       expect(script).toContain('--support');
-      expect(script).toContain('start= auto');
-      expect(script).toContain('obj= LocalSystem');
-      expect(script).toContain('com.flowz.helper.exe');
-      expect(script).toContain('sing-box.exe');
       // 启动服务
       expect(script).toContain('sc.exe start FlowZHelper');
       // 幂等：重装先停删旧服务
