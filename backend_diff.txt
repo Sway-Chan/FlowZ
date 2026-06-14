@@ -1,0 +1,1946 @@
+diff --git a/src/main/services/CoreUpdateService.ts b/src/main/services/CoreUpdateService.ts
+index dcbb0cc..6eb116b 100644
+--- a/src/main/services/CoreUpdateService.ts
++++ b/src/main/services/CoreUpdateService.ts
+@@ -11,6 +11,10 @@ import { LogManager } from './LogManager';
+ import { ProxyManager } from './ProxyManager';
+ import { resourceManager } from './ResourceManager';
+ 
++import type { UserConfig } from '../../shared/types';
++import { encodeMajorMinor } from '../utils/version';
++import coreManifest from '../../shared/core-manifest.json';
++
+ export interface CoreUpdateCheckResult {
+   hasUpdate: boolean;
+   currentVersion: string;
+@@ -27,10 +31,31 @@ export interface CoreVersionInfo {
+   lastKnownVersion: string | null;
+ }
+ 
++/**
++ * FlowZ 配置生成器已验证适配的 sing-box 版本带上限，编码为 major*1000+minor（1013 = 1.13）。
++ * 跨越此版本带（如 1.14）可能因 sing-box 配置 schema 破坏性变更导致生成的配置无法解析；默认不
++ * 自动跨带更新（可在设置关闭）。用整数编码比较，避免 parseFloat 把 "1.20" 误判为 1.2 < 1.13 而
++ * 漏放跨带更新。sing-box 升级并验证配置生成兼容后，应调高此值（统一在 core-manifest.json 维护）。
++ */
++const COMPATIBLE_CEILING = coreManifest.compatibleCeiling;
++
+ export class CoreUpdateService {
+   private logManager: LogManager;
+   private proxyManager: ProxyManager | null = null;
+   private isUpdating: boolean = false;
++  // 更新后等待「首次成功运行」验证的新版本号；首启成功→清除并删备份，首启失败→自动回滚
++  private pendingUpdateVersion: string | null = null;
++  private pendingUpdateAt: number = 0; // 更新落盘时间戳，用于"待验证"过期保护（防陈旧 pending 误回滚）
++  private stabilityTimer: ReturnType<typeof setTimeout> | null = null;
++  // 兜底计时器：更新后若迟迟无 'started'/'error' 事件来解决待验证态（如更新时代理未运行、用户不重启），
++  // 到期解除自动重启抑制，避免抑制闩永久挂起。
++  private pendingFallbackTimer: ReturnType<typeof setTimeout> | null = null;
++  private configProvider: (() => Promise<UserConfig>) | null = null;
++  // 新核心首启成功后需"稳定运行"此时长（无 error）才删旧备份——防 'started'(仅1s存活) 假成功删掉回滚网。
++  // 不变量：必须 > ProxyManager 健康检查间隔(10s)，否则 TUN 模式下崩溃在轮询检测到之前就被判稳定、误删备份。
++  private static readonly STABILITY_DWELL_MS = 30000;
++  // "待验证"最长有效期：超过则后续 error 视为与本次更新无关，不再触发回滚（防陈旧 pending 误回滚）
++  private static readonly PENDING_MAX_AGE_MS = 5 * 60 * 1000;
+ 
+   constructor(logManager: LogManager) {
+     this.logManager = logManager;
+@@ -40,6 +65,11 @@ export class CoreUpdateService {
+     this.proxyManager = proxyManager;
+   }
+ 
++  /** 注入配置读取器（用于读取"仅兼容版本带内更新"开关）。 */
++  setConfigProvider(provider: () => Promise<UserConfig>): void {
++    this.configProvider = provider;
++  }
++
+   /**
+    * 检查核心更新
+    */
+@@ -71,6 +101,39 @@ export class CoreUpdateService {
+       );
+ 
+       if (this.compareVersions(latestVersion, currentVersion) > 0) {
++        // 跳过曾预检/启动失败的问题版本（手动更新可绕过）
++        if (this.isKnownBad(latestVersion)) {
++          this.logManager.addLog(
++            'info',
++            `最新版本 ${latestVersion} 曾验证失败，已跳过自动更新`,
++            'CoreUpdateService'
++          );
++          return {
++            hasUpdate: false,
++            currentVersion,
++            latestVersion,
++            error: `版本 ${latestVersion} 与当前配置不兼容（已跳过）；如需仍可手动更新`,
++          };
++        }
++
++        // 版本带闸门：默认不自动跨越配置生成器已验证的版本带上限（防 schema 破坏导致无法解析）
++        if (await this.isRestrictToCompatibleMinor()) {
++          const latest = encodeMajorMinor(latestVersion);
++          if (!isNaN(latest) && latest > COMPATIBLE_CEILING) {
++            this.logManager.addLog(
++              'info',
++              `最新版本 ${latestVersion} 跨越兼容版本带(>1.13)，不自动更新`,
++              'CoreUpdateService'
++            );
++            return {
++              hasUpdate: false,
++              currentVersion,
++              latestVersion,
++              error: `新版本 ${latestVersion} 跨越兼容版本带，建议随 App 升级（可在设置关闭"仅兼容版本带内更新"以手动尝试）`,
++            };
++          }
++        }
++
+         // 找到适合当前平台的资源
+         const asset = this.findSuitableAsset(latestRelease.assets);
+         if (asset) {
+@@ -111,6 +174,7 @@ export class CoreUpdateService {
+     }
+ 
+     this.isUpdating = true;
++    let backupMade = false;
+ 
+     try {
+       // 1. 下载文件
+@@ -122,6 +186,21 @@ export class CoreUpdateService {
+       this.logManager.addLog('info', '正在解压核心文件...', 'CoreUpdateService');
+       const { corePath, extractDir: tempExtractDir } = await this.extractCore(tempPath);
+ 
++      // 2.5 预检：新核心可执行 + 可解析当前配置。不通过则不动现役核心（代理继续运行，永不 brick）。
++      const preflight = await this.preflightValidate(corePath);
++      if (!preflight.ok) {
++        if (preflight.version) this.markKnownBad(preflight.version);
++        try {
++          fs.unlinkSync(tempPath);
++          if (tempExtractDir && fs.existsSync(tempExtractDir)) {
++            fs.rmSync(tempExtractDir, { recursive: true, force: true });
++          }
++        } catch {
++          /* ignore */
++        }
++        throw new Error(`核心更新预检失败，已放弃（现役核心继续运行）：${preflight.reason}`);
++      }
++
+       // 3. 停止代理
+       let wasRunning = false;
+       if (this.proxyManager) {
+@@ -137,6 +216,7 @@ export class CoreUpdateService {
+ 
+       // 4. 备份旧核心
+       await this.backupCurrentCore();
++      backupMade = true;
+ 
+       // 5. 替换核心
+       this.logManager.addLog('info', '正在替换核心文件...', 'CoreUpdateService');
+@@ -172,6 +252,10 @@ export class CoreUpdateService {
+         fs.chmodSync(targetPath, 0o755);
+       }
+ 
++      // 核心单独更新后，确保 NaiveProxy 库 libcronet 与新核心同目录（官方 sing-box 包不含 libcronet，
++      // naive 仍依赖随 app 打包的那个；purego 从核心同目录加载）。
++      await resourceManager.ensureCronetBeside(targetDir);
++
+       // macOS: 清除下载隔离标记并重新 ad-hoc 签名
+       // 原因: macOS Gatekeeper 对新放入的未公证二进制会拦截执行 (SIGKILL)
+       // xattr -cr 清除 quarantine 标记, codesign --force -s - 重新 ad-hoc 签名使其被系统接受
+@@ -192,6 +276,36 @@ export class CoreUpdateService {
+ 
+       this.logManager.addLog('info', '核心文件替换成功', 'CoreUpdateService');
+ 
++      // naive 依赖随 app 打包的 libcronet（匹配出厂核心的 cronet-go 版本）。单独更新核心——尤其跨版本——
++      // 可能与打包库 ABI 漂移；该漂移在 dlopen 前不可见，sing-box check 预检无法发现。有 naive 节点则提示。
++      if (this.proxyManager?.hasNaiveNodes()) {
++        this.logManager.addLog(
++          'warn',
++          'naive 节点依赖随 app 打包的 libcronet；本次核心更新后如遇 naive 不可用，请回滚核心或等待 app 整体更新',
++          'CoreUpdateService'
++        );
++      }
++
++      // 标记"待首启验证"：稳定运行→删备份（稳定即弃）；首启失败→自动回滚（见 index 'error' 钩子）。
++      // 同时抑制 ProxyManager 自动重启——让新核心首次异常退出立即上报，而非在坏核心上空转重试。
++      this.pendingUpdateVersion = preflight.version;
++      this.pendingUpdateAt = Date.now();
++      this.proxyManager?.setAutoRestartSuppressed(true);
++      // 兜底：到期仍未被 'started'/'error' 解决，则清待验证态并解除抑制（避免抑制闩永久挂起）。
++      if (this.pendingFallbackTimer) clearTimeout(this.pendingFallbackTimer);
++      this.pendingFallbackTimer = setTimeout(() => {
++        this.pendingFallbackTimer = null;
++        if (this.pendingUpdateVersion) {
++          this.logManager.addLog(
++            'info',
++            '核心更新待验证窗口超时未见首启事件，解除自动重启抑制',
++            'CoreUpdateService'
++          );
++          this.pendingUpdateVersion = null;
++          this.proxyManager?.setAutoRestartSuppressed(false);
++        }
++      }, CoreUpdateService.PENDING_MAX_AGE_MS);
++
+       // 6. 清理临时文件
+       try {
+         fs.unlinkSync(tempPath);
+@@ -221,8 +335,8 @@ export class CoreUpdateService {
+       const msg = error instanceof Error ? error.message : String(error);
+       this.logManager.addLog('error', `更新核心失败: ${msg}`, 'CoreUpdateService');
+ 
+-      // 尝试恢复备份
+-      await this.restoreBackup();
++      // 尝试恢复备份（仅当本次确已备份；预检阶段失败时尚无新备份，避免误恢复陈旧 .bak 致降级）
++      if (backupMade) await this.restoreBackup();
+ 
+       throw error;
+     } finally {
+@@ -290,6 +404,15 @@ export class CoreUpdateService {
+       const data = { version, recordedAt: new Date().toISOString() };
+       fs.writeFileSync(versionFilePath, JSON.stringify(data, null, 2), 'utf-8');
+       this.logManager.addLog('info', `已记录成功版本: ${version}`, 'CoreUpdateService');
++
++      // 该版本成功运行 → 从问题版本名单移除（曾因瞬时原因误标记的版本恢复自动更新资格）
++      this.clearKnownBad(version);
++
++      // 若处于"更新后待验证"窗口：'started' 仅代表存活 1s、可能假成功，不立即删备份；改启动稳定
++      // 观察期，期内无 error 才判稳定→删备份（详见 startStabilityWatch / 修 review #3 假成功删备份）
++      if (this.pendingUpdateVersion) {
++        this.startStabilityWatch();
++      }
+     } catch (error) {
+       const msg = error instanceof Error ? error.message : String(error);
+       this.logManager.addLog('warn', `记录版本失败: ${msg}`, 'CoreUpdateService');
+@@ -462,6 +585,10 @@ export class CoreUpdateService {
+       fs.chmodSync(targetPath, 0o755);
+     }
+ 
++    // 手动替换核心后，确保 libcronet 与新核心同目录（naive 依赖随 app 打包的库；修 review M4，
++    // 与自动核心更新路径一致）
++    await resourceManager.ensureCronetBeside(targetDir);
++
+     // macOS: 清除隔离标记并重新签名
+     if (process.platform === 'darwin') {
+       try {
+@@ -505,6 +632,210 @@ export class CoreUpdateService {
+     this.logManager.addLog('info', '手动替换核心成功', 'CoreUpdateService');
+   }
+ 
++  // === 核心更新健壮性：预检 / 问题版本跳过 / 备份生命周期 / 自动回滚 ===
++
++  /** 取任意 sing-box 二进制的版本号（执行 `<bin> version` 解析）；不可执行返回 null。 */
++  private async getBinaryVersion(binPath: string): Promise<string | null> {
++    try {
++      const execFileAsync = require('util').promisify(require('child_process').execFile);
++      const { stdout } = await execFileAsync(binPath, ['version']);
++      const m = String(stdout).match(/(?:version\s+|v)(\d+\.\d+(?:\.\d+)?)/i);
++      return m ? m[1] : null;
++    } catch {
++      return null;
++    }
++  }
++
++  private getKnownBadPath(): string {
++    return path.join(app.getPath('userData'), 'core-known-bad.json');
++  }
++
++  private loadKnownBad(): string[] {
++    try {
++      const p = this.getKnownBadPath();
++      if (!fs.existsSync(p)) return [];
++      const d = JSON.parse(fs.readFileSync(p, 'utf-8'));
++      return Array.isArray(d?.versions) ? d.versions : [];
++    } catch {
++      return [];
++    }
++  }
++
++  /** 标记某版本为"问题版本"（预检/启动失败），自动更新将跳过；手动更新仍可强制安装。 */
++  private markKnownBad(version: string): void {
++    try {
++      const list = this.loadKnownBad();
++      if (!list.includes(version)) list.push(version);
++      fs.writeFileSync(
++        this.getKnownBadPath(),
++        JSON.stringify({ versions: list }, null, 2),
++        'utf-8'
++      );
++      this.logManager.addLog(
++        'warn',
++        `已标记问题版本 ${version}，自动更新将跳过`,
++        'CoreUpdateService'
++      );
++    } catch {
++      /* ignore */
++    }
++  }
++
++  isKnownBad(version: string): boolean {
++    return this.loadKnownBad().includes(version);
++  }
++
++  /** 从问题版本名单移除某版本（该版本成功运行后调用，使误标记可恢复）。 */
++  private clearKnownBad(version: string): void {
++    try {
++      const list = this.loadKnownBad();
++      if (!list.includes(version)) return;
++      const next = list.filter((v) => v !== version);
++      fs.writeFileSync(
++        this.getKnownBadPath(),
++        JSON.stringify({ versions: next }, null, 2),
++        'utf-8'
++      );
++    } catch {
++      /* ignore */
++    }
++  }
++
++  private async isRestrictToCompatibleMinor(): Promise<boolean> {
++    try {
++      if (!this.configProvider) return true;
++      const cfg = await this.configProvider();
++      return cfg?.restrictCoreUpdateToCompatibleMinor !== false; // 默认 true
++    } catch {
++      return true;
++    }
++  }
++
++  /**
++   * 核心更新预检：新核心二进制可执行 + 能解析"针对其版本生成的"当前配置（sing-box check）。
++   * 在替换现役核心之前调用 —— 不通过则现役核心不动、代理继续运行（永不 brick）。
++   */
++  private async preflightValidate(
++    newCorePath: string
++  ): Promise<{ ok: boolean; version: string | null; reason?: string }> {
++    const version = await this.getBinaryVersion(newCorePath);
++    if (!version) {
++      return { ok: false, version: null, reason: '新核心无法执行（架构不符或文件损坏）' };
++    }
++
++    const cfgJson = this.proxyManager ? this.proxyManager.buildPreflightConfigJson(version) : null;
++    if (!cfgJson) {
++      // 无活动配置（代理从未启动）→ 二进制可执行即视为通过
++      this.logManager.addLog(
++        'info',
++        `预检：新核心 ${version} 可执行（无活动配置，跳过 check）`,
++        'CoreUpdateService'
++      );
++      return { ok: true, version };
++    }
++
++    const tmpCfg = path.join(app.getPath('temp'), `flowz-preflight-${Date.now()}.json`);
++    try {
++      fs.writeFileSync(tmpCfg, cfgJson, 'utf-8');
++      const execFileAsync = require('util').promisify(require('child_process').execFile);
++      await execFileAsync(newCorePath, ['check', '-c', tmpCfg]);
++      this.logManager.addLog(
++        'info',
++        `预检通过：新核心 ${version} 可解析当前配置`,
++        'CoreUpdateService'
++      );
++      return { ok: true, version };
++    } catch (e: any) {
++      const detail = String(e?.stderr || e?.message || e).split('\n')[0];
++      return { ok: false, version, reason: `新核心无法解析当前配置：${detail}` };
++    } finally {
++      try {
++        fs.unlinkSync(tmpCfg);
++      } catch {
++        /* ignore */
++      }
++    }
++  }
++
++  /** 删除旧核心备份（新核心已稳定运行后调用 —— 稳定即不再回滚，省磁盘）。 */
++  private pruneBackup(): void {
++    try {
++      const bak = this.getBackupPath();
++      if (fs.existsSync(bak)) {
++        fs.unlinkSync(bak);
++        this.logManager.addLog('info', '新核心已稳定运行，已删除旧核心备份', 'CoreUpdateService');
++      }
++    } catch {
++      /* ignore */
++    }
++  }
++
++  /**
++   * 新核心首启成功后启动"稳定观察期"：STABILITY_DWELL_MS 内无 'error' 才判定稳定 → 删旧备份、清待
++   * 验证标记、恢复自动重启。期内若 'error' 触发 autoRollback 会先取消本计时器（备份仍在，可回滚）。
++   */
++  private startStabilityWatch(): void {
++    if (this.stabilityTimer) clearTimeout(this.stabilityTimer);
++    const watching = this.pendingUpdateVersion;
++    this.stabilityTimer = setTimeout(() => {
++      this.stabilityTimer = null;
++      if (this.pendingUpdateVersion !== watching) return; // 已被回滚/其它路径清除
++      this.logManager.addLog(
++        'info',
++        `新核心 ${watching} 已稳定运行 ${CoreUpdateService.STABILITY_DWELL_MS / 1000}s，删除旧核心备份`,
++        'CoreUpdateService'
++      );
++      this.pruneBackup();
++      if (this.pendingFallbackTimer) clearTimeout(this.pendingFallbackTimer);
++      this.pendingFallbackTimer = null;
++      this.pendingUpdateVersion = null;
++      this.proxyManager?.setAutoRestartSuppressed(false);
++    }, CoreUpdateService.STABILITY_DWELL_MS);
++  }
++
++  /**
++   * 更新后新核心"首次启动失败"时调用（由上层在 proxy 'error' 事件中触发）：回滚到备份核心并标记
++   * 问题版本。返回 true 表示已回滚（调用方应以旧核心重启代理）。先清除待验证标记防重入/回滚循环。
++   */
++  async autoRollbackIfPendingUpdate(): Promise<boolean> {
++    if (this.stabilityTimer) {
++      clearTimeout(this.stabilityTimer);
++      this.stabilityTimer = null;
++    }
++    if (this.pendingFallbackTimer) {
++      clearTimeout(this.pendingFallbackTimer);
++      this.pendingFallbackTimer = null;
++    }
++    const pending = this.pendingUpdateVersion;
++    const pendingAge = Date.now() - this.pendingUpdateAt;
++    this.pendingUpdateVersion = null;
++    this.proxyManager?.setAutoRestartSuppressed(false); // 回滚后旧核心恢复正常自动重启
++    if (!pending) return false;
++    // 过期保护：距本次更新过久仍未成功运行，此刻的 error 多半与核心更新无关（如用户改了配置）→ 不回滚
++    if (pendingAge > CoreUpdateService.PENDING_MAX_AGE_MS) {
++      this.logManager.addLog(
++        'info',
++        `待验证版本 ${pending} 距更新已超 ${CoreUpdateService.PENDING_MAX_AGE_MS / 60000} 分钟仍未成功运行，本次错误不触发回滚`,
++        'CoreUpdateService'
++      );
++      return false;
++    }
++    if (!this.hasBackup()) return false;
++    this.logManager.addLog(
++      'error',
++      `新核心 ${pending} 启动失败，自动回滚到备份核心`,
++      'CoreUpdateService'
++    );
++    try {
++      await this.rollbackCore(); // 恢复 .bak → 现役（内部停代理 + 删备份 + 记录版本）
++      this.markKnownBad(pending);
++      return true;
++    } catch (e) {
++      this.logManager.addLog('error', `自动回滚失败: ${e}`, 'CoreUpdateService');
++      return false;
++    }
++  }
++
+   /**
+    * 版本记录文件路径
+    */
+@@ -547,8 +878,16 @@ export class CoreUpdateService {
+   }
+ 
+   private compareVersions(v1: string, v2: string): number {
+-    const p1 = v1.split('.').map(Number);
+-    const p2 = v2.split('.').map(Number);
++    // 容忍前导 v 与 prerelease/build 后缀（"v1.13.13"、"1.13.13-beta"、"1.13.13+naive"），
++    // 每段 NaN→0，避免 "1.13.13-beta" 这类标签把某段算成 NaN 而误判为相等。
++    const norm = (v: string) =>
++      v
++        .replace(/^v/i, '')
++        .split(/[-+]/)[0]
++        .split('.')
++        .map((p) => parseInt(p, 10) || 0);
++    const p1 = norm(v1);
++    const p2 = norm(v2);
+     for (let i = 0; i < Math.max(p1.length, p2.length); i++) {
+       const n1 = p1[i] || 0;
+       const n2 = p2[i] || 0;
+@@ -673,12 +1012,30 @@ export class CoreUpdateService {
+           return;
+         }
+ 
++        // 完整性校验：累计字节与 Content-Length 比对，拦截被截断/中断的下载流入解压
++        const lenHeader = response.headers['content-length'];
++        const expectedBytes = parseInt(
++          (Array.isArray(lenHeader) ? lenHeader[0] : lenHeader) as string,
++          10
++        );
++        let receivedBytes = 0;
++
+         response.on('data', (chunk) => {
++          receivedBytes += chunk.length;
+           file.write(chunk);
+         });
+ 
+         response.on('end', () => {
+           file.close(() => {
++            if (!isNaN(expectedBytes) && receivedBytes !== expectedBytes) {
++              // 截断的 GitHub 下载会经 handleError 自动换镜像重试一次
++              handleError(
++                new Error(
++                  `下载不完整：收到 ${receivedBytes} 字节，期望 ${expectedBytes}（可能被截断）`
++                )
++              );
++              return;
++            }
+             resolve(tempPath);
+           });
+         });
+diff --git a/src/main/services/ProxyManager.ts b/src/main/services/ProxyManager.ts
+index a5b35b0..8b190e0 100644
+--- a/src/main/services/ProxyManager.ts
++++ b/src/main/services/ProxyManager.ts
+@@ -13,6 +13,7 @@ import type { ILogManager } from './LogManager';
+ import { IPC_CHANNELS } from '../../shared/ipc-channels';
+ import { resourceManager } from './ResourceManager';
+ import { retry } from '../utils/retry';
++import { coreVersionAtLeast } from '../utils/version';
+ import {
+   getUserDataPath,
+   getSingBoxConfigPath,
+@@ -21,6 +22,7 @@ import {
+   getCachePath,
+ } from '../utils/paths';
+ import { getAppPreset } from '../../shared/app-rules-preset';
++import coreManifest from '../../shared/core-manifest.json';
+ 
+ /**
+  * 私有 IP 地址段（CIDR 格式）
+@@ -191,6 +193,8 @@ interface SingBoxOutbound {
+     password: string;
+   };
+   network?: string;
++  // naive specific: 走 HTTP/3 (QUIC) 传输
++  quic?: boolean;
+   // TUIC specific
+   congestion_control?: string;
+   udp_relay_mode?: string;
+@@ -217,14 +221,30 @@ interface SingBoxOutbound {
+       public_key: string;
+       short_id: string;
+     };
++    ech?: { enabled: boolean };
++    fragment?: boolean;
+   };
+   // Transport
+   transport?: {
+     type: string;
+     path?: string;
++    host?: string;
+     headers?: Record<string, string | string[]>;
+     service_name?: string;
++    max_early_data?: number;
++    early_data_header_name?: string;
+   };
++  // Multiplex 多路复用
++  multiplex?: {
++    enabled: boolean;
++    protocol?: string;
++    max_connections?: number;
++    min_streams?: number;
++    padding?: boolean;
++  };
++  // Hysteria2 端口跳跃
++  server_ports?: string[];
++  hop_interval?: string;
+   // DNS resolver for outbound server domain
+   domain_resolver?: string;
+   // UDP over TCP (UoT)
+@@ -242,6 +262,10 @@ interface SingBoxOutbound {
+   host_key?: string[];
+   host_key_algorithms?: string[];
+   client_version?: string;
++  // selector specific（用于 clash_api 热切换节点：default=当前选中，interrupt_exist_connections=切换时是否中断现有连接）
++  outbounds?: string[];
++  default?: string;
++  interrupt_exist_connections?: boolean;
+ }
+ 
+ interface SingBoxRouteRule {
+@@ -283,6 +307,35 @@ interface SingBoxRouteConfig {
+   final?: string;
+ }
+ 
++/**
++ * 浏览器隐私 DoH 泄漏域名（DoH-over-HTTPS / DoH-over-QUIC）。route reject 与 DNS 拦截须用同一份清单，
++ * 避免某处漏掉某域名导致 DoH 绕过 hijack-dns / FakeIP 体系。改这一处即两处同步。
++ */
++const DOH_LEAK_DOMAIN_KEYWORDS = [
++  'dns.google',
++  'cloudflare-dns.com',
++  'doh.opendns.com',
++  'dns.quad9.net',
++  'one.one.one.one',
++];
++
++/** 主机字符串是否为 IPv4 字面量（与 DNS/route 生成各处保持同一判定，避免分类不一致）。 */
++const isIpv4Host = (host: string): boolean => /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(host);
++
++/** 主机字符串是否为 IPv6 字面量。 */
++const isIpv6Host = (host: string): boolean => /^[0-9a-fA-F:]+$/.test(host) && host.includes(':');
++
++/**
++ * QUIC(UDP/443) reject 规则工厂：可选叠加域名/进程等匹配器。route 与各处 blockQuic 共用，
++ * 保证 network/port/action 字面量始终一致（避免某处漏写 network 导致行为漂移）。
++ */
++const udp443RejectRule = (matcher: Record<string, unknown> = {}): SingBoxRouteRule => ({
++  ...matcher,
++  network: ['udp'],
++  port: [443],
++  action: 'reject',
++});
++
+ interface SingBoxExperimental {
+   cache_file?: {
+     enabled: boolean;
+@@ -315,11 +368,13 @@ export interface IProxyManager {
+   start(config: UserConfig): Promise<void>;
+   stop(): Promise<void>;
+   restart(config: UserConfig): Promise<void>;
++  switchMode(config: UserConfig): Promise<void>;
+   getStatus(): ProxyStatus;
+   generateSingBoxConfig(config: UserConfig, resolvedIps?: Record<string, string>): SingBoxConfig;
+   on(event: 'started' | 'stopped' | 'error', listener: (...args: any[]) => void): void;
+   off(event: 'started' | 'stopped' | 'error', listener: (...args: any[]) => void): void;
+   getCoreVersion(): Promise<string>;
++  buildPreflightConfigJson(targetVersion: string): string | null;
+ }
+ 
+ export class ProxyManager extends EventEmitter implements IProxyManager {
+@@ -328,6 +383,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+   private pid: number | null = null;
+   private singboxPid: number | null = null; // macOS TUN 模式下实际的 sing-box PID
+   private currentConfig: UserConfig | null = null;
++  // 启动时生成的「节点 id → selector 成员 tag」映射，用于 clash_api 热切换时定位目标 tag
++  private currentIdToTagMap: Map<string, string> | null = null;
+   private configPath: string;
+   private singboxPath: string;
+   private logManager: ILogManager | null = null;
+@@ -346,6 +403,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+ 
+   // 自动重启相关
+   private autoRestartEnabled: boolean = true;
++  // 核心更新"待验证窗口"内由 CoreUpdateService 置 true：抑制自动重启，让新核心首次异常退出立即
++  // 上报 'error' 触发回滚（而非在已知有问题的新核心上空转 MAX_RESTART_COUNT 次后才上报）。
++  private autoRestartSuppressed: boolean = false;
+   private restartCount: number = 0;
+   private lastRestartTime: number = 0;
+   private static readonly MAX_RESTART_COUNT = 3; // 最大重启次数
+@@ -433,6 +493,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+     await this.copyRuleSetsToUserData();
+ 
+     // 3.5. 预解析所有节点的域名为 IP（仅针对 TUN 模式），防止 Windows 下回流死循环
++    // 【待真机验证 / CDN 风险】：对"域名节点"预解析得到的 IP 会进 route_exclude_address，若节点在
++    //   共享 CDN(如 Cloudflare) 后，等于把共享 IP 加直连 → 误伤同 IP 的被墙站点、且抗不住 IP 轮换。
++    //   现已在 generateRouteConfig 用"全节点域名 → direct"的纯域名规则(sniff SNI)做 CDN 安全豁免；
++    //   此处 Windows IP 预解析是否仍为断环所必需，需 Wintun 真机验证：若域名规则+sniff 足够 → 删除本块；
++    //   若 Windows 确需 IP 级兜底 → 应仅对 IP-literal 节点保留、域名节点不预解析。无 Windows 环境暂不擅改。
+     const resolvedServerIps: Record<string, string> = {};
+     if (isTunMode && process.platform === 'win32') {
+       this.logToManager('info', '正在预解析节点域名以防止 TUN 回流...');
+@@ -513,6 +578,38 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+     if (config.proxyModeType === 'systemProxy') {
+       await this.setSystemProxy(config);
+     }
++
++    // H3 修复：sing-box 的 cache_file 会持久化 selector 的 clash_api 选择，重启后缓存会覆盖 config
++    // 的 default。故启动后用 clash_api 把 selector 校正回 config.selectedServerId，让 FlowZ 配置成为
++    // 单一真值、压过缓存。best-effort（不阻塞启动成功）。
++    void this.reassertSelectorSelection(config);
++  }
++
++  /**
++   * 启动后把 selector 选择校正回 config.selectedServerId（压过 cache_file 持久化的旧选择，修 H3）。
++   * best-effort + 短重试，clash_api 刚起可能未就绪；失败不影响启动（cache/default 仍是有效节点）。
++   */
++  private async reassertSelectorSelection(config: UserConfig): Promise<void> {
++    for (let i = 0; i < 10; i++) {
++      if (!this.singboxProcess && !this.singboxPid) return; // 已停止则放弃
++      // 每轮读最新 currentConfig.selectedServerId：若启动窗口内用户已热切到别的节点，则用新节点、
++      // 不要把它 revert 回启动时的旧节点。
++      const targetId = this.currentConfig?.selectedServerId ?? config.selectedServerId;
++      const tag = this.currentIdToTagMap?.get(targetId as string);
++      if (!tag) return;
++      try {
++        const res = await fetch('http://127.0.0.1:9090/proxies/proxy-selector', {
++          method: 'PUT',
++          headers: { 'Content-Type': 'application/json' },
++          body: JSON.stringify({ name: tag }),
++          signal: AbortSignal.timeout(2000),
++        });
++        if (res.ok) return;
++      } catch {
++        // clash_api 未就绪/瞬时失败 → 短延迟后重试
++      }
++      await new Promise((r) => setTimeout(r, 300));
++    }
+   }
+ 
+   /**
+@@ -530,6 +627,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+     }
+ 
+     await this.stopSingBoxProcess();
++    // 进程已停 → 清掉旧的 id→tag 映射，防止对一个已不存在的 selector 误发 clash_api 切换
++    this.currentIdToTagMap = null;
+   }
+ 
+   /**
+@@ -545,77 +644,98 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+    * 检测模式变化，如果代理正在运行则重启
+    */
+   async switchMode(newConfig: UserConfig): Promise<void> {
+-    // 检查是否有模式变化
+-    const modeChanged = this.hasModeChanged(newConfig);
+-
+-    if (!modeChanged) {
+-      // 模式没有变化，只更新配置
++    // 代理未运行：只更新配置（下次 start 时按新配置生成）
++    if (!this.singboxProcess && !this.singboxPid) {
+       this.currentConfig = newConfig;
+       return;
+     }
+ 
+-    // 如果代理正在运行，需要重启
+-    if (this.singboxProcess) {
+-      this.logToManager('info', '代理模式已更改，正在重启代理...');
+-      await this.restart(newConfig);
+-    } else {
+-      // 代理未运行，只更新配置
+-      this.currentConfig = newConfig;
++    // 唯一变化是「切节点」→ clash_api 热切换 selector，不重启 sing-box（优雅切换，连接保留与否由
++    // selector.interrupt_exist_connections 开关决定）。失败则退回重启式切换，保证一定能应用。
++    if (this.canHotSwitch(newConfig)) {
++      if (await this.hotSwitchNode(newConfig)) {
++        this.currentConfig = newConfig;
++        return;
++      }
++      this.logToManager('warn', '热切换失败，退回重启式切换');
+     }
++
++    // 其余变化（模式/端口/TUN/规则/节点集合/interrupt 开关 等需重生成配置的项）→ 重启应用。
++    this.logToManager('info', '配置已更改，正在重启代理以应用...');
++    await this.restart(newConfig);
+   }
+ 
+   /**
+-   * 检查模式是否变化
++   * 是否可走 clash_api 热切换：当且仅当唯一变化是「切到一个已在运行中 selector 里的节点」，
++   * 其余影响配置生成的项（模式/端口/TUN/customRules/servers 集合/appRules/interrupt 开关）都未变。
+    */
+-  private hasModeChanged(newConfig: UserConfig): boolean {
+-    if (!this.currentConfig) {
+-      return true;
+-    }
+-
+-    // 检查代理模式
+-    if (this.currentConfig.proxyMode !== newConfig.proxyMode) {
+-      return true;
+-    }
+-
+-    // 检查代理模式类型
+-    if (this.currentConfig.proxyModeType !== newConfig.proxyModeType) {
+-      return true;
+-    }
+-
+-    // 检查选中的服务器
+-    if (this.currentConfig.selectedServerId !== newConfig.selectedServerId) {
+-      return true;
+-    }
+-
+-    // 检查端口
+-    if (
+-      this.currentConfig.socksPort !== newConfig.socksPort ||
+-      this.currentConfig.httpPort !== newConfig.httpPort
+-    ) {
+-      return true;
+-    }
++  private canHotSwitch(newConfig: UserConfig): boolean {
++    const old = this.currentConfig;
++    if (!old) return false;
++    // 必须确实是切节点
++    if (old.selectedServerId === newConfig.selectedServerId) return false;
++    if (!newConfig.selectedServerId) return false;
++    // 目标节点必须已存在于运行中的 selector（= 启动时的 servers），否则 PUT 指向不存在的成员
++    if (!old.servers.some((s) => s.id === newConfig.selectedServerId)) return false;
++    // Windows TUN：route_exclude_address 在 start 时仅按「选中 + appRules」节点构建；热切到其它
++    // IP-literal 节点时其 server IP 不在排除集 → Wintun 会把 sing-box 自身出向包回捕进 TUN 成环。
++    // 配置不重生成无法补排除集，故 Windows TUN 一律退回重启（由重启重生成排除集）。
++    if (process.platform === 'win32' && newConfig.proxyModeType === 'tun') return false;
++    // 唯一允许变化的就是 selectedServerId：对齐它、servers 按 id 归一化后整体深比较——任何其它影响
++    // 配置生成的字段（blockQuic/tlsFragment/dnsConfig/各 TUN 子字段/appRules/customRules/端口/interrupt
++    // 开关 等）有差异都退回重启，避免「切节点 + 改某设置」同时发生时把那个设置静默丢掉。
++    const norm = (c: UserConfig) =>
++      this.stableStringify({
++        ...c,
++        selectedServerId: null,
++        servers: [...c.servers].sort((a, b) => a.id.localeCompare(b.id)),
++      });
++    return norm(old) === norm(newConfig);
++  }
+ 
+-    // 检查 TUN 配置（如果是 TUN 模式）
+-    if (newConfig.proxyModeType === 'tun') {
+-      const oldTun = this.currentConfig.tunConfig;
+-      const newTun = newConfig.tunConfig;
++  /**
++   * 递归按 key 排序后序列化——使深比较对对象属性插入顺序不敏感。
++   * 渲染层重建配置对象时键序常与原对象不同，普通 JSON.stringify 会因此误判"配置已变"而退回重启、
++   * 废掉热切换。数组顺序保留（customRules/appRules 顺序具语义，顺序变化应视为真变更触发重启）。
++   */
++  private stableStringify(v: any): string {
++    if (v === null || typeof v !== 'object') return JSON.stringify(v) ?? 'null';
++    if (Array.isArray(v)) return '[' + v.map((x) => this.stableStringify(x)).join(',') + ']';
++    return (
++      '{' +
++      Object.keys(v)
++        .sort()
++        .filter((k) => v[k] !== undefined) // 与 JSON.stringify 一致：丢弃 undefined 键，避免 undefined↔null 误判相等
++        .map((k) => JSON.stringify(k) + ':' + this.stableStringify(v[k]))
++        .join(',') +
++      '}'
++    );
++  }
+ 
+-      if (
+-        oldTun.mtu !== newTun.mtu ||
+-        oldTun.stack !== newTun.stack ||
+-        oldTun.autoRoute !== newTun.autoRoute ||
+-        oldTun.strictRoute !== newTun.strictRoute
+-      ) {
+-        return true;
++  /**
++   * 通过 clash_api `PUT /proxies/proxy-selector` 把 selector 切到目标节点（无需重启）。
++   * 成功返回 true；任何异常/非 2xx 返回 false（调用方退回重启）。
++   */
++  private async hotSwitchNode(newConfig: UserConfig): Promise<boolean> {
++    const targetTag = this.currentIdToTagMap?.get(newConfig.selectedServerId as string);
++    if (!targetTag) return false;
++    try {
++      const res = await fetch('http://127.0.0.1:9090/proxies/proxy-selector', {
++        method: 'PUT',
++        headers: { 'Content-Type': 'application/json' },
++        body: JSON.stringify({ name: targetTag }),
++        signal: AbortSignal.timeout(2000),
++      });
++      if (!res.ok) {
++        this.logToManager('warn', `clash_api 热切换返回 HTTP ${res.status}`);
++        return false;
+       }
+-    }
+-
+-    // 检查自定义规则
+-    if (JSON.stringify(this.currentConfig.customRules) !== JSON.stringify(newConfig.customRules)) {
++      this.logToManager('info', `已热切换节点 → ${targetTag}（clash_api，无重启）`);
+       return true;
++    } catch (e: any) {
++      this.logToManager('warn', `clash_api 热切换异常: ${e?.message ?? e}`);
++      return false;
+     }
+-
+-    return false;
+   }
+ 
+   /**
+@@ -672,10 +792,30 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+ 
+       // 备选方案：尝试直接取第一组连续的数字版本号
+       const secondMatch = stdout.match(/(\d+\.\d+\.\d+)/);
+-      return secondMatch ? secondMatch[1] : '1.13.0';
++      return secondMatch ? secondMatch[1] : coreManifest.bundledCoreVersion;
+     } catch (error) {
+       this.logToManager('error', `获取核心版本失败: ${(error as any).message}`);
+-      return '1.13.0';
++      return coreManifest.bundledCoreVersion;
++    }
++  }
++
++  /**
++   * 为「核心更新预检」生成针对目标版本的配置 JSON：用当前活动配置 + 目标核心版本的生成风格
++   * （<1.13 走 inbound sniff，≥1.13 走 route action），供 sing-box check 校验新核心能否解析。
++   * 无活动配置（代理从未启动）时返回 null —— 调用方仅校验二进制可执行即可。
++   */
++  buildPreflightConfigJson(targetVersion: string): string | null {
++    if (!this.currentConfig) return null;
++    const savedVersion = this.coreVersion;
++    try {
++      this.coreVersion = targetVersion;
++      const cfg = this.generateSingBoxConfig(this.currentConfig);
++      return JSON.stringify(cfg, null, 2);
++    } catch (e) {
++      this.logToManager('warn', `预检配置生成失败: ${(e as any)?.message ?? e}`);
++      return null;
++    } finally {
++      this.coreVersion = savedVersion;
+     }
+   }
+ 
+@@ -687,6 +827,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+     if (!selectedServer) {
+       throw new Error('Selected server not found');
+     }
++    // 选中节点不可用（naive 缺 libcronet）→ 明确报错，不静默切到别的节点（修 review M1）
++    if (!this.isNodeUsable(selectedServer)) {
++      throw new Error(this.naiveUnavailableReason(selectedServer));
++    }
+ 
+     // 调试日志
+     console.log('[ProxyManager] Generating config with:', {
+@@ -703,7 +847,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+     // 关键优化：预先生成 ID 到 Tag 的唯一映射，使用服务器名称作为 Tag，确保拓扑和日志显示友好名称
+     // 这样做之后内容拓扑（Clash API）和日志中显示的将是“香港 01”而不是“proxy-uuid”
+     const idToTagMap = new Map<string, string>();
+-    const usedTags = new Set<string>();
++    // 预占内置出站 tag，防止用户把节点命名为 proxy-selector/direct/block 等导致 tag 撞车启动 FATAL
++    const usedTags = new Set<string>(['proxy-selector', 'direct', 'block', 'direct-loopback']);
+ 
+     const getUniqueTag = (server: ServerConfig) => {
+       let baseTag = server.name.trim() || '未命名节点';
+@@ -721,13 +866,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+     for (const s of config.servers) {
+       idToTagMap.set(s.id, getUniqueTag(s));
+     }
++    // 记录本次生成的 id→tag 映射，供 clash_api 热切换定位 selector 成员 tag（见 hotSwitchNode）
++    this.currentIdToTagMap = idToTagMap;
+ 
+     const singboxConfig: SingBoxConfig = {
+       log: this.generateLogConfig(config),
+-      dns: this.generateDnsConfig(
+-        config,
+-        idToTagMap.get(config.selectedServerId as string) || 'proxy'
+-      ),
++      dns: this.generateDnsConfig(config, 'proxy-selector'),
+       inbounds: this.generateInbounds(config, resolvedIps),
+       outbounds: this.generateOutbounds(selectedServer, config, idToTagMap),
+       route: this.generateRouteConfig(config, idToTagMap),
+@@ -747,6 +891,19 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+       },
+     };
+ 
++    // 路由规则若指向「已被跳过/不存在的出站」（如缺 libcronet 被跳过的 naive 节点），sing-box 会以
++    // "outbound not found" 启动失败。统一把这类死引用修正为 selector（修 review H2：app/custom 分流
++    // 指向被跳过 naive 节点的情况）。
++    const validTags = new Set(
++      singboxConfig.outbounds.map((o) => o.tag).filter((t): t is string => !!t)
++    );
++    for (const rule of singboxConfig.route?.rules ?? []) {
++      const r = rule as { action?: string; outbound?: string };
++      if (r.action === 'route' && r.outbound && !validTags.has(r.outbound)) {
++        r.outbound = 'proxy-selector';
++      }
++    }
++
+     // 调试日志
+     console.log('[ProxyManager] Generated inbounds count:', singboxConfig.inbounds.length);
+     console.log('[ProxyManager] Generated outbounds count:', singboxConfig.outbounds.length);
+@@ -1017,9 +1174,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+     // 版本兼容：
+     //   1.12.x → sniff/sniff_override_destination 是 inbound 级别字段
+     //   1.13.x → 这些字段已移除，改由路由层 action: 'sniff' + override_destination: true 实现
+-    const inboundVer = this.coreVersion.match(/^(\d+\.\d+)/);
+-    const inboundVerNum = inboundVer ? parseFloat(inboundVer[1]) : 1.13;
+-    const useLegacySniff = !isNaN(inboundVerNum) && inboundVerNum < 1.13;
++    const useLegacySniff = !coreVersionAtLeast(this.coreVersion, 1, 13);
+ 
+     const httpInbound: SingBoxInbound = {
+       type: 'http',
+@@ -1060,9 +1215,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+ 
+     // TUN 模式额外添加 TUN inbound
+     if (modeType === 'tun') {
+-      const isIpv4 = (host: string) => /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(host);
+-      const isIpv6 = (host: string) => /^[0-9a-fA-F:]+$/.test(host) && host.includes(':');
+-
+       const shouldBypassLAN = config.bypassLAN !== false; // 默认为 true
+       // 恢复 3.3.18 能完美工作的排除列表。
+       // 注意：macOS 下绝对不能在底层排除物理局域网段，否则 macOS NetworkExtension 的路由逆向拦截机制会导致从 TUN (172.19.0.1) 发回 192.168.x.x 的 TCP 回执包被当作非法源 IP 丢弃，导致网页无限 HANG。
+@@ -1097,14 +1249,14 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+         if (!serverId) continue;
+         const server = config.servers.find((s) => s.id === serverId);
+         if (server?.address) {
+-          if (isIpv4(server.address)) {
++          if (isIpv4Host(server.address)) {
+             excludeAddr.push(`${server.address}/32`);
+-          } else if (isIpv6(server.address)) {
++          } else if (isIpv6Host(server.address)) {
+             excludeAddr.push(`${server.address}/128`);
+           } else if (resolvedIps && resolvedIps[serverId]) {
+             // 使用预解析的 IP
+             const addr = resolvedIps[serverId];
+-            excludeAddr.push(isIpv6(addr) ? `${addr}/128` : `${addr}/32`);
++            excludeAddr.push(isIpv6Host(addr) ? `${addr}/128` : `${addr}/32`);
+           }
+         }
+       }
+@@ -1148,11 +1300,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+         route_exclude_address: excludeAddr,
+       };
+ 
+-      // 兼容 sing-box 1.12.x 版本 (即 Windows 上的 1.12.13)，必须在 inbound 定义 sniff 否则无法域名分流。
++      // 兼容 sing-box 1.12.x 版本（打包核心现已全部 ≥1.13.13，此分支仅为向后兼容旧 userData 核心保留），必须在 inbound 定义 sniff 否则无法域名分流。
+       // 对于 1.13.0+，嗅探逻辑已经统一由后方 route.rules 承担，但在入站开启会报错，因此需精准版本判断。
+-      const inboundVersionMatch = this.coreVersion.match(/^(\d+\.\d+)/);
+-      const inboundVersionNum = inboundVersionMatch ? parseFloat(inboundVersionMatch[1]) : 1.13;
+-      if (!isNaN(inboundVersionNum) && inboundVersionNum < 1.13) {
++      if (!coreVersionAtLeast(this.coreVersion, 1, 13)) {
+         (tunInbound as any).sniff = true;
+       }
+ 
+@@ -1173,35 +1323,29 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+     return inbounds;
+   }
+ 
++  /** 节点是否可用：naive 需要 libcronet 核心库，缺库时不可用（会被跳过、分流/选中回退到 selector）。 */
++  private isNodeUsable(server: ServerConfig): boolean {
++    if (server.protocol.toLowerCase() === 'naive' && !resourceManager.hasCronetLib()) {
++      return false;
++    }
++    return true;
++  }
++
+   /**
+-   * 递归获取代理链中的所有前置节点
++   * naive 节点因缺 libcronet 不可用时的用户可读原因，按平台/真因区分文案：
++   * - copy-failed：内置库存在但拷贝到核心目录失败（权限/磁盘/AV），提示重启或修权限，而非误报"无预编译库"
++   * - macOS no-lib：mac-x64 等未静态编入 cronet 的核心
++   * - 其它 no-lib：linux/win 未随包提供 libcronet（如未跑 fetch-cronet）
+    */
+-  private getDetourChain(server: ServerConfig, allServers: ServerConfig[]): ServerConfig[] {
+-    const chain: ServerConfig[] = [];
+-    const visitedIds = new Set<string>();
+-    visitedIds.add(server.id);
+-
+-    let currentServer = server;
+-    while (currentServer.detour) {
+-      if (visitedIds.has(currentServer.detour)) {
+-        console.warn(
+-          `[ProxyManager] Detected proxy chain loop: ${currentServer.name} -> ${currentServer.detour}`
+-        );
+-        break;
+-      }
+-
+-      const detourServer = allServers.find((s) => s.id === currentServer.detour);
+-      if (!detourServer) {
+-        console.warn(`[ProxyManager] Detour server not found: ${currentServer.detour}`);
+-        break;
+-      }
+-
+-      chain.push(detourServer);
+-      visitedIds.add(detourServer.id);
+-      currentServer = detourServer;
++  private naiveUnavailableReason(server: ServerConfig): string {
++    const status = resourceManager.getCronetLibStatus();
++    if (status === 'copy-failed') {
++      return `选中的节点「${server.name}」是 NaiveProxy：libcronet 核心库已内置，但拷贝到核心目录失败（可能是权限/磁盘空间/杀软占用）。请重启应用重试或检查目录权限；如仍失败，请改用其它协议的节点。`;
+     }
+-
+-    return chain;
++    if (process.platform === 'darwin') {
++      return `选中的节点「${server.name}」是 NaiveProxy，但当前 macOS 核心未内置 cronet（暂无官方预编译库）。请选择其它协议的节点。`;
++    }
++    return `选中的节点「${server.name}」是 NaiveProxy，但未找到 libcronet 核心库。请选择其它协议的节点。`;
+   }
+ 
+   private generateOutbounds(
+@@ -1212,84 +1356,80 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+     const outbounds: SingBoxOutbound[] = [];
+ 
+     if (config) {
+-      // 1. 生成主选节点的 Outbound 及其前置节点
+-      const mainChain = this.getDetourChain(selectedServer, config.servers);
+-
+-      // 添加前置节点
+-      for (const detourServer of mainChain.reverse()) {
+-        const detourOutbound = this.generateProxyOutbound(detourServer, idToTagMap);
+-        detourOutbound.tag = idToTagMap.get(detourServer.id) || `proxy-${detourServer.id}`;
+-        // 避免重复添加
+-        if (!outbounds.some((o) => o.tag === detourOutbound.tag)) {
+-          outbounds.push(detourOutbound);
+-        }
+-      }
+-
+-      // 添加主节点
+-      const mainOutbound = this.generateProxyOutbound(selectedServer, idToTagMap);
+-      // 主节点默认使用 'proxy' tag，为了兼容老的路由规则
+-      // 但对于拓扑显示，我们希望看到名称，所以这里我们保留一个名为 'proxy' 的 outbound
+-      // 并在最后将其 tag 设为服务器名称（或者通过 detour 链处理）
+-      // 这里的策略是：主选节点 tag 设为人类可读名称，并同步给路由规则使用。
+-      const selectedServerTag = idToTagMap.get(selectedServer.id) || 'proxy';
+-      mainOutbound.tag = selectedServerTag;
+-
+-      if (selectedServer.detour && config.servers.some((s) => s.id === selectedServer.detour)) {
+-        mainOutbound.detour = idToTagMap.get(selectedServer.detour);
+-      }
+-      outbounds.push(mainOutbound);
+-
+-      // 2. 生成自定义规则中指定的目标节点的 Outbound
+-      // 遍历所有启用且指定了 targetServerId 的规则（包括 customRules 和 appRules）
+-      const targetServerIds = new Set<string>();
+-      if (config.customRules) {
+-        for (const rule of config.customRules) {
+-          if (rule.enabled && rule.action === 'proxy' && rule.targetServerId) {
+-            targetServerIds.add(rule.targetServerId);
+-          }
++      // 生成【全部】节点的 Outbound：selector 需要列出所有可切换节点；detour 前置节点亦在 config.servers
++      // 中，一并生成、通过 detour 字段链接。单个节点配置异常不应拖垮整体配置，逐节点 try/catch 跳过。
++      // （app/custom 分流规则指向的固定节点 tag 不变，仍直接命中其节点出站，不经 selector。）
++      for (const server of config.servers) {
++        const tag = idToTagMap.get(server.id) || `proxy-${server.id}`;
++        if (outbounds.some((o) => o.tag === tag)) continue; // 去重
++        // 不可用节点跳过：naive 缺 libcronet 时，sing-box 启动会预初始化全部出站、缺库的 naive 会让
++        // 整个代理启动 FATAL（连非 naive 节点也用不了）。跳过后，路由层对该节点 tag 的死引用会在
++        // generateSingBoxConfig 末尾被统一修正为 selector（见 H2 修复）。
++        if (!this.isNodeUsable(server)) {
++          this.logToManager(
++            'warn',
++            `跳过不可用节点「${server.name}」：NaiveProxy 缺少 libcronet 核心库`
++          );
++          continue;
+         }
+-      }
+-      if (config.appRules) {
+-        for (const rule of config.appRules) {
+-          if (rule.enabled && rule.action === 'proxy' && rule.targetServerId) {
+-            targetServerIds.add(rule.targetServerId);
++        try {
++          const ob = this.generateProxyOutbound(server, idToTagMap);
++          ob.tag = tag;
++          if (server.detour && config.servers.some((s) => s.id === server.detour)) {
++            // 环检测：沿 detour 链行进，若回到本节点即成环 → 不设 detour，避免 sing-box 报循环引用启动失败
++            const seen = new Set<string>([server.id]);
++            let cur: string | undefined = server.detour;
++            let looped = false;
++            while (cur) {
++              if (seen.has(cur)) {
++                looped = true;
++                break;
++              }
++              seen.add(cur);
++              cur = config.servers.find((s) => s.id === cur)?.detour;
++            }
++            if (looped) {
++              this.logToManager('warn', `检测到代理链成环，已跳过 detour: ${server.name}`);
++            } else {
++              ob.detour = idToTagMap.get(server.detour);
++            }
+           }
++          outbounds.push(ob);
++        } catch (e: any) {
++          this.logToManager(
++            'warn',
++            `生成节点出站失败，已跳过: ${server.name} (${e?.message ?? e})`
++          );
+         }
+       }
+ 
+-      for (const targetId of Array.from(targetServerIds)) {
+-        // 如果目标节点就是主节点，不需要额外添加（主节点已有 'proxy' tag）
+-        if (targetId === selectedServer.id) continue;
+-
+-        // 查找目标服务器配置
+-        const targetServer = config.servers.find((s) => s.id === targetId);
+-        if (!targetServer) continue;
+-
+-        // 获取目标节点的前置链
+-        const targetChain = this.getDetourChain(targetServer, config.servers);
+-
+-        // 添加目标节点的前置节点
+-        for (const detourServer of targetChain.reverse()) {
+-          const detourOutbound = this.generateProxyOutbound(detourServer, idToTagMap);
+-          detourOutbound.tag = idToTagMap.get(detourServer.id) || `proxy-${detourServer.id}`;
+-          // 避免重复添加
+-          if (!outbounds.some((o) => o.tag === detourOutbound.tag)) {
+-            outbounds.push(detourOutbound);
++      // 全局 TLS 分片（PR-6）：开启后对所有已生成的 TCP-TLS 节点出站切分 ClientHello，抗 SNI-DPI。
++      // 跳过 hy2/tuic（QUIC 内 TLS、无 TCP ClientHello，死配置）与 naive（Cronet 自管 TLS，拒绝
++      // fragment 字段 → 启动 FATAL）。
++      if (config.tlsFragment) {
++        for (const ob of outbounds) {
++          if (ob.tls && ob.type !== 'hysteria2' && ob.type !== 'tuic' && ob.type !== 'naive') {
++            ob.tls.fragment = true;
+           }
+         }
++      }
+ 
+-        // 添加目标节点本身
+-        const targetOutbound = this.generateProxyOutbound(targetServer, idToTagMap);
+-        targetOutbound.tag = idToTagMap.get(targetServer.id) || `proxy-${targetServer.id}`; // 使用节点名称作为 Tag
+-        if (targetServer.detour && config.servers.some((s) => s.id === targetServer.detour)) {
+-          targetOutbound.detour = idToTagMap.get(targetServer.detour);
+-        }
+-
+-        // 避免重复添加
+-        if (!outbounds.some((o) => o.tag === targetOutbound.tag)) {
+-          outbounds.push(targetOutbound);
+-        }
++      // selector：列出已生成的全部节点 tag，default 指向当前选中节点；interrupt_exist_connections 由用户
++      // 开关决定（默认 false=优雅切换，现有连接保留至自然关闭）。clash_api `PUT /proxies/proxy-selector`
++      // 据此热切换、无需重启 sing-box（详见 switchMode）。路由的 final 与「→代理」规则统一指向本 selector。
++      const nodeTags = outbounds.map((o) => o.tag).filter((t): t is string => !!t);
++      // 所有节点生成失败 → 空 selector 会让 sing-box 启动报含糊错误；这里提前给出清晰原因
++      if (nodeTags.length === 0) {
++        throw new Error('没有可用的代理节点出站（所有节点配置生成失败）');
+       }
++      const selectedServerTag = idToTagMap.get(selectedServer.id) || 'proxy';
++      outbounds.push({
++        type: 'selector',
++        tag: 'proxy-selector',
++        outbounds: nodeTags,
++        default: nodeTags.includes(selectedServerTag) ? selectedServerTag : nodeTags[0],
++        interrupt_exist_connections: config.interruptConnectionsOnSwitch === true,
++      });
+     } else {
+       // Fallback if config is missing (shouldn't happen)
+       outbounds.push(this.generateProxyOutbound(selectedServer, idToTagMap));
+@@ -1304,9 +1444,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+     // 版本条件：sing-box 1.12.x 需要在 outbound 层面做 override_address
+     // 因为 1.12 的路由规则不支持 override_address 字段（会被静默忽略）。
+     // 1.13+ 已将此功能迁移到路由规则，不需要额外的 outbound。
+-    const vArr = this.coreVersion.split('.');
+-    const vNum = parseFloat(vArr[0] + '.' + (vArr[1] || '0'));
+-    if (isNaN(vNum) || vNum < 1.13) {
++    if (!coreVersionAtLeast(this.coreVersion, 1, 13)) {
+       outbounds.push({
+         type: 'direct',
+         tag: 'direct-loopback',
+@@ -1324,11 +1462,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+     // 为每个使用 Shadow-TLS 的节点插入内层 SS outbound
+     const stlsOutbounds: SingBoxOutbound[] = [];
+     for (const ob of outbounds) {
+-      // 根据 tag 找到对应的 ServerConfig
+-      const srv =
+-        ob.tag === 'proxy'
+-          ? selectedServer
+-          : config?.servers.find((s) => `proxy-${s.id}` === ob.tag);
++      // 根据 tag（节点名称）反查对应的 ServerConfig；selector/direct/block 等非节点出站匹配不到 → 跳过
++      const srv = config?.servers.find((s) => idToTagMap.get(s.id) === ob.tag);
+       if (srv?.shadowTlsSettings) {
+         // 创建独立的外层 ShadowTLS outbound
+         const stlsTag = `stls-out-${srv.id}`;
+@@ -1386,13 +1521,19 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+       domain_resolver: 'dns-bootstrap',
+     };
+ 
++    // vless/vmess UDP 封装：默认 xudp；可经 server.packetEncoding 覆盖（兼容拒收 xudp 的旧核心/服务端，
++    // 否则 UDP 断流且无从调整）。显式设为空串则省略该字段（不下发 packet_encoding，由核心用其默认）。
++    const packetEncoding = server.packetEncoding ?? 'xudp';
++
+     // VLESS 特定配置
+     if (protocol === 'vless') {
+       outbound.uuid = server.uuid;
+       if (server.flow) {
+         outbound.flow = server.flow;
+       }
+-      outbound.packet_encoding = 'xudp';
++      if (packetEncoding) {
++        outbound.packet_encoding = packetEncoding;
++      }
+     }
+ 
+     // VMess 特定配置
+@@ -1400,7 +1541,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+       outbound.uuid = server.uuid;
+       outbound.security = server.vmessSecurity || 'auto';
+       outbound.alter_id = server.alterId || 0;
+-      outbound.packet_encoding = 'xudp';
++      if (packetEncoding) {
++        outbound.packet_encoding = packetEncoding;
++      }
+     }
+ 
+     // Trojan 特定配置
+@@ -1501,6 +1644,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+         enabled: true,
+         server_name: server.tlsSettings?.serverName || server.address,
+       };
++
++      // HTTP/3：naive 经 quic:true 走 h3(QUIC/UDP) 拨号传输，对应服务端 `--listen=quic://`。
++      // 注意这只改变"拨号传输"：naive 仍只过 TCP（HTTP CONNECT）、不能中继客户端 UDP（除非
++      // udp_over_tcp，FlowZ 不下发）。客户端 QUIC 若走到 naive，由 blockQuic（udp443 reject 逼回退 TCP）
++      // 或 sing-box 出站层（"UDP is not supported by outbound"）处理；该拨号本身受 fwmark 保护、
++      // 绕过 route 规则，不被 reject 误杀（已实测）。
++      if (server.naiveSettings?.useHttp3) {
++        outbound.quic = true;
++      }
+     }
+ 
+     // SOCKS 特定配置
+@@ -1620,18 +1772,78 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+       outbound.transport = this.generateTransportConfig(server);
+     }
+ 
++    // PR-6 抗封增强（ECH / TLS 分片 / Multiplex / Hy2 端口跳跃）统一后处理
++    this.applyAntiCensorshipOptions(outbound, server);
++
+     return outbound;
+   }
+ 
++  /**
++   * PR-6 抗封增强统一后处理：ECH、每节点 TLS 分片、Multiplex(reality+vision 跳过)、Hy2 端口跳跃。
++   * 放在 outbound 构建完成后统一处理，避免散落到各协议的 tls/transport 构建点。
++   */
++  private applyAntiCensorshipOptions(outbound: SingBoxOutbound, server: ServerConfig): void {
++    const protocolLower = server.protocol.toLowerCase();
++
++    // fragment 仅对「标准 sing-box TCP-TLS 栈」有意义，以下协议必须排除（否则死配置或直接启动 FATAL）：
++    //   · hy2/tuic：TLS 在 QUIC 内、无 TCP ClientHello（死配置）；
++    //   · naive：TLS 由 Cronet 自管，naive 出站直接拒绝 fragment 字段（实测
++    //     "fragment is not supported on naive outbound" → 启动 FATAL），无论 h2/h3。
++    // 注：ECH 不受此限——QUIC 与 naive(Cronet) 均原生支持 ECH。
++    const fragmentUnsupported =
++      protocolLower === 'hysteria2' || protocolLower === 'tuic' || protocolLower === 'naive';
++
++    // ECH（隐藏 SNI）+ 每节点 TLS 分片（抗 SNI-DPI）：需已有 tls 块
++    if (outbound.tls) {
++      if (server.tlsSettings?.ech) outbound.tls.ech = { enabled: true };
++      if (server.tlsSettings?.fragment && !fragmentUnsupported) outbound.tls.fragment = true;
++    }
++
++    // Multiplex（vless/trojan/vmess/shadowsocks）；vision flow(xtls-rprx-vision) 自带流分帧、与 mux
++    // 不兼容（与是否 reality 无关，普通 TLS+vision 同样不兼容）→ 跳过
++    const mux = server.multiplexSettings;
++    const hasVisionFlow = (server.flow || '').toLowerCase().includes('vision');
++    if (
++      mux?.enabled &&
++      ['vless', 'trojan', 'vmess', 'shadowsocks'].includes(protocolLower) &&
++      !hasVisionFlow
++    ) {
++      outbound.multiplex = {
++        enabled: true,
++        protocol: mux.protocol || 'h2mux',
++        ...(mux.maxConnections ? { max_connections: mux.maxConnections } : {}),
++        ...(mux.minStreams ? { min_streams: mux.minStreams } : {}),
++        ...(mux.padding ? { padding: true } : {}),
++      };
++    }
++
++    // Hysteria2 端口跳跃（serverPorts 为逗号分隔的范围串，如 "20000:30000"，支持多段）
++    if (protocolLower === 'hysteria2' && server.hysteria2Settings?.serverPorts) {
++      const ports = server.hysteria2Settings.serverPorts
++        .split(',')
++        .map((s) => s.trim())
++        .filter(Boolean);
++      if (ports.length > 0) {
++        outbound.server_ports = ports;
++        if (server.hysteria2Settings.hopInterval) {
++          outbound.hop_interval = server.hysteria2Settings.hopInterval;
++        }
++      }
++    }
++  }
++
+   /**
+    * 生成传输层配置
+    */
+   private generateTransportConfig(server: ServerConfig): SingBoxOutbound['transport'] {
+     if (server.network === 'ws' && server.wsSettings) {
++      // 0-RTT early-data：订阅/分享链解析时已存入 wsSettings，此前未落运行时配置导致静默失效
+       return {
+         type: 'ws',
+         path: server.wsSettings.path || '/',
+         headers: server.wsSettings.headers,
++        max_early_data: server.wsSettings.maxEarlyData,
++        early_data_header_name: server.wsSettings.earlyDataHeaderName,
+       };
+     }
+ 
+@@ -1642,6 +1854,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+       };
+     }
+ 
++    // httpupgrade：较 ws 更隐蔽的 HTTP Upgrade 传输（复用 ws 的 path / Host）
++    if (server.network === 'httpupgrade') {
++      return {
++        type: 'httpupgrade',
++        path: server.wsSettings?.path || '/',
++        host: server.wsSettings?.headers?.['Host'] || server.tlsSettings?.serverName,
++      };
++    }
++
+     return undefined;
+   }
+ 
+@@ -1655,20 +1876,34 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+     const rules: SingBoxRouteRule[] = [];
+     const proxyMode = (config.proxyMode || 'smart').toLowerCase();
+ 
+-    const selectedServerTag = idToTagMap.get(config.selectedServerId as string) || 'proxy';
+-    // 获取当前选中的服务器，用于排除代理服务器域名
+-    const selectedServer = config.servers.find((s) => s.id === config.selectedServerId);
+-
+-    const versionArr = this.coreVersion.split('.');
+-    const versionNum = parseFloat(versionArr[0] + '.' + (versionArr[1] || '0'));
++    // 主代理出站统一走 selector(proxy-selector)：clash_api 热切换即改 selector 指向、路由无需重生成。
++    // 具体 targetServerId 的 app/custom 分流在各自逻辑里直指节点 tag，不经此变量。
++    const selectedServerTag = 'proxy-selector';
++
++    // blockQuic（节点无关）：开启时对"将走代理"的 QUIC(UDP443) 执行 reject，逼浏览器回退 TCP。
++    // 「禁 QUIC」即禁 QUIC，与选中节点的协议/中继能力无关，对所有节点一视同仁。两点实测保证安全：
++    //   · 节点自身的 UDP 拨号(naive-h3/hy2/tuic dial server)无害——拨号是 sing-box 进程自有 socket，
++    //     受 fwmark/auto_detect_interface 保护、绕过 route 规则；netns TUN 抓包实测：带 reject udp443
++    //     时 hy2 拨号包仍正常逸出（证伪旧假设"reject 经 strict_route 回流误杀拨号"）。
++    //   · 不下发"全 UDP reject"——只禁 QUIC(443)。非 QUIC 的代理向 UDP 若节点不能中继(naive/ssh/http)，
++    //     由 sing-box 出站层自动拒绝（实测日志 "UDP is not supported by outbound"，不漏 direct、不黑洞），
++    //     无需路由层按节点固化。这也使路由配置与选中节点解耦 → 支持 selector 跨协议无缝热切换。
++    // 节点无关：只要开了 blockQuic 且存在代理路径（非 direct 模式、有节点）就拦——不依赖 selectedServer
++    // 解析成功（避免 selectedServerId 失效但 selector default 仍出流量时 QUIC 漏过）。
++    const blockProxyQuic =
++      config.blockQuic === true && proxyMode !== 'direct' && config.servers.length > 0;
++
++    // 给定域名匹配器，返回应配对的 udp443 reject 规则（smart 模式放在每条 →代理 规则之前），否则 null。
++    const proxyUdpRejectFor = (matcher: Record<string, unknown>): SingBoxRouteRule | null =>
++      blockProxyQuic ? udp443RejectRule(matcher) : null;
+ 
+     // A. 嗅探规则（必须在前，用于识别域名）
+     // 1.13+ 必须在路由层开启 sniff，替代已移除的 inbound 级别 sniff 字段
+     // sing-box 1.13.x 嗅探后自动将域名用于路由匹配（等效旧版 sniff_override_destination）
+-    if (!isNaN(versionNum) && versionNum >= 1.13) {
++    if (coreVersionAtLeast(this.coreVersion, 1, 13)) {
+       rules.push({
+         action: 'sniff',
+-      } as any);
++      });
+     }
+ 
+     // 1. 强制放行 sing-box 核心进程：防止流量回流死循环
+@@ -1708,7 +1943,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+     rules.push({
+       protocol: 'icmp',
+       action: 'reject',
+-    } as any);
++    });
+ 
+     rules.push({
+       process_name: [
+@@ -1759,51 +1994,47 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+     // 迫使浏览器退回系统标准 UDP 53，重新被 hijack-dns 捕获进入 DNS 分流/FakeIP 体系。
+     // 与下方同组 DoH 域名的 QUIC/UDP-443 reject 规则保持行为一致。
+     rules.push({
+-      domain_keyword: [
+-        'dns.google',
+-        'cloudflare-dns.com',
+-        'doh.opendns.com',
+-        'dns.quad9.net',
+-        'one.one.one.one',
+-      ],
++      domain_keyword: DOH_LEAK_DOMAIN_KEYWORDS,
+       port: [443, 853],
+       action: 'reject',
+-    } as any);
++    });
+ 
+-    // 排除代理服务器域名，确保代理服务器的连接走直连
+-    // 这必须放在其他规则之前，否则可能被 geosite-cn 匹配导致死循环
+-    if (selectedServer?.address) {
+-      const proxyHosts = [selectedServer.address];
+-      if (selectedServer.tlsSettings?.serverName) {
+-        proxyHosts.push(selectedServer.tlsSettings.serverName);
++    // 排除全部代理节点的域名/IP，确保到任一节点的连接走直连（防回流死循环 + 兼容无缝切换/代理链）。
++    // CDN 安全：域名节点用纯域名规则(domain + domain_suffix，靠 sniff 出的 SNI 精确匹配节点域名)，
++    //   不预解析为共享 CDN IP（共享 IP 加直连会误伤同 IP 的被墙站点、且抗不住 IP 轮换）；
++    //   去掉过宽的 domain_keyword（会误匹配任意"含该域名串"的无关域名）。
++    // 仅用户显式填的 IP-literal 节点用 ip_cidr 排除（专用 IP、非共享，安全）。
++    // 扩展到全部节点(不止选中)：切节点 / detour 前置代理无需重生成配置即被豁免。
++    // 必须放在其他规则之前，否则可能被 geosite-cn 匹配导致死循环。
++    {
++      const ipSet = new Set<string>();
++      const domainSet = new Set<string>();
++      for (const s of config.servers) {
++        const hosts = [s.address, s.tlsSettings?.serverName].filter(
++          (h): h is string => !!h && h.length > 0
++        );
++        for (const host of hosts) {
++          if (isIpv4Host(host)) ipSet.add(`${host}/32`);
++          else if (isIpv6Host(host)) ipSet.add(`${host}/128`);
++          else domainSet.add(host);
++        }
+       }
+-      const uniqueHosts = Array.from(new Set(proxyHosts));
+-
+-      const ips: string[] = [];
+-      const domains: string[] = [];
+-
+-      const isIpv4 = (host: string) => /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(host);
+-      const isIpv6 = (host: string) => /^[0-9a-fA-F:]+$/.test(host) && host.includes(':');
+ 
+-      uniqueHosts.forEach((host) => {
+-        if (isIpv4(host)) ips.push(`${host}/32`);
+-        else if (isIpv6(host)) ips.push(`${host}/128`);
+-        else domains.push(host);
+-      });
+-
+-      if (domains.length > 0) {
++      if (domainSet.size > 0) {
++        const domains = Array.from(domainSet);
+         rules.push({
++          // domain(精确，= 节点 SNI) + domain_suffix(仅 .${d}，匹配子域)。不放裸 d 进 domain_suffix：
++          // 那是 raw 后缀匹配，会把共享 apex 下别的真实站点也沉降到直连。
+           domain: domains,
+-          domain_suffix: domains.flatMap((d) => [d, `.${d}`]),
+-          domain_keyword: domains,
++          domain_suffix: domains.map((d) => `.${d}`),
+           action: 'route',
+           outbound: 'direct',
+         });
+       }
+ 
+-      if (ips.length > 0) {
++      if (ipSet.size > 0) {
+         rules.push({
+-          ip_cidr: ips,
++          ip_cidr: Array.from(ipSet),
+           action: 'route',
+           outbound: 'direct',
+         });
+@@ -1821,7 +2052,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+       (d) => !UKEY_LOCAL_DOMAINS.includes(d)
+     );
+ 
+-    if (!isNaN(versionNum) && versionNum >= 1.13) {
++    if (coreVersionAtLeast(this.coreVersion, 1, 13)) {
+       // 1.13+：路由规则支持 override_address
+       rules.push({
+         domain_suffix: UKEY_LOCAL_DOMAINS,
+@@ -1870,7 +2101,28 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+         idToTagMap,
+         selectedServerTag
+       );
+-      rules.push(...customRules);
++      // 走代理的自定义规则同样要配对 udp443 reject（终止规则、在末尾兜底前命中）。逐条插入：
++      // 代理向规则前先放一条同匹配器的 udp443 reject；direct/block 规则不配对。
++      for (const cr of customRules) {
++        if (
++          cr.action === 'route' &&
++          cr.outbound &&
++          cr.outbound !== 'direct' &&
++          cr.outbound !== 'block'
++        ) {
++          const matcher: Record<string, any> = {};
++          if (cr.domain) matcher.domain = cr.domain;
++          if (cr.domain_suffix) matcher.domain_suffix = cr.domain_suffix;
++          if (cr.domain_keyword) matcher.domain_keyword = cr.domain_keyword;
++          if (cr.rule_set) matcher.rule_set = cr.rule_set;
++          if (cr.ip_cidr) matcher.ip_cidr = cr.ip_cidr;
++          if (Object.keys(matcher).length > 0) {
++            const r = proxyUdpRejectFor(matcher);
++            if (r) rules.push(r);
++          }
++        }
++        rules.push(cr);
++      }
+ 
+       if (customRuleSets.length > 0) {
+         if (!routeConfig.rule_set) {
+@@ -1910,8 +2162,16 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+           outbound = 'block';
+         }
+ 
++        // 走代理的 app 分流也要配对 udp443 reject（这些是终止规则、在末尾兜底之前命中，否则 blockQuic
++        // 对该应用的 QUIC 失效）。direct/block 不配对。
++        const appOutIsProxy = outbound !== 'direct' && outbound !== 'block';
++
+         // a. 基于进程名的规则（最精准，适用于 macOS/Windows TUN 模式）
+         if (preset.processNames && preset.processNames.length > 0) {
++          if (appOutIsProxy) {
++            const r = proxyUdpRejectFor({ process_name: preset.processNames });
++            if (r) rules.push(r);
++          }
+           rules.push({
+             process_name: preset.processNames,
+             action: 'route',
+@@ -1926,6 +2186,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+         ];
+ 
+         if (ruleSets.length > 0) {
++          if (appOutIsProxy) {
++            const r = proxyUdpRejectFor({ rule_set: ruleSets });
++            if (r) rules.push(r);
++          }
+           rules.push({
+             rule_set: ruleSets,
+             action: 'route',
+@@ -1939,18 +2203,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+     // 这样游戏设为直连时，进程名匹配在前，游戏的 UDP 流量不会被误拒。
+     // 仅阻断浏览器的 DoH over QUIC，迫使浏览器回退到系统 UDP 53 + hijack-dns 体系。
+     // 重要：不能全量 reject 所有 UDP 443，否则 Hysteria2/TUIC 等 QUIC 协议节点会被误伤。
+-    rules.push({
+-      domain_keyword: [
+-        'dns.google',
+-        'cloudflare-dns.com',
+-        'doh.opendns.com',
+-        'dns.quad9.net',
+-        'one.one.one.one',
+-      ],
+-      network: ['udp'],
+-      port: [443],
+-      action: 'reject',
+-    } as any);
++    rules.push(udp443RejectRule({ domain_keyword: DOH_LEAK_DOMAIN_KEYWORDS }));
+ 
+     // 【DNS 死循环防范】：sing-box 本地 DNS 解析器的请求必须强制直连，否则在全局代理模式下会产生死循环
+     // 兼容 Windows 1.12.x 版本，不使用 DNS 配置里的 detour
+@@ -1958,7 +2211,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+       protocol: 'dns',
+       action: 'route',
+       outbound: 'direct',
+-    } as any);
++    });
+ 
+     rules.push({
+       ip_cidr: ['223.5.5.5/32'],
+@@ -2015,13 +2268,22 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+ 
+       // 针对 Google 核心服务（搜索/YouTube/Gmail 等）的关键词兜底规则（仅在未专门设置应用分流时作为备份）
+       // 注意：这些规则在 AppRules 之后，所以不会覆盖用户手动指定的节点
++      const googleKeywords = ['google', 'gmail', 'youtube', 'gstatic', 'googleapis', 'googlevideo'];
++
++      // 代理向 UDP（smart）：在每条"→代理"规则之前配对一条 reject，使该走代理的 UDP 在被路由到代理
++      // 前就 reject——不能中继的节点拦全部 UDP，能中继+blockQuic 仅拦 QUIC(UDP443)。下方 CN 直连规则
++      // 不配对，故 CN/直连 UDP 不受影响（兜底见 generateRouteConfig 末尾）。
++      const googleUdpReject = proxyUdpRejectFor({ domain_keyword: googleKeywords });
++      if (googleUdpReject) rules.push(googleUdpReject);
+       rules.push({
+-        domain_keyword: ['google', 'gmail', 'youtube', 'gstatic', 'googleapis', 'googlevideo'],
++        domain_keyword: googleKeywords,
+         action: 'route',
+         outbound: selectedServerTag,
+       });
+ 
+       // 国外域名走代理
++      const foreignUdpReject = proxyUdpRejectFor({ rule_set: 'geosite-geolocation-!cn' });
++      if (foreignUdpReject) rules.push(foreignUdpReject);
+       rules.push({
+         rule_set: 'geosite-geolocation-!cn',
+         action: 'route',
+@@ -2120,38 +2382,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+       }
+     }
+ 
+-    // 【UDP 黑洞防范兜底】：对于不支持 UDP 的代理协议（如 SSH, HTTP, AnyTLS），
+-    // 凡是没有被上面的直连规则（如国内 IP/域名、局域网等）匹配的剩余 UDP 流量，
+-    // 原本会分配给 final 出站。但由于这些代理协议在 sing-box 中不支持 UDP，
+-    // 流量会穿透 final 跌落到系统 direct，导致被墙的 UDP 请求（如 QUIC）静默丢包假死 30 秒。
+-    // 在这里统一 reject 剩余 UDP，促使浏览器立即 fallback 到 TCP 走代理。
+-    if (proxyMode !== 'direct' && selectedServer) {
+-      const tcpOnlyProtocols = ['ssh', 'http', 'anytls'];
+-      if (tcpOnlyProtocols.includes(selectedServer.protocol.toLowerCase())) {
+-        rules.push({
+-          network: ['udp'],
+-          action: 'reject',
+-        } as any);
+-      }
+-
+-      // T2-4: 用户开启"阻止 QUIC"时 reject 入站 UDP 443，让浏览器 QUIC 立即回退 TCP，
+-      // 消除节点 UDP relay 不通时的 QUIC 黑洞（网页打开一会卡死）。协议三分类：
+-      //   - ssh/http/anytls：上面已全量 reject UDP，此处对其为冗余 no-op；
+-      //   - hysteria2/tuic：节点自身走 QUIC dial-server，会因 strict_route 回流被这条 reject
+-      //     误杀，必须按协议 guard 跳过；
+-      //   - vless/vmess/trojan/shadowsocks/naive/socks：本条真正生效对象（均 TCP dial-server；
+-      //     naive 在 sing-box 是 H2/TLS/TCP、不支持 h3/QUIC，故安全；若将来支持 naive-h3 需更新此表）。
+-      const udpTransportProtocols = ['hysteria2', 'tuic'];
+-      if (
+-        config.blockQuic === true &&
+-        !udpTransportProtocols.includes(selectedServer.protocol.toLowerCase())
+-      ) {
+-        rules.push({
+-          network: ['udp'],
+-          port: [443],
+-          action: 'reject',
+-        } as any);
+-      }
++    // 【代理向 QUIC 兜底】：放在所有直连/分流规则之后，拦截"会落到 final(代理)"的剩余 QUIC(udp443)。
++    // global 模式拦全部代理向 QUIC；smart 模式拦未被上方 →代理 配对 reject 命中的（CN 已直连豁免）。
++    // 只拦 QUIC——非 QUIC 的代理向 UDP 若节点不能中继，由 sing-box 出站层自动拒绝（见上方 blockProxyQuic）。
++    if (blockProxyQuic) {
++      rules.push(udp443RejectRule());
+     }
+ 
+     return routeConfig;
+@@ -2461,7 +2696,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+             if (!caps.includes('cap_net_admin')) {
+               this.logToManager('info', 'Linux 核心缺失网络权限，正在请求提权...');
+               // 使用 pkexec 调用 setcap 赋权
+-              execSync(`pkexec setcap 'cap_net_admin,cap_net_bind_service,cap_net_raw=+ep' "${this.singboxPath}"`);
++              execSync(
++                `pkexec setcap 'cap_net_admin,cap_net_bind_service,cap_net_raw=+ep' "${this.singboxPath}"`
++              );
+               this.logToManager('info', 'Linux 核心提权成功');
+             }
+           } catch (err) {
+@@ -2571,9 +2808,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+         // 这是银行 U盾本地域名（如 windows10.microdone.cn → 127.0.0.1）正常工作的前提。
+         // 1.13+ 已将此功能迁移到路由规则，不需要此环境变量。
+         const spawnEnv = { ...process.env };
+-        const cvArr = this.coreVersion.split('.');
+-        const cvNum = parseFloat(cvArr[0] + '.' + (cvArr[1] || '0'));
+-        if (isNaN(cvNum) || cvNum < 1.13) {
++        if (!coreVersionAtLeast(this.coreVersion, 1, 13)) {
+           spawnEnv['ENABLE_DEPRECATED_DESTINATION_OVERRIDE_FIELDS'] = 'true';
+         }
+ 
+@@ -3327,6 +3562,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+     if (!this.autoRestartEnabled || !this.currentConfig) {
+       return false;
+     }
++    // 核心更新待验证窗口：禁止自动重启，使新核心首次异常退出立即上报 error → 触发回滚
++    if (this.autoRestartSuppressed) {
++      return false;
++    }
+ 
+     const now = Date.now();
+ 
+@@ -3339,6 +3578,18 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
+     return this.restartCount < ProxyManager.MAX_RESTART_COUNT;
+   }
+ 
++  /** 核心更新待验证窗口内由 CoreUpdateService 置 true：抑制自动重启，首次失败即上报触发回滚。 */
++  setAutoRestartSuppressed(suppressed: boolean): void {
++    this.autoRestartSuppressed = suppressed;
++  }
++
++  /** 当前配置是否含 naive 节点（naive 依赖随 app 打包的 libcronet，核心更新可能引入 ABI 漂移）。 */
++  hasNaiveNodes(): boolean {
++    return (this.currentConfig?.servers || []).some(
++      (s) => (s.protocol || '').toLowerCase() === 'naive'
++    );
++  }
++
+   /**
+    * 尝试自动重启
+    */
+diff --git a/src/main/services/SubscriptionService.ts b/src/main/services/SubscriptionService.ts
+index 6b2e840..21bec69 100644
+--- a/src/main/services/SubscriptionService.ts
++++ b/src/main/services/SubscriptionService.ts
+@@ -21,27 +21,44 @@ type SingboxTls = {
+   alpn?: string[];
+   utls?: { enabled?: boolean; fingerprint?: string };
+   reality?: { enabled?: boolean; public_key?: string; short_id?: string };
++  ech?: { enabled?: boolean };
++  fragment?: boolean;
+ };
+ type SingboxTransport = {
+   type?: string;
+   path?: string;
++  host?: string;
+   headers?: Record<string, string>;
+   service_name?: string;
+ };
++type SingboxMultiplex = {
++  enabled?: boolean;
++  protocol?: string;
++  max_connections?: number;
++  min_streams?: number;
++  padding?: boolean;
++};
+ type SingboxOutbound = {
+   type: string;
+   tag: string;
+   server?: string;
+   server_port?: number;
++  server_ports?: string[];
++  hop_interval?: string;
+   uuid?: string;
+   flow?: string;
++  packet_encoding?: string;
++  username?: string;
+   password?: string;
+   method?: string;
+   plugin?: string;
+   plugin_opts?: string;
+   obfs?: { type?: string; password?: string };
++  // naive：是否启用 HTTP/3 (QUIC) 传输
++  quic?: boolean;
+   tls?: SingboxTls;
+   transport?: SingboxTransport;
++  multiplex?: SingboxMultiplex;
+ };
+ 
+ export class SubscriptionService {
+@@ -81,25 +98,34 @@ export class SubscriptionService {
+     outbounds: SingboxOutbound[],
+     subscriptionId: string
+   ): ServerConfig[] {
+-    const SUPPORTED = new Set(['shadowsocks', 'vless', 'trojan', 'hysteria2']);
++    const SUPPORTED = new Set(['shadowsocks', 'vless', 'trojan', 'hysteria2', 'naive']);
+     const servers: ServerConfig[] = [];
+     const now = new Date().toISOString();
+ 
+     for (const ob of outbounds) {
+       if (!SUPPORTED.has(ob.type)) continue;
+-      if (!ob.server || !ob.server_port) continue;
++      // 支持仅含 server_ports（端口跳跃、无 server_port）的 Hy2 节点：从首个范围的低位端口推导 port
++      const effectivePort =
++        ob.server_port ??
++        (ob.server_ports?.[0] ? parseInt(ob.server_ports[0].split(':')[0], 10) : undefined);
++      if (!ob.server || !effectivePort) continue;
+ 
+       try {
+         const base: Partial<ServerConfig> = {
+           id: randomUUID(),
+-          name: ob.tag || `${ob.server}:${ob.server_port}`,
++          name: ob.tag || `${ob.server}:${effectivePort}`,
+           address: ob.server,
+-          port: ob.server_port,
++          port: effectivePort,
+           subscriptionId,
+           createdAt: now,
+           updatedAt: now,
+         };
+ 
++        // vless/vmess UDP 封装：JSON 订阅显式携带时透传（缺省时不写，由 ProxyManager 默认 xudp）
++        if (ob.packet_encoding !== undefined) {
++          base.packetEncoding = ob.packet_encoding;
++        }
++
+         // TLS / Reality
+         if (ob.tls && ob.tls.enabled !== false) {
+           const hasReality = ob.tls.reality?.enabled && ob.tls.reality.public_key;
+@@ -109,6 +135,8 @@ export class SubscriptionService {
+             allowInsecure: ob.tls.insecure ?? false,
+             alpn: ob.tls.alpn,
+             fingerprint: ob.tls.utls?.fingerprint,
++            ech: ob.tls.ech?.enabled === true ? true : undefined,
++            fragment: ob.tls.fragment === true ? true : undefined,
+           };
+           if (hasReality && ob.tls.reality) {
+             base.realitySettings = {
+@@ -121,17 +149,33 @@ export class SubscriptionService {
+         // Transport
+         if (ob.transport?.type) {
+           const t = ob.transport;
+-          const netType = t.type as 'ws' | 'grpc' | 'http' | 'tcp';
++          const netType = t.type as 'ws' | 'grpc' | 'http' | 'httpupgrade' | 'tcp';
+           base.network = netType;
+           if (netType === 'ws') {
+-            base.wsSettings = { path: t.path, headers: t.headers };
++            // 与 httpupgrade 对齐：transport.host 折叠进 Host header（部分配置把 ws Host 放在 t.host），
++            // 避免同一节点经 JSON 订阅 vs 分享链解析出不一致的 wsSettings（丢 Host）。
++            base.wsSettings = { path: t.path, headers: t.host ? { Host: t.host } : t.headers };
+           } else if (netType === 'grpc') {
+             base.grpcSettings = { serviceName: t.service_name };
+           } else if (netType === 'http') {
+             base.httpSettings = { path: t.path };
++          } else if (netType === 'httpupgrade') {
++            // httpupgrade 复用 ws 设置承载 path/Host
++            base.wsSettings = { path: t.path, headers: t.host ? { Host: t.host } : t.headers };
+           }
+         }
+ 
++        // Multiplex（vless/trojan/vmess/ss）
++        if (ob.multiplex?.enabled) {
++          base.multiplexSettings = {
++            enabled: true,
++            protocol: (ob.multiplex.protocol as 'smux' | 'yamux' | 'h2mux') || 'h2mux',
++            maxConnections: ob.multiplex.max_connections,
++            minStreams: ob.multiplex.min_streams,
++            padding: ob.multiplex.padding,
++          };
++        }
++
+         // Protocol-specific
+         if (ob.type === 'shadowsocks') {
+           servers.push({
+@@ -164,12 +208,28 @@ export class SubscriptionService {
+             password: ob.password ?? '',
+             security: 'tls',
+           };
++          const hy2Settings: NonNullable<ServerConfig['hysteria2Settings']> = {};
+           if (ob.obfs?.type === 'salamander' && ob.obfs.password) {
+-            hy2.hysteria2Settings = {
+-              obfs: { type: 'salamander', password: ob.obfs.password },
+-            };
++            hy2Settings.obfs = { type: 'salamander', password: ob.obfs.password };
++          }
++          // 端口跳跃：server_ports 形如 ["20000:30000"]，存为逗号分隔字符串
++          if (ob.server_ports && ob.server_ports.length > 0) {
++            hy2Settings.serverPorts = ob.server_ports.join(',');
++            if (ob.hop_interval) hy2Settings.hopInterval = ob.hop_interval;
++          }
++          if (Object.keys(hy2Settings).length > 0) {
++            hy2.hysteria2Settings = hy2Settings;
+           }
+           servers.push(hy2);
++        } else if (ob.type === 'naive') {
++          // sing-box naive 的 quic:true 表示走 HTTP/3 (QUIC) 传输（h3 节点）
++          servers.push({
++            ...(base as ServerConfig),
++            protocol: 'naive',
++            username: ob.username ?? '',
++            password: ob.password ?? '',
++            naiveSettings: ob.quic ? { useHttp3: true } : undefined,
++          });
+         }
+       } catch (e: any) {
+         this.logManager.addLog(
+@@ -182,6 +242,29 @@ export class SubscriptionService {
+     return servers;
+   }
+ 
++  /** 订阅地址主机是否指向本机/内网/link-local（字面 IP 兜底，拦云元数据/回环/内网）。 */
++  private isBlockedSubscriptionHost(hostname: string): boolean {
++    const h = hostname.replace(/^\[|\]$/g, '').toLowerCase(); // 去 IPv6 方括号
++    if (h === 'localhost') return true;
++    const m = h.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
++    if (m) {
++      const a = parseInt(m[1], 10);
++      const b = parseInt(m[2], 10);
++      if (a === 0 || a === 127) return true; // 本机/通配
++      if (a === 10) return true; // 私网
++      if (a === 192 && b === 168) return true; // 私网
++      if (a === 172 && b >= 16 && b <= 31) return true; // 私网
++      if (a === 169 && b === 254) return true; // link-local / 云元数据 169.254.169.254
++      if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
++    }
++    // IPv6 字面量必含冒号——用它把主机名（如 fcm.googleapis.com / fd-cdn.net）排除在 fc/fd ULA 判断外
++    if (h.includes(':')) {
++      if (h === '::1' || h === '::') return true; // 回环 / 通配
++      if (h.startsWith('fe80:') || h.startsWith('fc') || h.startsWith('fd')) return true; // link-local / ULA
++    }
++    return false;
++  }
++
+   /**
+    * 拉取并解析订阅 URL，返回 ServerConfig 列表。
+    * 支持三种格式:
+@@ -196,6 +279,23 @@ export class SubscriptionService {
+     try {
+       this.logManager.addLog('info', `正在拉取订阅: ${url}`, 'Subscription');
+ 
++      // SSRF 防护：订阅地址来自用户/分享，限 http(s)、拒指向本机/内网/link-local 的字面 IP
++      // （拦 file://、http://169.254.169.254 云元数据、内网回环等）。基于主机名的 DNS 旁路仍存在，
++      // 此处仅做字面 IP 兜底。
++      const urlObj = (() => {
++        try {
++          return new URL(url);
++        } catch {
++          return null;
++        }
++      })();
++      if (!urlObj || (urlObj.protocol !== 'http:' && urlObj.protocol !== 'https:')) {
++        throw new Error(`订阅地址协议不支持（仅允许 http/https）: ${url}`);
++      }
++      if (this.isBlockedSubscriptionHost(urlObj.hostname)) {
++        throw new Error(`订阅地址指向本机/内网/link-local，已拒绝: ${urlObj.hostname}`);
++      }
++
+       const response = await net.fetch(url, {
+         headers: { 'User-Agent': 'FlowZ-Client' },
+       });
+@@ -261,7 +361,19 @@ export class SubscriptionService {
+         }
+       }
+ 
+-      this.logManager.addLog('info', `成功从订阅解析了 ${servers.length} 个节点`, 'Subscription');
++      if (servers.length === 0) {
++        // 区分「格式不识别」与「节点都解析失败」，避免 0 节点静默冒充成功（含 Base64 解码失败的情况）
++        const hadUrlLines = lines.some((l) => l.includes('://'));
++        this.logManager.addLog(
++          'warn',
++          hadUrlLines
++            ? '订阅中的节点 URL 均无法解析（协议不支持或格式错误）'
++            : '无法识别订阅格式：既非 sing-box JSON，也未发现可解析的节点 URL（可能 Base64 解码失败或格式不受支持）',
++          'Subscription'
++        );
++      } else {
++        this.logManager.addLog('info', `成功从订阅解析了 ${servers.length} 个节点`, 'Subscription');
++      }
+       return { servers, userInfo };
+     } catch (error: any) {
+       this.logManager.addLog('error', `拉取订阅失败 (${url}): ${error.message}`, 'Subscription');

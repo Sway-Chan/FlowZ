@@ -135,6 +135,4 @@ export function registerServerHandlers(
       await configManager.saveConfig(config);
     }
   );
-
-  console.log('[Server Handlers] Registered all server IPC handlers');
 }

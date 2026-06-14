@@ -86,6 +86,4 @@ export function registerUpdateHandlers(): void {
     }
     return { success: true };
   });
-
-  console.log('[Update Handlers] Registered all update IPC handlers');
 }

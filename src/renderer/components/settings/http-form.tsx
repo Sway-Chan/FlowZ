@@ -26,8 +26,8 @@ const createHttpSchema = (t: any) =>
     port: z.number().min(1).max(65535),
     username: z.string().optional(),
     password: z.string().optional(),
-    isHttps: z.boolean().default(false),
-    tlsAllowInsecure: z.boolean().default(false),
+    isHttps: z.boolean(),
+    tlsAllowInsecure: z.boolean(),
     tlsServerName: z.string().optional(),
   });
 

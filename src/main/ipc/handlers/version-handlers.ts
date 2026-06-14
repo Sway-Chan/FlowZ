@@ -6,10 +6,12 @@
 import { IpcMainInvokeEvent, app, shell } from 'electron';
 import { IPC_CHANNELS } from '../../../shared/ipc-channels';
 import { registerIpcHandler } from '../ipc-handler';
+// 内核版本以 core-manifest.json 为权威（构建时随内核打包的真相），非 package.json.singboxVersion（旧值易漂移）。
+import coreManifest from '../../../shared/core-manifest.json';
+// 构建时刻注入的真实构建日期（scripts/gen-build-info.js 生成），非运行时 new Date（B-1）。
+import { BUILD_DATE } from '../../../shared/build-info';
 
-// 从 package.json 读取 sing-box 版本
-const packageJson = require('../../../../../package.json');
-const SINGBOX_VERSION = packageJson.singboxVersion || 'Unknown';
+const BUNDLED_CORE_VERSION = coreManifest.bundledCoreVersion || 'Unknown';
 
 interface VersionInfo {
   appVersion: string;
@@ -29,7 +31,7 @@ export function registerVersionHandlers(coreUpdateService?: CoreUpdateService): 
   registerIpcHandler<void, VersionInfo>(
     IPC_CHANNELS.VERSION_GET_INFO,
     async (_event: IpcMainInvokeEvent) => {
-      let currentSingBoxVersion = SINGBOX_VERSION;
+      let currentSingBoxVersion = BUNDLED_CORE_VERSION;
       if (coreUpdateService) {
         try {
           const version = await coreUpdateService.getCurrentVersion();
@@ -44,7 +46,7 @@ export function registerVersionHandlers(coreUpdateService?: CoreUpdateService): 
       return {
         appVersion: app.getVersion(),
         appName: 'FlowZ',
-        buildDate: new Date().toISOString().split('T')[0],
+        buildDate: BUILD_DATE,
         singBoxVersion: currentSingBoxVersion,
         copyright: `© ${new Date().getFullYear()} FlowZ. All rights reserved.`,
         repositoryUrl: 'https://github.com/dododook/FlowZ',
@@ -60,6 +62,4 @@ export function registerVersionHandlers(coreUpdateService?: CoreUpdateService): 
       return true;
     }
   );
-
-  console.log('[Version Handlers] Registered all version IPC handlers');
 }

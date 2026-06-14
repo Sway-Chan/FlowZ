@@ -1,0 +1,970 @@
+{
+  "tun-smart__auto": {
+    "dns": {
+      "servers": [
+        {
+          "tag": "dns-bootstrap-udp",
+          "type": "udp",
+          "server": "223.5.5.5",
+          "server_port": 53
+        },
+        {
+          "tag": "dns-bootstrap",
+          "type": "https",
+          "server": "223.5.5.5",
+          "server_port": 443,
+          "path": "/dns-query"
+        },
+        {
+          "tag": "dns-local",
+          "type": "local"
+        },
+        {
+          "tag": "dns-domestic",
+          "type": "https",
+          "server": "doh.pub",
+          "server_port": 443,
+          "path": "/dns-query",
+          "domain_resolver": "dns-bootstrap"
+        },
+        {
+          "tag": "dns-remote",
+          "type": "https",
+          "server": "dns.google",
+          "server_port": 443,
+          "path": "/dns-query",
+          "domain_resolver": "dns-bootstrap",
+          "detour": "proxy-selector"
+        },
+        {
+          "tag": "fakeip",
+          "type": "fakeip",
+          "inet4_range": "198.18.0.0/15",
+          "inet6_range": "fc00::/18"
+        }
+      ],
+      "rules": [
+        {
+          "domain": ["a.example-argo.com", "sni-a.example.net"],
+          "domain_suffix": [
+            "a.example-argo.com",
+            ".a.example-argo.com",
+            "sni-a.example.net",
+            ".sni-a.example.net"
+          ],
+          "domain_keyword": ["a.example-argo.com", "sni-a.example.net"],
+          "server": "dns-domestic"
+        },
+        {
+          "domain": ["doh.pub", "dns.google", "cloudflare-dns.com", "one.one.one.one"],
+          "server": "dns-bootstrap-udp"
+        },
+        {
+          "domain_suffix": [
+            ".local",
+            ".arpa",
+            ".lan",
+            ".home.arpa",
+            ".microdone.cn",
+            ".icbc.com.cn",
+            ".boc.cn",
+            ".ccb.com",
+            ".abchina.com",
+            ".abchina.com.cn",
+            ".bankcomm.com",
+            ".cmbchina.com",
+            ".psbc.com",
+            ".spdb.com.cn",
+            ".cebbank.com",
+            ".citicbank.com",
+            ".pingan.com",
+            ".cib.com.cn",
+            ".hxb.com.cn",
+            ".cmbc.com.cn",
+            ".hzbank.com.cn",
+            ".10jqka.com.cn",
+            ".thsi.cn",
+            ".eastmoney.com",
+            ".1234567.com.cn",
+            ".gw.com.cn",
+            ".tdx.com.cn"
+          ],
+          "server": "dns-local"
+        },
+        {
+          "query_type": ["A", "AAAA"],
+          "server": "fakeip"
+        }
+      ],
+      "final": "dns-domestic",
+      "strategy": "prefer_ipv4"
+    },
+    "routeRules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "process_name": ["sing-box", "sing-box.exe"],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": [
+          "223.5.5.5/32",
+          "223.6.6.6/32",
+          "119.29.29.29/32",
+          "119.28.28.28/32",
+          "114.114.114.114/32"
+        ],
+        "port": [53, 443],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "port": [53],
+        "action": "hijack-dns"
+      },
+      {
+        "protocol": "icmp",
+        "action": "reject"
+      },
+      {
+        "process_name": [
+          "Surge",
+          "Surge 4",
+          "Surge 5",
+          "Clash",
+          "Clash for Windows",
+          "ClashX",
+          "ClashX Pro",
+          "clash-meta",
+          "Quantumult X",
+          "sing-box",
+          "sing-box.exe",
+          "mDNSResponder",
+          "apsd",
+          "nsurlsessiond",
+          "airportd",
+          "syspolicyd",
+          "trustd",
+          "ocspd",
+          "securityd",
+          "taskgated",
+          "findmydeviced",
+          "cloudd"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_keyword": [
+          "dns.google",
+          "cloudflare-dns.com",
+          "doh.opendns.com",
+          "dns.quad9.net",
+          "one.one.one.one"
+        ],
+        "port": [443, 853],
+        "action": "reject"
+      },
+      {
+        "domain": ["a.example-argo.com", "sni-a.example.net", "b.trycloudflare.com"],
+        "domain_suffix": [".a.example-argo.com", ".sni-a.example.net", ".b.trycloudflare.com"],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": ["203.0.113.7/32"],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [".microdone.cn"],
+        "action": "route",
+        "outbound": "direct",
+        "override_address": "127.0.0.1"
+      },
+      {
+        "domain_suffix": [
+          ".icbc.com.cn",
+          ".boc.cn",
+          ".ccb.com",
+          ".abchina.com",
+          ".abchina.com.cn",
+          ".bankcomm.com",
+          ".cmbchina.com",
+          ".psbc.com",
+          ".spdb.com.cn",
+          ".cebbank.com",
+          ".citicbank.com",
+          ".pingan.com",
+          ".cib.com.cn",
+          ".hxb.com.cn",
+          ".cmbc.com.cn",
+          ".hzbank.com.cn",
+          ".10jqka.com.cn",
+          ".thsi.cn",
+          ".eastmoney.com",
+          ".1234567.com.cn",
+          ".gw.com.cn",
+          ".tdx.com.cn"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": [
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16",
+          "127.0.0.0/8",
+          "169.254.0.0/16",
+          "224.0.0.0/4",
+          "240.0.0.0/4",
+          "::1/128",
+          "fc00::/7",
+          "fe80::/10",
+          "ff00::/8"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_keyword": [
+          "dns.google",
+          "cloudflare-dns.com",
+          "doh.opendns.com",
+          "dns.quad9.net",
+          "one.one.one.one"
+        ],
+        "network": ["udp"],
+        "port": [443],
+        "action": "reject"
+      },
+      {
+        "protocol": "dns",
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": ["223.5.5.5/32"],
+        "port": [53, 443],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": ["doh.pub"],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "gvt2.com",
+          "gvt1.com",
+          "oauthaccountmanager.googleapis.com",
+          "clientservices.googleapis.com",
+          "optimizationguide-pa.googleapis.com",
+          "mtalk.google.com",
+          "android.clients.google.com",
+          "clients1.google.com",
+          "clients2.google.com",
+          "clients3.google.com",
+          "clients4.google.com",
+          "clients5.google.com",
+          "clients6.google.com",
+          "update.googleapis.com"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": ["google", "gmail", "youtube", "gstatic", "googleapis", "googlevideo"],
+        "action": "route",
+        "outbound": "proxy-selector"
+      },
+      {
+        "rule_set": "geosite-geolocation-!cn",
+        "action": "route",
+        "outbound": "proxy-selector"
+      },
+      {
+        "rule_set": "geosite-cn",
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "rule_set": "geoip-cn",
+        "action": "route",
+        "outbound": "direct"
+      }
+    ],
+    "routeDefaultDomainResolver": "dns-bootstrap",
+    "inbounds": [
+      {
+        "type": "http",
+        "tag": "http-in"
+      },
+      {
+        "type": "socks",
+        "tag": "socks-in"
+      },
+      {
+        "type": "tun",
+        "tag": "tun-in",
+        "route_exclude_address": ["127.0.0.0/8", "::1/128"]
+      }
+    ],
+    "outboundResolvers": [
+      {
+        "tag": "香港 A",
+        "type": "vless",
+        "domain_resolver": "dns-bootstrap"
+      },
+      {
+        "tag": "美国 B",
+        "type": "trojan",
+        "domain_resolver": "dns-bootstrap"
+      },
+      {
+        "tag": "IP 节点",
+        "type": "trojan",
+        "domain_resolver": "dns-bootstrap"
+      }
+    ]
+  },
+  "tun-global__auto": {
+    "dns": {
+      "servers": [
+        {
+          "tag": "dns-bootstrap-udp",
+          "type": "udp",
+          "server": "223.5.5.5",
+          "server_port": 53
+        },
+        {
+          "tag": "dns-bootstrap",
+          "type": "https",
+          "server": "223.5.5.5",
+          "server_port": 443,
+          "path": "/dns-query"
+        },
+        {
+          "tag": "dns-local",
+          "type": "local"
+        },
+        {
+          "tag": "dns-domestic",
+          "type": "https",
+          "server": "doh.pub",
+          "server_port": 443,
+          "path": "/dns-query",
+          "domain_resolver": "dns-bootstrap"
+        },
+        {
+          "tag": "dns-remote",
+          "type": "https",
+          "server": "dns.google",
+          "server_port": 443,
+          "path": "/dns-query",
+          "domain_resolver": "dns-bootstrap",
+          "detour": "proxy-selector"
+        },
+        {
+          "tag": "fakeip",
+          "type": "fakeip",
+          "inet4_range": "198.18.0.0/15",
+          "inet6_range": "fc00::/18"
+        }
+      ],
+      "rules": [
+        {
+          "domain": ["a.example-argo.com", "sni-a.example.net"],
+          "domain_suffix": [
+            "a.example-argo.com",
+            ".a.example-argo.com",
+            "sni-a.example.net",
+            ".sni-a.example.net"
+          ],
+          "domain_keyword": ["a.example-argo.com", "sni-a.example.net"],
+          "server": "dns-domestic"
+        },
+        {
+          "domain": ["doh.pub", "dns.google", "cloudflare-dns.com", "one.one.one.one"],
+          "server": "dns-bootstrap-udp"
+        },
+        {
+          "domain_suffix": [
+            ".local",
+            ".arpa",
+            ".lan",
+            ".home.arpa",
+            ".microdone.cn",
+            ".icbc.com.cn",
+            ".boc.cn",
+            ".ccb.com",
+            ".abchina.com",
+            ".abchina.com.cn",
+            ".bankcomm.com",
+            ".cmbchina.com",
+            ".psbc.com",
+            ".spdb.com.cn",
+            ".cebbank.com",
+            ".citicbank.com",
+            ".pingan.com",
+            ".cib.com.cn",
+            ".hxb.com.cn",
+            ".cmbc.com.cn",
+            ".hzbank.com.cn",
+            ".10jqka.com.cn",
+            ".thsi.cn",
+            ".eastmoney.com",
+            ".1234567.com.cn",
+            ".gw.com.cn",
+            ".tdx.com.cn"
+          ],
+          "server": "dns-local"
+        },
+        {
+          "query_type": ["A", "AAAA"],
+          "server": "fakeip"
+        }
+      ],
+      "final": "dns-domestic",
+      "strategy": "prefer_ipv4"
+    },
+    "routeRules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "process_name": ["sing-box", "sing-box.exe"],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": [
+          "223.5.5.5/32",
+          "223.6.6.6/32",
+          "119.29.29.29/32",
+          "119.28.28.28/32",
+          "114.114.114.114/32"
+        ],
+        "port": [53, 443],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "port": [53],
+        "action": "hijack-dns"
+      },
+      {
+        "protocol": "icmp",
+        "action": "reject"
+      },
+      {
+        "process_name": [
+          "Surge",
+          "Surge 4",
+          "Surge 5",
+          "Clash",
+          "Clash for Windows",
+          "ClashX",
+          "ClashX Pro",
+          "clash-meta",
+          "Quantumult X",
+          "sing-box",
+          "sing-box.exe",
+          "mDNSResponder",
+          "apsd",
+          "nsurlsessiond",
+          "airportd",
+          "syspolicyd",
+          "trustd",
+          "ocspd",
+          "securityd",
+          "taskgated",
+          "findmydeviced",
+          "cloudd"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_keyword": [
+          "dns.google",
+          "cloudflare-dns.com",
+          "doh.opendns.com",
+          "dns.quad9.net",
+          "one.one.one.one"
+        ],
+        "port": [443, 853],
+        "action": "reject"
+      },
+      {
+        "domain": ["a.example-argo.com", "sni-a.example.net", "b.trycloudflare.com"],
+        "domain_suffix": [".a.example-argo.com", ".sni-a.example.net", ".b.trycloudflare.com"],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": ["203.0.113.7/32"],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [".microdone.cn"],
+        "action": "route",
+        "outbound": "direct",
+        "override_address": "127.0.0.1"
+      },
+      {
+        "domain_suffix": [
+          ".icbc.com.cn",
+          ".boc.cn",
+          ".ccb.com",
+          ".abchina.com",
+          ".abchina.com.cn",
+          ".bankcomm.com",
+          ".cmbchina.com",
+          ".psbc.com",
+          ".spdb.com.cn",
+          ".cebbank.com",
+          ".citicbank.com",
+          ".pingan.com",
+          ".cib.com.cn",
+          ".hxb.com.cn",
+          ".cmbc.com.cn",
+          ".hzbank.com.cn",
+          ".10jqka.com.cn",
+          ".thsi.cn",
+          ".eastmoney.com",
+          ".1234567.com.cn",
+          ".gw.com.cn",
+          ".tdx.com.cn"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": [
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16",
+          "127.0.0.0/8",
+          "169.254.0.0/16",
+          "224.0.0.0/4",
+          "240.0.0.0/4",
+          "::1/128",
+          "fc00::/7",
+          "fe80::/10",
+          "ff00::/8"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_keyword": [
+          "dns.google",
+          "cloudflare-dns.com",
+          "doh.opendns.com",
+          "dns.quad9.net",
+          "one.one.one.one"
+        ],
+        "network": ["udp"],
+        "port": [443],
+        "action": "reject"
+      },
+      {
+        "protocol": "dns",
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": ["223.5.5.5/32"],
+        "port": [53, 443],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": ["doh.pub"],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "gvt2.com",
+          "gvt1.com",
+          "oauthaccountmanager.googleapis.com",
+          "clientservices.googleapis.com",
+          "optimizationguide-pa.googleapis.com",
+          "mtalk.google.com",
+          "android.clients.google.com",
+          "clients1.google.com",
+          "clients2.google.com",
+          "clients3.google.com",
+          "clients4.google.com",
+          "clients5.google.com",
+          "clients6.google.com",
+          "update.googleapis.com"
+        ],
+        "action": "reject"
+      }
+    ],
+    "routeDefaultDomainResolver": "dns-bootstrap",
+    "inbounds": [
+      {
+        "type": "http",
+        "tag": "http-in"
+      },
+      {
+        "type": "socks",
+        "tag": "socks-in"
+      },
+      {
+        "type": "tun",
+        "tag": "tun-in",
+        "route_exclude_address": ["127.0.0.0/8", "::1/128"]
+      }
+    ],
+    "outboundResolvers": [
+      {
+        "tag": "香港 A",
+        "type": "vless",
+        "domain_resolver": "dns-bootstrap"
+      },
+      {
+        "tag": "美国 B",
+        "type": "trojan",
+        "domain_resolver": "dns-bootstrap"
+      },
+      {
+        "tag": "IP 节点",
+        "type": "trojan",
+        "domain_resolver": "dns-bootstrap"
+      }
+    ]
+  },
+  "systemproxy__auto": {
+    "dns": {
+      "servers": [
+        {
+          "tag": "dns-bootstrap-udp",
+          "type": "udp",
+          "server": "223.5.5.5",
+          "server_port": 53
+        },
+        {
+          "tag": "dns-bootstrap",
+          "type": "https",
+          "server": "223.5.5.5",
+          "server_port": 443,
+          "path": "/dns-query"
+        },
+        {
+          "tag": "dns-local",
+          "type": "local"
+        },
+        {
+          "tag": "dns-domestic",
+          "type": "https",
+          "server": "doh.pub",
+          "server_port": 443,
+          "path": "/dns-query",
+          "domain_resolver": "dns-bootstrap"
+        },
+        {
+          "tag": "dns-remote",
+          "type": "https",
+          "server": "dns.google",
+          "server_port": 443,
+          "path": "/dns-query",
+          "domain_resolver": "dns-bootstrap",
+          "detour": "proxy-selector"
+        }
+      ],
+      "rules": [
+        {
+          "domain": ["a.example-argo.com", "sni-a.example.net"],
+          "domain_suffix": [
+            "a.example-argo.com",
+            ".a.example-argo.com",
+            "sni-a.example.net",
+            ".sni-a.example.net"
+          ],
+          "domain_keyword": ["a.example-argo.com", "sni-a.example.net"],
+          "server": "dns-domestic"
+        },
+        {
+          "domain": ["doh.pub", "dns.google", "cloudflare-dns.com", "one.one.one.one"],
+          "server": "dns-bootstrap-udp"
+        },
+        {
+          "domain_suffix": [
+            ".local",
+            ".arpa",
+            ".lan",
+            ".home.arpa",
+            ".microdone.cn",
+            ".icbc.com.cn",
+            ".boc.cn",
+            ".ccb.com",
+            ".abchina.com",
+            ".abchina.com.cn",
+            ".bankcomm.com",
+            ".cmbchina.com",
+            ".psbc.com",
+            ".spdb.com.cn",
+            ".cebbank.com",
+            ".citicbank.com",
+            ".pingan.com",
+            ".cib.com.cn",
+            ".hxb.com.cn",
+            ".cmbc.com.cn",
+            ".hzbank.com.cn",
+            ".10jqka.com.cn",
+            ".thsi.cn",
+            ".eastmoney.com",
+            ".1234567.com.cn",
+            ".gw.com.cn",
+            ".tdx.com.cn"
+          ],
+          "server": "dns-local"
+        },
+        {
+          "rule_set": "geosite-cn",
+          "server": "dns-domestic"
+        },
+        {
+          "server": "dns-remote"
+        }
+      ],
+      "final": "dns-domestic",
+      "strategy": "prefer_ipv4"
+    },
+    "routeRules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "process_name": ["sing-box", "sing-box.exe"],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": [
+          "223.5.5.5/32",
+          "223.6.6.6/32",
+          "119.29.29.29/32",
+          "119.28.28.28/32",
+          "114.114.114.114/32"
+        ],
+        "port": [53, 443],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "port": [53],
+        "action": "hijack-dns"
+      },
+      {
+        "protocol": "icmp",
+        "action": "reject"
+      },
+      {
+        "process_name": [
+          "Surge",
+          "Surge 4",
+          "Surge 5",
+          "Clash",
+          "Clash for Windows",
+          "ClashX",
+          "ClashX Pro",
+          "clash-meta",
+          "Quantumult X",
+          "sing-box",
+          "sing-box.exe",
+          "mDNSResponder",
+          "apsd",
+          "nsurlsessiond",
+          "airportd",
+          "syspolicyd",
+          "trustd",
+          "ocspd",
+          "securityd",
+          "taskgated",
+          "findmydeviced",
+          "cloudd"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_keyword": [
+          "dns.google",
+          "cloudflare-dns.com",
+          "doh.opendns.com",
+          "dns.quad9.net",
+          "one.one.one.one"
+        ],
+        "port": [443, 853],
+        "action": "reject"
+      },
+      {
+        "domain": ["a.example-argo.com", "sni-a.example.net", "b.trycloudflare.com"],
+        "domain_suffix": [".a.example-argo.com", ".sni-a.example.net", ".b.trycloudflare.com"],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": ["203.0.113.7/32"],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [".microdone.cn"],
+        "action": "route",
+        "outbound": "direct",
+        "override_address": "127.0.0.1"
+      },
+      {
+        "domain_suffix": [
+          ".icbc.com.cn",
+          ".boc.cn",
+          ".ccb.com",
+          ".abchina.com",
+          ".abchina.com.cn",
+          ".bankcomm.com",
+          ".cmbchina.com",
+          ".psbc.com",
+          ".spdb.com.cn",
+          ".cebbank.com",
+          ".citicbank.com",
+          ".pingan.com",
+          ".cib.com.cn",
+          ".hxb.com.cn",
+          ".cmbc.com.cn",
+          ".hzbank.com.cn",
+          ".10jqka.com.cn",
+          ".thsi.cn",
+          ".eastmoney.com",
+          ".1234567.com.cn",
+          ".gw.com.cn",
+          ".tdx.com.cn"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": [
+          "10.0.0.0/8",
+          "172.16.0.0/12",
+          "192.168.0.0/16",
+          "127.0.0.0/8",
+          "169.254.0.0/16",
+          "224.0.0.0/4",
+          "240.0.0.0/4",
+          "::1/128",
+          "fc00::/7",
+          "fe80::/10",
+          "ff00::/8"
+        ],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_keyword": [
+          "dns.google",
+          "cloudflare-dns.com",
+          "doh.opendns.com",
+          "dns.quad9.net",
+          "one.one.one.one"
+        ],
+        "network": ["udp"],
+        "port": [443],
+        "action": "reject"
+      },
+      {
+        "protocol": "dns",
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "ip_cidr": ["223.5.5.5/32"],
+        "port": [53, 443],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": ["doh.pub"],
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "domain_suffix": [
+          "gvt2.com",
+          "gvt1.com",
+          "oauthaccountmanager.googleapis.com",
+          "clientservices.googleapis.com",
+          "optimizationguide-pa.googleapis.com",
+          "mtalk.google.com",
+          "android.clients.google.com",
+          "clients1.google.com",
+          "clients2.google.com",
+          "clients3.google.com",
+          "clients4.google.com",
+          "clients5.google.com",
+          "clients6.google.com",
+          "update.googleapis.com"
+        ],
+        "action": "reject"
+      },
+      {
+        "domain_keyword": ["google", "gmail", "youtube", "gstatic", "googleapis", "googlevideo"],
+        "action": "route",
+        "outbound": "proxy-selector"
+      },
+      {
+        "rule_set": "geosite-geolocation-!cn",
+        "action": "route",
+        "outbound": "proxy-selector"
+      },
+      {
+        "rule_set": "geosite-cn",
+        "action": "route",
+        "outbound": "direct"
+      },
+      {
+        "rule_set": "geoip-cn",
+        "action": "route",
+        "outbound": "direct"
+      }
+    ],
+    "routeDefaultDomainResolver": "dns-bootstrap",
+    "inbounds": [
+      {
+        "type": "http",
+        "tag": "http-in"
+      },
+      {
+        "type": "socks",
+        "tag": "socks-in"
+      }
+    ],
+    "outboundResolvers": [
+      {
+        "tag": "香港 A",
+        "type": "vless",
+        "domain_resolver": "dns-bootstrap"
+      },
+      {
+        "tag": "美国 B",
+        "type": "trojan",
+        "domain_resolver": "dns-bootstrap"
+      },
+      {
+        "tag": "IP 节点",
+        "type": "trojan",
+        "domain_resolver": "dns-bootstrap"
+      }
+    ]
+  }
+}

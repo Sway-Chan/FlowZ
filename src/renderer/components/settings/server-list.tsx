@@ -74,29 +74,33 @@ const ALL_PROTOCOLS = [
 
 const getCountryCode = (name: string): string | null => {
   const lowerName = name.toLowerCase();
-  if (/香港|hk|hong kong|🇭🇰/.test(lowerName)) return 'hk';
-  if (/台湾|tw|taiwan|🇹🇼|台北|新北/.test(lowerName)) return 'cn';
-  if (/日本|jp|japan|🇯🇵|东京|大阪/.test(lowerName)) return 'jp';
-  if (/新加坡|sg|singapore|🇸🇬|狮城/.test(lowerName)) return 'sg';
-  if (/美国|us|america|usa|🇺🇸|洛杉矶|硅谷|西雅图/.test(lowerName)) return 'us';
-  if (/韩国|kr|korea|🇰🇷|首尔/.test(lowerName)) return 'kr';
-  if (/英国|uk|gb|🇬🇧|伦敦/.test(lowerName)) return 'gb';
-  if (/德国|de|germany|🇩🇪|法兰克福/.test(lowerName)) return 'de';
-  if (/法国|fr|france|🇫🇷|巴黎/.test(lowerName)) return 'fr';
-  if (/澳洲|澳大利亚|au|australia|🇦🇺|悉尼/.test(lowerName)) return 'au';
-  if (/加拿大|ca|canada|🇨🇦|多伦多|温哥华/.test(lowerName)) return 'ca';
-  if (/印度|in|india|🇮🇳|孟买/.test(lowerName)) return 'in';
-  if (/俄罗斯|ru|russia|🇷🇺|莫斯科/.test(lowerName)) return 'ru';
-  if (/荷兰|nl|netherlands|🇳🇱|阿姆斯特丹/.test(lowerName)) return 'nl';
-  if (/土耳其|tr|turkey|🇹🇷|伊斯坦布尔/.test(lowerName)) return 'tr';
-  if (/阿根廷|ar|argentina|🇦🇷/.test(lowerName)) return 'ar';
-  if (/意大利|it|italy|🇮🇹|罗马|米兰/.test(lowerName)) return 'it';
-  if (/巴西|br|brazil|🇧🇷|圣保罗/.test(lowerName)) return 'br';
-  if (/西班牙|es|spain|🇪🇸|马德里/.test(lowerName)) return 'es';
-  if (/瑞士|ch|switzerland|🇨🇭|苏黎世/.test(lowerName)) return 'ch';
-  if (/瑞典|se|sweden|🇸🇪|斯德哥尔摩/.test(lowerName)) return 'se';
-  if (/印尼|印度尼西亚|id|indonesia|🇮🇩|雅加达/.test(lowerName)) return 'id';
-  if (/马来西亚|my|malaysia|🇲🇾|吉隆坡/.test(lowerName)) return 'my';
+  // 拉丁字母国家码/缩写要求两侧不与其他字母相邻（允许数字/分隔符），以免子串误判：
+  // russia 含 us、berlin 含 in、montreal 含 tr、sweden 含 de、madrid 含 id 等；
+  // 同时兼容 "US01" / "HK-02" 等写法。中文名/城市/旗帜 emoji 足够独特，仍按子串匹配。
+  if (/香港|🇭🇰|hong kong|(?<![a-z])hk(?![a-z])/.test(lowerName)) return 'hk';
+  if (/台湾|🇹🇼|台北|新北|(?<![a-z])(?:tw|taiwan)(?![a-z])/.test(lowerName)) return 'cn';
+  if (/日本|🇯🇵|东京|大阪|(?<![a-z])(?:jp|japan)(?![a-z])/.test(lowerName)) return 'jp';
+  if (/新加坡|🇸🇬|狮城|(?<![a-z])(?:sg|singapore)(?![a-z])/.test(lowerName)) return 'sg';
+  if (/美国|🇺🇸|洛杉矶|硅谷|西雅图|(?<![a-z])(?:us|usa|america)(?![a-z])/.test(lowerName))
+    return 'us';
+  if (/韩国|🇰🇷|首尔|(?<![a-z])(?:kr|korea)(?![a-z])/.test(lowerName)) return 'kr';
+  if (/英国|🇬🇧|伦敦|(?<![a-z])(?:uk|gb)(?![a-z])/.test(lowerName)) return 'gb';
+  if (/德国|🇩🇪|法兰克福|(?<![a-z])(?:de|germany)(?![a-z])/.test(lowerName)) return 'de';
+  if (/法国|🇫🇷|巴黎|(?<![a-z])(?:fr|france)(?![a-z])/.test(lowerName)) return 'fr';
+  if (/澳洲|澳大利亚|🇦🇺|悉尼|(?<![a-z])(?:au|australia)(?![a-z])/.test(lowerName)) return 'au';
+  if (/加拿大|🇨🇦|多伦多|温哥华|(?<![a-z])(?:ca|canada)(?![a-z])/.test(lowerName)) return 'ca';
+  if (/印度|🇮🇳|孟买|(?<![a-z])(?:in|india)(?![a-z])/.test(lowerName)) return 'in';
+  if (/俄罗斯|🇷🇺|莫斯科|(?<![a-z])(?:ru|russia)(?![a-z])/.test(lowerName)) return 'ru';
+  if (/荷兰|🇳🇱|阿姆斯特丹|(?<![a-z])(?:nl|netherlands)(?![a-z])/.test(lowerName)) return 'nl';
+  if (/土耳其|🇹🇷|伊斯坦布尔|(?<![a-z])(?:tr|turkey)(?![a-z])/.test(lowerName)) return 'tr';
+  if (/阿根廷|🇦🇷|(?<![a-z])(?:ar|argentina)(?![a-z])/.test(lowerName)) return 'ar';
+  if (/意大利|🇮🇹|罗马|米兰|(?<![a-z])(?:it|italy)(?![a-z])/.test(lowerName)) return 'it';
+  if (/巴西|🇧🇷|圣保罗|(?<![a-z])(?:br|brazil)(?![a-z])/.test(lowerName)) return 'br';
+  if (/西班牙|🇪🇸|马德里|(?<![a-z])(?:es|spain)(?![a-z])/.test(lowerName)) return 'es';
+  if (/瑞士|🇨🇭|苏黎世|(?<![a-z])(?:ch|switzerland)(?![a-z])/.test(lowerName)) return 'ch';
+  if (/瑞典|🇸🇪|斯德哥尔摩|(?<![a-z])(?:se|sweden)(?![a-z])/.test(lowerName)) return 'se';
+  if (/印尼|印度尼西亚|🇮🇩|雅加达|(?<![a-z])(?:id|indonesia)(?![a-z])/.test(lowerName)) return 'id';
+  if (/马来西亚|🇲🇾|吉隆坡|(?<![a-z])(?:my|malaysia)(?![a-z])/.test(lowerName)) return 'my';
   return null;
 };
 
@@ -110,7 +114,6 @@ const getTransportLabel = (server: ServerConfigWithId): string => {
 
 interface ServerListProps {
   servers: ServerConfigWithId[];
-  subscriptions?: import('@/bridge/types').SubscriptionConfig[];
   selectedServerId?: string;
   showAddButton?: boolean;
   onAddServer: () => void;
@@ -136,6 +139,8 @@ export function ServerList({
 }: ServerListProps) {
   const latencyMap = useAppStore((state) => state.latencyMap);
   const setLatencyMap = useAppStore((state) => state.setLatencyMap);
+  // 启动前配置校验 gate 剔除的非法节点：列表标灰 + tooltip（不禁用点击，用户仍可选/编辑/删除）。
+  const invalidNodes = useAppStore((state) => state.invalidNodes);
   const [isTestingSpeed, setIsTestingSpeed] = useState(false);
   const [testingServerIds, setTestingServerIds] = useState<Set<string>>(new Set());
   const { t } = useTranslation();
@@ -213,16 +218,16 @@ export function ServerList({
   const getLatencyColor = (latency: number | undefined) => {
     if (latency === undefined) return 'text-muted-foreground';
     if (latency === -1) return 'text-destructive';
-    if (latency < 100) return 'text-green-500';
-    if (latency < 300) return 'text-yellow-500';
+    if (latency < 100) return 'text-success';
+    if (latency < 300) return 'text-warning';
     return 'text-destructive';
   };
 
   const getLatencyBg = (latency: number | undefined) => {
     if (latency === undefined) return '';
     if (latency === -1) return 'bg-destructive/10';
-    if (latency < 100) return 'bg-green-500/10';
-    if (latency < 300) return 'bg-yellow-500/10';
+    if (latency < 100) return 'bg-success/10';
+    if (latency < 300) return 'bg-warning/10';
     return 'bg-destructive/10';
   };
 
@@ -262,7 +267,10 @@ export function ServerList({
 
   const handleBatchCopy = async () => {
     try {
-      const selectedServersList = servers.filter((s) => selectedIds.has(s.id));
+      // ssh 无分享链接，批量复制时排除（避免 per-server 抛错刷屏 toast）
+      const selectedServersList = servers.filter(
+        (s) => selectedIds.has(s.id) && s.protocol?.toLowerCase() !== 'ssh'
+      );
       const urls: string[] = [];
       let successCount = 0;
 
@@ -397,15 +405,18 @@ export function ServerList({
           {latencyMap[server.id] === -1 ? t('servers.timeout') : `${latencyMap[server.id]} ms`}
         </span>
       )}
-      <Button
-        variant="ghost"
-        size="sm"
-        title={t('servers.copyShareUrl')}
-        className="h-7 w-7 p-0"
-        onClick={(e) => handleCopyShareUrl(server, e)}
-      >
-        <Copy className="h-3.5 w-3.5" />
-      </Button>
+      {/* ssh 无分享链接(ProtocolParser.generateUrl 无 ssh 分支)，隐藏复制按钮 */}
+      {server.protocol?.toLowerCase() !== 'ssh' && (
+        <Button
+          variant="ghost"
+          size="sm"
+          title={t('servers.copyShareUrl')}
+          className="h-7 w-7 p-0"
+          onClick={(e) => handleCopyShareUrl(server, e)}
+        >
+          <Copy className="h-3.5 w-3.5" />
+        </Button>
+      )}
       {onCloneServer && (
         <Button
           variant="ghost"
@@ -743,7 +754,7 @@ export function ServerList({
                   selectedServerId === server.id
                     ? 'ring-2 ring-primary bg-primary/5'
                     : 'hover:bg-muted/50'
-                } ${isSelecting && selectedIds.has(server.id) ? 'ring-2 ring-blue-400 bg-blue-50/10' : ''}`}
+                } ${isSelecting && selectedIds.has(server.id) ? 'ring-2 ring-primary bg-primary/10' : ''}`}
                 onClick={() =>
                   isSelecting
                     ? toggleSelect(server.id, { stopPropagation: () => {} } as any)
@@ -774,7 +785,16 @@ export function ServerList({
                 <CardHeader className={`pb-2 ${isSelecting ? 'pl-8' : ''}`}>
                   <div className="flex items-start justify-between gap-2">
                     <div className="min-w-0">
-                      <CardTitle className="text-sm truncate">{server.name}</CardTitle>
+                      <CardTitle
+                        className={`text-sm truncate ${invalidNodes[server.id] ? 'opacity-50' : ''}`}
+                        title={
+                          invalidNodes[server.id]
+                            ? `${t('servers.nodeInvalid')}: ${invalidNodes[server.id].reason}`
+                            : undefined
+                        }
+                      >
+                        {server.name}
+                      </CardTitle>
                       <CardDescription className="text-xs mt-0.5">
                         {server.address}:{server.port}
                       </CardDescription>
@@ -834,7 +854,7 @@ export function ServerList({
                 key={server.id}
                 className={`relative overflow-hidden flex items-center gap-3 px-4 py-2.5 cursor-pointer transition-colors ${
                   selectedServerId === server.id ? 'bg-primary/5' : 'hover:bg-muted/50'
-                } ${isSelecting && selectedIds.has(server.id) ? 'bg-blue-50/10' : ''}`}
+                } ${isSelecting && selectedIds.has(server.id) ? 'bg-primary/10' : ''}`}
                 onClick={() => {
                   if (isSelecting) {
                     setSelectedIds((prev) => {
@@ -885,7 +905,16 @@ export function ServerList({
                 {/* 名称 + 地址 */}
                 <div className="flex-1 min-w-0 relative z-10">
                   <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium truncate">{server.name}</span>
+                    <span
+                      className={`text-sm font-medium truncate ${invalidNodes[server.id] ? 'opacity-50' : ''}`}
+                      title={
+                        invalidNodes[server.id]
+                          ? `${t('servers.nodeInvalid')}: ${invalidNodes[server.id].reason}`
+                          : undefined
+                      }
+                    >
+                      {server.name}
+                    </span>
                     <Badge
                       className={`text-[10px] h-4 px-1 flex-shrink-0 border ${getProtocolBadgeVariant(server.protocol)}`}
                     >

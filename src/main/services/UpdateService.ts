@@ -8,6 +8,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { LogManager } from './LogManager';
 import type { UpdateInfo, UpdateCheckResult, UpdateProgress } from '../../shared/types/update';
+import { APP_USER_AGENT } from '../../shared/constants';
 import { getUserDataPath } from '../utils/paths';
 
 const GITHUB_OWNER = 'dododook';
@@ -220,6 +221,7 @@ export class UpdateService {
 
         // 给一点时间让 VBS 启动，然后退出应用
         setTimeout(() => {
+          this.destroyTrayForExit();
           app.exit(0);
         }, 500);
       } else if (process.platform === 'darwin') {
@@ -248,6 +250,7 @@ open "${installerPath}"
         this.logManager.addLog('info', 'DMG 文件将在应用退出后打开...', 'UpdateService');
 
         setTimeout(() => {
+          this.destroyTrayForExit();
           app.exit(0);
         }, 1000);
       } else {
@@ -255,6 +258,7 @@ open "${installerPath}"
         await shell.openPath(installerPath);
         this.logManager.addLog('info', '安装程序已启动，正在退出应用...', 'UpdateService');
         setTimeout(() => {
+          this.destroyTrayForExit();
           app.exit(0);
         }, 1000);
       }
@@ -263,6 +267,19 @@ open "${installerPath}"
     } catch (error: any) {
       this.logManager.addLog('error', `安装更新失败: ${error?.message}`, 'UpdateService');
       return false;
+    }
+  }
+
+  /**
+   * app.exit() 绕过 before-quit/will-quit 退出管线（含托盘销毁）→ 安装更新前主动销毁托盘，
+   * 否则 Windows 上残留幽灵图标（hover 才消失）。延迟 require 避免与 index.ts 顶层循环依赖；best-effort。
+   */
+  private destroyTrayForExit(): void {
+    try {
+      const { getTrayManager } = require('../index');
+      getTrayManager()?.destroyTray();
+    } catch {
+      /* 托盘销毁失败不阻断更新退出 */
     }
   }
 
@@ -544,7 +561,7 @@ open "${installerPath}"
         method: 'GET',
         url: `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases`,
       });
-      request.setHeader('User-Agent', 'FlowZ-Electron');
+      request.setHeader('User-Agent', APP_USER_AGENT);
       request.setHeader('Accept', 'application/vnd.github.v3+json');
 
       request.on('response', (res) => {
@@ -646,7 +663,7 @@ open "${installerPath}"
         url: url,
         method: 'GET',
       });
-      request.setHeader('User-Agent', 'FlowZ-Electron');
+      request.setHeader('User-Agent', APP_USER_AGENT);
 
       request.on('response', (response) => {
         if (response.statusCode === 302 || response.statusCode === 301) {
@@ -734,7 +751,7 @@ open "${installerPath}"
         url: url,
         method: 'GET',
       });
-      request.setHeader('User-Agent', 'FlowZ-Electron');
+      request.setHeader('User-Agent', APP_USER_AGENT);
 
       request.on('response', (response) => {
         if (response.statusCode === 302 || response.statusCode === 301) {

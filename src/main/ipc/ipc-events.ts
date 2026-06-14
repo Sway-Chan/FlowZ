@@ -34,8 +34,6 @@ export class IpcEventEmitter {
    * 向所有注册的窗口发送事件
    */
   sendToAll<T = any>(channel: string, data: T): void {
-    console.log(`[IPC Event] Broadcasting to ${this.windows.size} windows: ${channel}`, data);
-
     for (const window of this.windows) {
       if (!window.isDestroyed() && window.webContents) {
         window.webContents.send(channel, data);
@@ -48,7 +46,6 @@ export class IpcEventEmitter {
    */
   sendToWindow<T = any>(window: BrowserWindow, channel: string, data: T): void {
     if (!window.isDestroyed() && window.webContents) {
-      console.log(`[IPC Event] Sending to window: ${channel}`, data);
       window.webContents.send(channel, data);
     }
   }
@@ -58,7 +55,6 @@ export class IpcEventEmitter {
    */
   sendToWebContents<T = any>(webContents: WebContents, channel: string, data: T): void {
     if (!webContents.isDestroyed()) {
-      console.log(`[IPC Event] Sending to webContents: ${channel}`, data);
       webContents.send(channel, data);
     }
   }

@@ -3,6 +3,8 @@ import * as z from 'zod';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useTranslation } from 'react-i18next';
+import { useAppStore } from '@/store/app-store';
+import { encodeMajorMinor } from '@shared/version';
 import { Button } from '@/components/ui/button';
 import { Loader2 } from 'lucide-react';
 import {
@@ -48,6 +50,8 @@ interface NaiveFormProps {
 export function NaiveForm({ serverConfig, onSubmit }: NaiveFormProps) {
   const { t } = useTranslation();
   const naiveFormSchema = createNaiveSchema(t);
+  const setCurrentView = useAppStore((s) => s.setCurrentView);
+  const setSettingsSection = useAppStore((s) => s.setSettingsSection);
 
   // naive 需 sing-box ≥1.13。仅当实测核心 <1.13 才提示更新；已支持则不打扰（修旧版无条件提示）。
   const [needsCoreUpgrade, setNeedsCoreUpgrade] = useState(false);
@@ -55,8 +59,8 @@ export function NaiveForm({ serverConfig, onSubmit }: NaiveFormProps) {
     api.coreUpdate
       .getVersionInfo()
       .then((info) => {
-        const m = (info.currentVersion || '').match(/^v?(\d+)\.(\d+)/);
-        setNeedsCoreUpgrade(!!m && parseInt(m[1], 10) * 1000 + parseInt(m[2], 10) < 1013);
+        // 与 ProxyManager/CoreUpdateService 统一用 shared 的整数编码解析；NaN<1013=false 保持原「未知则不提示」语义
+        setNeedsCoreUpgrade(encodeMajorMinor(info.currentVersion || '') < 1013);
       })
       .catch(() => {});
   }, []);
@@ -122,7 +126,10 @@ export function NaiveForm({ serverConfig, onSubmit }: NaiveFormProps) {
                   variant="outline"
                   size="sm"
                   className="h-8 border-amber-300 dark:border-amber-700 hover:bg-amber-100 dark:hover:bg-amber-900/40 text-amber-900 dark:text-amber-100"
-                  onClick={() => (window.location.hash = '#/settings/about')}
+                  onClick={() => {
+                    setSettingsSection('about');
+                    setCurrentView('settings');
+                  }}
                 >
                   {t('servers.naive.goUpdate')}
                 </Button>

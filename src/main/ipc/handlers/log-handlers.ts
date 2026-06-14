@@ -5,7 +5,7 @@
 
 import { IpcMainInvokeEvent } from 'electron';
 import { IPC_CHANNELS } from '../../../shared/ipc-channels';
-import type { LogEntry, LogLevel } from '../../../shared/types';
+import type { LogEntry } from '../../../shared/types';
 import { registerIpcHandler } from '../ipc-handler';
 import { LogManager } from '../../services/LogManager';
 import { ProxyManager } from '../../services/ProxyManager';
@@ -34,18 +34,8 @@ export function registerLogHandlers(logManager: LogManager, proxyManager?: Proxy
     }
   });
 
-  // 设置日志级别
-  registerIpcHandler<{ level: LogLevel }, void>(
-    IPC_CHANNELS.LOGS_SET_LEVEL,
-    async (_event: IpcMainInvokeEvent, args: { level: LogLevel }) => {
-      logManager.setLogLevel(args.level);
-    }
-  );
-
   // 监听日志事件并广播到所有渲染进程
   logManager.on('log', (log: LogEntry) => {
     broadcastEvent(IPC_CHANNELS.EVENT_LOG_RECEIVED, log);
   });
-
-  console.log('[Log Handlers] Registered all log IPC handlers and event forwarding');
 }

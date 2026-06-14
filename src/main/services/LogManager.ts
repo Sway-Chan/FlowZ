@@ -36,6 +36,12 @@ export class LogManager extends EventEmitter implements ILogManager {
 
   private initPromise: Promise<void>;
   private pendingWrites: Set<Promise<void>> = new Set();
+  // 连续相同日志折叠：上游重试/风暴/多源(stderr+文件监听)可能短时间刷同一行（level+source+message）。
+  // 仅折叠「严格连续」的相同行（被任意不同行打断即重置），3s 内重复丢弃 → 同一 FATAL 不再刷 5-6 行；
+  // 持续重复每 ~3s 仍放行一次，保留对「仍在发生」的可见性。distinct/交错日志不受影响。
+  private lastFoldKey = '';
+  private lastFoldAt = 0;
+  private static readonly FOLD_WINDOW_MS = 3000;
 
   constructor(logDir?: string) {
     super();
@@ -82,10 +88,14 @@ export class LogManager extends EventEmitter implements ILogManager {
    * 添加日志条目
    */
   addLog(level: LogLevel, message: string, source: string, stack?: string): void {
-    // 检查日志级别过滤
-    if (!this.shouldLog(level)) {
+    // 折叠连续相同日志（防同一行被风暴/重试/多源短时间刷屏）——文件与 UI 都受益，故置于级别过滤之前。
+    const foldKey = `${level}|${source}|${message}`;
+    const nowMs = Date.now();
+    if (foldKey === this.lastFoldKey && nowMs - this.lastFoldAt < LogManager.FOLD_WINDOW_MS) {
       return;
     }
+    this.lastFoldKey = foldKey;
+    this.lastFoldAt = nowMs;
 
     const entry: LogEntry = {
       timestamp: new Date().toISOString(),
@@ -95,13 +105,14 @@ export class LogManager extends EventEmitter implements ILogManager {
       stack,
     };
 
-    // 添加到内存日志
-    this.logs.push(entry);
-    if (this.logs.length > this.maxLogs) {
-      this.logs.shift();
+    // app.log 落盘级别完全跟随用户设置的 logLevel（去掉原 min(level, info) 的 info 保底硬编码）——所见即所得：
+    // 用户调高(error/fatal)即文件与界面一同安静、调低(debug)即一同更详细。默认 currentLogLevel=info 保证开箱
+    // 排障够；主动调高是知情选择（设置页已提示「调高会减少排障日志」）。file 与 UI 统一受 currentLogLevel 过滤。
+    if (!this.shouldLog(level)) {
+      return;
     }
 
-    // 异步写入文件
+    // 文件 sink（app.log，writeToFile 内含按 maxLogFileSize 轮转）
     const writePromise = this.writeToFile(entry)
       .catch((error) => {
         console.error('Failed to write log to file:', error);
@@ -109,10 +120,13 @@ export class LogManager extends EventEmitter implements ILogManager {
       .finally(() => {
         this.pendingWrites.delete(writePromise);
       });
-
     this.pendingWrites.add(writePromise);
 
-    // 触发事件
+    // 内存缓冲 + UI 事件
+    this.logs.push(entry);
+    if (this.logs.length > this.maxLogs) {
+      this.logs.shift();
+    }
     this.emit('log', entry);
   }
 
@@ -175,8 +189,6 @@ export class LogManager extends EventEmitter implements ILogManager {
           }
         }
       }
-
-      console.log('All log files cleared');
     } catch (error) {
       console.error('Failed to clear log files:', error);
     }
@@ -206,7 +218,7 @@ export class LogManager extends EventEmitter implements ILogManager {
   private formatLogEntry(entry: LogEntry): string {
     const timestamp = entry.timestamp; // 已经是 ISO 字符串
     const level = entry.level.toUpperCase().padEnd(5);
-    const source = entry.source.padEnd(20);
+    const source = entry.source.slice(0, 20).padEnd(20);
     let line = `[${timestamp}] [${level}] [${source}] ${entry.message}`;
 
     if (entry.stack) {

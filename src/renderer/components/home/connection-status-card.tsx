@@ -1,13 +1,8 @@
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
+import { Select, SelectContent, SelectTrigger, SelectValue } from '@/components/ui/select';
+import { ServerSelectGroups } from '@/components/settings/server-select-groups';
 import { useAppStore } from '@/store/app-store';
 import { Plus } from 'lucide-react';
 import { toast } from 'sonner';
@@ -16,8 +11,9 @@ import { useTranslation } from 'react-i18next';
 export function ConnectionStatusCard() {
   const connectionStatus = useAppStore((state) => state.connectionStatus);
   const config = useAppStore((state) => state.config);
-  const error = useAppStore((state) => state.error);
-  const isLoading = useAppStore((state) => state.isLoading);
+  const proxyError = useAppStore((state) => state.proxyError);
+  const proxyBusy = useAppStore((state) => state.proxyBusy);
+  const proxyPhase = useAppStore((state) => state.proxyPhase);
   const saveConfig = useAppStore((state) => state.saveConfig);
   const setCurrentView = useAppStore((state) => state.setCurrentView);
 
@@ -28,7 +24,7 @@ export function ConnectionStatusCard() {
 
   const getStatusInfo = () => {
     // Use proxyModeType from connectionStatus if available, otherwise fall back to config
-    const proxyModeType = connectionStatus?.proxyModeType || config?.proxyModeType || 'systemProxy';
+    const proxyModeType = config?.proxyModeType || connectionStatus?.proxyModeType || 'systemProxy';
     const isTunMode = proxyModeType === 'tun';
     const isManualMode = proxyModeType === 'manual';
     const modeText = isTunMode
@@ -37,12 +33,12 @@ export function ConnectionStatusCard() {
         ? t('home.manualMode')
         : t('home.systemProxyMode');
 
-    // Show error from store if present
-    if (error) {
+    // Show proxy error from store if present
+    if (proxyError) {
       return {
         label: t('home.statusError'),
         variant: 'destructive' as const,
-        description: error,
+        description: proxyError,
         mode: modeText,
       };
     }
@@ -95,11 +91,12 @@ export function ConnectionStatusCard() {
         };
       }
 
-      if (isLoading) {
+      if (proxyBusy) {
+        const stopping = proxyPhase === 'stopping';
         return {
-          label: t('home.statusConnecting'),
+          label: t(stopping ? 'home.disconnecting' : 'home.statusConnecting'),
           variant: 'secondary' as const,
-          description: t('home.startingTun'),
+          description: t(stopping ? 'home.stoppingProxy' : 'home.startingTun'),
           mode: modeText,
         };
       }
@@ -146,11 +143,12 @@ export function ConnectionStatusCard() {
       };
     }
 
-    if (isLoading) {
+    if (proxyBusy) {
+      const stopping = proxyPhase === 'stopping';
       return {
-        label: t('home.statusConnecting'),
+        label: t(stopping ? 'home.disconnecting' : 'home.statusConnecting'),
         variant: 'secondary' as const,
-        description: t('home.startingSingbox'),
+        description: t(stopping ? 'home.stoppingProxy' : 'home.startingSingbox'),
         mode: modeText,
       };
     }
@@ -199,7 +197,7 @@ export function ConnectionStatusCard() {
         </div>
 
         <div className="flex items-center justify-between">
-          <span className="text-sm text-muted-foreground">{t('home.proxyMode')}</span>
+          <span className="text-sm text-muted-foreground">{t('home.runningMode')}</span>
           <Badge variant="secondary">{statusInfo.mode}</Badge>
         </div>
 
@@ -232,13 +230,7 @@ export function ConnectionStatusCard() {
                   <SelectValue placeholder={t('home.selectServer')} />
                 </SelectTrigger>
                 <SelectContent>
-                  {servers.map((server) => (
-                    <SelectItem key={server.id} value={server.id}>
-                      <span className="truncate max-w-[200px] md:max-w-[260px] inline-block align-bottom">
-                        {server.name} ({server.protocol})
-                      </span>
-                    </SelectItem>
-                  ))}
+                  <ServerSelectGroups servers={servers} />
                 </SelectContent>
               </Select>
             </div>
@@ -254,13 +246,10 @@ export function ConnectionStatusCard() {
                     <SelectValue placeholder={t('home.selectServer')} />
                   </SelectTrigger>
                   <SelectContent>
-                    {servers.map((server) => (
-                      <SelectItem key={server.id} value={server.id}>
-                        <span className="truncate max-w-[200px] md:max-w-[260px] inline-block align-bottom">
-                          {server.name} ({server.protocol})
-                        </span>
-                      </SelectItem>
-                    ))}
+                    <ServerSelectGroups
+                      servers={servers}
+                      selectedId={selectedServerId ?? undefined}
+                    />
                   </SelectContent>
                 </Select>
               </div>

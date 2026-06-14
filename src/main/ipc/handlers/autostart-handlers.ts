@@ -28,7 +28,6 @@ export function registerAutoStartHandlers(): void {
   registerIpcHandler<{ enabled: boolean }, boolean>(
     IPC_CHANNELS.AUTO_START_SET,
     async (_event: IpcMainInvokeEvent, args: { enabled: boolean }) => {
-      console.log('[AutoStart Handlers] AUTO_START_SET:', args.enabled);
       const manager = getAutoStartManager();
       return await manager.setAutoStart(args.enabled);
     }
@@ -40,10 +39,7 @@ export function registerAutoStartHandlers(): void {
     async (_event: IpcMainInvokeEvent) => {
       const manager = getAutoStartManager();
       const enabled = await manager.isAutoStartEnabled();
-      console.log('[AutoStart Handlers] AUTO_START_GET_STATUS:', enabled);
       return { enabled };
     }
   );
-
-  console.log('[AutoStart Handlers] Registered all autostart IPC handlers');
 }

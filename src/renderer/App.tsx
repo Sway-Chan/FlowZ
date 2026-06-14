@@ -1,10 +1,13 @@
-import { useEffect, useState } from 'react';
+import { useEffect } from 'react';
 import { MainLayout } from './components/layout/main-layout';
 import { useAppStore } from './store/app-store';
 import { useNativeEventListeners } from './hooks/use-native-events';
 import { HomePage } from './pages/home-page';
+import { LogsPage } from './pages/logs-page';
+import { ConnectionsPage } from './pages/connections-page';
 import { ServerPage } from './pages/server-page';
 import { RulesPage } from './pages/rules-page';
+import { RuleResourcesPage } from './pages/rule-resources-page';
 import { AppPolicyPage } from './pages/app-policy-page';
 import { SettingsPage } from './pages/settings-page';
 import { Toaster } from './components/ui/sonner';
@@ -18,20 +21,13 @@ import i18n from './i18n';
 function App() {
   const currentView = useAppStore((state) => state.currentView);
   const setCurrentView = useAppStore((state) => state.setCurrentView);
+  const settingsSection = useAppStore((state) => state.settingsSection);
+  const setSettingsSection = useAppStore((state) => state.setSettingsSection);
   const loadConfig = useAppStore((state) => state.loadConfig);
   const refreshConnectionStatus = useAppStore((state) => state.refreshConnectionStatus);
   const setPrivacyMode = useAppStore((state) => state.setPrivacyMode);
 
-  // Settings sub-navigation state
-  const [settingsSection, setSettingsSection] = useState('general');
-
-  // When leaving settings, reset to general
-  const handleViewChange = (view: string) => {
-    setCurrentView(view);
-    if (view !== 'settings') {
-      setSettingsSection('general');
-    }
-  };
+  // 离开设置页重置子节的逻辑已下沉到 store.setCurrentView，此处直接用 setCurrentView
 
   // Listen to native events
   useNativeEventListeners();
@@ -57,14 +53,17 @@ function App() {
     const routeMap: Record<string, string> = {
       '/settings': 'settings',
       '/home': 'home',
+      '/logs': 'logs',
+      '/connections': 'connections',
       '/server': 'server',
+      '/ruleResources': 'ruleResources',
       '/rules': 'rules',
     };
 
     const unsubscribe = ipcClient.on<string>('navigate', (route) => {
       const view = routeMap[route];
       if (view) {
-        handleViewChange(view);
+        setCurrentView(view);
       }
     });
 
@@ -80,11 +79,11 @@ function App() {
         .map((r) =>
           r.latency !== null
             ? `${r.name}（${r.protocol}）: ${r.latency}ms`
-            : `${r.name}（${r.protocol}）: 超时`
+            : `${r.name}（${r.protocol}）: ${i18n.t('servers.timeout')}`
         )
         .join('\n');
 
-      toast.info('测速结果', {
+      toast.info(i18n.t('home.speedTestResult'), {
         description: message,
         duration: 10000,
         style: { whiteSpace: 'pre-line' },
@@ -113,13 +112,16 @@ function App() {
       <PrivacyOverlay />
       <MainLayout
         currentView={currentView}
-        onViewChange={handleViewChange}
+        onViewChange={setCurrentView}
         settingsSection={settingsSection}
         onSettingsSectionChange={setSettingsSection}
       >
         {currentView === 'home' && <HomePage />}
+        {currentView === 'logs' && <LogsPage />}
+        {currentView === 'connections' && <ConnectionsPage />}
         {currentView === 'server' && <ServerPage />}
         {currentView === 'appPolicy' && <AppPolicyPage />}
+        {currentView === 'ruleResources' && <RuleResourcesPage />}
         {currentView === 'rules' && <RulesPage />}
         {currentView === 'settings' && <SettingsPage activeSection={settingsSection} />}
       </MainLayout>

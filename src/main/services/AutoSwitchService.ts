@@ -23,6 +23,7 @@ import type { ConfigManager } from './ConfigManager';
 import type { LogManager } from './LogManager';
 import type { ProxyManager } from './ProxyManager';
 import { IPC_CHANNELS } from '../../shared/ipc-channels';
+import { ProxyErrorCode } from '../../shared/types';
 
 const HEARTBEAT_INTERVAL_MS = 30_000; // 30 秒检测一次
 const MAX_CONSECUTIVE_FAILURES = 3; // 连续 3 次失败触发换节点
@@ -246,7 +247,12 @@ export class AutoSwitchService extends EventEmitter {
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.logManager.addLog('error', `自动换节点失败: ${msg}`, 'AutoSwitch');
+      // 内核替换窗口期 switchMode 被 core-swap 门控瞬态拒绝（CORE_UPDATE_IN_PROGRESS），非真实失败，降级避免日志噪音
+      if ((err as any)?.code === ProxyErrorCode.CORE_UPDATE_IN_PROGRESS) {
+        this.logManager.addLog('debug', `自动换节点因内核更新中暂缓: ${msg}`, 'AutoSwitch');
+      } else {
+        this.logManager.addLog('error', `自动换节点失败: ${msg}`, 'AutoSwitch');
+      }
     } finally {
       this.isSwitching = false;
     }

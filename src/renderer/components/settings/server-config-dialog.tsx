@@ -177,7 +177,7 @@ export function ServerConfigDialog({
                 <SelectItem value="direct">
                   {t('servers.directConnection', 'Direct (No Chain)')}
                 </SelectItem>
-                <ServerSelectGroups servers={servers} excludeId={server?.id} />
+                <ServerSelectGroups servers={servers} excludeId={server?.id} selectedId={detour} />
               </SelectContent>
             </Select>
             <p className="text-sm text-muted-foreground">

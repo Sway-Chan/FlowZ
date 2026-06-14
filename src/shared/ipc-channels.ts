@@ -18,6 +18,9 @@ export const IPC_CHANNELS = {
   CONFIG_SET_VALUE: 'config:setValue',
   CONFIG_GET_PRIVACY_MODE: 'config:getPrivacyMode',
   CONFIG_SET_PRIVACY_MODE: 'config:setPrivacyMode',
+  PRIVACY_SET_PASSWORD: 'privacy:setPassword',
+  PRIVACY_UNLOCK: 'privacy:unlock',
+  PRIVACY_HAS_PASSWORD: 'privacy:hasPassword',
 
   // 服务器管理
   SERVER_SWITCH: 'server:switch',
@@ -35,23 +38,29 @@ export const IPC_CHANNELS = {
   SUBSCRIPTION_UPDATE: 'subscription:update',
   SUBSCRIPTION_DELETE: 'subscription:delete',
   SUBSCRIPTION_UPDATE_SERVERS: 'subscription:updateServers',
-  SUBSCRIPTION_UPDATE_ALL: 'subscription:updateAll',
 
   // 路由规则管理
   RULES_GET_ALL: 'rules:getAll',
   RULES_ADD: 'rules:add',
   RULES_UPDATE: 'rules:update',
   RULES_DELETE: 'rules:delete',
+  RULES_REORDER: 'rules:reorder',
+
+  // 规则资源管理（.srs 下载/管理）
+  RULE_RESOURCES_LIST: 'ruleResources:list',
+  RULE_RESOURCES_DOWNLOAD: 'ruleResources:download',
+  RULE_RESOURCES_REDOWNLOAD: 'ruleResources:redownload',
+  RULE_RESOURCES_DELETE: 'ruleResources:delete',
+  RULE_RESOURCES_SET_GH_PROXY: 'ruleResources:setGhProxy',
+  RULE_RESOURCES_GET_CATALOG: 'ruleResources:getCatalog',
+  RULE_RESOURCES_REFRESH_CATALOG: 'ruleResources:refreshCatalog',
+  RULE_RESOURCES_SET_AUTO_UPDATE: 'ruleResources:setAutoUpdate',
+  RULE_RESOURCES_UPDATE_ALL: 'ruleResources:updateAll',
+  RULE_RESOURCES_RESET_BUILTIN: 'ruleResources:resetBuiltin',
 
   // 日志管理
   LOGS_GET: 'logs:get',
   LOGS_CLEAR: 'logs:clear',
-  LOGS_SET_LEVEL: 'logs:setLevel',
-
-  // 系统代理管理
-  SYSTEM_PROXY_ENABLE: 'systemProxy:enable',
-  SYSTEM_PROXY_DISABLE: 'systemProxy:disable',
-  SYSTEM_PROXY_GET_STATUS: 'systemProxy:getStatus',
 
   // 自启动管理
   AUTO_START_SET: 'autoStart:set',
@@ -59,7 +68,15 @@ export const IPC_CHANNELS = {
 
   // 统计信息
   STATS_GET: 'stats:get',
-  STATS_RESET: 'stats:reset',
+  CONNECTIONS_GET: 'connections:get',
+  CONNECTIONS_CLOSE: 'connections:close', // 关单条连接（main 经 9090 DELETE /connections/{id}）
+  CONNECTIONS_CLOSE_ALL: 'connections:closeAll', // 关全部连接（main 经 9090 DELETE /connections，触发 ResetNetwork）
+
+  // 出口 IP 信息（本地直连出口 / 代理出口）
+  IP_INFO_GET: 'ipinfo:get',
+
+  // 系统进程枚举（路由规则的进程快速选择器）
+  SYSTEM_LIST_PROCESSES: 'system:listProcesses',
 
   // 版本信息
   VERSION_GET_INFO: 'version:getInfo',
@@ -72,9 +89,15 @@ export const IPC_CHANNELS = {
   UPDATE_OPEN_RELEASES: 'update:openReleases',
 
   // 核心管理
+  CORE_UPDATE_CHECK: 'core-update:check',
+  CORE_UPDATE_RUN: 'core-update:update',
   CORE_GET_VERSION_INFO: 'core:getVersionInfo',
   CORE_ROLLBACK: 'core:rollback',
   CORE_REPLACE_MANUAL: 'core:replaceManual',
+  CORE_UPDATE_GET_AUTO_STATUS: 'core:getAutoStatus', // 内核自动更新状态（lastCheckAt/staged/跨带提示）
+  CORE_UPDATE_APPLY_STAGED: 'core:applyStaged', // 用户点「立即应用」：停代理→换核→重启（唯一允许主动断流）
+  CORE_RESET_FACTORY: 'core-update:reset-factory', // B6：把内核恢复为随 App 出厂的版本
+  APP_UNINSTALL_ALL: 'app:uninstall-all', // B6：完全卸载 FlowZ（提权 helper / 受保护目录内核 / 用户配置 / 应用本体）
 
   // Shell 操作
   SHELL_OPEN_EXTERNAL: 'shell:openExternal',
@@ -85,6 +108,11 @@ export const IPC_CHANNELS = {
   // 管理员权限
   ADMIN_CHECK: 'admin:check',
 
+  // macOS 提权 helper（免提权启停 sing-box）
+  HELPER_GET_STATUS: 'helper:getStatus',
+  HELPER_INSTALL: 'helper:install',
+  HELPER_UNINSTALL: 'helper:uninstall',
+
   // 事件 (主进程 -> 渲染进程)
   EVENT_PROXY_STARTED: 'event:proxyStarted',
   EVENT_PROXY_STOPPED: 'event:proxyStopped',
@@ -92,10 +120,14 @@ export const IPC_CHANNELS = {
   EVENT_CONFIG_CHANGED: 'event:configChanged',
   EVENT_LOG_RECEIVED: 'event:logReceived',
   EVENT_STATS_UPDATED: 'event:statsUpdated',
-  EVENT_CONNECTION_STATE_CHANGED: 'event:connectionStateChanged',
+  EVENT_CONNECTIONS_UPDATED: 'event:connectionsUpdated',
   EVENT_ENTER_PRIVACY_MODE: 'event:enterPrivacyMode',
   EVENT_CORE_VERSION_CHANGED: 'event:coreVersionChanged',
+  EVENT_CORE_AUTO_UPDATE_STATUS: 'event:coreAutoUpdateStatus', // 内核自动更新状态变更（staged 待生效 / 跨带提示）
   EVENT_AUTO_NODE_SWITCHED: 'event:autoNodeSwitched', // 自动换节点成功通知
+  EVENT_PROXY_INVALID_NODES: 'proxy:invalid-nodes', // 启动 gate 剔除的非法节点（空数组=清陈旧标灰）
+  EVENT_IP_INFO_UPDATED: 'event:ipInfoUpdated', // 出口 IP 信息更新
+  EVENT_RULE_RESOURCE_PROGRESS: 'event:ruleResourceProgress', // 规则资源下载进度
 
   // 应用语言同步（渲染进程 -> 主进程）
   APP_SET_LANGUAGE: 'app:setLanguage',

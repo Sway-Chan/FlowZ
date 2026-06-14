@@ -17,6 +17,17 @@ export function encodeMajorMinor(version: string): number {
 }
 
 /**
+ * 两版本是否同 major.minor（兼容版本带内）。
+ *   "1.13.13" vs "1.13.14" → true；"1.13.x" vs "1.14.x" → false；"1.x" vs "2.x" → false。
+ * 任一无法解析（含 "未知"）→ NaN → false（失败安全：内核自动更新跨带硬闸宁可不更，绝不误判同带跨 minor 落位）。
+ */
+export function sameMajorMinor(a: string, b: string): boolean {
+  const ea = encodeMajorMinor(a);
+  const eb = encodeMajorMinor(b);
+  return !isNaN(ea) && !isNaN(eb) && ea === eb;
+}
+
+/**
  * 判断核心版本是否 ≥ major.minor。
  * @param fallback 无法解析时的返回值。默认 true —— 打包核心恒 ≥1.13.13、
  *   且 getCoreVersion 解析失败也兜底返回 "1.13.0"，故"未知"按现代版本处理最安全。

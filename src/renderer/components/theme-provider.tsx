@@ -31,16 +31,19 @@ export function ThemeProvider({ children, ...props }: ThemeProviderProps) {
     const applyTheme = () => {
       root.classList.remove('light', 'dark');
 
-      if (theme === 'system') {
-        const systemTheme = window.matchMedia('(prefers-color-scheme: dark)').matches
-          ? 'dark'
-          : 'light';
-
-        root.classList.add(systemTheme);
-        return;
+      const resolved =
+        theme === 'system'
+          ? window.matchMedia('(prefers-color-scheme: dark)').matches
+            ? 'dark'
+            : 'light'
+          : theme;
+      root.classList.add(resolved);
+      // 缓存解析后的主题，供下次冷启动时 index.html 的早期脚本同步应用、消除 FOUC 闪白（修问题 2）。
+      try {
+        localStorage.setItem('flowz-theme-resolved', resolved);
+      } catch {
+        /* ignore */
       }
-
-      root.classList.add(theme);
     };
 
     applyTheme();

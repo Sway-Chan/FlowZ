@@ -3,20 +3,28 @@ import { EyeOff, Lock } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { useAppStore } from '@/store/app-store';
+import { api } from '@/ipc';
 import { toast } from 'sonner';
+import { useTranslation } from 'react-i18next';
 
 export function PrivacyOverlay() {
-  const config = useAppStore((state) => state.config);
+  const { t } = useTranslation();
   const isPrivacyMode = useAppStore((state) => state.isPrivacyMode);
   const setPrivacyMode = useAppStore((state) => state.setPrivacyMode);
   const [passwordInput, setPasswordInput] = useState('');
   const [errorShake, setErrorShake] = useState(false);
+  // F29：密码哈希在 main，渲染端不再读 config 明文——是否设密码经 IPC 查询，解锁经 IPC 校验。
+  const [hasPassword, setHasPassword] = useState(false);
+  const [verifying, setVerifying] = useState(false);
 
-  // Auto focus logic can be handled natively by React
   useEffect(() => {
     if (isPrivacyMode) {
       setPasswordInput('');
       setErrorShake(false);
+      api.privacy
+        .hasPassword()
+        .then(setHasPassword)
+        .catch(() => setHasPassword(false));
     }
   }, [isPrivacyMode]);
 
@@ -24,44 +32,53 @@ export function PrivacyOverlay() {
     return null;
   }
 
-  const handleUnlock = (e?: React.FormEvent) => {
+  const handleUnlock = async (e?: React.FormEvent) => {
     if (e) e.preventDefault();
-
-    // Check if the user has a password set. If not, just unlock immediately.
-    const savedPassword = config?.privacyPassword || '';
-
-    if (savedPassword === '' || passwordInput === savedPassword) {
-      setPrivacyMode(false);
-      toast.success('已解除隐私保护模式'); // Keeping Chinese for native consistency or we can translate
-    } else {
+    if (verifying) return;
+    setVerifying(true);
+    try {
+      // 在 main 校验（无密码则 main 直接放行）；ok 时 main 已退出隐私模式，这里同步 store 即时收起遮罩
+      const { ok } = await api.privacy.unlock(passwordInput);
+      if (ok) {
+        setPrivacyMode(false);
+        toast.success(t('privacy.unlocked'));
+      } else {
+        setErrorShake(true);
+        toast.error(t('privacy.wrongPassword'));
+        setTimeout(() => setErrorShake(false), 500);
+      }
+    } catch {
+      // IPC 异常按解锁失败处理，避免静默卡在遮罩上
       setErrorShake(true);
-      toast.error('解锁密码错误');
+      toast.error(t('privacy.wrongPassword'));
       setTimeout(() => setErrorShake(false), 500);
+    } finally {
+      setVerifying(false);
     }
   };
 
   return (
     <div className="fixed inset-0 z-[9999] flex flex-col justify-center items-center backdrop-blur-[100px] bg-background/95 transition-all duration-500">
       <EyeOff className="w-24 h-24 text-muted-foreground mb-6 animate-pulse" />
-      <h2 className="text-3xl font-bold mb-3 tracking-tight">隐私保护模式已开启</h2>
-      <p className="text-muted-foreground mb-8">操作界面已锁定，请输入解锁密码以继续</p>
+      <h2 className="text-3xl font-bold mb-3 tracking-tight">{t('privacy.title')}</h2>
+      <p className="text-muted-foreground mb-8">{t('privacy.subtitle')}</p>
 
       <form onSubmit={handleUnlock} className="flex flex-col gap-3 items-center w-full max-w-sm">
-        {config?.privacyPassword ? (
+        {hasPassword ? (
           <div className={`flex w-full space-x-2 ${errorShake ? 'animate-shake' : ''}`}>
             <div className="relative flex-1">
               <Lock className="absolute left-3 top-2.5 h-4 w-4 text-muted-foreground" />
               <Input
                 type="password"
-                placeholder="请输入解锁密码"
+                placeholder={t('privacy.passwordPlaceholder')}
                 className="pl-9 w-full"
                 value={passwordInput}
                 onChange={(e) => setPasswordInput(e.target.value)}
                 autoFocus
               />
             </div>
-            <Button type="submit" variant="default">
-              退出隐私保护模式
+            <Button type="submit" variant="default" disabled={verifying}>
+              {t('privacy.exit')}
             </Button>
           </div>
         ) : (
@@ -72,7 +89,7 @@ export function PrivacyOverlay() {
             size="lg"
             className="w-full"
           >
-            退出隐私保护模式
+            {t('privacy.exit')}
           </Button>
         )}
       </form>

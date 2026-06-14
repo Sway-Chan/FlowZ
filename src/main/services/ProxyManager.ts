@@ -3,25 +3,56 @@
  * 负责 sing-box 进程的生命周期管理和配置生成
  */
 
-import { BrowserWindow } from 'electron';
+import { BrowserWindow, Notification, shell } from 'electron';
 import { spawn, ChildProcess } from 'child_process';
 import * as fs from 'fs/promises';
 import * as path from 'path';
+import * as net from 'net';
 import { EventEmitter } from 'events';
-import type { UserConfig, ServerConfig, ProxyStatus } from '../../shared/types';
+import type {
+  UserConfig,
+  ServerConfig,
+  ProxyStatus,
+  HelperStatus,
+  InvalidNodeInfo,
+} from '../../shared/types';
+import { ProxyErrorCode } from '../../shared/types';
 import type { ILogManager } from './LogManager';
+import { HelperManager } from './HelperManager';
+import { ClashApiClient } from './ClashApiClient';
+import { PlatformPrivilegeService } from './PlatformPrivilegeService';
+import { type ISystemProxyManager, SystemProxyBase } from './SystemProxyManager';
 import { IPC_CHANNELS } from '../../shared/ipc-channels';
+import { LOGIN_ITEMS_SETTINGS_URL } from '../../shared/constants';
 import { resourceManager } from './ResourceManager';
+import {
+  BUILTIN_GEO_RULESETS,
+  getRuleSetRuntimeDir as getRuntimeRulesDir,
+  seedBuiltinRuleSets,
+} from './builtin-geo-rulesets';
 import { retry } from '../utils/retry';
-import { coreVersionAtLeast } from '../utils/version';
+import { coreVersionAtLeast } from '../../shared/version';
+import { effectiveLogLevel } from '../../shared/log-level';
 import {
   getUserDataPath,
   getSingBoxConfigPath,
   getSingBoxLogPath,
   getSingBoxPidPath,
   getCachePath,
+  getRuleResourcesPath,
+  getCustomRulesDir,
 } from '../utils/paths';
 import { getAppPreset } from '../../shared/app-rules-preset';
+import { parseDnsServerSpec, type ParsedDnsServer } from '../../shared/dns';
+import { ruleConditions } from '../../shared/rules';
+import {
+  EXT_TYPES,
+  planCustomRule,
+  customRuleFileBase,
+  buildCustomRuleFiles,
+  usesFakeIp,
+  condMatcherFields,
+} from './custom-rule-files';
 import coreManifest from '../../shared/core-manifest.json';
 
 /**
@@ -139,6 +170,8 @@ interface SingBoxDnsConfig {
   final?: string;
   strategy?: string;
   fakeip?: SingBoxFakeIPConfig;
+  // 关 FakeIP 时注入：用 DNS 解析结果反查域名补无 SNI/ECH 流量的路由匹配（不改节点收 IP 事实）。
+  reverse_mapping?: boolean;
 }
 
 interface SingBoxInbound {
@@ -276,19 +309,29 @@ interface SingBoxRouteRule {
   domain?: string[];
   domain_suffix?: string[];
   domain_keyword?: string[];
+  domain_regex?: string[];
   geosite?: string[];
   ip_cidr?: string[];
+  source_ip_cidr?: string[];
   port?: number | number[];
+  port_range?: string[];
+  source_port?: number | number[];
+  source_port_range?: string[];
   process_name?: string | string[];
+  process_path?: string | string[];
   process_name_not?: string | string[]; // sing-box 1.13+
   inbound?: string | string[]; // sing-box 1.13+
-  action: string;
+  action?: string; // logical 子规则为纯 matcher 无 action；default/logical 外层显式设 'route'
   outbound?: string;
   sniffer?: string[];
   rewrite_target?: boolean; // sing-box 1.12+
   timeout?: string;
   domain_resolver?: string; // sing-box 1.13+: 指定该规则使用的 DNS 解析器
   override_address?: string; // sing-box 1.13+: 在规则层强制修改目标地址
+  // logical 规则（多条件跨维度 OR / AND）：type:'logical' + mode + rules(纯 matcher 子规则，无 action/outbound)
+  type?: string;
+  mode?: string;
+  rules?: SingBoxRouteRule[];
 }
 
 interface SingBoxRuleSet {
@@ -345,6 +388,19 @@ const udp443RejectRule = (matcher: Record<string, unknown> = {}): SingBoxRouteRu
   action: 'reject',
 });
 
+/**
+ * 从 sing-box `check` 的 stderr 解析出错出站的数组下标。覆盖两种措辞：
+ *  - decode 阶段复数：`outbounds[2].method: ...`
+ *  - initialize 阶段单数：`outbound[2]: ...` / `dependency... for outbound[2]`
+ * 不命中返回 null（调用方降级为「配置校验失败」不启动，不误剔）。
+ */
+export function parseCheckOutboundIndex(stderr: string): number | null {
+  const m = /\boutbounds?\[(\d+)\]/.exec(stderr);
+  if (!m) return null;
+  const idx = Number(m[1]);
+  return Number.isInteger(idx) && idx >= 0 ? idx : null;
+}
+
 interface SingBoxExperimental {
   cache_file?: {
     enabled: boolean;
@@ -374,16 +430,25 @@ interface SingBoxConfig {
 }
 
 export interface IProxyManager {
-  start(config: UserConfig): Promise<void>;
-  stop(): Promise<void>;
-  restart(config: UserConfig): Promise<void>;
+  start(config: UserConfig, options?: { interactive?: boolean }): Promise<void>;
+  stop(opts?: { quitting?: boolean }): Promise<void>;
+  teardownForQuit(): Promise<void>;
+  restart(config: UserConfig, options?: { interactive?: boolean }): Promise<void>;
   switchMode(config: UserConfig): Promise<void>;
   getStatus(): ProxyStatus;
+  isStartedViaHelper(): boolean;
   generateSingBoxConfig(config: UserConfig, resolvedIps?: Record<string, string>): SingBoxConfig;
-  on(event: 'started' | 'stopped' | 'error', listener: (...args: any[]) => void): void;
-  off(event: 'started' | 'stopped' | 'error', listener: (...args: any[]) => void): void;
+  on(
+    event: 'started' | 'stopped' | 'error' | 'node-hot-switched',
+    listener: (...args: any[]) => void
+  ): void;
+  off(
+    event: 'started' | 'stopped' | 'error' | 'node-hot-switched',
+    listener: (...args: any[]) => void
+  ): void;
   getCoreVersion(): Promise<string>;
   buildPreflightConfigJson(targetVersion: string): string | null;
+  closeConnection(id?: string): Promise<{ ok: boolean; status: number }>;
 }
 
 export class ProxyManager extends EventEmitter implements IProxyManager {
@@ -391,12 +456,87 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private startTime: Date | null = null;
   private pid: number | null = null;
   private singboxPid: number | null = null; // macOS TUN 模式下实际的 sing-box PID
+  // macOS 提权 helper（装一次后免提权启停）；未注入/未就绪则回退 PR-M1 osascript 看护脚本。
+  private helperManager: HelperManager | null = null;
+  // 系统代理单一写者（注入 index.ts 的同一 singleton，与 IPC handler/tray 共享 originalSettings/marker 状态）。
+  // 拆双轨：ProxyManager 不再内联 networksetup/reg，统一经此调用 enableProxy/disableProxy（带 marker + 防自指）。
+  private systemProxyManager: ISystemProxyManager | null = null;
+  // 杀核前「静默 clash_api 客户端」回调（停 StatsService 轮询 + 关其到 9090 的 keep-alive 连接）：让 client 主动关
+  // → 9090 不进 TIME_WAIT → 下次用户态 sing-box 免撞 root TIME_WAIT 等 30s（P0-2 治本 TIME_WAIT）。
+  private quiesceClashClients: (() => void) | null = null;
+  // clash_api(9090) 专属 HTTP 客户端（T15：原 clashApiAgent 字段 + clashApiRequest/clashAuthHeaders/
+  // destroyClashApiAgent 收口进 ClashApiClient，与 StatsService 共用单一 agent）。经 setClashApiClient 注入。
+  private clashApiClient: ClashApiClient | null = null;
+  // 平台提权服务（T16：原提权脚本生成 / 文件权限 / 提权复制等纯函数迁出，经 setPrivilegeService 注入；
+  // delegate 落地后调用点零改动）。macOS 委托 helperManager 分支由子 commit 后续处理，本字段先占位。
+  private privilegeService: PlatformPrivilegeService | null = null;
+  // ensureSystemProxyCleared 单飞：终态清理可能被 giveUp/健康检查/信号死多路并发触发，防重复 disable。
+  private clearingSystemProxy = false;
+  // 「主动停止/重启中」：stop() 期间置位，令 ensureSystemProxyCleared 跳过——避免重启 stop 腿清掉系统代理后
+  // 又被 start() reconcile 设回的并发竞态（C1）。真·外部死亡时为 false → 信号死分支照常清理。
+  private stopping = false;
+  // 用户在自动重启退避窗口内主动停止 → 置位，令 attemptAutoRestart 退避后放弃重启（用户意图优先，M3）。
+  // 退避已加宽到 2/5/15s，窗口可达分钟级；start() 入口复位。
+  private autoRestartAborted = false;
+  // 生命周期世代：start()/stop() 入口各 +1。attemptAutoRestart 进入时快照，退避后比对——变了说明已有更新的
+  // start/stop 接管生命周期（如退避窗口内用户手动 start，它会 reset autoRestartAborted=false 绕过 M3 检查）→
+  // 本次自动重启静默让位，杜绝「自动腿 + 手动腿」双启动流并发互相杀进程/撞 9090/误清对方系统代理（M-2′）。
+  private lifecycleGeneration = 0;
+  // 在途自动重启腿的世代快照（isRestarting 置位时记，finally 清 -1）。供 handleProcessExit 判断「在途腿是否已被
+  // supersede（注定让位）」→ 若是且此刻又崩溃，置 crashWhileSuperseded 让那条腿醒来补发一次重启，否则崩溃信号
+  // 被 isRestarting dedup 吞掉、接管会话死后无人恢复（M-2′-G1）。
+  private restartingGen = -1;
+  private crashWhileSuperseded = false;
+  // helper 引导门控回调（主进程 UI 注入）。收敛单点：所有 start/restart 入口（按钮/托盘/切模式/
+  // config-changed 重启/换节点回退重启…）最终都汇入 start()，gate 设在此处即不可能漏。
+  // 返回 'abort' → start() 抛 HELPER_GATE_ABORTED 终止启动（终态等价 osascript 取消=停止态）。
+  private helperGate:
+    | ((hs: HelperStatus, config: UserConfig) => Promise<'proceed' | 'abort'>)
+    | null = null;
+  // 本次 sing-box 是否经 helper 启动（决定停止走 helper socket 还是 osascript）。
+  private startedViaHelper: boolean = false;
+  // 本次 start 是否交互式（非交互=崩溃自动重启）：helper 不可用时非交互不裸弹 osascript（F10）。
+  private startInteractive: boolean = true;
+  // 重启去抖：连改多条配置（编辑多条规则/导入/迁移）合并为一次重启，避免每次编辑 ~1.2s 断流。
+  // trailing 触发时取 this.currentConfig（恒最新），故各 switchMode 分支须先更新 currentConfig。
+  private restartDebounceTimer: NodeJS.Timeout | null = null;
+  private static readonly RESTART_DEBOUNCE_MS = 1500;
+  // 上次生成时有外化规则因「文件未落盘」降级走 inline（值已在 inline route 规则里、文件无消费者）。
+  // 置 true → 热路径(switchMode no-op 分支)改走重启重落盘，防「写文件但无人消费」导致值陈旧。
+  private customRuleFilesDegraded = false;
   private currentConfig: UserConfig | null = null;
   // 启动时生成的「节点 id → selector 成员 tag」映射，用于 clash_api 热切换时定位目标 tag
   private currentIdToTagMap: Map<string, string> | null = null;
+  // 启动时生成的「规则 key → { selectorTag, memberTag }」映射，用于「改规则目标节点」clash_api 热切换
+  // （rule-sel-<ruleId> 独立 selector，避免固定规则经共享 proxy-selector 跟随全局节点漂移）。
+  // key 形如 `custom:<ruleId>` / `app:<appId>`（与生成侧 selectorTag 一一对应）。
+  private currentRuleTargetMap: Map<string, { selectorTag: string; memberTag: string }> | null =
+    null;
+  // 生成侧暂存：本轮 generateOutbounds 产出的 rule-sel selector 列表（selectorTag/memberTag/targetServerId），
+  // 供 generateSingBoxConfig 末尾按 targetServerId → currentConfig 解析回 ruleKey 填充 currentRuleTargetMap。
+  // 仅 generateRuleSelectors 写、generateSingBoxConfig 末尾读，跨这两步的临时载体（非持久态）。
+  private pendingRuleSelectors: {
+    ruleKey: string;
+    selectorTag: string;
+    memberTag: string;
+    targetServerId?: string;
+  }[] = [];
+  // 启动前配置校验 gate 标记的非法节点（坏节点会让 sing-box 整体启动 FATAL）：仅会话内存，每次
+  // startInternal 清空重判（换核自动复活）。generateOutbounds 据此跳过、不进 selector；checkAndPruneConfig
+  // 迭代填充并在末尾推送渲染端标灰。
+  private gateInvalidNodes = new Map<string, InvalidNodeInfo>();
+  // 本次 start 是否已用过「run-FATAL dependency not found」解析修正腿（A7 备用腿，单次闸，防重写抖动）。
+  private refFixAttempted = false;
+  // 出口 IP 探针 inbound 的动态端口（每次 start 重新分配）：probe-direct-in → direct 出站，
+  // probe-proxy-in → proxy-selector。经此两口发请求，能在「三种接管 × 三种分流」全矩阵下稳定测出
+  // 真实直连出口 IP 与代理出口 IP（inbound 规则在 route.rules 头部短路，不受分流策略影响）。
+  private probeDirectPort: number | null = null;
+  private probeProxyPort: number | null = null;
   private configPath: string;
   private singboxPath: string;
   private logManager: ILogManager | null = null;
+  // 隐私模式 provider（index 注入 getPrivacyMode）：隐私开 → sing-box 日志级别抬到 ≥warn，不记访问域名/SNI。
+  private privacyProvider: () => boolean = () => false;
   private lastLogMessage: string = '';
   private lastLogCount: number = 0;
   private lastLogTime: number = 0;
@@ -415,6 +555,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   // 核心更新"待验证窗口"内由 CoreUpdateService 置 true：抑制自动重启，让新核心首次异常退出立即
   // 上报 'error' 触发回滚（而非在已知有问题的新核心上空转 MAX_RESTART_COUNT 次后才上报）。
   private autoRestartSuppressed: boolean = false;
+  // 核心更新「二进制替换窗口」内由 CoreUpdateService.installCoreFromDir 置 true：拒绝手动 start/restart/switchMode，
+  // 防用户在内核半替换期间拉起进程撞 FATAL。与 autoRestartSuppressed 同区但生命周期更短——仅覆盖 installCoreFromDir
+  // 执行期（install 返回即清，让 updateCore/applyStagedNow 后续 start 放行）；autoRestartSuppressed 覆盖更长的
+  // 「首启验证窗口」（armPendingValidation 管）。两者独立，勿混。
+  private coreSwapInProgress: boolean = false;
   private restartCount: number = 0;
   private lastRestartTime: number = 0;
   private static readonly MAX_RESTART_COUNT = 3; // 最大重启次数
@@ -448,16 +593,56 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
-   * 启动代理
+   * 启动代理（public 包装）：失败统一收口清系统代理——重启/切模式场景下旧会话系统代理仍指向现已死的端口，
+   * 启动失败必须清掉防全网断（L-2′）。覆盖所有直接 start 入口（PROXY_START/托盘/自动连接）与 restart 的 start 腿，
+   * 故 restart() 不再单独 catch-clear。ensureSystemProxyCleared 在非主动 stop 语境 stopping=false → 会真清；
+   * fresh start 无 marker → no-op。
    */
-  async start(config: UserConfig): Promise<void> {
+  async start(config: UserConfig, options: { interactive?: boolean } = {}): Promise<void> {
+    try {
+      await this.startInternal(config, options);
+    } catch (e) {
+      // 启动失败终态收口：① 清进程引用——否则 singboxProcess/pid 仍指向已死进程，下次 start 的内部 stop() 会对
+      //   死进程挂 once('exit')（exit 早发过、永不再触发）→ 永挂 → UI 恒「启动中」（修「二次点击卡死」根因 A）。
+      //   cleanup 在此只在「最终失败」执行，不影响 retry 成功路径的探针端口。② 清可能残留的系统代理（L-2′）。
+      this.cleanup();
+      await this.ensureSystemProxyCleared();
+      throw e;
+    }
+  }
+
+  private async startInternal(
+    config: UserConfig,
+    options: { interactive?: boolean } = {}
+  ): Promise<void> {
+    // core-swap 手动轴门控：内核替换窗口中拒绝启动（防撞半替换核 FATAL）。须在 lifecycleGeneration++ 之前——
+    // 被拒时不污染世代。updateCore/applyStagedNow 自身的 start 在 installCoreFromDir 返回后调用（coreSwapInProgress
+    // 已清），不受此闸影响。
+    this.rejectIfCoreSwapInProgress('启动代理');
+    // 生命周期世代 +1：标记一次新的 start 接管（供退避中的 attemptAutoRestart 比对让位，M-2′）。
+    this.lifecycleGeneration++;
+    // 新启动接管 → 清掉任何陈旧的 supersede-崩溃补发标记（防上一会话遗留的标记误触发补发，M-2′-G1 防陈旧）。
+    this.crashWhileSuperseded = false;
+    // 本次启动是否交互式（非交互=崩溃自动重启）：供 startSingBoxProcess 决定 helper 不可用时是否裸弹 osascript。
+    this.startInteractive = options.interactive !== false;
+    // 真正 start 即作废未决的去抖重启（崩溃自动重启直走 start、不经 stop，避免窗口内 crash 后被二次拉起）
+    if (this.restartDebounceTimer) {
+      clearTimeout(this.restartDebounceTimer);
+      this.restartDebounceTimer = null;
+    }
     // 如果已经在运行，先停止
     if (this.singboxProcess || this.singboxPid) {
       await this.stop();
     }
 
-    // 用户手动启动时重置重启计数
-    if (!this.isRestarting) {
+    // 复位自动重启取消标记：必须在上面的内部 stop() 之后（stop 会置 true）——真正开始一次启动即清掉，
+    // 否则 start 的内部 stop poison 该标记会让此后所有崩溃自动重启被误拦（M3 回归防护）。
+    this.autoRestartAborted = false;
+
+    // 用户态启动（手动/托盘/IPC/去抖重启，恒 interactive!==false）即重置重启计数；自动重启腿恒 interactive:false
+    // 不重置（计数需跨自动重启累积到上限）。按用户意图判而非 isRestarting——退避窗口内用户手动 start 时
+    // isRestarting 仍为 true，旧 `!isRestarting` 会漏掉这次重置（gen token 已钦定它为合法接管，L-G2）。
+    if (options.interactive !== false) {
       this.resetRestartCount();
     }
 
@@ -471,14 +656,24 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       } catch (err) {
         this.logToManager('error', `Linux 核心准备失败: ${(err as Error).message}`);
       }
+    } else if (process.platform === 'darwin') {
+      // B 块：受保护目录是 macOS 现役核单一真相，install-core 换核后路径不变、内容变；每次 start 重解析
+      // this.singboxPath，消除「同会话换核/装 helper 后仍用构造时缓存的旧（bundle）路径」（修 review HIGH-1）。
+      this.singboxPath = this.getSingBoxPath();
     }
 
-    // 仅在 TUN 模式下清理可能残留的 sing-box 进程
-    // 系统代理模式不需要管理员权限，也不会有残留的 TUN 进程问题
+    // 清理可能残留的 sing-box 孤儿进程（崩溃残留占 TUN 设备/端口致下次启动失败）。1B：去掉旧 TUN gate，
+    // 系统代理模式也清——Mac 非 TUN 走零提权用户态 kill（systemProxy sing-box 是用户进程，绝不弹 osascript）。
     const isTunMode = config.proxyModeType === 'tun';
-    if (isTunMode) {
-      await this.killOrphanedSingBoxProcesses();
-    }
+
+    // macOS 提权 helper 引导门控（收敛单点，先于一切重活；abort 直接抛出、不留半启动态）。
+    await this.maybePromptHelperGate(config, isTunMode, options);
+
+    await this.killOrphanedSingBoxProcesses(isTunMode);
+
+    // 孤儿清理后仍占 9090 → 按端口清掉占用者（helper freePort / osascript），否则明确终态（L2，含外部/旧路径
+    // sing-box）。把「裸 spawn 撞 9090 占用 → retry 风暴」收敛为一次明确、可定位的失败。
+    await this.resolveClashApiPortConflict();
 
     // 0. 获取核心版本（用于后续生成兼容的配置文件）
     this.coreVersion = await this.getCoreVersion();
@@ -500,6 +695,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // 3. 准备规则文件（必须在生成配置前完成）
     await this.copyRuleSetsToUserData();
+    // 3.1 落盘外化自定义规则文件 + 孤儿对账清扫（必须在 generateSingBoxConfig 前——缺文件 sing-box 启动 FATAL）
+    await this.writeCustomRuleFiles(config);
 
     // 3.5. 预解析所有节点的域名为 IP（仅针对 TUN 模式），防止 Windows 下回流死循环
     // 【待真机验证 / CDN 风险】：对"域名节点"预解析得到的 IP 会进 route_exclude_address，若节点在
@@ -513,7 +710,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       const dns = require('dns').promises;
       const allServerIds = new Set([
         config.selectedServerId as string,
-        ...(config.appRules || []).map((r) => r.targetServerId),
+        ...this.effectiveAppRules(config).map((r) => r.targetServerId),
       ]);
 
       const resolvePromises = Array.from(allServerIds).map(async (serverId) => {
@@ -537,12 +734,24 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       await Promise.all(resolvePromises);
     }
 
+    // 3.6. 为出口 IP 探针分配端口（失败不阻断启动，仅探针不可用）
+    await this.allocateProbePorts(config);
+
+    // 3.7. 复位启动前配置校验 gate 状态（必须在 generateSingBoxConfig→generateOutbounds 消费 gateInvalidNodes
+    //      之前）：每次 start 重新判定坏节点，换核 / 修好配置后自动复活，不跨会话残留。
+    this.gateInvalidNodes.clear();
+    this.refFixAttempted = false;
+
     // 4. 生成 sing-box 配置文件
     const singboxConfig = this.generateSingBoxConfig(config, resolvedServerIps);
 
     // 写入配置文件
     await this.writeSingBoxConfig(singboxConfig);
     this.logToManager('info', 'sing-box 配置文件已生成');
+
+    // 4.5 启动前配置校验 gate：剔除会致整体启动 FATAL 的坏节点后重写盘（插在写盘后、retry 前 →
+    //     gate 抛错由 start() catch 收口，不进 retry；选中节点被剔/全部剔光/降级 → throw 不启动）。
+    await this.checkAndPruneConfig(singboxConfig, config);
 
     // TUN 模式下，删除旧的 PID 文件，确保不会读到旧的 PID
     if (this.needsOsascript() || this.needsWindowsUAC()) {
@@ -555,6 +764,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       delay: 2000,
       exponentialBackoff: true,
       shouldRetry: (error) => {
+        // 启动 gate 备用腿（补 check 盲区）：run 阶段 `dependency[X] not found` FATAL（detour/selector 幽灵
+        // tag）→ 允许重试一次（onRetry 会解析 tag、pruneTagsClosure 修正重写盘），refFixAttempted 闸保证只修一次。
+        if (/dependency\[(.+?)\] not found/i.test(error.message)) {
+          return !this.refFixAttempted;
+        }
         // 只对特定错误进行重试
         const message = error.message.toLowerCase();
 
@@ -580,12 +794,79 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       },
       onRetry: (error, attempt) => {
         this.logToManager('warn', `启动失败，正在进行第 ${attempt} 次重试: ${error.message}`);
+        // 端口被占（含探针端口在 osascript 授权窗口内被抢占）→ 重分配探针端口并重写配置（review P1-4）。
+        // retry 在 onRetry 后有 2s+ 退避，足够这段 ms 级异步完成。
+        if (/address already in use|in use|bind|eaddrinuse/i.test(error.message)) {
+          void (async () => {
+            try {
+              await this.allocateProbePorts(config);
+              // T9：用已 prune 的 singboxConfig（捕获 startInternal :746 外层变量），不重新 generateSingBoxConfig
+              //     ——否则会丢掉 :754 checkAndPruneConfig 已就地剔除的坏节点，导致坏节点回流重撞 FATAL。
+              //     仅把新探针端口回填到对应 inbound.listen_port（allocateProbePorts 只改 this.probe*Port 字段，
+              //     不改 singboxConfig 对象；不回填则 sing-box 仍 bind 旧冲突端口）。
+              for (const ib of singboxConfig.inbounds) {
+                if (ib.tag === 'probe-direct-in' && this.probeDirectPort) {
+                  ib.listen_port = this.probeDirectPort;
+                } else if (ib.tag === 'probe-proxy-in' && this.probeProxyPort) {
+                  ib.listen_port = this.probeProxyPort;
+                }
+              }
+              await this.writeSingBoxConfig(singboxConfig);
+            } catch {
+              /* 忽略：下次尝试用现有配置 */
+            }
+          })();
+        }
+        // 启动 gate 备用腿：run 阶段 `dependency[X] not found` → 解析幽灵 tag、pruneTagsClosure 修正重写盘，
+        // 只修一次（refFixAttempted 闸）。tag 经 idToTagMap 进 gateInvalidNodes，下次 generateSingBoxConfig 跳过。
+        const depMatch = /dependency\[(.+?)\] not found/i.exec(error.message);
+        if (depMatch && !this.refFixAttempted) {
+          this.refFixAttempted = true;
+          void (async () => {
+            try {
+              const cfg = this.generateSingBoxConfig(config, resolvedServerIps);
+              this.pruneTagsClosure(cfg, config, new Set([depMatch[1]]), 'detour');
+              await this.writeSingBoxConfig(cfg);
+              this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_INVALID_NODES, [
+                ...this.gateInvalidNodes.values(),
+              ]);
+            } catch (e) {
+              this.logToManager(
+                'warn',
+                `启动 gate 引用修正失败（将按现有配置重试）: ${(e as Error)?.message ?? e}`
+              );
+            }
+          })();
+        }
       },
     });
 
-    // 如果是系统代理模式，设置系统代理
-    if (config.proxyModeType === 'systemProxy') {
-      await this.setSystemProxy(config);
+    // 系统代理单一写者收口（拆双轨）：systemProxy 模式 → 置系统代理（marker + 防自指在 SystemProxyManager 内，
+    // 杜绝把自己当原始保存致 disable restore 死端口）；TUN/manual 模式 → 反向清掉可能残留的系统代理
+    // （覆盖「切接管方式 systemProxy→TUN 经 switchMode 去抖重启」这条不经 IPC handler 的路径）。
+    // best-effort：networksetup/reg 失败仅告警不阻断启动（enableProxy 内含重试 + 失败回滚 + 清 marker）。
+    try {
+      if (config.proxyModeType === 'systemProxy') {
+        await this.systemProxyManager?.enableProxy(
+          '127.0.0.1',
+          config.httpPort || 2080,
+          config.socksPort || 2081
+        );
+      } else {
+        await this.ensureSystemProxyCleared();
+      }
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      this.logToManager('warn', `系统代理状态同步失败: ${msg}`);
+      // 非致命：核心已起但系统代理没设上 → UI 会显示「已连接」而流量实未走代理。发一条非终态提示告知用户
+      // （enableProxy 内部已 fail-closed 关掉半残留，不会留死端口），避免「显示连上、实际没代理」的静默不一致（L-4）。
+      if (config.proxyModeType === 'systemProxy') {
+        this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_ERROR, {
+          message: `系统代理设置失败：${msg}。核心已启动但流量可能未走代理，请检查系统网络权限后重试。`,
+          errorCode: ProxyErrorCode.SYSTEM_PROXY_FAILED,
+          code: -3,
+        });
+      }
     }
 
     // H3 修复：sing-box 的 cache_file 会持久化 selector 的 clash_api 选择，重启后缓存会覆盖 config
@@ -595,57 +876,274 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
-   * 启动后把 selector 选择校正回 config.selectedServerId（压过 cache_file 持久化的旧选择，修 H3）。
+   * 启动后把各 selector 选择校正回用户意图（压过 cache_file 持久化的旧选择，修 H3）：
+   *  - proxy-selector → currentConfig.selectedServerId（启动窗口内用户热切则跟随最新）。
+   *  - 各 rule-sel-<id> → currentConfig 中对应规则的 targetServerId（防 cache_file 把规则选择回弹到旧节点）。
    * best-effort + 短重试，clash_api 刚起可能未就绪；失败不影响启动（cache/default 仍是有效节点）。
+   * proxy-selector 成功后再 reassert rule-sel（clash_api 已就绪，rule-sel 通常首轮即成）。
    */
   private async reassertSelectorSelection(config: UserConfig): Promise<void> {
+    // 阶段 1：proxy-selector（带重试，等 clash_api 就绪）
     for (let i = 0; i < 10; i++) {
       if (!this.singboxProcess && !this.singboxPid) return; // 已停止则放弃
+      if (this.stopping) return; // 主动停止/重启中：勿在 destroyClashApiAgent 后又用新 agent 重连 9090（M-1：防杀核前重建连接致 9090 TIME_WAIT）
       // 每轮读最新 currentConfig.selectedServerId：若启动窗口内用户已热切到别的节点，则用新节点、
       // 不要把它 revert 回启动时的旧节点。
       const targetId = this.currentConfig?.selectedServerId ?? config.selectedServerId;
       const tag = this.currentIdToTagMap?.get(targetId as string);
-      if (!tag) return;
-      try {
-        const res = await fetch('http://127.0.0.1:9090/proxies/proxy-selector', {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: tag }),
-          signal: AbortSignal.timeout(2000),
-        });
-        if (res.ok) return;
-      } catch {
-        // clash_api 未就绪/瞬时失败 → 短延迟后重试
-      }
+      if (!tag) break;
+      const res =
+        (await this.clashApiClient?.request('/proxies/proxy-selector', 'PUT', { name: tag })) ??
+        ({ ok: false, status: 0 } as const);
+      if (res.ok) break;
+      // clash_api 未就绪/瞬时失败 → 短延迟后重试
       await new Promise((r) => setTimeout(r, 300));
+    }
+    // 阶段 2：各 rule-sel（无重试——proxy-selector 已就绪证 clash_api 可用；失败由 cache/default 兜底）
+    await this.reassertRuleSelectors(config);
+  }
+
+  /**
+   * 重载后 reassert 各 rule-sel 选择：按 currentConfig 的规则 targetServerId 重新 PUT（启动窗口内用户热切规则
+   * 目标的话 currentConfig 反映最新意图）。恒优化后无 targetServerId 的 proxy 规则也生成 rule-sel（default=
+   * proxy-selector 跟全局，嵌套），但 sing-box 重载不擦 selector default、默认值靠生成时正确指向 + 嵌套跟随全局，
+   * 故本函数仍只 reassert 有 targetServerId 者（下方 put/循环 `!targetServerId continue` skip 无 target 者正合此语义）。
+   */
+  private async reassertRuleSelectors(config: UserConfig): Promise<void> {
+    const map = this.currentRuleTargetMap;
+    const idToTag = this.currentIdToTagMap;
+    const cur = this.currentConfig ?? config;
+    if (!map || !idToTag) return;
+
+    const put = (ruleKey: string, targetServerId: string | undefined) => {
+      if (!targetServerId) return;
+      const entry = map.get(ruleKey);
+      if (!entry) return;
+      const memberTag = idToTag.get(targetServerId);
+      if (!memberTag) return; // 目标被 gate 剔除/不存在 → 跳过（selector default 仍有效，不 FATAL）
+      void this.clashApiClient?.request(`/proxies/${entry.selectorTag}`, 'PUT', {
+        name: memberTag,
+      });
+    };
+
+    for (const rule of cur.customRules || []) {
+      if (!rule.enabled || rule.action !== 'proxy' || !rule.targetServerId) continue;
+      put(`custom:${rule.id}`, rule.targetServerId);
+    }
+    for (const appRule of cur.appRules || []) {
+      if (!appRule.enabled || appRule.action !== 'proxy' || !appRule.targetServerId) continue;
+      put(`app:${appRule.appId}`, appRule.targetServerId);
     }
   }
 
   /**
    * 停止代理
    */
-  async stop(): Promise<void> {
+  async stop(opts?: { quitting?: boolean }): Promise<void> {
+    // 生命周期世代 +1：标记一次停止接管（退避中的 attemptAutoRestart 比对到变化即让位，M-2′/L-1′）。
+    this.lifecycleGeneration++;
+    // 取消未决的去抖重启（停止/退出优先于 trailing 重启，避免停了又被自动拉起）
+    if (this.restartDebounceTimer) {
+      clearTimeout(this.restartDebounceTimer);
+      this.restartDebounceTimer = null;
+    }
+    // 用户意图优先：取消可能在退避窗口内待发的自动重启（崩溃后进程已死、refs 均 null 会触发下面的早退，
+    // 但 attemptAutoRestart 仍在退避中——退避期 isRestarting=true，故这里能拦下，M3）。
+    // 条件置位（含 isRestarting）：避免 start() 启动窗口内（已过复位点、refs 尚未就绪、isRestarting=false）
+    // 的一次「无可停止」stop() 把标记毒化为 true → 本会话此后所有崩溃自动重启被静默废掉（M-A 回归防护）。
+    if (this.singboxProcess || this.singboxPid || this.isRestarting) {
+      this.autoRestartAborted = true;
+    }
     // macOS TUN 模式：即使 singboxProcess 为 null，也可能有后台进程在运行
     if (!this.singboxProcess && !this.singboxPid) {
       return;
     }
 
-    // 如果当前是系统代理模式，取消系统代理
-    if (this.currentConfig && this.currentConfig.proxyModeType === 'systemProxy') {
-      await this.unsetSystemProxy();
+    // stopping 标记「主动停止/重启中」：stopSingBoxProcess 的 SIGTERM 会触发 handleProcessExit 信号死分支
+    // → emit('stopped') → index 监听器调 ensureSystemProxyCleared。若不区分，会在「重启 stop 腿」就把系统代理清掉，
+    // 与紧随的 start() reconcile enable 并发打架（C1 竞态）。置位后 ensureSystemProxyCleared 直接跳过：
+    //  - 用户主动停止 → IPC PROXY_STOP / 托盘 onStop 已在 stop() 前置调 ensureSystemProxyCleared（stopping 仍 false）清掉
+    //  - 切模式 / 重启 → 后继 start() 按新模式 reconcile（systemProxy→enable / TUN→clear）
+    //  - 真·外部死亡（非本 stop 触发）→ stopping=false → 信号死分支正常清
+    //  - 退出 → cleanupResources（marker 门控）/ disableProxySync 兜底
+    this.stopping = true;
+    try {
+      await this.stopSingBoxProcess(opts);
+      // 进程已停 → 清掉旧的 id→tag 映射，防止对一个已不存在的 selector 误发 clash_api 切换
+      this.currentIdToTagMap = null;
+      this.currentRuleTargetMap = null;
+    } finally {
+      this.stopping = false;
     }
+  }
 
-    await this.stopSingBoxProcess();
-    // 进程已停 → 清掉旧的 id→tag 映射，防止对一个已不存在的 selector 误发 clash_api 切换
-    this.currentIdToTagMap = null;
+  /**
+   * 退出语境的总拆除：停当前会话代理（quitting=跳过交互式提权弹框）+ macOS 经 root helper
+   * 回收托管/孤儿 sing-box。幂等、best-effort —— 覆盖 stop() 早退够不到的「跨会话孤儿 / 隐藏会话残留」。
+   * helper socket 不存在（未装）时 stopCore/cleanup 快速失败（ENOENT），无额外延迟、不弹框。
+   */
+  async teardownForQuit(): Promise<void> {
+    try {
+      await this.stop({ quitting: true });
+    } catch (e) {
+      this.logToManager('warn', `退出停止代理失败: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (process.platform === 'darwin') {
+      // sing-box 由 root helper 托管（非 GUI 子进程）→ 显式让 helper 停 child + 扫孤儿（覆盖跨会话残留）。
+      try {
+        this.helperManager ??= new HelperManager();
+        await this.helperManager.stopCore();
+        await this.helperManager.cleanup();
+      } catch {
+        /* best-effort：退出兜底，失败不阻塞退出 */
+      }
+    }
+  }
+
+  /**
+   * macOS 提权 helper 引导门控（收敛单点，唯一弹窗实现）。所有 start/restart 入口（开启代理按钮/托盘/
+   * 切接管/CONFIG_CHANGED 重启/换节点回退重启…）汇入此处；仅 interactive 启动 + darwin + TUN +
+   * helper 未就绪 + 用户未 dismiss 时，经注入回调弹 native 引导（无窗口依赖）；回调返回 'abort' → 抛
+   * HELPER_GATE_ABORTED 终止启动（终态等价 osascript 取消=停止态）。崩溃自动重启(interactive:false) 跳过。
+   * 注：ready 但 pathMismatch（socket 通但 plist 路径失效）必须进 gate（否则 startViaHelper 会失败→裸弹 osascript）。
+   */
+  private async maybePromptHelperGate(
+    config: UserConfig,
+    isTunMode: boolean,
+    options: { interactive?: boolean }
+  ): Promise<void> {
+    if (options.interactive === false) return; // 崩溃自动重启等：禁模态
+    if (process.platform !== 'darwin' || !isTunMode) return; // 非 macOS / 非 TUN：systemProxy 绝不弹
+    if (!this.helperManager || !this.helperGate) return;
+    const hs = await this.helperManager.getStatus().catch(() => null);
+    // 关键：backgroundDisabled 时**即便 ready 也不能早退**——install-over-top 让 daemon 在跑(ready=true)但 BTM
+    // 开关仍关（disposition allowed 位缺），必须进 gate 提示用户去系统设置手动开启（修 Bug2：原 `ready→return` 把
+    // 混合态直接放过，用户永远收不到引导）。getStatus 已直读 disposition 判 backgroundDisabled（无需去抖）。
+    if (!hs || (hs.ready && !hs.pathMismatch && !hs.backgroundDisabled)) return;
+    if (!(hs.backgroundDisabled || hs.needsRepair || !hs.installed)) return;
+    // 尊重「不再提示」（needsRepair=路径不符 不可 dismiss）
+    const dismissed = hs.backgroundDisabled
+      ? config.helperDisabledPromptDismissed === true
+      : !hs.installed
+        ? config.helperPromptDismissed === true
+        : false;
+    if (dismissed) return; // 静默落 osascript（与今天 dismissed 行为一致）
+    const decision = await this.helperGate(hs, config).catch(() => 'proceed' as const);
+    if (decision === 'abort') {
+      const err = new Error('用户取消了提权助手引导') as Error & { code?: string };
+      err.code = 'HELPER_GATE_ABORTED';
+      throw err;
+    }
   }
 
   /**
    * 重启代理
    */
-  async restart(config: UserConfig): Promise<void> {
+  async restart(config: UserConfig, options: { interactive?: boolean } = {}): Promise<void> {
     await this.stop();
-    await this.start(config);
+    // start 腿失败的系统代理清理已下沉进 start() 的 public 包装（L-2′），此处无需再 catch。
+    await this.start(config, options);
+  }
+
+  /**
+   * 去抖重启：连改多条配置合并为一次重启。trailing 触发时取最新 this.currentConfig（调用方须已更新它），
+   * 故窗口内的后续切节点(hotSwitch)/no-op/再次结构变更都会被最终那次重启自然纳入。stop()/quit 取消未决重启。
+   */
+  private scheduleDebouncedRestart(): void {
+    if (this.restartDebounceTimer) clearTimeout(this.restartDebounceTimer);
+    this.restartDebounceTimer = setTimeout(() => {
+      this.restartDebounceTimer = null;
+      // 窗口内可能已被 stop()/quit 清掉：仅在仍运行时重启
+      if (!this.singboxProcess && !this.singboxPid) return;
+      const cfg = this.currentConfig;
+      if (!cfg) return;
+      // helper gate abort / 其它错误内部消化（终态=停止），防 timer 回调 unhandled rejection
+      void this.restart(cfg).catch((e) => {
+        this.logToManager('warn', `去抖重启结束: ${e instanceof Error ? e.message : String(e)}`);
+        // 去抖重启失败 → sing-box 未拉起，终态清掉曾指向我们的系统代理，避免死端口致全网断（marker 门控、幂等）。
+        void this.ensureSystemProxyCleared();
+      });
+    }, ProxyManager.RESTART_DEBOUNCE_MS);
+  }
+
+  /**
+   * 启动期落盘外化规则文件 + 孤儿对账清扫（start() 在 generateSingBoxConfig 前调用）。
+   * 函数头先清降级标记；① mkdir；② 删孤儿（custom-rule-*(.tmp) 但不在期望集——删规则/禁用/转 inline/
+   * 改 id/direct 切换的遗留）；③ 期望集全量写（仅内容变化的原子写）。逐文件写失败 → 删旧副本 + 置降级标记
+   * （缺文件触发 generateCustomRules inline 降级，用内存态值），仅 warn 不抛。
+   */
+  private async writeCustomRuleFiles(config: UserConfig): Promise<void> {
+    const dir = getCustomRulesDir();
+    const expected = buildCustomRuleFiles(config); // fileName → JSON
+    this.customRuleFilesDegraded = false;
+    try {
+      await fs.mkdir(dir, { recursive: true });
+      // 孤儿清扫（含 atomicWrite 可能残留的 .tmp）
+      let existing: string[] = [];
+      try {
+        existing = await fs.readdir(dir);
+      } catch {
+        /* 目录刚建/读失败：无孤儿可清 */
+      }
+      for (const name of existing) {
+        if (/^custom-rule-.+\.json(\.tmp)?$/.test(name) && !expected.has(name)) {
+          await fs.unlink(path.join(dir, name)).catch(() => {});
+        }
+      }
+      // 期望集落盘（内容未变跳过）。单文件写失败（EIO/磁盘满）→ 删旧副本，避免 sing-box 消费陈旧值：
+      // 缺文件触发 generateCustomRules existsSync 降级走 inline（用内存态值，功能不损）+ 置 degraded 走重启兜底。
+      for (const [name, content] of expected) {
+        const filePath = path.join(dir, name);
+        const cur = await fs.readFile(filePath, 'utf-8').catch(() => null);
+        if (cur === content) continue;
+        try {
+          await this.atomicWrite(filePath, content);
+        } catch (e) {
+          await fs.unlink(filePath).catch(() => {});
+          this.customRuleFilesDegraded = true;
+          this.logToManager(
+            'warn',
+            `外化规则文件写失败，已删旧副本回退 inline: ${name} (${e instanceof Error ? e.message : String(e)})`
+          );
+        }
+      }
+    } catch (e) {
+      this.customRuleFilesDegraded = true;
+      this.logToManager(
+        'warn',
+        `落盘外化规则文件失败（回退 inline）: ${e instanceof Error ? e.message : String(e)}`
+      );
+    }
+  }
+
+  /**
+   * 运行中外化规则「值」热更：仅原子替换内容变化的文件（fswatch 热重载），**绝不删文件**
+   *（运行中删被挂载文件会致 sing-box reload 报错；删除只在 start() 清扫）。写失败 → 去抖重启兜底。
+   */
+  private async syncCustomRuleFiles(config: UserConfig): Promise<void> {
+    const dir = getCustomRulesDir();
+    const expected = buildCustomRuleFiles(config);
+    try {
+      for (const [name, content] of expected) {
+        const filePath = path.join(dir, name);
+        const cur = await fs.readFile(filePath, 'utf-8').catch(() => null);
+        if (cur === content) continue;
+        await this.atomicWrite(filePath, content);
+      }
+    } catch (e) {
+      this.logToManager(
+        'warn',
+        `热更外化规则文件失败，退回去抖重启: ${e instanceof Error ? e.message : String(e)}`
+      );
+      this.scheduleDebouncedRestart();
+    }
+  }
+
+  /** 原子写：临时文件 + rename（与 RuleResourceManager 同形；rename-over 触发 sing-box fswatch 热重载）。 */
+  private async atomicWrite(filePath: string, content: string): Promise<void> {
+    const tmp = `${filePath}.tmp`;
+    await fs.writeFile(tmp, content, 'utf-8');
+    await fs.rename(tmp, filePath);
   }
 
   /**
@@ -653,58 +1151,276 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 检测模式变化，如果代理正在运行则重启
    */
   async switchMode(newConfig: UserConfig): Promise<void> {
+    // core-swap 手动轴门控：内核替换窗口中拒绝切模式/切节点——防 clash_api 打到半替换核、防重启式切换撞核。
+    this.rejectIfCoreSwapInProgress('切换代理模式');
     // 代理未运行：只更新配置（下次 start 时按新配置生成）
     if (!this.singboxProcess && !this.singboxPid) {
       this.currentConfig = newConfig;
       return;
     }
 
-    // 唯一变化是「切节点」→ clash_api 热切换 selector，不重启 sing-box（优雅切换，连接保留与否由
-    // selector.interrupt_exist_connections 开关决定）。失败则退回重启式切换，保证一定能应用。
-    if (this.canHotSwitch(newConfig)) {
-      if (await this.hotSwitchNode(newConfig)) {
+    // clash_api 热切换（不重启 sing-box）：覆盖「切全局节点」「改规则目标节点」「两者同时」三类纯值变化。
+    // planHotSwitch 产出需 PUT 的 selector 列表；任一 PUT 失败 → 退回去抖重启兜底（保证一定能应用）。
+    // norm 已移出 selectedServerId/targetServerId → 仅这俩值变不翻转 norm → 可经此热切换路径。
+    const plan = this.planHotSwitch(newConfig);
+    if (plan.kind !== 'none') {
+      let allOk = true;
+      for (const p of plan.puts) {
+        if (!(await this.hotSwitchSelector(p.selectorTag, p.memberTag))) {
+          allOk = false;
+          break;
+        }
+      }
+      if (allOk) {
         this.currentConfig = newConfig;
+        // L3：norm 排除了外化规则的值 → 「切节点 + 改外化规则值」同一次 save 会通过 planHotSwitch 检查，
+        //   补一次文件对账防值静默丢失（通常零 diff、幂等）。降级态文件无消费者 → 改走重启重落盘（与 no-op 分支对称）。
+        if (this.customRuleFilesDegraded) this.scheduleDebouncedRestart();
+        else await this.syncCustomRuleFiles(newConfig);
+        // 全局节点热切换出口（覆盖渲染端/托盘/自动换节点三条切节点路径）→ 通知重测代理出口 IP。
+        // 纯规则目标热切换（kind=rules）不切换全局出口 IP，不发 node-hot-switched（避免无谓重测）。
+        // 注意：所有切节点路径必须经 switchMode，否则代理 IP 会陈旧至手动刷新。
+        if (plan.kind === 'global' || plan.kind === 'both') {
+          this.emit('node-hot-switched');
+        }
         return;
       }
       this.logToManager('warn', '热切换失败，退回重启式切换');
     }
 
+    // 生成无关变更（仅 mainSessionViaProxy/ghProxyPrefix/订阅元数据/内置 geo 戳/未引用资源 等归一化字段，
+    // 且节点未变、且无规则 targetServerId 变化）→ 既无需热切换也无需重启：直接更新缓存。避免纯切「更新检查
+    // 走代理」开关触发 ~1.2s 断流。注意 planHotSwitch=none 已排除规则 targetServerId 变化（那会进 rules/both）。
+    if (
+      this.currentConfig &&
+      this.currentConfig.selectedServerId === newConfig.selectedServerId &&
+      this.configGenerationNorm(this.currentConfig) === this.configGenerationNorm(newConfig)
+    ) {
+      this.currentConfig = newConfig;
+      // L3 值热更主路径：norm 结构相等但外化规则的值可能变了 ⇔ 文件内容 diff → 原子替换 + fswatch 热重载、零重启。
+      // 降级桥：上次有外化规则未落盘走 inline（文件无消费者）→ 改走重启重落盘，防「写了没人消费」的值陈旧。
+      if (this.customRuleFilesDegraded) this.scheduleDebouncedRestart();
+      else await this.syncCustomRuleFiles(newConfig);
+      return;
+    }
+
     // 其余变化（模式/端口/TUN/规则/节点集合/interrupt 开关 等需重生成配置的项）→ 重启应用。
-    this.logToManager('info', '配置已更改，正在重启代理以应用...');
-    await this.restart(newConfig);
+    // 去抖合并：先把缓存更新到最新 newConfig（窗口内 hotSwitch/no-op/再次结构变更都对账到它），
+    // 再调度 trailing 重启（~1.5s 内连改多条只重启一次，消除「连改 5 条规则=5 次断流」）。
+    this.logToManager('info', '配置已更改，调度去抖重启以应用...');
+    this.currentConfig = newConfig;
+    this.scheduleDebouncedRestart();
   }
 
   /**
    * 是否可走 clash_api 热切换：当且仅当唯一变化是「切到一个已在运行中 selector 里的节点」，
    * 其余影响配置生成的项（模式/端口/TUN/customRules/servers 集合/appRules/interrupt 开关）都未变。
    */
-  private canHotSwitch(newConfig: UserConfig): boolean {
+  /**
+   * Windows TUN 热切换 guard：system 栈放行（实测零环路），gvisor 栈未实测保守退回重启。
+   * 全局节点热切换与规则目标热切换共用（rule-sel selector 切换同理可能触发 Wintun 回捕）。
+   */
+  private winTunBlocksHotSwitch(config: UserConfig): boolean {
+    if (process.platform !== 'win32' || config.proxyModeType !== 'tun') return false;
+    const winTunStack = config.tunConfig?.stack || 'system'; // Windows 默认 system 栈
+    return winTunStack !== 'system';
+  }
+
+  /**
+   * 热切换规划：判 newConfig 相对 currentConfig 能否走 clash_api 热切换，并产出需 PUT 的 selector 列表。
+   * - norm(old)===norm(new) 是前提（targetServerId 已移出 norm → 改规则目标不翻转 norm）。
+   * - kind=global：仅 selectedServerId 变 → PUT proxy-selector。
+   * - kind=rules：仅规则 targetServerId 变 → PUT 各 rule-sel-<id>。
+   * - kind=both：全局 + 规则同时变 → PUT proxy-selector + 各 rule-sel。
+   * - kind=none：无热切换可行（结构变更/目标节点不在 selector/WIN gvisor guard）→ 退回去抖重启。
+   */
+  private planHotSwitch(newConfig: UserConfig): {
+    kind: 'none' | 'global' | 'rules' | 'both';
+    puts: { selectorTag: string; memberTag: string }[];
+  } {
     const old = this.currentConfig;
-    if (!old) return false;
-    // 必须确实是切节点
-    if (old.selectedServerId === newConfig.selectedServerId) return false;
-    if (!newConfig.selectedServerId) return false;
-    // 目标节点必须已存在于运行中的 selector（= 启动时的 servers），否则 PUT 指向不存在的成员
-    if (!old.servers.some((s) => s.id === newConfig.selectedServerId)) return false;
-    // Windows TUN：旧版担心「热切到非排除 IP 节点 → Wintun 回捕 sing-box 自身出向包成环」而一律退回重启。
-    // 实测(2026-06-10, Win11 + sing-box 1.13.13, system 栈)证伪：route.auto_detect_interface=true 已把
-    // 出站对节点的拨号绑定到物理网卡、不回灌 TUN，与 server IP 是否在 route_exclude_address 无关 →
-    // 热切换零断流、零环路（出口 IP 实测正确切换、日志无 loop）。故 system 栈放行热切换(省去 ~1.2s 重启断流)；
-    // gvisor 栈未实测，保守仍退回重启。auto_detect_interface 在 generateRouteConfig 恒为 true，无需额外判定。
-    if (process.platform === 'win32' && newConfig.proxyModeType === 'tun') {
-      const winTunStack = newConfig.tunConfig?.stack || 'system'; // Windows 默认 system 栈
-      if (winTunStack !== 'system') return false;
+    if (!old) return { kind: 'none', puts: [] };
+    // norm 前提：结构等价（targetServerId/selectedServerId 均已移出 norm → 仅这俩值变不翻转 norm）。
+    if (this.configGenerationNorm(old) !== this.configGenerationNorm(newConfig)) {
+      return { kind: 'none', puts: [] };
     }
-    // 唯一允许变化的就是 selectedServerId：对齐它、servers 按 id 归一化后整体深比较——任何其它影响
-    // 配置生成的字段（blockQuic/tlsFragment/dnsConfig/各 TUN 子字段/appRules/customRules/端口/interrupt
-    // 开关 等）有差异都退回重启，避免「切节点 + 改某设置」同时发生时把那个设置静默丢掉。
-    const norm = (c: UserConfig) =>
-      this.stableStringify({
-        ...c,
-        selectedServerId: null,
-        servers: [...c.servers].sort((a, b) => a.id.localeCompare(b.id)),
-      });
-    return norm(old) === norm(newConfig);
+    if (this.winTunBlocksHotSwitch(newConfig)) return { kind: 'none', puts: [] };
+
+    const puts: { selectorTag: string; memberTag: string }[] = [];
+    let globalChanged = false;
+
+    // 全局节点变化
+    if (old.selectedServerId !== newConfig.selectedServerId && newConfig.selectedServerId) {
+      // 目标节点必须已存在于运行中的 selector（= 启动时 servers），否则 PUT 指向不存在的成员
+      if (!old.servers.some((s) => s.id === newConfig.selectedServerId)) {
+        return { kind: 'none', puts: [] };
+      }
+      const targetTag = this.currentIdToTagMap?.get(newConfig.selectedServerId);
+      if (!targetTag) return { kind: 'none', puts: [] };
+      puts.push({ selectorTag: 'proxy-selector', memberTag: targetTag });
+      globalChanged = true;
+    }
+
+    // 规则目标变化：diff customRules + appRules 的 targetServerId，对每条变化的规则从 currentRuleTargetMap
+    // 查 selectorTag、从 newConfig 的 idToTagMap（= 启动时映射，结构等价所以不变）解析新 memberTag。
+    const rulePuts = this.planRuleHotSwitch(old, newConfig);
+    if (rulePuts === null) return { kind: 'none', puts: [] }; // 任一规则目标节点不在 selector → 整体退回重启
+    puts.push(...rulePuts);
+
+    if (puts.length === 0) return { kind: 'none', puts: [] };
+    const kind = globalChanged && rulePuts.length > 0 ? 'both' : globalChanged ? 'global' : 'rules';
+    return { kind, puts };
+  }
+
+  /**
+   * 规则 targetServerId diff → rule-sel PUT 列表。返回 null 表示任一目标节点不在运行中 selector（应整体退回重启）。
+   * currentRuleTargetMap 的 memberTag 是【生成时】的 default（启动时 targetServerId 解析）；此处按 newConfig 重解析
+   * 新 targetServerId → 新 memberTag（currentIdToTagMap 结构等价不变，可复用）。
+   */
+  private planRuleHotSwitch(
+    old: UserConfig,
+    newConfig: UserConfig
+  ): { selectorTag: string; memberTag: string }[] | null {
+    const map = this.currentRuleTargetMap;
+    if (!map) return []; // 启动时无 rule-sel（无 proxy+targetServerId 规则）→ 无规则热切换
+    const idToTag = this.currentIdToTagMap;
+    if (!idToTag) return null;
+
+    const puts: { selectorTag: string; memberTag: string }[] = [];
+    const visit = (
+      ruleKey: string,
+      oldTarget: string | undefined,
+      newTarget: string | undefined
+    ): boolean => {
+      if (oldTarget === newTarget) return true; // 未变
+      const entry = map.get(ruleKey);
+      if (!entry) return true; // currentRuleTargetMap 无此条（启动时该规则未生成 rule-sel，如被 gate 剔除）→ 跳过
+      // 新目标有→解析节点 tag；无（节点切回默认/跟全局）→ proxy-selector（rule-sel 嵌套 default）
+      const memberTag = newTarget ? idToTag.get(newTarget) : 'proxy-selector';
+      if (newTarget && !memberTag) return false; // 新目标节点不在 selector → 退回重启
+      puts.push({ selectorTag: entry.selectorTag, memberTag: memberTag || 'proxy-selector' });
+      return true;
+    };
+
+    // customRules：按 id 配对（结构等价 ⇒ 顺序与 id 集合一致）
+    const oldRulesById = new Map(
+      (old.customRules || []).filter((r) => r.enabled).map((r) => [r.id, r])
+    );
+    for (const r of newConfig.customRules || []) {
+      if (!r.enabled) continue;
+      const oldR = oldRulesById.get(r.id);
+      if (!oldR) continue;
+      if (!visit(`custom:${r.id}`, oldR.targetServerId, r.targetServerId)) return null;
+    }
+    // appRules：按 appId 配对
+    const oldAppsByAppId = new Map(
+      (old.appRules || []).filter((a) => a.enabled).map((a) => [a.appId, a])
+    );
+    for (const a of newConfig.appRules || []) {
+      if (!a.enabled) continue;
+      const oldA = oldAppsByAppId.get(a.appId);
+      if (!oldA) continue;
+      if (!visit(`app:${a.appId}`, oldA.targetServerId, a.targetServerId)) return null;
+    }
+    return puts;
+  }
+
+  /**
+   * 配置的「生成相关」归一化键：剔除只影响下载/调度/Electron 会话/元数据、不影响 sing-box 配置生成的字段
+   * （selectedServerId、ghProxyPrefix、ruleResource* 调度、builtinGeoMeta、subscriptions 元数据、
+   * mainSessionViaProxy、未被引用的本地资源、servers 的 updatedAt/createdAt 时间戳）。
+   * 两配置此键相等 ⇔ 生成的 sing-box 配置等价。供 canHotSwitch（判纯切节点）与 switchMode（判生成无关变更 → 免重启 no-op）共用。
+   */
+  private configGenerationNorm(c: UserConfig): string {
+    // 被启用 ruleSet 规则引用的本地资源 id 集（只有它们影响生成；未引用资源的增删不应阻断热切换）
+    const ids = new Set<string>();
+    for (const r of c.customRules || []) {
+      if (!r.enabled) continue;
+      for (const cond of ruleConditions(r)) {
+        if (cond.type === 'ruleSet') {
+          for (const v of cond.values) if (v.startsWith('res:')) ids.add(v.slice(4));
+        }
+      }
+    }
+    return this.stableStringify({
+      ...c,
+      selectedServerId: null,
+      ghProxyPrefix: null,
+      ruleResourceAutoUpdate: null,
+      ruleResourceUpdateIntervalHours: null,
+      builtinGeoMeta: null,
+      subscriptions: null,
+      mainSessionViaProxy: null,
+      // helper 引导「不再提示」纯 UI 偏好，不影响 sing-box 生成 → 运行中勾选不应触发重启断流。
+      helperPromptDismissed: null,
+      helperDisabledPromptDismissed: null,
+      // fakeIpToggleMigrated 是一次性迁移元数据标记，不影响生成（enableFakeIp 本身仍在 norm 内 → 影响生成保留）。
+      //   若不排除：未来某路径重建 dnsConfig 丢标记 → norm 翻转无谓重启，且再次迁移可能覆盖用户手动改的值。
+      dnsConfig: c.dnsConfig ? { ...c.dnsConfig, fakeIpToggleMigrated: null } : c.dnsConfig,
+      // 规则投影：禁用规则不进生成（generateCustomRules / DNS 侧均跳过 disabled）→ 内容/增删不触发重启；
+      //   remarks 纯展示元数据，不影响生成。顺序保留（reorder 仍重启，语义正确）。
+      // L3：外化规则（非 direct、全 EXT 可表达）的「值」移出 norm（值变 ⇔ 文件 diff → 热重载、不重启）；
+      //   保留结构位（id/action/target/combineMode/bypassFakeIP/各 cond 的 type 与 ok=有无 matcher）。
+      //   direct 模式 / inline 规则 → 全量投影回退（值仍在 DNS/route inline 消费，值变须重启），与现状一致。
+      customRules: (() => {
+        const extProjection = (c.proxyMode || 'smart').toLowerCase() !== 'direct';
+        return (c.customRules || [])
+          .filter((r) => r.enabled)
+          .map((r) => {
+            if (!extProjection) {
+              // direct 模式：generateRuleSelectors 跳过（无 rule-sel），规则 outbound 直绑节点
+              // → targetServerId 在 route 消费、改值须重启 → 全量保留
+              const copy: Record<string, unknown> = { ...r };
+              delete copy.remarks;
+              return copy;
+            }
+            if (planCustomRule(r).kind === 'inline') {
+              // 非 direct 的 inline 规则：rule-sel 恒存在（default=target 节点或 proxy-selector 跟全局）。
+              // targetServerId 值变（换节点/节点↔默认）= rule-sel default 变（PUT 热切换）→ 移出 norm。
+              // 其余值（域名/IP 等）仍在 inline route 消费、改值须重启 → 保留全量结构。
+              const copy: Record<string, unknown> = { ...r };
+              delete copy.remarks;
+              delete copy.targetServerId;
+              return copy;
+            }
+            return {
+              __ext: 1, // 防与 inline 形态键集碰撞误判等价
+              id: r.id, // 文件身份绑定 id；id 变=结构变=重启
+              action: r.action,
+              // targetServerId 移出 norm（值热切换）：rule-sel 恒存在，default=target 节点或 proxy-selector
+              //   跟全局，值变=PUT rule-sel default 热切换、不重启。
+              targetServerId: null,
+              combineMode: r.combineMode ?? null,
+              bypassFakeIP: !!r.bypassFakeIP,
+              // ok 位承载 fail-closed/skip 决策与「值空↔非空」翻转（值本身不入 norm）
+              conds: ruleConditions(r).map((cd) => ({
+                t: cd.type,
+                ok: condMatcherFields(cd) !== null,
+              })),
+            };
+          });
+      })(),
+      // appRules 投影：targetServerId 移出 norm（rule-sel-app 恒存在，default=target 节点或 proxy-selector
+      //   跟全局，值变=PUT rule-sel-app default 热切换）；保留 appId/action/enabled 结构位（增删/换 action/换 appId 仍重启）。
+      appRules: (c.appRules || []).map((a) => ({
+        appId: a.appId,
+        action: a.action,
+        enabled: a.enabled,
+        targetServerId: null,
+      })),
+      ruleResources: (c.ruleResources || [])
+        .filter((rr) => ids.has(rr.id))
+        .map((rr) => rr.id)
+        .sort(),
+      servers: [...c.servers]
+        .sort((a, b) => a.id.localeCompare(b.id))
+        .map((s) => {
+          const copy: Record<string, unknown> = { ...s };
+          delete copy.updatedAt;
+          delete copy.createdAt;
+          return copy;
+        }),
+    });
   }
 
   /**
@@ -726,41 +1442,59 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     );
   }
 
+  /** destroy 并重建 clash_api agent（杀核前调，防 9090 root TIME_WAIT）。T15：delegate client.destroyAgent。 */
+  private destroyClashApiAgent(): void {
+    this.clashApiClient?.destroyAgent();
+  }
+
+  /** 当前 clash_api secret（供 StatsService 等其它主进程内部 9090 调用带鉴权）。 */
+  getClashApiSecret(): string {
+    return this.currentConfig?.clashApiSecret || '';
+  }
+
   /**
-   * 通过 clash_api `PUT /proxies/proxy-selector` 把 selector 切到目标节点（无需重启）。
-   * 成功返回 true；任何异常/非 2xx 返回 false（调用方退回重启）。
+   * 关闭连接（连接信息页用）：直调 ClashApiClient（专属 agent + Bearer secret 内部封装，渲染端不持 secret）。
+   * id 给定 → DELETE /connections/{id}（关单条）；id 省略 → DELETE /connections（关全部 = CloseAllConnections + ResetNetwork）。
+   * 不抛异常，按 { ok, status } 语义返回（与 reassert/hotSwitch 同治）。
    */
-  private async hotSwitchNode(newConfig: UserConfig): Promise<boolean> {
-    const targetTag = this.currentIdToTagMap?.get(newConfig.selectedServerId as string);
-    if (!targetTag) return false;
-    try {
-      const res = await fetch('http://127.0.0.1:9090/proxies/proxy-selector', {
-        method: 'PUT',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: targetTag }),
-        signal: AbortSignal.timeout(2000),
-      });
-      if (!res.ok) {
-        this.logToManager('warn', `clash_api 热切换返回 HTTP ${res.status}`);
-        return false;
-      }
-      this.logToManager('info', `已热切换节点 → ${targetTag}（clash_api，无重启）`);
-      return true;
-    } catch (e: any) {
-      this.logToManager('warn', `clash_api 热切换异常: ${e?.message ?? e}`);
+  async closeConnection(id?: string): Promise<{ ok: boolean; status: number }> {
+    const pathName = id ? `/connections/${encodeURIComponent(id)}` : '/connections';
+    // T15：直调 client.request（原 clashApiRequest wrapper 已删）。client 未注入 → fallback {ok:false}。
+    return (
+      this.clashApiClient?.request(pathName, 'DELETE') ?? Promise.resolve({ ok: false, status: 0 })
+    );
+  }
+
+  /**
+   * clash_api 热切换任一 selector 的选中成员（PUT /proxies/<selectorTag>）。
+   * 泛化自 hotSwitchNode：全局 proxy-selector 与各 rule-sel-<id> 复用同一原语。
+   * @returns true=PUT 成功；false=定位失败或 HTTP 非 2xx（调用方退回去抖重启兜底）。
+   */
+  private async hotSwitchSelector(selectorTag: string, memberTag: string): Promise<boolean> {
+    if (!memberTag) return false;
+    // T15：直调 client.request（原 clashApiRequest wrapper 已删）。client 未注入 → fallback {ok:false}。
+    const res =
+      (await this.clashApiClient?.request(`/proxies/${selectorTag}`, 'PUT', { name: memberTag })) ??
+      ({ ok: false, status: 0 } as const);
+    if (!res.ok) {
+      this.logToManager('warn', `clash_api 热切换 ${selectorTag} 失败（HTTP ${res.status}）`);
       return false;
     }
+    this.logToManager('info', `已热切换 ${selectorTag} → ${memberTag}（clash_api，无重启）`);
+    return true;
   }
 
   /**
    * 获取代理状态
    */
   getStatus(): ProxyStatus {
-    // TUN 模式下只检查 singboxPid（sing-box 的实际 PID）
-    // 系统代理模式下检查 pid（直接启动的进程 PID）
-    // 注意：TUN 模式下 this.pid 是 osascript/PowerShell 的 PID，不是 sing-box 的
-    const isTunMode = this.currentConfig?.proxyModeType === 'tun';
-    const activePid = isTunMode ? this.singboxPid : this.singboxPid || this.pid;
+    // 判定依据：是否经「包装进程」启动（macOS osascript / Windows UAC）。
+    //   · 包装进程模式：this.pid 是 osascript/PowerShell 的 PID，真实 sing-box PID 在 singboxPid。
+    //   · 直接 spawn 模式（含 Linux TUN）：只有 this.pid，singboxPid 恒 null。
+    // 旧逻辑按 `proxyModeType==='tun'` 取 singboxPid → Linux TUN 直接 spawn 时 activePid 恒 null →
+    // getStatus 恒返回 running:false（issue #33「连接状态/按钮不同步」根因，且令健康检查失效）。
+    const wrapperMode = this.needsOsascript() || this.needsWindowsUAC();
+    const activePid = wrapperMode ? this.singboxPid : this.singboxPid || this.pid;
 
     // 验证进程是否真正存活
     const isRunning = activePid !== null && this.isProcessAlive(activePid);
@@ -834,6 +1568,290 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
+   * 为出口 IP 探针分配两个空闲端口（probe-direct-in / probe-proxy-in）。每次 start 重新分配，避免
+   * 端口被占。失败（极少见）则置 null，generateInbounds/generateRouteConfig 据此跳过探针，不影响代理。
+   */
+  private async allocateProbePorts(config?: UserConfig): Promise<void> {
+    // 排除用户自配端口与 clash_api，避免 listen(0) 偶撞用户端口段致 sing-box bind FATAL（review P1-4）
+    const exclude = new Set<number>([9090]);
+    if (config) {
+      if (config.httpPort) exclude.add(config.httpPort);
+      if (config.socksPort) exclude.add(config.socksPort);
+      if (config.mixedPort) exclude.add(config.mixedPort);
+    }
+    const servers: net.Server[] = [];
+    const ports: number[] = [];
+    try {
+      for (let i = 0; i < 2; i++) {
+        let port = 0;
+        // 至多 5 次重绑避开排除端口（ephemeral 段与常用端口几乎不撞，循环仅作保险）
+        for (let attempt = 0; attempt < 5; attempt++) {
+          const srv = net.createServer();
+
+          await new Promise<void>((resolve, reject) => {
+            srv.listen(0, '127.0.0.1', () => resolve());
+            srv.on('error', reject);
+          });
+          port = (srv.address() as net.AddressInfo).port;
+          if (!exclude.has(port) && !ports.includes(port)) {
+            servers.push(srv);
+            break;
+          }
+
+          await new Promise<void>((resolve) => srv.close(() => resolve()));
+          port = 0;
+        }
+        if (!port) throw new Error('probe port allocation collided');
+        ports.push(port);
+      }
+      this.probeDirectPort = ports[0];
+      this.probeProxyPort = ports[1];
+    } catch {
+      this.probeDirectPort = null;
+      this.probeProxyPort = null;
+    } finally {
+      await Promise.all(
+        servers.map((srv) => new Promise<void>((resolve) => srv.close(() => resolve())))
+      );
+    }
+  }
+
+  /**
+   * 启动前确认 clash_api 端口(9090)可用，仍被占则**按端口**清掉占用者（L2，彻底摆脱 cmdline 匹配）。
+   * 9090 是对外契约固定端口（StatsService / external_controller / 高级设置展示与复制），不改可变端口，故唯一
+   * 正确处置是「清掉占用者，否则明确终态」。处置阶梯：① helper 就绪 → freePort（root、按端口、零提权，是 sing-box
+   * 才杀，否则回报占用者名）；② 交互 + 无 helper → osascript 一次性按端口清；③ 兜底明确终态。所有终态码
+   * ∈ 不可恢复错误（含 _FOREIGN / _AUTH_CANCELLED，均含 clash_api_port_busy 子串）→ 不进自动重启风暴。
+   */
+  private async resolveClashApiPortConflict(): Promise<void> {
+    const PORT = 9090;
+    // 占用两态：listening(connect 连上=有活监听者，必有 PID，可杀) / bindBusy(bind EADDRINUSE)。
+    // bindBusy 但 !listening = TIME_WAIT 类——XNU in_pcbbind 有 UID 检查：root sing-box 死后留下的 9090
+    // root TIME_WAIT，用户态(systemProxy) sing-box 即使 SO_REUSEADDR 也压不过 → EADDRINUSE，持续 2MSL≈30s。
+    // **TIME_WAIT 无进程可杀（lsof 抓不到），只能等它自然回收**，绝不能弹提权框（无意义且阻塞）。
+    const probe = async (): Promise<{ bindBusy: boolean; listening: boolean }> => {
+      const [bindBusy, listening] = await Promise.all([
+        this.isPortBindBusy(PORT),
+        this.isPortListening(PORT),
+      ]);
+      return { bindBusy, listening };
+    };
+    let p = await probe();
+    if (!p.bindBusy && !p.listening) {
+      this.logToManager('info', `[9090] 端口空闲，正常继续`);
+      return;
+    }
+    this.logToManager(
+      'warn',
+      `[9090] 仍被占用(bindBusy=${p.bindBusy} listening=${p.listening})，进入清理（helper=${!!this.helperManager}）`
+    );
+
+    // ② 有活监听者（孤儿/外部/旧路径 sing-box）→ 按端口提权杀（freePort 零提权 / osascript 带超时）
+    if (p.listening) {
+      if (this.helperManager && (await this.helperManager.isReady())) {
+        this.logToManager('info', `[9090] helper 就绪 → freePort 按端口清理`);
+        const r = await this.helperManager.freePort(PORT);
+        this.logToManager('info', `[9090] freePort 结果: ${JSON.stringify(r)}`);
+        if (r.foreign) throw this.clashPortError('FOREIGN', r.foreign);
+      }
+      p = await probe();
+      if (p.listening && this.startInteractive && process.platform === 'darwin') {
+        this.logToManager(
+          'warn',
+          `[9090] freePort 未清净 → osascript 按端口清理（带超时，弹前置顶窗口）`
+        );
+        const res = await this.osascriptFreePort(PORT);
+        this.logToManager('info', `[9090] osascript 按端口清理结果: ${res}`);
+        if (res === 'cancelled') throw this.clashPortError('AUTH_CANCELLED');
+        if (res === 'foreign') throw this.clashPortError('FOREIGN');
+        p = await probe();
+      }
+      if (!p.bindBusy && !p.listening) {
+        this.logToManager('info', `[9090] 活监听者已清掉，端口空闲`);
+        return;
+      }
+      if (p.listening) {
+        // 仍有活监听者没杀掉（非交互/取消/外部）
+        this.logToManager('error', `[9090] 活监听者仍在 → 终态 BUSY`);
+        throw this.clashPortError('BUSY');
+      }
+      // 杀完活孤儿后 bindBusy && !listening → 它自己留下的 root TIME_WAIT → 落入 ③ 等待
+    }
+
+    // ③ bindBusy 且无活监听者 = TIME_WAIT → 等自然回收（≤35s，覆盖 2MSL=30s），全程不弹提权框
+    if (p.bindBusy && !p.listening) {
+      // 预检放行：本次若经 macOS root(osascript/helper) 启动 sing-box（TUN 模式），残留多为上次 root sing-box 的
+      // 9090 TIME_WAIT（同 uid 0）。Go listener 默认带 SO_REUSEADDR，root 进程对同 uid TIME_WAIT 残留可直接 bind →
+      // 无需空等 30s，直接放行；失败由启动失败链（retry 退避，不进重启风暴）兜底。仅 darwin TUN 放行：用户态
+      // systemProxy sing-box 跨 uid 压不过 root TIME_WAIT 仍须等；Win/Linux 的 bind/TIME_WAIT 语义未验证，保守仍等待（M-2）。
+      // 注：依赖 XNU in_pcbbind「同 uid + SO_REUSEADDR 放行 TIME_WAIT」语义，需真机抓包实测确认（设计文档待验证项）。
+      if (this.needsOsascript()) {
+        this.logToManager(
+          'info',
+          `[9090] TIME_WAIT 残留，本次以 root 启动 sing-box（SO_REUSEADDR 复用同 uid 残留）→ 跳过等待直接放行`
+        );
+        return;
+      }
+      this.logToManager(
+        'warn',
+        `[9090] 端口处于回收中(TIME_WAIT)，等待系统释放（≤35s，无需结束进程）...`
+      );
+      this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_ERROR, {
+        message:
+          '上一会话的 clash_api 端口正在回收（约 30 秒），请稍候自动重试或片刻后再启动，无需手动结束进程。',
+        errorCode: ProxyErrorCode.CLASH_API_PORT_RECYCLING,
+        code: -5,
+      });
+      const deadline = Date.now() + 35000;
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 1000));
+        p = await probe();
+        if (!p.bindBusy && !p.listening) {
+          this.logToManager('info', `[9090] TIME_WAIT 已回收，端口空闲`);
+          return;
+        }
+        if (p.listening) break; // 期间又冒出活监听者 → 跳出走 BUSY 终态（罕见）
+      }
+      if (p.bindBusy && !p.listening) {
+        this.logToManager('error', `[9090] TIME_WAIT 35s 未回收 → 终态`);
+        throw this.clashPortError('BUSY_TIMEWAIT');
+      }
+    }
+    this.logToManager('error', `[9090] 清理后仍被占用 → 终态 BUSY`);
+    throw this.clashPortError('BUSY');
+  }
+
+  /** bind 探测 127.0.0.1:port 是否被占（listen 报 EADDRINUSE=占用）。覆盖「活监听 + (SO_REUSEADDR 之外的)端口持有」，
+   *  与 sing-box(Go) 的 bind 语义最接近——connect 探测漏掉的 held-but-not-accepting 由它兜住（修 9090 storm 回归）。 */
+  private isPortBindBusy(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const srv = net.createServer();
+      srv.once('error', (e: NodeJS.ErrnoException) => resolve(e.code === 'EADDRINUSE'));
+      srv.listen(port, '127.0.0.1', () => srv.close(() => resolve(false)));
+    });
+  }
+
+  /** connect 探测 127.0.0.1:port 是否有活监听者（连上=有）。被拒/超时=无（不被 TIME_WAIT 误判为占用）。 */
+  private isPortListening(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const sock = net.connect({ port, host: '127.0.0.1' });
+      const done = (v: boolean): void => {
+        sock.destroy();
+        resolve(v);
+      };
+      sock.once('connect', () => done(true));
+      sock.once('error', () => done(false));
+      sock.setTimeout(800, () => done(false));
+    });
+  }
+
+  /** 构造 9090 占用终态错误（err.code 带机读码；三条消息均含「clash_api 端口 9090」→ isUnrecoverableRestartError 命中、立即终态）。 */
+  private clashPortError(
+    kind: 'BUSY' | 'FOREIGN' | 'AUTH_CANCELLED' | 'BUSY_TIMEWAIT',
+    occupant?: string
+  ): Error & { code?: string } {
+    const PORT = 9090;
+    let msg: string;
+    let code: string;
+    if (kind === 'FOREIGN') {
+      msg = `clash_api 端口 ${PORT} 被${occupant ? `「${occupant}」` : '非 sing-box 进程'}占用，请手动结束该进程后重试`;
+      code = 'CLASH_API_PORT_BUSY_FOREIGN';
+    } else if (kind === 'AUTH_CANCELLED') {
+      msg = `清理占用 clash_api 端口 ${PORT} 的进程需要授权，已取消`;
+      code = 'CLASH_API_PORT_BUSY_AUTH_CANCELLED';
+    } else if (kind === 'BUSY_TIMEWAIT') {
+      // TIME_WAIT 无进程可杀，提示「稍候重试」而非「结束进程」（避免误导用户去杀不存在的进程）
+      msg = `clash_api 端口 ${PORT} 仍在系统回收中（上一会话残留的 TIME_WAIT，约 30 秒），请稍候片刻再启动，无需手动结束进程`;
+      code = 'CLASH_API_PORT_BUSY';
+    } else {
+      msg = `clash_api 端口 ${PORT} 被占用（残留 sing-box 未释放或被外部进程占用），请手动结束占用进程后重试`;
+      code = 'CLASH_API_PORT_BUSY';
+    }
+    const err = new Error(msg) as Error & { code?: string };
+    err.code = code;
+    return err;
+  }
+
+  /** 无 helper 时按端口清 9090 占用者：写临时脚本（避内联引号转义）→ osascript 提权跑（lsof → 是 sing-box 才杀）。 */
+  private osascriptFreePort(port: number): Promise<'freed' | 'cancelled' | 'foreign'> {
+    const scriptPath = path.join(getUserDataPath(), 'flowz-freeport.sh');
+    // 用 ps -o comm=（仅可执行名，不含参数）判据：避免「参数里碰巧含 sing-box」的无辜进程被 root 误杀（M2）。
+    // 杀掉的进程 cmdline 记到 KILLED 行供 app 落日志（killUserOrphansMac「不波及外部」承诺的口径透明化）。
+    const script = `#!/bin/bash
+pids=$(/usr/sbin/lsof -ti tcp:${port} -sTCP:LISTEN 2>/dev/null)
+[ -z "$pids" ] && { echo FREED; exit 0; }
+foreign=""; killed=""
+for p in $pids; do
+  comm=$(/bin/ps -o comm= -p $p 2>/dev/null)
+  case "$comm" in
+    *sing-box*) /bin/kill -9 $p 2>/dev/null; killed="$killed $p";;
+    *) foreign="$foreign|$comm";;
+  esac
+done
+[ -n "$killed" ] && echo "KILLED$killed"
+[ -n "$foreign" ] && echo "FOREIGN$foreign" || echo FREED
+`;
+    try {
+      require('fs').writeFileSync(scriptPath, script, { mode: 0o755 });
+    } catch {
+      return Promise.resolve('cancelled');
+    }
+    const cleanup = (): void => {
+      try {
+        require('fs').rmSync(scriptPath, { force: true });
+      } catch {
+        /* 忽略 */
+      }
+    };
+    // 注：不再 mainWindow.show()/focus()——osascript `with administrator privileges` 的授权框是 SecurityAgent
+    // 系统级 modal、自带置顶，不依赖 app 窗口可见；强行 show 隐藏窗口会经 'show' 把 Dock 图标拽回来（破坏
+    // 「关窗=隐藏到托盘」的 Dock 状态机，是「程序坞关不掉」的副作用源）。有 120s 超时兜底，不会因不 show 而永挂。
+    return new Promise((resolve) => {
+      const proc = spawn('/usr/bin/osascript', [
+        '-e',
+        `do shell script "/bin/bash '${scriptPath}'" with administrator privileges`,
+      ]);
+      let out = '';
+      let settled = false;
+      const finish = (r: 'freed' | 'cancelled' | 'foreign'): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        cleanup();
+        resolve(r);
+      };
+      // 硬超时：授权框被遮挡/无人应答 120s → 杀 osascript 按取消处理，绝不让 start() 永挂（修卡死诱因）。
+      const timer = setTimeout(() => {
+        this.logToManager('warn', `[9090] osascript 授权框 120s 未应答，按取消处理`);
+        try {
+          proc.kill('SIGKILL');
+        } catch {
+          /* 忽略 */
+        }
+        finish('cancelled');
+      }, 120_000);
+      proc.stdout?.on('data', (d: Buffer) => (out += d.toString()));
+      proc.on('close', (code) => {
+        const k = out.match(/KILLED(.+)/);
+        if (k)
+          this.logToManager('info', `已提权按端口清掉占用 ${port} 的 sing-box: ${k[1].trim()}`);
+        if (code !== 0)
+          finish('cancelled'); // 用户取消授权(-128) 等
+        else finish(out.includes('FOREIGN') ? 'foreign' : 'freed');
+      });
+      proc.on('error', () => finish('cancelled'));
+    });
+  }
+
+  /** 当前出口 IP 探针端口；代理未启动或分配失败时返回 null。供 IpInfoService 取数用。 */
+  getProbePorts(): { direct: number; proxy: number } | null {
+    if (this.probeDirectPort && this.probeProxyPort) {
+      return { direct: this.probeDirectPort, proxy: this.probeProxyPort };
+    }
+    return null;
+  }
+
+  /**
    * 生成 sing-box 配置（sing-box 1.12.x / 1.13.x 兼容格式）
    */
   generateSingBoxConfig(config: UserConfig, resolvedIps?: Record<string, string>): SingBoxConfig {
@@ -846,14 +1864,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       throw new Error(this.naiveUnavailableReason(selectedServer));
     }
 
-    // 调试日志
-    console.log('[ProxyManager] Generating config with:', {
-      proxyMode: config.proxyMode,
-      proxyModeType: config.proxyModeType,
-      selectedServerId: config.selectedServerId,
-      serverProtocol: selectedServer.protocol,
-    });
-
     // 获取用户数据目录用于缓存文件
     const userDataPath = getUserDataPath();
     const cachePath = getCachePath();
@@ -862,7 +1872,14 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 这样做之后内容拓扑（Clash API）和日志中显示的将是“香港 01”而不是“proxy-uuid”
     const idToTagMap = new Map<string, string>();
     // 预占内置出站 tag，防止用户把节点命名为 proxy-selector/direct/block 等导致 tag 撞车启动 FATAL
-    const usedTags = new Set<string>(['proxy-selector', 'direct', 'block', 'direct-loopback']);
+    const usedTags = new Set<string>([
+      'proxy-selector',
+      'direct',
+      'block',
+      'direct-loopback',
+      'probe-direct-in',
+      'probe-proxy-in',
+    ]);
 
     const getUniqueTag = (server: ServerConfig) => {
       let baseTag = server.name.trim() || '未命名节点';
@@ -899,7 +1916,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         clash_api: {
           external_controller: '127.0.0.1:9090',
           external_ui: path.join(userDataPath, 'ui'),
-          secret: '', // 为空以保持与现有渲染进程 fetch 逻辑兼容
+          // 随机 secret 鉴权（持久化于 config）：内部调用带 Authorization，防恶意网页跨域读连接历史
+          secret: config.clashApiSecret || '',
           default_mode: 'rule',
         },
       },
@@ -907,23 +1925,44 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // 路由规则若指向「已被跳过/不存在的出站」（如缺 libcronet 被跳过的 naive 节点），sing-box 会以
     // "outbound not found" 启动失败。统一把这类死引用修正为 selector（修 review H2：app/custom 分流
-    // 指向被跳过 naive 节点的情况）。
-    const validTags = new Set(
-      singboxConfig.outbounds.map((o) => o.tag).filter((t): t is string => !!t)
-    );
-    for (const rule of singboxConfig.route?.rules ?? []) {
-      const r = rule as { action?: string; outbound?: string };
-      if (r.action === 'route' && r.outbound && !validTags.has(r.outbound)) {
-        r.outbound = 'proxy-selector';
-      }
+    // 指向被跳过 naive 节点的情况）。抽成方法供 gate 剔除后复用（A5 等价重构）。
+    this.fixRouteDeadReferences(singboxConfig);
+
+    // gate 已剔除的非法节点：onRetry 端口重分配会重新走 generateSingBoxConfig，上面的 idToTagMap 会把
+    // 这些 id 的 tag 重新填回 → 删掉对应 entry，防 hotSwitchNode/reassertSelectorSelection 经 clash_api
+    // PUT 复活幽灵 tag（generateOutbounds 的 gateInvalidNodes.has 跳过保证它们不进 outbounds/selector）。
+    for (const id of this.gateInvalidNodes.keys()) {
+      this.currentIdToTagMap?.delete(id);
     }
 
-    // 调试日志
-    console.log('[ProxyManager] Generated inbounds count:', singboxConfig.inbounds.length);
-    console.log('[ProxyManager] Generated outbounds count:', singboxConfig.outbounds.length);
-    console.log('[ProxyManager] Route rule_set count:', singboxConfig.route?.rule_set?.length || 0);
+    // 回填 currentRuleTargetMap：ruleKey → { selectorTag, memberTag }，供「改规则目标节点」clash_api 热切换
+    // 定位各 rule-sel selector。pendingRuleSelectors 由 generateRuleSelectors 填充（generateOutbounds 内）。
+    // 仅保留仍存在于 outbounds 的 selector（detour 死引用剔除可能删空 rule-sel → 该 entry 不进 map，热切换
+    // 跳过它、由 fixRouteDeadReferences 兜底改写的 proxy-selector 接管）。
+    const liveSelectorTags = new Set(
+      singboxConfig.outbounds
+        .filter((o) => o.type === 'selector')
+        .map((o) => o.tag)
+        .filter((t): t is string => !!t)
+    );
+    this.currentRuleTargetMap = new Map(
+      this.pendingRuleSelectors
+        .filter((r) => liveSelectorTags.has(r.selectorTag))
+        .map((r) => [r.ruleKey, { selectorTag: r.selectorTag, memberTag: r.memberTag }])
+    );
+    this.pendingRuleSelectors = [];
+
+    this.logToManager(
+      'debug',
+      `配置已生成: inbounds=${singboxConfig.inbounds.length}, outbounds=${singboxConfig.outbounds.length}, rule_set=${singboxConfig.route?.rule_set?.length || 0}`
+    );
 
     return singboxConfig;
+  }
+
+  /** 隐私模式 provider 注入（index：getPrivacyMode）：隐私开时 sing-box 日志级别经 effectiveLogLevel 抬到 ≥warn。 */
+  setPrivacyProvider(fn: () => boolean): void {
+    this.privacyProvider = fn;
   }
 
   /**
@@ -931,8 +1970,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    */
   private generateLogConfig(config: UserConfig): SingBoxLogConfig {
     // 日志级别由用户配置（默认 info）。level 影响是否记录访问域名/SNI（info/debug 会记，warn+ 不记）。
+    // 隐私模式经 effectiveLogLevel 抬到 ≥warn，从源头不让 sing-box 记录连接明细到 singbox.log。
     const logConfig: SingBoxLogConfig = {
-      level: config.logLevel || 'info',
+      level: effectiveLogLevel(config.logLevel || 'info', this.privacyProvider()),
       timestamp: true,
     };
 
@@ -981,6 +2021,36 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     }
   }
 
+  /** 用户自定义国内 DNS 若为 IP（非 DoH 域名），返回 {ip, port} 供 TUN 直连放行/排除集；否则 null。 */
+  private getCustomDomesticDnsEndpoint(config: UserConfig): { ip: string; port: number } | null {
+    const p = parseDnsServerSpec(config.dnsConfig?.domesticDns);
+    return p && !p.isDomain ? { ip: p.server, port: p.port } : null;
+  }
+
+  /**
+   * #57 节点域名解析器档位 → 实际使用的 DNS server tag。
+   * 同时供节点 outbound 的 domain_resolver（ctx='dial'）与节点域名 DNS rule1（ctx='rule'）取值，
+   * 保证 dial 与 rule1 用同一档（outbound 级统一 tag），不破坏 selector 热切换。
+   *
+   * 档位（缺省 / 'auto' = 零行为变化，dial 与 rule1 忠实保留各自基线解析器）：
+   *  - auto   → dial=dns-bootstrap（AliDNS IP-DoH 223.5.5.5，保 outbound.domain_resolver 现状）；
+   *             rule=dns-domestic（doh.pub DoH，保节点域名 DNS rule1 现状）。
+   *             两路径基线本就不同档，统一会把 rule1 从 doh.pub 悄改成 AliDNS，违反「默认零行为变化」。
+   *  - dnspod → dns-node（DNSPod IP-DoH 1.12.12.12）
+   *  - system → dns-local（系统 DNS）；但 INV-1：TUN 下 rule ctx 强制 dns-node（IP-DoH）防递归——
+   *             节点域名查询若落 dns-local，其上游可能再经 TUN 被 hijack-dns 劫持回 DNS rules 形成软死循环。
+   */
+  private getNodeResolverTag(config: UserConfig | null | undefined, ctx: 'dial' | 'rule'): string {
+    const mode = config?.dnsConfig?.nodeDomainResolver ?? 'auto';
+    if (mode === 'dnspod') return 'dns-node';
+    if (mode === 'system') {
+      if (ctx === 'rule' && config?.proxyModeType === 'tun') return 'dns-node'; // INV-1
+      return 'dns-local';
+    }
+    // auto（含缺省）：忠实保留两路径各自基线解析器，逐字节回现状。
+    return ctx === 'dial' ? 'dns-bootstrap' : 'dns-domestic';
+  }
+
   private generateDnsConfig(config: UserConfig, selectedServerTag: string): SingBoxDnsConfig {
     const proxyMode = (config.proxyMode || 'smart').toLowerCase();
 
@@ -997,8 +2067,48 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 配合我们刚刚修复的 macOS gvisor strict_route DHCP DNS 劫持逻辑，
     // FakeIP 现在能够 100% 完美的用内部 cache 把假 IP 还原成真域名丢给代理节点。
     // 从而完美避开机场对纯 IP 请求的无情封杀！
-    const enableFakeIp =
-      config.proxyModeType?.toLowerCase() !== 'systemproxy' ? true : userDnsConfig.enableFakeIp;
+    // 单一真值：与 custom-rule-files.usesFakeIp 同源（外化判定一致，避免漂移）
+    const enableFakeIp = usesFakeIp(config);
+
+    // 用户自定义 DNS：解析 domesticDns/foreignDns（https DoH / tls DoT / udp / 裸 IP），非法或空回退默认并告警。
+    const DEFAULT_DOMESTIC: ParsedDnsServer = {
+      type: 'https',
+      server: 'doh.pub',
+      port: 443,
+      path: '/dns-query',
+      isDomain: true,
+    };
+    const DEFAULT_FOREIGN: ParsedDnsServer = {
+      type: 'https',
+      server: 'dns.google',
+      port: 443,
+      path: '/dns-query',
+      isDomain: true,
+    };
+    const domestic = parseDnsServerSpec(userDnsConfig.domesticDns) ?? DEFAULT_DOMESTIC;
+    const foreign = parseDnsServerSpec(userDnsConfig.foreignDns) ?? DEFAULT_FOREIGN;
+    if (userDnsConfig.domesticDns && !parseDnsServerSpec(userDnsConfig.domesticDns)) {
+      this.logToManager(
+        'warn',
+        `国内 DNS 无法解析，已回退默认 doh.pub: ${userDnsConfig.domesticDns}`
+      );
+    }
+    if (userDnsConfig.foreignDns && !parseDnsServerSpec(userDnsConfig.foreignDns)) {
+      this.logToManager(
+        'warn',
+        `境外 DNS 无法解析，已回退默认 dns.google: ${userDnsConfig.foreignDns}`
+      );
+    }
+    // 由解析结果构造 dns server：域名型 DNS 需 domain_resolver 引导解析；DoH 带 path；remote 走代理 detour。
+    const buildUserDns = (tag: string, p: ParsedDnsServer, detour?: string): SingBoxDnsServer => ({
+      tag,
+      type: p.type,
+      server: p.server,
+      server_port: p.port,
+      ...(p.type === 'https' ? { path: p.path || '/dns-query' } : {}),
+      ...(p.isDomain ? { domain_resolver: 'dns-bootstrap' } : {}),
+      ...(detour ? { detour } : {}),
+    });
 
     // sing-box 1.13+ 新格式：每个 server 必须有显式 type 字段
     //
@@ -1027,30 +2137,26 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         path: '/dns-query',
       },
       {
+        // 节点域名解析器可选档（#57，DNSPod IP-DoH）：向 1.12.12.12:443 直接发 DoH 包。
+        // 与 dns-bootstrap 同为 IP-based DoH（免疫 UDP 53 限速/劫持）、靠 route 把 1.12.12.12:443 直连放行绕过 TUN。
+        // 仅当用户把节点域名解析器切到「DNSPod」或 system 档（TUN 下 rule ctx 防递归）时被引用；
+        // 恒加进 servers——未被引用的 server sing-box 不会主动连接，零成本，避免按档增删 server 破坏热切换 tag 稳定性。
+        tag: 'dns-node',
+        type: 'https',
+        server: '1.12.12.12',
+        server_port: 443,
+        path: '/dns-query',
+      },
+      {
         // 兼容性和兜底的系统 DNS
         tag: 'dns-local',
         type: 'local',
       },
-      {
-        // 国内直连 DNS (推荐 DoH)
-        tag: 'dns-domestic',
-        type: 'https',
-        server: 'doh.pub',
-        server_port: 443,
-        path: '/dns-query',
-        domain_resolver: 'dns-bootstrap',
-      },
-      {
-        // 远程代理 DNS (推荐 DoH)
-        tag: 'dns-remote',
-        type: 'https',
-        server: 'dns.google',
-        server_port: 443,
-        path: '/dns-query',
-        domain_resolver: 'dns-bootstrap',
-        // 关键核心：远程解析必须走代理，否则在境内直接发起会因 GFW 拦截/污染导致 FakeIP 映射失败或由于 TTL 极短产生大量无效解析。
-        detour: selectedServerTag,
-      },
+      // 国内直连 DNS（用户可自定义，默认 doh.pub DoH）
+      buildUserDns('dns-domestic', domestic),
+      // 远程代理 DNS（用户可自定义，默认 dns.google DoH）。必须走代理 detour，
+      // 否则在境内直接发起会因 GFW 拦截/污染导致 FakeIP 映射失败或 TTL 极短产生大量无效解析。
+      buildUserDns('dns-remote', foreign, selectedServerTag),
     ];
 
     if (enableFakeIp) {
@@ -1068,31 +2174,48 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       rules: [],
       // 默认使用国内 DNS 解析
       final: 'dns-domestic',
-      // macOS 使用 RealIP 模式（嗅探），Windows 依然使用高效的 FakeIP
-      strategy: process.platform === 'darwin' || config.enableIPv6 ? 'prefer_ipv4' : 'ipv4_only',
+      // strategy 仅控制 A/AAAA 偏好，与 FakeIP 无关：统一 prefer_ipv4（sing-box 官方默认行为，三平台一致）。
+      // 原 ipv4_only 分支会抑制 AAAA 查询，伤 CDN 优选域名 / IPv6-only 目标的解析（#57）；prefer_ipv4 在无 IPv6 时
+      // 仍优先用 A，安全无副作用。usesFakeIp 无平台分支，三平台 enableFakeIp 时一致走 FakeIP（旧注释已过时，实为恒 FakeIP）。
+      strategy: 'prefer_ipv4',
+      // 关 FakeIP：补 reverse_mapping，让无 SNI/ECH 的连接也能用 DNS 反查域名做路由匹配（不改节点收 IP 事实，见设计 T3）。
+      // 开 FakeIP 时不加（FakeIP 本身已提供域名↔假 IP 的双向映射）。
+      ...(enableFakeIp ? {} : { reverse_mapping: true }),
     };
     const dnsRules: SingBoxDnsRule[] = [];
 
-    // 代理服务器域名必须使用真实 DNS 解析（避免 FakeIP 劫持产生死循环）
-    const selectedServer = config.servers.find((s) => s.id === config.selectedServerId);
-    if (selectedServer?.address) {
-      const proxyDomains = [selectedServer.address];
-      if (selectedServer.tlsSettings?.serverName) {
-        proxyDomains.push(selectedServer.tlsSettings.serverName);
-      }
-      const uniqueDomains = Array.from(new Set(proxyDomains));
-
+    // 代理服务器域名必须使用真实 DNS 解析（避免 FakeIP 劫持产生死循环）。
+    // #57 rule1 全量化：遍历【全部】节点的 address + tlsSettings.serverName（过滤 IP 字面量），而非仅当前选中节点——
+    //   修热切换 query 侧缺口：原先只含 selectedServer，热切换到其它节点后该节点域名查询会落 FakeIP/dns-local。
+    // 去掉过宽的 domain_keyword（exact domain + suffix 已对节点域名全覆盖，keyword 易误伤同名子串）。
+    // server 取 getNodeResolverTag(config,'rule')：auto 忠实回 dns-domestic（doh.pub DoH，与基线一致，
+    //   不随 dial 的 dns-bootstrap 统一）；dnspod=dns-node；TUN+system 强制 dns-node 防递归。
+    const nodeDomains = Array.from(
+      new Set(
+        config.servers.flatMap((s) => {
+          const ds: string[] = [];
+          if (s.address) ds.push(s.address);
+          if (s.tlsSettings?.serverName) ds.push(s.tlsSettings.serverName);
+          return ds;
+        })
+      )
+    ).filter((d) => !!d && !isIpv4Host(d) && !isIpv6Host(d));
+    if (nodeDomains.length) {
+      // 观测：超大订阅下 rule1 域名规模（不设上限，trie 匹配千级无压力；异常膨胀时据此定位）。
+      this.logToManager('info', `DNS rule1 节点域名规则: ${nodeDomains.length} 个域名`);
       dnsRules.push({
-        domain: uniqueDomains,
-        domain_suffix: uniqueDomains.flatMap((d) => [d, `.${d}`]),
-        domain_keyword: uniqueDomains,
-        server: 'dns-domestic', // 强制使用 DoH 解析节点域名，防止 UDP 53 被运营商劫持/丢包导致 TTL 过期后断网
+        domain: nodeDomains,
+        domain_suffix: nodeDomains.flatMap((d) => [d, `.${d}`]),
+        server: this.getNodeResolverTag(config, 'rule'),
       } as SingBoxDnsRule);
     }
 
-    // 处理基础 DNS 服务的地址解析，确保它们走引导解析器
+    // 处理基础 DNS 服务的地址解析，确保它们走引导解析器（含用户自定义的 DoH 域名）
+    const bootstrapDomains = ['doh.pub', 'dns.google', 'cloudflare-dns.com', 'one.one.one.one'];
+    if (domestic.isDomain) bootstrapDomains.push(domestic.server);
+    if (foreign.isDomain) bootstrapDomains.push(foreign.server);
     dnsRules.push({
-      domain: ['doh.pub', 'dns.google', 'cloudflare-dns.com', 'one.one.one.one'],
+      domain: Array.from(new Set(bootstrapDomains)),
       server: 'dns-bootstrap-udp',
     } as SingBoxDnsRule);
 
@@ -1104,25 +2227,54 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       server: 'dns-local',
     } as SingBoxDnsRule);
 
-    // 处理自定义规则中的 bypassFakeIP
+    // 处理自定义规则中的 bypassFakeIP（仅 domain / domainSuffix / domainKeyword 三类域名规则有效）。
+    // 可外化规则（smart/global + 已落盘 <base>.dns.json）→ 引用其 <base>-dns rule_set，值不进 DNS 配置
+    // （改值原子替换文件 → fswatch 热重载、零重启）；inline / direct 模式 / 文件缺失降级 → 仍按值提取合并（现状）。
     if (config.customRules && enableFakeIp) {
-      const bypassDomains: string[] = [];
+      const bypassDomains: string[] = []; // type 'domain'
+      const bypassSuffixes: string[] = []; // type 'domainSuffix'
+      const bypassKeywords: string[] = []; // type 'domainKeyword'
+      const dnsTags: string[] = [];
+      const externalize = proxyMode !== 'direct'; // direct 不外化（route 侧 generateCustomRules 不执行）
       for (const rule of config.customRules) {
-        if (rule.enabled && rule.bypassFakeIP && rule.domains.length > 0) {
-          for (const d of rule.domains) {
-            if (!d.startsWith('geosite:')) {
-              bypassDomains.push(d.startsWith('*.') ? d.slice(2) : d);
+        if (!rule.enabled || !rule.bypassFakeIP) continue;
+        if (externalize) {
+          const plan = planCustomRule(rule);
+          if (plan.kind !== 'inline' && plan.dnsRules) {
+            const base = customRuleFileBase(rule.id);
+            const dnsPath = path.join(getCustomRulesDir(), `${base}.dns.json`);
+            if (require('fs').existsSync(dnsPath)) {
+              if (!dnsTags.includes(`${base}-dns`)) dnsTags.push(`${base}-dns`);
+              continue; // 已外化：域名值走文件，不在此提取
             }
+          }
+        }
+        // inline / direct / 文件缺失降级：取所有 domain/domainSuffix/domainKeyword 条件的值并集
+        for (const cond of ruleConditions(rule)) {
+          const vals = (cond.values || []).map((v) => v.trim()).filter(Boolean);
+          if (vals.length === 0) continue;
+          if (cond.type === 'domain') {
+            bypassDomains.push(...vals);
+          } else if (cond.type === 'domainSuffix') {
+            bypassSuffixes.push(...vals.map((d) => (d.startsWith('*.') ? d.slice(2) : d)));
+          } else if (cond.type === 'domainKeyword') {
+            bypassKeywords.push(...vals);
           }
         }
       }
 
-      if (bypassDomains.length > 0) {
-        dnsRules.push({
-          domain: bypassDomains,
-          domain_suffix: bypassDomains.flatMap((d) => [d, `.${d}`]),
-          server: 'dns-bootstrap', // 使用真实 DNS 绕过 FakeIP
-        } as SingBoxDnsRule);
+      if (bypassDomains.length || bypassSuffixes.length || bypassKeywords.length) {
+        const bypassRule: Record<string, unknown> = { server: 'dns-bootstrap' };
+        if (bypassDomains.length) bypassRule.domain = bypassDomains;
+        if (bypassSuffixes.length) {
+          bypassRule.domain_suffix = bypassSuffixes.flatMap((d) => [d, `.${d}`]);
+        }
+        if (bypassKeywords.length) bypassRule.domain_keyword = bypassKeywords;
+        dnsRules.push(bypassRule as unknown as SingBoxDnsRule);
+      }
+      // 外化规则的域名匹配走 rule_set 引用（与上面 inline 合并规则相邻，OR 语义等价）
+      if (dnsTags.length) {
+        dnsRules.push({ rule_set: dnsTags, server: 'dns-bootstrap' } as unknown as SingBoxDnsRule);
       }
     }
 
@@ -1192,7 +2344,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     //
     // 版本兼容：
     //   1.12.x → sniff/sniff_override_destination 是 inbound 级别字段
-    //   1.13.x → 这些字段已移除，改由路由层 action: 'sniff' + override_destination: true 实现
+    //   1.13.x → 这两个字段均已移除。sniff（嗅出域名用于路由匹配）由路由层只 push {action:'sniff'} 替代；
+    //            sniff_override_destination（改写 outbound 目标让节点收到域名）在 1.13.0 已移除且无替代
+    //            （详见 generateRouteConfig A. 嗅探规则段注释）。
     const useLegacySniff = !coreVersionAtLeast(this.coreVersion, 1, 13);
 
     const httpInbound: SingBoxInbound = {
@@ -1216,6 +2370,26 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     }
 
     inbounds.push(httpInbound, socksInbound);
+
+    // 出口 IP 探针 inbound（仅本地回环，端口动态分配）：经 probe-direct-in 的请求由 route.rules 头部
+    // 钉死走 direct 出站、经 probe-proxy-in 钉死走 proxy-selector，从而无论接管/分流模式都能测出真实出口
+    // IP。loopback 不进 TUN，无回环风险。分配失败（probe*Port 为 null）则不注入，IP 卡显示「获取失败」。
+    if (this.probeDirectPort && this.probeProxyPort) {
+      inbounds.push(
+        {
+          type: 'http',
+          tag: 'probe-direct-in',
+          listen: '127.0.0.1',
+          listen_port: this.probeDirectPort,
+        },
+        {
+          type: 'http',
+          tag: 'probe-proxy-in',
+          listen: '127.0.0.1',
+          listen_port: this.probeProxyPort,
+        }
+      );
+    }
 
     // Mixed 端口（可选）：同时接受 HTTP 和 SOCKS5 请求
     if (config.mixedPort && config.mixedPort > 0) {
@@ -1248,19 +2422,25 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         excludeAddr.push(
           '223.5.5.5/32',
           '223.6.6.6/32',
+          '1.12.12.12/32', // #57 DNSPod IP-DoH（节点域名解析器 DNSPod 档）：同 223.5.5.5 须排除防回流死循环
           '119.29.29.29/32',
           '119.28.28.28/32',
           '114.114.114.114/32',
           '8.8.8.8/32',
           '1.1.1.1/32'
         );
+        // 用户自定义的国内 DNS（IP 型）一并排除，防 WFP 进程匹配失效时回流死循环
+        const customDns = this.getCustomDomesticDnsEndpoint(config);
+        if (customDns) {
+          excludeAddr.push(`${customDns.ip}/${isIpv6Host(customDns.ip) ? 128 : 32}`);
+        }
       }
 
       // 绝杀级修复（多服务器版本）：如果在 应用分流 (App Policy) 中选择了其他节点，那么这些节点的 IP 也必须被排除。
       // 否则，FlowZ 去连接这些次选节点的流量也会回流进入 TUN 产生死循环。
       const allServerIds = new Set([
         config.selectedServerId as string,
-        ...(config.appRules || []).map((r) => r.targetServerId),
+        ...this.effectiveAppRules(config).map((r) => r.targetServerId),
       ]);
 
       // 去除会导致 macOS 崩溃的 shouldBypassLAN 全局排除逻辑，回到 3.3.18 时代的精简状态
@@ -1391,8 +2571,17 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           );
           continue;
         }
+        // 启动前配置校验 gate 已标记为非法的节点：跳过、不进 outbounds/selector（防 onRetry 重生成复活）。
+        // 路由层对其 tag 的死引用由 generateSingBoxConfig 末尾 fixRouteDeadReferences 统一修正为 selector。
+        if (this.gateInvalidNodes.has(server.id)) {
+          continue;
+        }
         try {
-          const ob = this.generateProxyOutbound(server, idToTagMap);
+          const ob = this.generateProxyOutbound(
+            server,
+            idToTagMap,
+            this.getNodeResolverTag(config, 'dial')
+          );
           ob.tag = tag;
           if (server.detour && config.servers.some((s) => s.id === server.detour)) {
             // 环检测：沿 detour 链行进，若回到本节点即成环 → 不设 detour，避免 sing-box 报循环引用启动失败
@@ -1425,6 +2614,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       // 全局 TLS 分片（PR-6）：开启后对所有已生成的 TCP-TLS 节点出站切分 ClientHello，抗 SNI-DPI。
       // 跳过 hy2/tuic（QUIC 内 TLS、无 TCP ClientHello，死配置）与 naive（Cronet 自管 TLS，拒绝
       // fragment 字段 → 启动 FATAL）。
+      // 机制选型：用 outbound 的 `tls.fragment`（按 TCP 段切分代理自身 ClientHello）而非 route action
+      // `route-options.tls_fragment`——后者作用于被嗅探出的流量（切内层），非代理自身握手入口。默认仅注入
+      // fragment=true，不注入 fragment_fallback_delay（用核心默认 500ms）/record_fragment（保持纯开关）。
       if (config.tlsFragment) {
         for (const ob of outbounds) {
           if (ob.tls && ob.type !== 'hysteria2' && ob.type !== 'tuic' && ob.type !== 'naive') {
@@ -1449,9 +2641,26 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         default: nodeTags.includes(selectedServerTag) ? selectedServerTag : nodeTags[0],
         interrupt_exist_connections: config.interruptConnectionsOnSwitch === true,
       });
+
+      // rule-sel：恒优化后「所有 proxy 规则」均生成独立 selector（无论 targetServerId 有无）。
+      //   有 target → default=目标节点（anti-drift：固定规则不经共享 proxy-selector，热切全局节点后不漂走）；
+      //   无 target → default=proxy-selector（跟全局，嵌套）。「节点↔默认」切换 = rule-sel default 变（PUT 热切换），
+      //   非 outbound 结构变（重启）。members 复用 proxy-selector 的可用 nodeTags（已排除 naive 缺库 / gate-invalid /
+      //   detour 死引用剔除的节点）；目标无效/被 gate 剔除/无 target → default 落 proxy-selector 兜底
+      //   （rule-sel 仍建、不 FATAL，与 fixRouteDeadReferences 兜底语义一致）。
+      // direct 模式不生成（generateCustomRules/effectiveAppRules 在 direct 不产出 proxy 规则 → 无消费者）。
+      if ((config.proxyMode || 'smart').toLowerCase() !== 'direct') {
+        this.generateRuleSelectors(config, idToTagMap, nodeTags, outbounds);
+      }
     } else {
       // Fallback if config is missing (shouldn't happen)
-      outbounds.push(this.generateProxyOutbound(selectedServer, idToTagMap));
+      outbounds.push(
+        this.generateProxyOutbound(
+          selectedServer,
+          idToTagMap,
+          this.getNodeResolverTag(config, 'dial')
+        )
+      );
     }
 
     // 直连出站
@@ -1515,7 +2724,154 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     }
     outbounds.push(...stlsOutbounds);
 
+    // detour 引用预校验（补 check 唯一盲区：start-stage 引用解析——check 过、run 时报
+    // `dependency[X] not found for outbound[Y]` FATAL）。任何 outbound.detour 指向「生成集合内不存在的
+    // tag」→ 剔除该引用方（**不删 detour 字段**，与 pruneTagsClosure 同隐私语义；选中节点则 throw），
+    // 从 selector 删成员并记录 gateInvalidNodes；selector 剔空 throw。仅 config 存在时有 selector，需 guard。
+    if (config) {
+      const tagToServerId = (tag: string): string | undefined => {
+        if (tag.startsWith('stls-out-')) return tag.slice('stls-out-'.length);
+        for (const [id, t] of idToTagMap) {
+          if (t === tag) return id;
+        }
+        return undefined;
+      };
+      const selector = outbounds.find((o) => o.tag === 'proxy-selector');
+      const selectedTag = idToTagMap.get(selectedServer.id);
+      let mutated = false;
+      // 反复扫描：剔一个引用方可能让别的 detour 链断裂，收敛到不再有死引用。
+
+      while (true) {
+        const validTags = new Set(outbounds.map((o) => o.tag).filter((t): t is string => !!t));
+        const dead = outbounds.find(
+          (ob) =>
+            ob.detour !== undefined && !validTags.has(ob.detour) && ob.tag !== 'proxy-selector'
+        );
+        if (!dead) break;
+        if (dead.tag === selectedTag) {
+          throw new Error(
+            `选中节点「${dead.tag}」的代理链依赖的前置节点不存在，无法启动，请更换节点后重试`
+          );
+        }
+        // 删该引用方 outbound + selector 成员；记录 gateInvalidNodes。
+        const removedTag = dead.tag;
+        const sid = tagToServerId(removedTag);
+        outbounds.splice(outbounds.indexOf(dead), 1);
+        // 同步剔除所有 selector（proxy-selector + 各 rule-sel）的成员引用：rule-sel 的 members 与
+        // proxy-selector 同源（generateRuleSelectors 复用 nodeTags 快照），节点被剔后须一并清理，否则
+        // rule-sel 引用幽灵 tag → sing-box 启动 FATAL。default 命中被剔 → 落剩余首个（兜底，不 FATAL）。
+        const allSelectors = outbounds.filter(
+          (o) => o.type === 'selector' && Array.isArray(o.outbounds)
+        );
+        for (const sel of allSelectors) {
+          sel.outbounds = (sel.outbounds as string[]).filter((t) => t !== removedTag);
+          if (sel.default === removedTag) sel.default = (sel.outbounds as string[])[0];
+        }
+        if (sid) {
+          idToTagMap.delete(sid);
+          if (!this.gateInvalidNodes.has(sid)) {
+            this.gateInvalidNodes.set(sid, {
+              id: sid,
+              tag: removedTag,
+              reason: '代理链依赖的前置节点不存在（detour 引用无效）',
+            });
+          }
+        }
+        this.logToManager(
+          'warn',
+          `启动前配置校验：节点「${removedTag}」的 detour 引用无效，已剔除`
+        );
+        mutated = true;
+      }
+      if (
+        mutated &&
+        selector &&
+        Array.isArray(selector.outbounds) &&
+        selector.outbounds.length === 0
+      ) {
+        throw new Error('没有可用的代理节点出站（节点代理链依赖无效）');
+      }
+      // rule-sel 剔空（members 全被 detour 死引用剔除）：删该 selector outbound，对应 route 规则的
+      // outbound（rule-sel-<id>）成死引用 → fixRouteDeadReferences 兜底改写为 proxy-selector，启动不 FATAL。
+      if (mutated) {
+        for (let i = outbounds.length - 1; i >= 0; i--) {
+          const o = outbounds[i];
+          if (
+            o.type === 'selector' &&
+            o.tag !== 'proxy-selector' &&
+            o.tag &&
+            o.tag.startsWith('rule-sel') &&
+            Array.isArray(o.outbounds) &&
+            o.outbounds.length === 0
+          ) {
+            outbounds.splice(i, 1);
+          }
+        }
+      }
+    }
+
     return outbounds;
+  }
+
+  /**
+   * 为「所有 proxy 的 customRule / appRule」生成独立 rule-sel selector（恒优化：不再限有 targetServerId 者）。
+   * members = 可用 nodeTags（与 proxy-selector 同源，已排除缺库/gate-invalid/detour 死引用节点）+ proxy-selector（嵌套全局）；
+   *   default = 规则目标 tag（有）；无 target / 目标无效/被剔除 → proxy-selector（跟全局嵌套，rule-sel 仍建、不 FATAL）。
+   * selectorTag 命名 `rule-sel-<ruleId>` / `rule-sel-app-<appId>`，与节点名撞车时加后缀去重（防启动 FATAL）。
+   * 同步填充 currentRuleTargetMap 供热切换定位（key=`custom:<id>` / `app:<appId>`）。
+   */
+  private generateRuleSelectors(
+    config: UserConfig,
+    idToTagMap: Map<string, string>,
+    nodeTags: string[],
+    outbounds: SingBoxOutbound[]
+  ): void {
+    const existingTags = new Set(outbounds.map((o) => o.tag).filter((t): t is string => !!t));
+    const interrupt = config.interruptConnectionsOnSwitch === true;
+    // (selectorTag, memberTag) 收集，供 generateSingBoxConfig 末尾回填 currentRuleTargetMap。
+    this.pendingRuleSelectors = [];
+
+    // rule-sel 恒存在（所有 proxy 规则，无论 targetServerId 有无）：members 含 proxy-selector（嵌套全局），
+    // default=target 节点（有）或 proxy-selector（无=跟全局）。使「节点↔默认」= rule-sel default 变化（PUT 热切换），
+    // 非 outbound 结构变（重启）。anti-drift 仍保留：固定节点规则 default=节点，不随全局漂。
+    const emit = (ruleKey: string, selectorTag: string, targetServerId: string | undefined) => {
+      // tag 防撞：节点名可能恰好叫 rule-sel-xxx → 加 (n) 后缀（与 getUniqueTag 同形）
+      let tag = selectorTag;
+      let n = 1;
+      while (existingTags.has(tag)) {
+        tag = `${selectorTag} (${n})`;
+        n++;
+      }
+      existingTags.add(tag);
+      const targetTag = targetServerId ? idToTagMap.get(targetServerId) : undefined;
+      // default：target 有效→节点 tag；target 无/无效→proxy-selector（跟全局，嵌套）
+      const defaultTag = targetTag && nodeTags.includes(targetTag) ? targetTag : 'proxy-selector';
+      outbounds.push({
+        type: 'selector',
+        tag,
+        outbounds: [...nodeTags, 'proxy-selector'],
+        default: defaultTag,
+        interrupt_exist_connections: interrupt,
+      });
+      this.pendingRuleSelectors.push({
+        ruleKey,
+        selectorTag: tag,
+        memberTag: defaultTag,
+        targetServerId,
+      });
+    };
+
+    for (const rule of config.customRules || []) {
+      if (!rule.enabled) continue;
+      if (rule.action !== 'proxy') continue;
+      emit(`custom:${rule.id}`, `rule-sel-${rule.id}`, rule.targetServerId);
+    }
+    for (const appRule of this.effectiveAppRules(config)) {
+      if (!appRule.enabled) continue;
+      if (appRule.action !== 'proxy') continue;
+      // appRule 按 appId 去重（effectiveAppRules），用 appId 作 key；selectorTag 加 app- 前缀避免与 customRule 混淆。
+      emit(`app:${appRule.appId}`, `rule-sel-app-${appRule.appId}`, appRule.targetServerId);
+    }
   }
 
   /**
@@ -1523,7 +2879,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    */
   private generateProxyOutbound(
     server: ServerConfig,
-    idToTagMap: Map<string, string>
+    idToTagMap: Map<string, string>,
+    // #57：节点域名 dial 解析器 tag，由调用方传 getNodeResolverTag(config,'dial')。
+    // 缺省 dns-bootstrap（AliDNS IP-DoH）= 现状，兼容无 config 上下文的兜底调用。
+    nodeResolverTag: string = 'dns-bootstrap'
   ): SingBoxOutbound {
     // sing-box 要求协议类型必须是小写
     const protocol = server.protocol.toLowerCase();
@@ -1535,9 +2894,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       tag: idToTagMap.get(server.id) || `proxy-${server.id}`,
       server: server.address,
       server_port: server.port,
-      // 代理节点域名经 DoH-over-IP 引导解析（dns-bootstrap），免疫 UDP 53 限速/劫持，
+      // 代理节点域名经引导解析（默认 dns-bootstrap=AliDNS IP-DoH），免疫 UDP 53 限速/劫持，
       // 避免节点解析失败导致全断流；同时防止 dns-local 死循环导致的连接挂起。
-      domain_resolver: 'dns-bootstrap',
+      // #57：节点域名解析器档位可改为 dns-node(DNSPod)/dns-local(系统 DNS)，dial 与 rule1 同档（统一 tag）。
+      domain_resolver: nodeResolverTag,
     };
 
     // vless/vmess UDP 封装：默认 xudp；可经 server.packetEncoding 覆盖（兼容拒收 xudp 的旧核心/服务端，
@@ -1768,6 +3128,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       outbound.tls = {
         enabled: true,
         server_name: server.tlsSettings?.serverName || undefined,
+        insecure: server.tlsSettings?.allowInsecure || false,
         utls: {
           enabled: true,
           fingerprint: server.tlsSettings?.fingerprint || 'chrome',
@@ -1888,34 +3249,35 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   /**
    * 生成路由配置（sing-box 1.12.x / 1.13.x 兼容格式）
    */
-  /** 本地 geo 规则集运行时目录（内置 .srs 拷贝落地处）。copy 与 route 生成共用，单一真值。 */
+  /** 本地 geo 规则集运行时目录（内置 .srs 拷贝落地处）。copy 与 route 生成共用，单一真值（委托共享模块）。 */
   private getRuleSetRuntimeDir(): string {
-    return path.join(getUserDataPath(), 'rules');
+    return getRuntimeRulesDir();
   }
 
   /**
    * 内置 geo 规则集的单一真值表：tag、运行时文件名、内置源路径。
-   * copyRuleSetsToUserData（写入）与 generateRouteConfig（引用 path）共用此表，避免两处各自硬编码
-   * 目录+文件名导致漂移——改一处而另一处仍指旧路径会让 sing-box 加载本地 rule_set 失败。
+   * copyRuleSetsToUserData（写入）、generateRouteConfig（引用 path）、RuleResourceManager（页面展示/更新）
+   * 共用 builtin-geo-rulesets 模块的 BUILTIN_GEO_RULESETS，避免多处硬编码目录+文件名导致漂移——
+   * 改一处而另一处仍指旧路径会让 sing-box 加载本地 rule_set 失败。
    */
   private getLocalGeoRuleSets(): { tag: string; fileName: string; srcPath: string }[] {
-    return [
-      {
-        tag: 'geosite-cn',
-        fileName: 'geosite-cn.srs',
-        srcPath: resourceManager.getGeoSiteCNPath(),
-      },
-      {
-        tag: 'geosite-geolocation-!cn',
-        fileName: 'geosite-geolocation-!cn.srs',
-        srcPath: resourceManager.getGeoSiteNonCNPath(),
-      },
-      {
-        tag: 'geoip-cn',
-        fileName: 'geoip-cn.srs',
-        srcPath: resourceManager.getGeoIPPath(),
-      },
-    ];
+    return BUILTIN_GEO_RULESETS.map((b) => ({
+      tag: b.tag,
+      fileName: b.fileName,
+      srcPath: b.bundledPath(),
+    }));
+  }
+
+  /**
+   * 应用分流总开关 gate：appRoutingEnabled===false → 空（appRules 完全不进 route 生成/TUN 排除/geo 收集）；
+   * undefined/true → 现状。单一真值点，4 个消费点统一经此，保证关闭=appRules[] 逐字节等价。
+   */
+  private effectiveAppRules(config: UserConfig): import('../../shared/types').AppRule[] {
+    // direct 模式：appRules 不进 route 生成（与 generateCustomRules 的 `proxyMode !== 'direct'` 门控对称）；
+    // generateRuleSelectors 在 direct 跳过（无 rule-sel），此处返回 [] 避免 generateRouteConfig emit 死引用 outbound。
+    if (config.appRoutingEnabled === false) return [];
+    if ((config.proxyMode || 'smart').toLowerCase() === 'direct') return [];
+    return config.appRules || [];
   }
 
   private generateRouteConfig(
@@ -1947,12 +3309,25 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       blockProxyQuic ? udp443RejectRule(matcher) : null;
 
     // A. 嗅探规则（必须在前，用于识别域名）
-    // 1.13+ 必须在路由层开启 sniff，替代已移除的 inbound 级别 sniff 字段
-    // sing-box 1.13.x 嗅探后自动将域名用于路由匹配（等效旧版 sniff_override_destination）
+    // 1.13+ 必须在路由层开启 sniff，替代已移除的 inbound 级别 sniff 字段。
+    // 注意（旧注释「等效 sniff_override_destination」不准确）：sniff 只把嗅出的域名用于【路由匹配】这半边——
+    // sniff_override_destination（改写 outbound 目标，让节点收到域名）在 1.13.0 已移除且无替代。
+    // 故关 FakeIP 时节点仍收真实 IP，域名交付节点只能靠 FakeIP（见 generateDnsConfig / 设计 T1·T4）。
     if (coreVersionAtLeast(this.coreVersion, 1, 13)) {
       rules.push({
         action: 'sniff',
       });
+    }
+
+    // A2. 出口 IP 探针钉死路由（必须紧随 sniff、先于一切分流/进程规则，确保短路不受分流策略影响）：
+    //   probe-direct-in → direct（auto_detect_interface 绑物理网卡，TUN 模式下也是真直连出口）
+    //   probe-proxy-in  → proxy-selector（现有 selector，clash_api 热切换节点后探针自动跟随）
+    // 由此在「三种接管 × 三种分流」全矩阵下分别测出真实直连出口 IP 与代理出口 IP。
+    if (this.probeDirectPort && this.probeProxyPort) {
+      rules.push(
+        { inbound: ['probe-direct-in'], action: 'route', outbound: 'direct' },
+        { inbound: ['probe-proxy-in'], action: 'route', outbound: selectedServerTag }
+      );
     }
 
     // 1. 强制放行 sing-box 核心进程：防止流量回流死循环
@@ -1967,15 +3342,21 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // C. 强制引导核心 DNS 直连（必须在 hijack-dns 之前！）
     // 把已知 bootstrap DNS IP 放在 hijack-dns 之前，无论哪个进程发包都走直连，彻底断环。
     // 注意：这里只应该放国内的 DNS IP。如果放 8.8.8.8，会导致用户去 ping 8.8.8.8 时走直连被墙！
+    const customDomesticDns = this.getCustomDomesticDnsEndpoint(config);
     rules.push({
       ip_cidr: [
         '223.5.5.5/32',
         '223.6.6.6/32',
+        '1.12.12.12/32', // #57 DNSPod IP-DoH（节点域名解析器 DNSPod 档）：与 223.5.5.5 同列，hijack-dns 前直连放行（443 端口已含）
         '119.29.29.29/32',
         '119.28.28.28/32',
         '114.114.114.114/32',
+        // 用户自定义的国内 DNS（IP 型）也须在 hijack-dns 之前直连放行，否则其 53 端口查询会被劫持成 FakeIP
+        ...(customDomesticDns
+          ? [`${customDomesticDns.ip}/${isIpv6Host(customDomesticDns.ip) ? 128 : 32}`]
+          : []),
       ],
-      port: [53, 443],
+      port: Array.from(new Set([53, 443, ...(customDomesticDns ? [customDomesticDns.port] : [])])),
       action: 'route',
       outbound: 'direct',
     });
@@ -2148,26 +3529,53 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         config.customRuleSets || [],
         config.selectedServerId || undefined,
         idToTagMap,
-        selectedServerTag
+        selectedServerTag,
+        config.ruleResources || [],
+        usesFakeIp(config) // FakeIP 启用 → 注册外化 bypass 规则的 DNS rule_set 条目（供 generateDnsConfig 引用）
       );
       // 走代理的自定义规则同样要配对 udp443 reject（终止规则、在末尾兜底前命中）。逐条插入：
       // 代理向规则前先放一条同匹配器的 udp443 reject；direct/block 规则不配对。
+      // udp443 reject matcher 提取：复制规则上除「动作/出站/目的端口/network」外的全部匹配字段，使 process/
+      // regex/source_ip/source_port 等各类代理向规则同样配对（修原先仅覆盖 5 字段的缺口）。
+      // 仅排除目的 port/port_range——它们与 udp443RejectRule 的 port:443 冲突；source_port 不冲突，可配对（修 P2-1）。
+      // type/mode/rules 也排除：logical 规则单独走嵌套 AND 路径（见下），default 规则本就无这些字段（防御）。
+      const UDP443_MATCHER_EXCLUDE = new Set([
+        'action',
+        'outbound',
+        'network',
+        'port',
+        'port_range',
+        'type',
+        'mode',
+        'rules',
+      ]);
       for (const cr of customRules) {
-        if (
+        const isProxyOut =
           cr.action === 'route' &&
-          cr.outbound &&
+          !!cr.outbound &&
           cr.outbound !== 'direct' &&
-          cr.outbound !== 'block'
-        ) {
-          const matcher: Record<string, any> = {};
-          if (cr.domain) matcher.domain = cr.domain;
-          if (cr.domain_suffix) matcher.domain_suffix = cr.domain_suffix;
-          if (cr.domain_keyword) matcher.domain_keyword = cr.domain_keyword;
-          if (cr.rule_set) matcher.rule_set = cr.rule_set;
-          if (cr.ip_cidr) matcher.ip_cidr = cr.ip_cidr;
-          if (Object.keys(matcher).length > 0) {
-            const r = proxyUdpRejectFor(matcher);
-            if (r) rules.push(r);
+          cr.outbound !== 'block';
+        if (isProxyOut && blockProxyQuic) {
+          if (cr.type === 'logical') {
+            // logical 规则顶层不接受 network/port（sing-box 解码会 FATAL）→ 把原 logical matcher 与 udp443
+            // 条件再套一层 AND logical（headless 子规则可带 network/port）：(原 logical 命中) ∧ (udp:443) → reject。
+            rules.push({
+              action: 'reject',
+              type: 'logical',
+              mode: 'and',
+              rules: [
+                { type: 'logical', mode: cr.mode, rules: cr.rules },
+                { network: ['udp'], port: [443] },
+              ],
+            });
+          } else {
+            const matcher: Record<string, any> = {};
+            for (const [k, v] of Object.entries(cr)) {
+              if (!UDP443_MATCHER_EXCLUDE.has(k) && v != null) matcher[k] = v;
+            }
+            if (Object.keys(matcher).length > 0) {
+              rules.push(udp443RejectRule(matcher));
+            }
           }
         }
         rules.push(cr);
@@ -2180,7 +3588,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         routeConfig.rule_set.push(...customRuleSets);
       }
 
-      // 排除进程规则：优先级最高，在应用分流之前插入，确保用户明确指定绕过的进程不被任何规则覆盖
+      // 排除进程：兼容旧配置的兜底（新数据已由 ConfigManager 迁移为 customRules 的 processName+direct 规则）。
+      // 位于自定义规则之后、应用分流之前；任意更早的自定义规则可覆盖它，并非"最高优先级"。
       if (config.bypassProcesses && config.bypassProcesses.length > 0) {
         rules.push({
           process_name: config.bypassProcesses,
@@ -2191,7 +3600,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
       // 应用分流规则（真·应用分流，基于进程名）
       // 优先级高于后续的智能分流/全局分流，确保特定应用的流量始终走用户指定的出口
-      for (const appRule of config.appRules || []) {
+      for (const appRule of this.effectiveAppRules(config)) {
         if (!appRule.enabled) continue;
         const preset = getAppPreset(appRule.appId, config.customAppPresets);
         if (!preset) continue;
@@ -2199,14 +3608,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         // 确定出站方式
         let outbound = 'direct';
         if (appRule.action === 'proxy') {
-          if (appRule.targetServerId && appRule.targetServerId !== config.selectedServerId) {
-            const serverExists = config.servers.some((s) => s.id === appRule.targetServerId);
-            outbound = serverExists
-              ? idToTagMap.get(appRule.targetServerId) || `proxy-${appRule.targetServerId}`
-              : selectedServerTag;
-          } else {
-            outbound = selectedServerTag;
-          }
+          // rule-sel-app 恒存在（generateRuleSelectors 为所有 proxy appRule 生成）：outbound 恒指
+          // rule-sel-app-<appId>，「默认/跟全局」= default=proxy-selector（嵌套），「指定节点」= default=节点 tag。
+          // 使「节点↔默认」= rule-sel-app default 变（PUT 热切换），非 outbound 结构变（重启）。
+          outbound = `rule-sel-app-${appRule.appId}`;
         } else if (appRule.action === 'block') {
           outbound = 'block';
         }
@@ -2263,7 +3668,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     });
 
     rules.push({
-      ip_cidr: ['223.5.5.5/32'],
+      // #57：1.12.12.12（DNSPod IP-DoH，节点域名解析器 DNSPod 档）与 223.5.5.5 同列直连放行
+      ip_cidr: ['223.5.5.5/32', '1.12.12.12/32'],
       port: [53, 443],
       action: 'route',
       outbound: 'direct',
@@ -2374,11 +3780,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     const { geosite: customGeositeCategories, geoip: customGeoipCategories } =
       this.getRequiredGeoCategories(
         config.customRules || [],
-        config.appRules || [],
+        this.effectiveAppRules(config),
         config.customAppPresets || []
       );
 
-    if (customGeositeCategories.size > 0 || customGeoipCategories.size > 0) {
+    // direct 模式无任何规则引用这些 remote rule_set → 不注入，避免启动期白拉 fastly.jsdelivr
+    if (
+      proxyMode !== 'direct' &&
+      (customGeositeCategories.size > 0 || customGeoipCategories.size > 0)
+    ) {
       if (!routeConfig.rule_set) {
         routeConfig.rule_set = [];
       }
@@ -2430,6 +3840,18 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       rules.push(udp443RejectRule());
     }
 
+    // rule_set 按 tag 去重（保留首次=本地 .srs 优先于远程）：用户加 geosite/geoip cn 等规则时，其远程
+    // rule_set tag 会与 getLocalGeoRuleSets 的本地 geosite-cn/geoip-cn 撞名 → sing-box 启动 FATAL
+    // (duplicate rule-set tag)。去重后撞名项复用本地 .srs，行为更优（无需下载）。(修 review P0)
+    if (routeConfig.rule_set && routeConfig.rule_set.length > 0) {
+      const seenTags = new Set<string>();
+      routeConfig.rule_set = routeConfig.rule_set.filter((rs) => {
+        if (seenTags.has(rs.tag)) return false;
+        seenTags.add(rs.tag);
+        return true;
+      });
+    }
+
     return routeConfig;
   }
 
@@ -2440,19 +3862,28 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 收集自定义规则中使用的 Geosite 和 GeoIP 类别（同时扫描 customRules 和 appRules）
    */
   private getRequiredGeoCategories(
-    customRules: import('../../shared/types').DomainRule[],
+    customRules: import('../../shared/types').Rule[],
     appRules: import('../../shared/types').AppRule[] = [],
     customAppPresets: import('../../shared/types').CustomAppPreset[] = []
   ): { geosite: Set<string>; geoip: Set<string> } {
     const geositeCategories = new Set<string>();
     const geoipCategories = new Set<string>();
 
-    // 扫描手动定义的 geosite: 域名规则
+    // 扫描 geosite / geoip 类型的自定义规则（values 即裸标签，如 'youtube'/'cn'）
     for (const rule of customRules) {
       if (!rule.enabled) continue;
-      for (const domain of rule.domains) {
-        if (domain.startsWith('geosite:')) {
-          geositeCategories.add(domain.slice(8));
+      // 扫所有条件（多条件规则的 logical 内可含 geosite/geoip → 否则其 remote rule_set 不被注入致引用缺失）
+      for (const cond of ruleConditions(rule)) {
+        if (cond.type === 'geosite') {
+          for (const t of cond.values) {
+            const tag = t.trim().toLowerCase();
+            if (tag) geositeCategories.add(tag);
+          }
+        } else if (cond.type === 'geoip') {
+          for (const t of cond.values) {
+            const tag = t.trim().toLowerCase();
+            if (tag) geoipCategories.add(tag);
+          }
         }
       }
     }
@@ -2472,87 +3903,209 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   private generateCustomRules(
-    customRules: import('../../shared/types').DomainRule[],
+    customRules: import('../../shared/types').Rule[],
     customRuleSets: import('../../shared/types').CustomRuleSet[] = [],
     selectedServerId?: string,
     idToTagMap?: Map<string, string>,
-    selectedServerTag: string = 'proxy'
+    selectedServerTag: string = 'proxy',
+    ruleResources: import('../../shared/types').RuleResource[] = [],
+    registerDnsBypass: boolean = false // FakeIP 启用时：为外化 bypassFakeIP 规则注册 <base>-dns rule_set 条目
   ): { rules: SingBoxRouteRule[]; ruleSets: SingBoxRuleSet[] } {
     const rules: SingBoxRouteRule[] = [];
     const ruleSets: SingBoxRuleSet[] = [];
+    let ruleSetIndex = 1;
 
-    // 处理旧的 DomainRule (纯文本域名/geosite类)
+    // 目的地 OR 组：这些 type 的字段在单条 default rule 内原生 OR（sing-box: domain||suffix||keyword||regex||ip_cidr）。
+    const OR_GROUP = new Set(['domain', 'domainSuffix', 'domainKeyword', 'domainRegex', 'ipCidr']);
+    const pushU = <T>(arr: T[] | undefined, items: T[]): T[] => [...(arr || []), ...items];
+
+    // 把一个条件的 type→字段累积到 target（值并集；geosite/geoip→rule_set tag；ruleSet→注册定义+tag）。返回 hasMatcher。
+    const applyConditionFields = (
+      cond: import('../../shared/types').RuleCondition,
+      target: SingBoxRouteRule
+    ): boolean => {
+      // EXT 类型（域名/IP/端口/进程 系）委托单一真值 condMatcherFields——与外化文件内容永不漂移。
+      // geosite/geoip/ruleSet 不可 headless 表达，留 inline（下方 switch）。
+      if (EXT_TYPES.has(cond.type)) {
+        const fields = condMatcherFields(cond);
+        if (!fields) return false;
+        const t = target as Record<string, unknown>;
+        for (const k of Object.keys(fields)) {
+          t[k] = pushU(t[k] as unknown[] | undefined, fields[k] as unknown[]);
+        }
+        return true;
+      }
+      const vals = (cond.values || []).map((v) => v.trim()).filter(Boolean);
+      if (vals.length === 0) return false;
+      switch (cond.type) {
+        case 'geosite':
+          // 裸标签 → geosite-<tag>（lowercase 对齐 getRequiredGeoCategories 与远程 .srs 文件名）
+          target.rule_set = pushU(
+            target.rule_set as string[] | undefined,
+            vals.map((t) => `geosite-${t.toLowerCase()}`)
+          );
+          return true;
+        case 'geoip':
+          target.rule_set = pushU(
+            target.rule_set as string[] | undefined,
+            vals.map((t) => `geoip-${t.toLowerCase()}`)
+          );
+          return true;
+        case 'ruleSet': {
+          // 远程 URL → custom-ruleset-N（format 按扩展名）；本地 res:<id> → 本地 rule_set。tag 去重（重复 tag 会 FATAL）。
+          const seen = new Set(
+            Array.isArray(target.rule_set)
+              ? target.rule_set
+              : target.rule_set != null
+                ? [target.rule_set]
+                : []
+          );
+          for (const v of vals) {
+            let tag: string;
+            if (v.startsWith('res:')) {
+              const res = ruleResources.find((rr) => rr.id === v.slice(4));
+              if (!res) {
+                this.logToManager('warn', `ruleSet 规则引用的资源不存在，已跳过: ${v}`);
+                continue;
+              }
+              const filePath = path.join(getRuleResourcesPath(), res.fileName);
+              if (!require('fs').existsSync(filePath)) {
+                this.logToManager(
+                  'warn',
+                  `ruleSet 规则引用的资源文件缺失，已跳过: ${res.fileName}`
+                );
+                continue;
+              }
+              tag = `local-rs-${res.id}`;
+              if (!ruleSets.some((rs) => rs.tag === tag)) {
+                ruleSets.push({ tag, type: 'local', format: res.format, path: filePath });
+              }
+            } else {
+              tag = `custom-ruleset-${ruleSetIndex++}`;
+              ruleSets.push({
+                tag,
+                type: 'remote',
+                format: v.toLowerCase().endsWith('.json') ? 'source' : 'binary',
+                url: v,
+                download_detour: selectedServerTag,
+                update_interval: REMOTE_RULESET_UPDATE_INTERVAL,
+              });
+            }
+            seen.add(tag);
+          }
+          if (seen.size > 0) {
+            target.rule_set = Array.from(seen);
+            return true;
+          }
+          return false;
+        }
+      }
+      return false;
+    };
+
+    // 每条 Rule → 单 default rule（目的地 OR 组合并：单条件 或 combineMode!=='and' 且全为 OR 组类型）
+    // 或 logical rule（跨维度/含 rule_set 的 OR、或 AND）。绝不把「应 OR」的条件塞进单 default rule 当 AND。
     for (const rule of customRules) {
-      if (
-        !rule.enabled ||
-        (rule.domains.length === 0 && (!rule.ipCidr || rule.ipCidr.length === 0))
-      )
-        continue;
+      if (!rule.enabled) continue;
 
-      // 统一使用 domain_suffix，匹配域名及其所有子域名
-      // 如 google.com 会匹配 google.com、www.google.com、mail.google.com 等
-      // 同时支持 geosite: 前缀，转换为 rule_set
-      const domainSuffix: string[] = [];
-      const geositeTags: string[] = [];
-
-      for (const d of rule.domains) {
-        if (d.startsWith('geosite:')) {
-          const category = d.slice(8);
-          geositeTags.push(`geosite-${category}`);
-        } else {
-          domainSuffix.push(d.startsWith('*.') ? d.slice(2) : d);
+      // ── L3 外化分流：全条件可 headless 表达 → 写独立 rule_set 文件，route 仅引用 tag（改值热重载零重启）。
+      const plan = planCustomRule(rule);
+      const extBase = customRuleFileBase(rule.id);
+      // DNS 文件注册须在 ext-skip 跳过之前：route 侧 fail-closed 跳过的 bypass 规则，DNS 侧今日仍消费其域名值。
+      if (registerDnsBypass && rule.bypassFakeIP && plan.kind !== 'inline' && plan.dnsRules) {
+        const dnsPath = path.join(getCustomRulesDir(), `${extBase}.dns.json`);
+        if (
+          require('fs').existsSync(dnsPath) &&
+          !ruleSets.some((rs) => rs.tag === `${extBase}-dns`)
+        ) {
+          ruleSets.push({ tag: `${extBase}-dns`, type: 'local', format: 'source', path: dnsPath });
         }
       }
-
-      // 如果有普通域名或 IP CIDR，创建一条规则
-      if (domainSuffix.length > 0 || (rule.ipCidr && rule.ipCidr.length > 0)) {
-        const singboxRule: SingBoxRouteRule = {
-          action: 'route',
-        };
-
-        if (domainSuffix.length > 0) {
-          // domain_suffix 匹配该域名及所有子域名（如 bbc.com 匹配 www.bbc.com）
-          singboxRule.domain_suffix = domainSuffix;
+      if (plan.kind === 'ext-skip') continue; // 全 EXT 但 fail-closed → 无 route 规则（DNS 已上方处理）
+      if (plan.kind === 'ext') {
+        const filePath = path.join(getCustomRulesDir(), `${extBase}.json`);
+        if (require('fs').existsSync(filePath)) {
+          if (!ruleSets.some((rs) => rs.tag === extBase)) {
+            ruleSets.push({ tag: extBase, type: 'local', format: 'source', path: filePath });
+          }
+          const extRule: SingBoxRouteRule = { action: 'route', rule_set: [extBase] };
+          this.applyRuleAction(
+            extRule,
+            rule.action,
+            rule.targetServerId,
+            selectedServerId,
+            idToTagMap,
+            selectedServerTag,
+            rule.id
+          );
+          rules.push(extRule);
+          continue;
         }
-
-        if (rule.ipCidr && rule.ipCidr.length > 0) {
-          singboxRule.ip_cidr = rule.ipCidr;
-        }
-
-        // Bug 1 修复：必须传入 idToTagMap 和 selectedServerTag，
-        // 否则 selectedServerTag 默认为 'proxy'，而实际出站标签是节点名称，导致 sing-box 启动失败
-        this.applyRuleAction(
-          singboxRule,
-          rule.action,
-          rule.targetServerId,
-          selectedServerId,
-          idToTagMap,
-          selectedServerTag
-        );
-        rules.push(singboxRule);
+        // 文件未落盘（预检/onRetry 重生成期）→ 标记降级，回落 inline 现状（值已知，功能不损）。
+        this.customRuleFilesDegraded = true;
       }
 
-      // 如果有 Geosite 引用，创建一条规则
-      if (geositeTags.length > 0) {
-        const singboxRule: SingBoxRouteRule = {
-          action: 'route',
-          rule_set: geositeTags,
-        };
-        // Bug 1 修复：同上，必须传入完整参数确保 outbound 标签正确
-        this.applyRuleAction(
-          singboxRule,
-          rule.action,
-          rule.targetServerId,
-          selectedServerId,
-          idToTagMap,
-          selectedServerTag
-        );
-        rules.push(singboxRule);
+      const rawConds = ruleConditions(rule);
+      const conds = rawConds
+        .map((c) => ({
+          type: c.type,
+          values: (c.values || []).map((v) => v.trim()).filter(Boolean),
+        }))
+        .filter((c) => c.values.length > 0);
+      if (conds.length === 0) continue;
+      // AND 模式任一条件在预过滤被丢弃（值全空白/空数组）→ 整条跳过（fail-closed）：否则会以剩余条件的
+      // 「超集」下发（含坍缩成单 default rule 绕过 logical 分支的 fail-closed）。UI 已拦空值，此为旁路写/手改兜底。
+      if (rule.combineMode === 'and' && conds.length < rawConds.length) continue;
+
+      const mergeable =
+        conds.length === 1 ||
+        (rule.combineMode !== 'and' && conds.every((c) => OR_GROUP.has(c.type)));
+
+      let finalRule: SingBoxRouteRule | null = null;
+      if (mergeable) {
+        const singboxRule: SingBoxRouteRule = { action: 'route' };
+        let hasMatcher = false;
+        for (const c of conds) if (applyConditionFields(c, singboxRule)) hasMatcher = true;
+        if (hasMatcher) finalRule = singboxRule;
+      } else {
+        // logical：每条件一个纯 matcher 子规则（无 action/outbound，action/outbound 在外层 logical 规则）
+        const subRules: SingBoxRouteRule[] = [];
+        let dropped = false;
+        for (const c of conds) {
+          const sub: SingBoxRouteRule = {};
+          if (applyConditionFields(c, sub)) subRules.push(sub);
+          else dropped = true; // 该条件无法产出 matcher（如 ruleSet 资源缺失、端口全非法）
+        }
+        // AND 模式任一子条件被丢弃 → 整条跳过（fail-closed）：否则剩余 AND 子集会匹配「超集」（比用户意图更宽），
+        // 与最小权限/旧行为（整条 skip）相悖。OR 模式丢弃失败子条件无害（少一个候选项）。
+        if (rule.combineMode === 'and' && dropped) {
+          finalRule = null;
+        } else if (subRules.length === 1) {
+          finalRule = { ...subRules[0], action: 'route' };
+        } else if (subRules.length > 1) {
+          finalRule = {
+            action: 'route',
+            type: 'logical',
+            mode: rule.combineMode || 'or',
+            rules: subRules,
+          };
+        }
       }
+      if (!finalRule) continue;
+
+      this.applyRuleAction(
+        finalRule,
+        rule.action,
+        rule.targetServerId,
+        selectedServerId,
+        idToTagMap,
+        selectedServerTag,
+        rule.id
+      );
+      rules.push(finalRule);
     }
 
-    // 处理新的 Remote RuleSet
-    let ruleSetIndex = 1;
+    // 兼容旧的独立 customRuleSets（迁移后通常为空；保留作防御 + 顺带修原 format 硬编码 'binary' 致 .json 坏）
     for (const ruleSet of customRuleSets) {
       if (!ruleSet.enabled || !ruleSet.url) continue;
 
@@ -2560,9 +4113,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       ruleSets.push({
         tag,
         type: 'remote',
-        format: 'binary',
+        format: ruleSet.url.toLowerCase().endsWith('.json') ? 'source' : 'binary',
         url: ruleSet.url,
-        download_detour: selectedServerTag, // 默认通过当前选中的代理下载自定义规则集
+        download_detour: selectedServerTag,
         update_interval: REMOTE_RULESET_UPDATE_INTERVAL,
       });
 
@@ -2570,8 +4123,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         action: 'route',
         rule_set: [tag],
       };
-
-      // 此处的 CustomRuleSet 只包含 action 而无 targetServerId，不过统一走 applyRuleAction 判断
       this.applyRuleAction(
         singboxRule,
         ruleSet.action,
@@ -2593,14 +4144,24 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     singboxRule: SingBoxRouteRule,
     action: string,
     targetServerId?: string,
-    selectedServerId?: string,
+    _selectedServerId?: string, // 3b 后不再用于条件判断（保留位参以不动调用方），下划线跳过未用检查
     idToTagMap?: Map<string, string>,
-    selectedServerTag: string = 'proxy'
+    selectedServerTag: string = 'proxy',
+    ruleId?: string // rule-sel selector 命名所需（customRule.id）；缺省则回落旧行为
   ): void {
     // 设置出站
     if (action === 'proxy') {
-      // 如果指定了目标服务器，且不是主节点，则路由到特定的 outbound tag
-      if (targetServerId && selectedServerId !== targetServerId) {
+      // anti-drift（铁律）：指定了目标节点的规则 → 指向独立 rule-sel-<ruleId> selector，**绝不直绑节点、
+      // 绝不经共享 proxy-selector**。直绑节点会让热切全局节点后这条固定规则漂走（复活旧 quirk）；经共享
+      // proxy-selector 会让「固定规则」随全局节点漂移。rule-sel 独立 selector 使「改规则目标节点」可经
+      // clash_api PUT /proxies/rule-sel-<id> 热切换、且互不干扰。selector 由 generateRuleSelectors 预建；
+      // 极端情况（selector 未生成，如降级/onRetry 中间态）→ 死引用由 fixRouteDeadReferences 兜底改写为
+      // proxy-selector，启动不 FATAL。
+      // rule-sel 恒存在（generateRuleSelectors 为所有 proxy 规则生成）：outbound 恒指 rule-sel-<ruleId>，
+      // 「默认/跟全局」= rule-sel default=proxy-selector（嵌套），「指定节点」= default=节点 tag。
+      if (ruleId) {
+        singboxRule.outbound = `rule-sel-${ruleId}`;
+      } else if (targetServerId) {
         const targetTag = idToTagMap?.get(targetServerId);
         singboxRule.outbound = targetTag || `proxy-${targetServerId}`;
       } else {
@@ -2625,10 +4186,246 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
-   * 检查当前配置是否需要 root/admin 权限（TUN 模式）
-   * Windows 和 macOS 的 TUN 模式都需要管理员权限
+   * 对已写盘的 configPath 跑一次 `sing-box check`（复用 CoreUpdateService.preflightValidate 的 execFile 模式）。
+   * - **spawn 层错误**（code 为字符串 errno，如 ENOENT/EACCES）或 **超时**（killed）→ `{ failOpen: true }`：
+   *   gate 跳过、直接启动（终态=现状，无回归）——核心缺失/无权限/慢盘不该把启动卡死。
+   * - **真实 check 失败**（退出码 1）→ `{ stderr }`（已过 removeAnsiCodes）：fail-closed，交由剔除逻辑处理。
+   * - 通过（退出码 0）→ `{ ok: true }`。
+   */
+  private async runSingBoxCheck(
+    configPath: string
+  ): Promise<{ ok?: true; stderr?: string; failOpen?: true }> {
+    const execFileAsync = require('util').promisify(require('child_process').execFile);
+    try {
+      await execFileAsync(this.singboxPath, ['check', '-c', configPath], {
+        windowsHide: true,
+        timeout: 15000,
+      });
+      return { ok: true };
+    } catch (e: any) {
+      // 超时被 kill：execFile 置 e.killed=true（且常带 SIGTERM）。慢盘/卡死 → fail-open，不阻断启动。
+      if (e?.killed) return { failOpen: true };
+      // spawn 层失败：errno 形如 'ENOENT'/'EACCES'（字符串），区别于 check 失败的数字退出码 1。
+      if (typeof e?.code === 'string') return { failOpen: true };
+      const stderr = this.removeAnsiCodes(String(e?.stderr || e?.message || e));
+      return { stderr };
+    }
+  }
+
+  /**
+   * 启动前配置校验 gate：对已写盘配置跑 `sing-box check`，把会致整体启动 FATAL 的坏节点（未知 cipher /
+   * ss2022 坏 key / 未知 plugin / naive alpn 等字段级问题）迭代剔除后重写盘，直到 check 通过或触上限。
+   *
+   * 设计要点（见 docs/design/config-validation-startup-gate.md）：
+   * - 插在 writeSingBoxConfig 后、retry(startSingBoxProcess) 前 → 抛错由 start() catch 收口，不进 retry。
+   * - check fail-fast 一次报一个下标 → 逐轮剔除收敛；上限 min(50, 节点数)。
+   * - 选中节点被 check 标中 → throw「请更换节点」（决策①，不自动回退，与 naive M1 同语义）。
+   * - 正则不命中 / 越界 / 命中非节点出站（selector/direct/block/probe）→ 降级 throw「配置校验失败」不启动
+   *   （不比现状差，且不误剔）；spawn 错 / 超时 → fail-open 跳过 gate。
+   */
+  private async checkAndPruneConfig(
+    singboxConfig: SingBoxConfig,
+    config: UserConfig
+  ): Promise<void> {
+    const maxPrunes = Math.min(50, config.servers.length || 0);
+    let prunes = 0;
+
+    while (true) {
+      const res = await this.runSingBoxCheck(this.configPath);
+      if (res.ok) break;
+      if (res.failOpen) {
+        this.logToManager(
+          'warn',
+          '启动前配置校验跳过（核心不可执行/校验超时），按现有配置直接启动'
+        );
+        break;
+      }
+
+      const stderr = res.stderr || '';
+      const firstLine = stderr.split('\n')[0]?.trim() || stderr.trim();
+
+      if (prunes >= maxPrunes) {
+        throw new Error(`配置校验失败：已剔除 ${prunes} 个非法节点仍无法通过校验（${firstLine}）`);
+      }
+
+      const idx = parseCheckOutboundIndex(stderr);
+      if (idx === null || idx < 0 || idx >= singboxConfig.outbounds.length) {
+        throw new Error(`配置校验失败：${firstLine}`);
+      }
+      const flagged = singboxConfig.outbounds[idx];
+      // 命中非节点出站（内置出站/探针）→ 不是坏节点问题，降级不启动（避免误剔内置出站致更大故障）。
+      const NON_NODE_TYPES = new Set(['selector', 'urltest', 'direct', 'block']);
+      const isProbeOrBuiltin =
+        NON_NODE_TYPES.has(flagged.type) ||
+        flagged.tag === 'proxy-selector' ||
+        flagged.tag === 'probe-direct-in' ||
+        flagged.tag === 'probe-proxy-in';
+      if (isProbeOrBuiltin) {
+        throw new Error(`配置校验失败：${firstLine}`);
+      }
+
+      // tag 反查 serverId：shadowtls 外层出站 tag 形如 `stls-out-<id>`，截前缀；其余经 idToTagMap 反查。
+      let serverId: string | undefined;
+      if (flagged.tag.startsWith('stls-out-')) {
+        serverId = flagged.tag.slice('stls-out-'.length);
+      } else {
+        for (const [id, tag] of this.currentIdToTagMap ?? []) {
+          if (tag === flagged.tag) {
+            serverId = id;
+            break;
+          }
+        }
+      }
+      // 反查不到 serverId（理论不应发生）→ 降级不启动，不盲剔。
+      if (!serverId) {
+        throw new Error(`配置校验失败：${firstLine}`);
+      }
+      // 决策①：选中节点被标中 → 报错让用户换，不自动回退到其它节点。
+      if (serverId === config.selectedServerId) {
+        throw new Error(`选中节点「${flagged.tag}」配置无效，无法启动，请更换节点后重试`);
+      }
+
+      // 级联剔除该节点（含 detour 引用方、shadow-tls 配对）+ 重写盘后进入下一轮 check。
+      this.pruneTagsClosure(singboxConfig, config, new Set([flagged.tag]), 'check');
+      prunes++;
+      await this.writeSingBoxConfig(singboxConfig);
+    }
+
+    if (prunes > 0) {
+      this.logToManager('warn', `启动前配置校验剔除了 ${prunes} 个非法节点，已用剩余节点启动`);
+    }
+    // 空数组也发：清除上次启动遗留的标灰（节点修好/换核复活后 UI 即恢复）。
+    this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_INVALID_NODES, [
+      ...this.gateInvalidNodes.values(),
+    ]);
+  }
+
+  /**
+   * 剔除指定 tag 的节点出站并级联修正（gate 主路径与 run-FATAL 备用腿共用）：
+   * ① 级联闭包：detour 指向被剔 tag 的节点出站一并剔（**不删 detour 字段**——静默降级为直连会改变流量
+   *    路径、有隐私风险，与 M1 不静默切换一致）；shadow-tls 内层节点与其 `stls-out-*` 外层互相配对同剔；
+   *    若级联触及选中节点 → throw（决策①）。
+   * ② 删 outbound（含 stls 孤儿）。
+   * ③ group（selector/urltest）成员删 tag + default 修正 + proxy-selector 剔空 throw。
+   * ④ fixRouteDeadReferences（route 死引用 → proxy-selector）。
+   * ⑤ idToTagMap 删 entry（防 hotSwitchNode PUT 幽灵 tag）+ gateInvalidNodes 记录 + warn。
+   *
+   * @param seedTags 起始要剔除的 outbound tag 集合
+   * @param origin   'check'=被 check 直接标中 / 'detour'=detour 死引用预校验标中（仅影响 reason 文案）
+   */
+  private pruneTagsClosure(
+    singboxConfig: SingBoxConfig,
+    config: UserConfig,
+    seedTags: Set<string>,
+    origin: 'check' | 'detour'
+  ): void {
+    // tag → serverId 反查（含 stls-out- 前缀），用于级联与 gateInvalidNodes 记录。
+    const tagToServerId = (tag: string): string | undefined => {
+      if (tag.startsWith('stls-out-')) return tag.slice('stls-out-'.length);
+      for (const [id, t] of this.currentIdToTagMap ?? []) {
+        if (t === tag) return id;
+      }
+      return undefined;
+    };
+
+    // ① 级联闭包：BFS 收集所有需剔除的 tag。
+    const toRemove = new Set<string>();
+    const queue: string[] = [...seedTags];
+    while (queue.length > 0) {
+      const tag = queue.shift() as string;
+      if (toRemove.has(tag)) continue;
+      toRemove.add(tag);
+
+      // shadow-tls 配对：内层节点 tag ↔ 其外层 `stls-out-<id>` 互相牵连。
+      const sid = tagToServerId(tag);
+      if (sid) {
+        const stlsTag = `stls-out-${sid}`;
+        if (singboxConfig.outbounds.some((o) => o.tag === stlsTag) && !toRemove.has(stlsTag)) {
+          queue.push(stlsTag);
+        }
+      }
+      // 若被剔的是某节点的 stls 外层，则其内层主节点（detour 指向它者）会在下面 detour 扫描里被牵出。
+
+      // detour 引用方级联：任何 detour 指向 toRemove 中 tag 的节点出站，一并剔（不静默改直连）。
+      for (const ob of singboxConfig.outbounds) {
+        if (ob.detour && toRemove.has(ob.detour) && !toRemove.has(ob.tag)) {
+          queue.push(ob.tag);
+        }
+      }
+    }
+
+    // 级联触及选中节点 → throw（决策①）：选中节点不可被静默剔除/降级。
+    const selectedTag = config.selectedServerId
+      ? this.currentIdToTagMap?.get(config.selectedServerId)
+      : undefined;
+    if (selectedTag && toRemove.has(selectedTag)) {
+      throw new Error(`选中节点「${selectedTag}」配置无效或其代理链依赖无效节点，请更换节点后重试`);
+    }
+
+    // ② 删 outbound。
+    singboxConfig.outbounds = singboxConfig.outbounds.filter((o) => !toRemove.has(o.tag));
+
+    // ③ group 成员删 tag + default 修正 + proxy-selector 剔空 throw。
+    for (const ob of singboxConfig.outbounds) {
+      if ((ob.type === 'selector' || ob.type === 'urltest') && Array.isArray(ob.outbounds)) {
+        ob.outbounds = ob.outbounds.filter((t) => !toRemove.has(t));
+        if (ob.tag === 'proxy-selector' && ob.outbounds.length === 0) {
+          throw new Error('没有可用的代理节点出站（全部节点未通过启动前配置校验）');
+        }
+        if (ob.default && toRemove.has(ob.default)) {
+          ob.default = ob.outbounds[0];
+        }
+      }
+    }
+
+    // ④ route 死引用修正回 proxy-selector。
+    this.fixRouteDeadReferences(singboxConfig);
+
+    // ⑤ idToTagMap 删 entry + gateInvalidNodes 记录 + warn。
+    for (const tag of toRemove) {
+      const sid = tagToServerId(tag);
+      if (sid) {
+        this.currentIdToTagMap?.delete(sid);
+        if (!this.gateInvalidNodes.has(sid)) {
+          const reason =
+            origin === 'detour'
+              ? '代理链依赖的前置节点无效（detour 引用不存在）'
+              : seedTags.has(tag)
+                ? '配置无法通过 sing-box 校验'
+                : '所依赖的节点被剔除（级联）';
+          this.gateInvalidNodes.set(sid, { id: sid, tag, reason });
+        }
+      }
+      this.logToManager('warn', `启动前配置校验已剔除非法出站「${tag}」`);
+    }
+  }
+
+  /**
+   * route 规则指向「已被剔除/不存在的出站」（死引用）→ 统一修正为 proxy-selector，避免 sing-box 以
+   * "outbound not found" 启动失败。从 generateSingBoxConfig 末尾抽出的纯等价重构（A5），gate 剔除后复用。
+   */
+  private fixRouteDeadReferences(singboxConfig: SingBoxConfig): void {
+    const validTags = new Set(
+      singboxConfig.outbounds.map((o) => o.tag).filter((t): t is string => !!t)
+    );
+    for (const rule of singboxConfig.route?.rules ?? []) {
+      const r = rule as { action?: string; outbound?: string };
+      if (r.action === 'route' && r.outbound && !validTags.has(r.outbound)) {
+        r.outbound = 'proxy-selector';
+      }
+    }
+  }
+
+  /**
+   * 检查当前配置是否需要 root/admin 权限（TUN 模式）。
+   * Windows/macOS/Linux TUN 模式都需要管理员权限。
+   *
+   * T16 子 commit 5：实现迁入 PlatformPrivilegeService.needsPrivilege，此处 thin wrapper delegate
+   * （resolveClashApiPortConflict / startSingBoxProcess / ensureLinuxTunCapabilities 等多处调用零改动）；
+   * 未注入时保留原实现兜底（防 index.ts 装配前调用）。
    */
   private needsRootPrivilege(): boolean {
+    if (this.privilegeService) return this.privilegeService.needsPrivilege();
     const isTunMode = this.currentConfig?.proxyModeType === 'tun';
     // Windows, macOS, and Linux TUN 模式都需要管理员权限
     return (
@@ -2640,17 +4437,218 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
-   * 检查是否需要使用 osascript 运行（仅 macOS）
+   * 检查是否需要使用 osascript 运行（仅 macOS）。
+   * T16 子 commit 5：thin wrapper，内部经 needsRootPrivilege delegate 到 service.needsPrivilege。
+   * 保留 wrapper：resolveClashApiPortConflict / startSingBoxProcess 等 ~10 处调用零改动。
    */
   private needsOsascript(): boolean {
     return process.platform === 'darwin' && this.needsRootPrivilege();
   }
 
   /**
-   * 检查是否需要使用 UAC 提升权限运行（仅 Windows TUN 模式）
+   * 检查是否需要使用 UAC 提升权限运行（仅 Windows TUN 模式）。
+   * T16 子 commit 5：thin wrapper（同 needsOsascript），内部 delegate 到 service.needsPrivilege。
    */
   private needsWindowsUAC(): boolean {
     return process.platform === 'win32' && this.needsRootPrivilege();
+  }
+
+  /** shell 单引号转义（防注入），与 HelperManager.shq 同形。delegate → PlatformPrivilegeService（T16 子 commit 1）。 */
+  private shq(s: string): string {
+    return this.privilegeService?.shq(s) ?? `'${s.replace(/'/g, `'\\''`)}'`;
+  }
+
+  /**
+   * 运行命令并捕获 stdout（出错 reject）。用于 getcap 探测。
+   * delegate → PlatformPrivilegeService（T16 子 commit 1）；未注入时保留原实现兜底（防 index.ts 装配前调用）。
+   */
+  private execCapture(bin: string, args: string[]): Promise<string> {
+    if (this.privilegeService) return this.privilegeService.execCapture(bin, args);
+    return new Promise((resolve, reject) => {
+      const proc = spawn(bin, args);
+      let stdout = '';
+      let stderr = '';
+      proc.stdout?.on('data', (d) => {
+        stdout += d.toString();
+      });
+      proc.stderr?.on('data', (d) => {
+        stderr += d.toString();
+      });
+      proc.on('exit', (code) => {
+        if (code === 0) resolve(stdout);
+        else reject(new Error(stderr.trim() || `exit ${code}`));
+      });
+      proc.on('error', reject);
+    });
+  }
+
+  /**
+   * 以 pkexec(root) 跑 bash 脚本（弹一次密码框）。区分取消(126)/无认证代理(127)。
+   * delegate → PlatformPrivilegeService（T16 子 commit 1）；未注入时保留原实现兜底。
+   */
+  private runPkexecScript(scriptPath: string): Promise<{ success: boolean; error?: string }> {
+    if (this.privilegeService) return this.privilegeService.runPkexecScript(scriptPath);
+    return new Promise((resolve) => {
+      const proc = spawn('/usr/bin/pkexec', ['/bin/bash', scriptPath]);
+      let stderr = '';
+      proc.stderr?.on('data', (d) => {
+        stderr += d.toString();
+      });
+      proc.on('exit', (code) => {
+        if (code === 0) resolve({ success: true });
+        else if (code === 126) resolve({ success: false, error: '授权被取消' });
+        else if (code === 127)
+          resolve({ success: false, error: '授权失败或系统缺少 polkit 认证代理' });
+        else if (code === 3) resolve({ success: false, error: '系统缺少 setcap（libcap2-bin）' });
+        else resolve({ success: false, error: stderr.trim() || `pkexec 退出码 ${code}` });
+      });
+      proc.on('error', (err) => resolve({ success: false, error: err.message }));
+    });
+  }
+
+  /**
+   * 生成 Linux TUN 提权脚本：setcap 赋权 + 安装限定用户的 resolve1 polkit 规则（含 0.105 .pkla 回退）。
+   * delegate → PlatformPrivilegeService（T16 子 commit 1）；未注入时保留原实现兜底。
+   */
+  private buildLinuxTunSetupScript(corePath: string, user: string, rulesFile: string): string {
+    if (this.privilegeService)
+      return this.privilegeService.buildLinuxTunSetupScript(corePath, user, rulesFile);
+    // user 已经白名单校验（[a-z0-9_.@-]），可安全嵌入 heredoc 字面量
+    return `#!/bin/bash
+set -e
+CORE=${this.shq(corePath)}
+RULES=${this.shq(rulesFile)}
+SETCAP="$(command -v setcap || echo /usr/sbin/setcap)"
+# setcap 缺失（精简 Debian 无 libcap2-bin）→ 用退出码 3 区分于 pkexec 的 126/127（P3-1）
+[ -x "$SETCAP" ] || { echo "setcap 未安装(libcap)" >&2; exit 3; }
+"$SETCAP" 'cap_net_admin,cap_net_bind_service,cap_net_raw=+ep' "$CORE"
+mkdir -p /etc/polkit-1/rules.d
+cat > "$RULES" <<'EOF'
+// FlowZ: 允许指定用户改 systemd-resolved 链路 DNS（TUN auto_route 免逐条密码框）。手动删除本文件即恢复默认。
+polkit.addRule(function(action, subject) {
+  if (action.id.indexOf("org.freedesktop.resolve1.") === 0 &&
+      subject.user === "${user}" && subject.local && subject.active) {
+    return polkit.Result.YES;
+  }
+});
+EOF
+# 0.105 .pkla 回退：只要 polkit localauthority 父目录在就建 50-local.d 并写（P3-2，放宽过严条件）
+PKLA_DIR=/etc/polkit-1/localauthority/50-local.d
+if [ -d /etc/polkit-1/localauthority ]; then
+  mkdir -p "$PKLA_DIR"
+  cat > "$PKLA_DIR/49-flowz-resolved.pkla" <<'EOF2'
+[FlowZ resolved DNS]
+Identity=unix-user:${user}
+Action=org.freedesktop.resolve1.*
+ResultActive=yes
+EOF2
+fi
+echo flowz-linux-tun-setup-ok
+`;
+  }
+
+  /**
+   * Linux TUN：确保打包核心具备 TUN 所需 capabilities，并安装一条「仅当前用户改 systemd-resolved
+   * 链路 DNS」的 polkit 规则——否则 sing-box(auto_route) 经 resolve1 D-Bus 设 DNS 时，polkit 按 uid
+   * （非 root）逐条弹 4 次密码框（issue #33）。一次 pkexec 同做 setcap + 写规则；幂等：caps 已具备且
+   * 规则文件已存在则零弹窗直接返回。授权取消 → 抛含「权限」的错误命中 nonRetryableErrors，不重试连弹。
+   * 仅 Linux TUN 生效；root 运行整 app 时跳过。
+   *
+   * T16 子 commit 4：实现迁入 PlatformPrivilegeService.ensureCapabilities，此处 delegate；
+   * 未注入时保留原实现兜底（防 index.ts 装配前调用）。
+   */
+  private async ensureLinuxTunCapabilities(): Promise<void> {
+    if (this.privilegeService) return this.privilegeService.ensureCapabilities();
+    if (process.platform !== 'linux' || !this.needsRootPrivilege()) return;
+    // 以 root 跑整个 app → 已有全部权限，无需 pkexec
+    if (typeof process.getuid === 'function' && process.getuid() === 0) return;
+
+    const fs = require('fs');
+    const corePath = this.singboxPath;
+    const rulesFile = '/etc/polkit-1/rules.d/49-flowz-resolved.rules';
+
+    // 核心不存在 → 直接报「找不到」（命中 nonRetryableErrors），不白弹密码框（P2-3）
+    if (!fs.existsSync(corePath)) {
+      throw new Error(`找不到 sing-box 可执行文件: ${corePath}`);
+    }
+
+    // 定位 getcap（普通用户 PATH 常不含 /usr/sbin）；绝对路径都不在则退回裸名走 PATH（P2-1）
+    const getcapBin =
+      ['/usr/sbin/getcap', '/sbin/getcap', '/usr/bin/getcap'].find((p) => {
+        try {
+          return fs.existsSync(p);
+        } catch {
+          return false;
+        }
+      }) || 'getcap';
+
+    // true=有 caps，false=无 caps，null=getcap 不可用（无法判定，复检时以脚本退出码为准）
+    const probeCaps = async (): Promise<boolean | null> => {
+      try {
+        return /cap_net_admin/.test(await this.execCapture(getcapBin, [corePath]));
+      } catch {
+        return null;
+      }
+    };
+
+    let rulesExist = false;
+    try {
+      rulesExist = fs.existsSync(rulesFile);
+    } catch {
+      /* ignore */
+    }
+
+    // 已具备 caps 且规则文件已存在 → 零弹窗
+    if ((await probeCaps()) === true && rulesExist) return;
+
+    // 当前用户名（白名单校验，杜绝注入）。允许企业目录用户名常见的 . 与 @（SSSD/AD），
+    // 三处嵌入上下文（quoted-heredoc / JS 双引号串 / .pkla 值）对 . @ 均安全。
+    let user = '';
+    try {
+      user = require('os').userInfo().username;
+    } catch {
+      /* fallthrough */
+    }
+    if (!user) {
+      throw new Error('TUN 模式需要管理员权限：无法确定当前用户名，请手动配置 setcap');
+    }
+    if (!/^[a-z_][a-z0-9_.@-]*$/i.test(user)) {
+      throw new Error(`TUN 模式需要管理员权限：用户名 "${user}" 含不支持的字符，请手动配置 setcap`);
+    }
+
+    this.logToManager(
+      'info',
+      'Linux TUN 首次配置：请求一次管理员授权（赋核心网络权限 + 安装 DNS polkit 规则）...'
+    );
+
+    const scriptPath = path.join(getUserDataPath(), 'flowz-linux-tun-setup.sh');
+    try {
+      fs.writeFileSync(scriptPath, this.buildLinuxTunSetupScript(corePath, user, rulesFile), {
+        mode: 0o755,
+      });
+    } catch (e) {
+      throw new Error(
+        `TUN 模式需要管理员权限：无法写入提权脚本 (${e instanceof Error ? e.message : String(e)})`
+      );
+    }
+
+    const result = await this.runPkexecScript(scriptPath);
+    try {
+      fs.unlinkSync(scriptPath);
+    } catch {
+      /* 忽略 */
+    }
+
+    // 复检 caps。getcap 不可用（null）时无法验证 → 信任脚本退出码（set -e + 末行 echo 保证 setcap
+    // 成功才退 0）。仅当「getcap 明确说无 caps」或「getcap 不可用且脚本失败」才判失败（P2-1）。
+    const post = await probeCaps();
+    if (post === false || (post === null && !result.success)) {
+      throw new Error(
+        `TUN 模式需要管理员权限：${result.error || '授权被取消或系统缺少 polkit 认证代理'}。` +
+          `可手动执行: sudo setcap 'cap_net_admin,cap_net_bind_service,cap_net_raw=+ep' "${corePath}"`
+      );
+    }
+    this.logToManager('info', 'Linux TUN 提权配置完成（核心已赋权，DNS polkit 规则已安装）');
   }
 
   /**
@@ -2659,6 +4657,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 需要在普通用户模式下修复这些文件的权限
    */
   private async fixFilePermissions(): Promise<void> {
+    // delegate → PlatformPrivilegeService（T16 子 commit 1：ctx.isTunMode 替代原 needsRootPrivilege 读取）；
+    // 未注入时保留原实现兜底（防 index.ts 装配前调用）。
+    if (this.privilegeService) return this.privilegeService.fixFilePermissions();
     // 只在 macOS 上需要处理
     if (process.platform !== 'darwin') {
       return;
@@ -2717,8 +4718,254 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   /**
    * 启动 sing-box 进程
    */
+  /** macOS root 看护脚本路径（osascript 以 root 执行它来托管 sing-box）。 */
+  private getWrapperScriptPath(): string {
+    return path.join(getUserDataPath(), 'singbox-wrapper.sh');
+  }
+
+  /**
+   * 停止信号文件：app 以普通用户写入，root 看护脚本检测到后自杀 sing-box —— 停止无需再次提权。
+   * T16 子 commit 3：改 public 供 PlatformPrivilegeService.ctx.stopFlagPath 回调注入。
+   */
+  getStopFlagPath(): string {
+    return path.join(getUserDataPath(), 'singbox.stopflag');
+  }
+
+  /**
+   * 写出 macOS root 看护脚本。设计：osascript 一次授权后以 root 跑此脚本 → 它起 sing-box 并循环监听
+   * stopflag(普通用户可写)与父进程(Electron)存活；二者任一触发即 TERM→(等待)→KILL sing-box 并清理。
+   * 收益：停止/退出/崩溃回收均无需再次管理员授权（仅启动那一次）。app 退出时父进程消失 → 不留孤儿。
+   */
+  private writeWrapperScript(): void {
+    // delegate → PlatformPrivilegeService（T16 子 commit 1）；未注入时保留原实现兜底。
+    if (this.privilegeService) {
+      this.privilegeService.writeWrapperScript();
+      return;
+    }
+    const script = `#!/bin/bash
+# FlowZ 看护脚本（osascript 以 root 执行）；勿手改。
+SB="$1"; CFG="$2"; LOG="$3"; PIDFILE="$4"; STOPFLAG="$5"; PARENT="$6"; FWD="$7"
+if [ "$FWD" = "1" ]; then sysctl -w net.inet.ip.forwarding=1 >/dev/null 2>&1; sysctl -w net.inet6.ip6.forwarding=1 >/dev/null 2>&1; fi
+"$SB" run -c "$CFG" > "$LOG" 2>&1 &
+SBPID=$!
+echo "$SBPID" > "$PIDFILE"
+while kill -0 "$SBPID" 2>/dev/null; do
+  [ -f "$STOPFLAG" ] && break
+  kill -0 "$PARENT" 2>/dev/null || break
+  sleep 0.5
+done
+kill -TERM "$SBPID" 2>/dev/null
+for i in $(seq 1 10); do kill -0 "$SBPID" 2>/dev/null || break; sleep 0.5; done
+kill -9 "$SBPID" 2>/dev/null
+rm -f "$STOPFLAG"
+`;
+    require('fs').writeFileSync(this.getWrapperScriptPath(), script, { mode: 0o755 });
+  }
+
+  /** Windows 提权看护脚本路径（UAC 提权的 PowerShell 以 -File 执行它来托管 sing-box）。 */
+  private getWindowsWatchdogScriptPath(): string {
+    return path.join(getUserDataPath(), 'flowz-win-watchdog.ps1');
+  }
+
+  /**
+   * 写出 Windows 提权看护脚本（镜像 macOS writeWrapperScript）。UAC 一次授权后以管理员执行：
+   * (a) 按本应用核心路径清扫提权遗留 sing-box（复用本次提权——非提权 taskkill 对提权孤儿恒
+   *     Access denied，wmic 在 Win11 24H2 已移除故用 Get-CimInstance）；
+   * (b) 起 sing-box 并写 PID 文件（与 waitForPidFile 协议完全一致：ASCII、无换行）；
+   * (c) ~1s 轮询 stopflag（普通用户可写）与父进程存活（校验进程名防 PID 复用）→ 任一触发
+   *     Stop-Process -Force 收割并清理 stopflag。
+   * 收益：正常停止/退出零 UAC；GUI 崩溃/强杀 ~1s 内收割提权 sing-box，不留孤儿。
+   * 注意：脚本须保持纯 ASCII；模板字符串内禁用 PS 花括号变量写法（会被 JS 当插值），统一用 $var。
+   */
+  private writeWindowsWatchdogScript(): void {
+    // delegate → PlatformPrivilegeService（T16 子 commit 1）；未注入时保留原实现兜底。
+    if (this.privilegeService) {
+      this.privilegeService.writeWindowsWatchdogScript();
+      return;
+    }
+    const script = `# FlowZ elevated watchdog (run by UAC-elevated PowerShell via -File). Do not edit manually.
+param(
+  [Parameter(Mandatory = $true)][string]$SbPath,
+  [Parameter(Mandatory = $true)][string]$CfgPath,
+  [Parameter(Mandatory = $true)][string]$PidFile,
+  [Parameter(Mandatory = $true)][string]$StopFlag,
+  [Parameter(Mandatory = $true)][int]$ParentPid,
+  [Parameter(Mandatory = $true)][string]$ParentName,
+  [Parameter(Mandatory = $true)][string]$LogFile,
+  [string]$Forward = '0'
+)
+$ErrorActionPreference = 'Continue'
+function Log([string]$Msg) {
+  try { ((Get-Date -Format 'HH:mm:ss') + ' [watchdog] ' + $Msg) | Out-File -FilePath $LogFile -Append -Encoding UTF8 } catch {}
+}
+try { 'FlowZ watchdog starting...' | Out-File -FilePath $LogFile -Encoding UTF8 } catch {}
+if (-not (Test-Path -LiteralPath $SbPath)) { Log 'ERROR: sing-box not found'; exit 1 }
+if (-not (Test-Path -LiteralPath $CfgPath)) { Log 'ERROR: config not found'; exit 1 }
+
+# (a) sweep leftover sing-box started from OUR core path (reuses this elevation).
+try {
+  $orphans = @(Get-CimInstance Win32_Process -Filter "Name='sing-box.exe'" | Where-Object { $_.ExecutablePath -eq $SbPath })
+  foreach ($o in $orphans) {
+    Log ('Killing leftover sing-box PID ' + $o.ProcessId)
+    Stop-Process -Id $o.ProcessId -Force -ErrorAction SilentlyContinue
+  }
+  if ($orphans.Count -gt 0) { Start-Sleep -Milliseconds 500 }
+} catch { Log ('Orphan sweep failed: ' + $_.Exception.Message) }
+
+if ($Forward -eq '1') {
+  try {
+    Set-NetIPInterface -Forwarding Enabled
+    Set-NetIPInterface -AddressFamily IPv6 -Forwarding Enabled
+    Log 'IP forwarding enabled'
+  } catch { Log ('Enable IP forwarding failed: ' + $_.Exception.Message) }
+}
+
+# (b) start sing-box (already elevated, no inner RunAs); PID file protocol unchanged.
+# Config path is explicitly quoted: -ArgumentList does NOT auto-quote elements with spaces.
+try {
+  $proc = Start-Process -FilePath $SbPath -ArgumentList 'run', '-c', ('"' + $CfgPath + '"') -PassThru -WindowStyle Hidden
+} catch {
+  Log ('ERROR: failed to start sing-box: ' + $_.Exception.Message)
+  exit 1
+}
+if (-not ($proc -and $proc.Id)) { Log 'ERROR: Start-Process returned null'; exit 1 }
+$sbId = $proc.Id
+try {
+  $sbId | Out-File -FilePath $PidFile -Encoding ASCII -NoNewline
+} catch {
+  Log ('ERROR: failed to write PID file: ' + $_.Exception.Message)
+  Stop-Process -Id $sbId -Force -ErrorAction SilentlyContinue
+  exit 1
+}
+Log ('sing-box started, PID ' + $sbId)
+
+# (c) babysit: exit when core dies; kill core on stopflag or parent death (name check vs PID reuse).
+while ($true) {
+  $sb = Get-Process -Id $sbId -ErrorAction SilentlyContinue
+  if (-not $sb -or $sb.ProcessName -ne 'sing-box') { Log 'sing-box exited by itself'; break }
+  if (Test-Path -LiteralPath $StopFlag) { Log 'Stopflag detected'; break }
+  $parent = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
+  if (-not $parent -or $parent.ProcessName -ne $ParentName) { Log 'Parent process gone'; break }
+  Start-Sleep -Seconds 1
+}
+$sb = Get-Process -Id $sbId -ErrorAction SilentlyContinue
+if ($sb -and $sb.ProcessName -eq 'sing-box') {
+  Stop-Process -Id $sbId -Force -ErrorAction SilentlyContinue
+  Log 'sing-box stopped by watchdog'
+}
+Remove-Item -LiteralPath $StopFlag -Force -ErrorAction SilentlyContinue
+Log 'Watchdog exit'
+exit 0
+`;
+    require('fs').writeFileSync(this.getWindowsWatchdogScriptPath(), script);
+  }
+
+  /** 停止收尾：删 PID 文件 + 资源清理 + 通知前端。 */
+  private finishStop(): void {
+    try {
+      require('fs').unlinkSync(this.getPidFilePath());
+    } catch {
+      /* 忽略 */
+    }
+    this.cleanup();
+    this.emit('stopped');
+    this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
+  }
+
+  /**
+   * macOS 提权 helper 路径：经 socket 让 root daemon 启动 sing-box（免授权）。
+   * 成功 resolve；失败 throw（交给 start() 的 retry 决策）。停止/退出/崩溃回收均免授权。
+   */
+  private async startViaHelper(): Promise<void> {
+    const helper = this.helperManager!;
+    const fs = require('fs');
+    if (!fs.existsSync(this.singboxPath)) {
+      throw new Error(`找不到 sing-box 可执行文件: ${this.singboxPath}`);
+    }
+    const pidFile = getSingBoxPidPath();
+    const startupLogFile = path.join(getUserDataPath(), 'singbox_startup.log');
+    const forward = !!this.currentConfig?.allowLan;
+    this.logToManager(
+      'info',
+      `TUN 模式经提权 helper 启动 sing-box（免授权）${forward ? '，并开启 IP 转发' : ''}...`
+    );
+
+    const res = await helper.startCore(this.configPath, startupLogFile, forward);
+    if (!res.ok || !res.pid) {
+      throw new Error(res.error || 'helper 启动 sing-box 失败');
+    }
+
+    this.singboxPid = res.pid;
+    this.pid = res.pid;
+    this.startTime = new Date();
+    this.startedViaHelper = true;
+    // 写 PID 文件，保持与 osascript 路径一致（健康检查/孤儿清理读它）
+    try {
+      fs.writeFileSync(pidFile, String(res.pid));
+    } catch {
+      /* 忽略 */
+    }
+
+    if (!this.isProcessAlive(res.pid)) {
+      this.cleanup();
+      throw new Error('helper 报告已启动但进程不存在');
+    }
+
+    this.startLogFileWatcher();
+    this.startHealthCheck();
+    this.emit('started');
+    this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STARTED, {
+      pid: res.pid,
+      startTime: this.startTime,
+    });
+    this.logToManager('info', 'sing-box 已由提权 helper 启动成功（免授权）');
+  }
+
   private async startSingBoxProcess(): Promise<void> {
+    // macOS TUN 模式 + helper 就绪 → 走零提权路径（避免每次启停弹 osascript 授权框）。
+    // helper 就绪但启动失败（如 .app 被移动致锁定的 singbox 路径失效）→ 回退 osascript 看护脚本，
+    // 不在 helper 路径死循环（startViaHelper 抛出前不会残留状态：未到设标志处，或经 cleanup 复位）。
+    if (this.needsOsascript() && this.helperManager) {
+      // 先判后台开关：backgroundDisabled 时即便 install-over-top 让 daemon 此刻活着(isReady=true)，BTM 也会在 ~20s 后
+      // 收割这个 disallowed daemon → sing-box 被收割、自动重启 F10 失败（真机实测）。故**跳过 helper 路径**（不论
+      // ready），走 osascript root 看护脚本（不受 BTM 管、会话稳定）。getStatus 经 SMAppService 判 backgroundDisabled，~30ms。
+      const st = await this.helperManager.getStatus().catch(() => null);
+      if (st?.backgroundDisabled) {
+        this.logToManager(
+          'warn',
+          'helper「允许在后台」被系统关闭：本次走 osascript 看护脚本（不依赖 BTM，避免 daemon 被系统收割）。请在「系统设置 > 通用 > 登录项与扩展」重新打开开关以恢复免授权启停'
+        );
+      } else if (await this.helperManager.isReady()) {
+        try {
+          return await this.startViaHelper();
+        } catch (e) {
+          this.logToManager(
+            'warn',
+            `helper 启动失败，回退 osascript 看护脚本: ${e instanceof Error ? e.message : String(e)}`
+          );
+        }
+      } else if (st?.installed) {
+        this.logToManager('warn', 'helper 已安装但未就绪，本次回退 osascript 授权路径');
+      }
+    }
+
+    // F10：非交互启动（崩溃自动重启）且 macOS TUN 需 osascript（helper 不可用/未就绪/路径失效）→ 不弹密码框。
+    // 崩溃循环里凭空弹管理员授权（最多连弹 MAX_RESTART_COUNT 次）比断流更糟；抛含「权限」的非重试错误进入
+    // 停止终态，待用户手动经 start gate 重新安装/修复 helper。交互式启动（按钮/托盘/切模式）不受影响。
+    if (this.needsOsascript() && !this.startInteractive) {
+      throw new Error(
+        '提权助手不可用，已跳过非交互（崩溃自动重启）的管理员权限授权——请手动重启代理以经引导安装/修复 helper'
+      );
+    }
+
+    // Linux TUN：在 spawn 前确保核心具备 capabilities + 安装 polkit 规则（首次弹 1 次密码，之后启停零
+    // 弹窗）。非 Linux / 非 TUN 为 no-op。授权取消 → 抛含「权限」的非重试性错误（见 nonRetryableErrors）。
+    await this.ensureLinuxTunCapabilities();
+
     return new Promise((resolve, reject) => {
+      // 启动是否已判定成功（resolve）：分离「启动期退出=启动失败，只 reject 交外层 retry」与「成功后退出=
+      // 运行中崩溃 → handleProcessExit 自动重启」，杜绝启动期 reject 与 attemptAutoRestart 双启动流并发竞跑。
+      let startupResolved = false;
       try {
         // 检查 sing-box 可执行文件是否存在
         const fs = require('fs');
@@ -2729,26 +4976,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           return;
         }
 
-        // Linux TUN 模式下的智能提权逻辑 (setcap)
-        if (process.platform === 'linux' && this.needsRootPrivilege()) {
-          try {
-            const { execSync } = require('child_process');
-            // 检查当前是否有 cap_net_admin
-            const caps = execSync(`getcap "${this.singboxPath}"`, { encoding: 'utf-8' });
-            if (!caps.includes('cap_net_admin')) {
-              this.logToManager('info', 'Linux 核心缺失网络权限，正在请求提权...');
-              // 使用 pkexec 调用 setcap 赋权
-              execSync(
-                `pkexec setcap 'cap_net_admin,cap_net_bind_service,cap_net_raw=+ep' "${this.singboxPath}"`
-              );
-              this.logToManager('info', 'Linux 核心提权成功');
-            }
-          } catch (err) {
-            this.logToManager('error', `Linux 核心提权失败: ${(err as Error).message}`);
-            // 不在此直接 reject，继续执行（用户可能通过其它方式提权或容错）
-          }
-        }
-
         // 根据平台和模式选择启动方式：
         // - macOS TUN 模式: 使用 osascript 请求管理员权限
         // - Windows TUN 模式: 使用 PowerShell Start-Process -Verb RunAs 请求 UAC 权限
@@ -2757,87 +4984,142 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         let args: string[];
 
         if (this.needsOsascript()) {
-          // macOS: 使用 osascript 请求管理员权限运行
-          // 注意：路径中可能包含空格，需要使用转义引号
-          // sing-box 配置中已经设置了 log.output，日志会写入文件
-          // 使用 & 让进程在后台运行，并将 PID 写入文件
+          // macOS: osascript 一次授权 → 以 root 跑「看护脚本」托管 sing-box（停止/退出/崩溃回收无需再提权）。
+          // 路径单引号包裹以容忍空格（与原实现一样不处理路径内引号——FlowZ 路径不含单/双引号）。
           const pidFile = getSingBoxPidPath();
           const startupLogFile = path.join(getUserDataPath(), 'singbox_startup.log');
-          command = '/usr/bin/osascript';
+          const stopFlag = this.getStopFlagPath();
+          const fwd = this.currentConfig?.allowLan ? '1' : '0';
+          const parentPid = process.pid; // Electron 主进程 PID：退出即让看护脚本联动停 sing-box，杜绝孤儿
 
-          // 如果开启了局域网共享且是 TUN 模式，同时开启系统的 IP 转发功能
-          const forwardCmd = this.currentConfig?.allowLan
-            ? 'sysctl -w net.ipv4.ip_forward=1; sysctl -w net.ipv6.conf.all.forwarding=1; '
-            : '';
+          // 清掉上轮残留 stopflag
+          try {
+            require('fs').unlinkSync(stopFlag);
+          } catch {
+            /* 不存在则忽略 */
+          }
 
-          // 使用 bash -c 来执行后台命令，确保 & 正常工作
-          // 重定向 stdout 和 stderr 到日志文件，以便排查启动失败原因
-          args = [
-            '-e',
-            `do shell script "/bin/bash -c '${forwardCmd}\\"${this.singboxPath}\\" run -c \\"${this.configPath}\\" > \\"${startupLogFile}\\" 2>&1 & echo $! > \\"${pidFile}\\"'" with administrator privileges`,
-          ];
+          // T16 子 commit 4：看护脚本写出 + 提权命令构造委托 service（generateWatchdogScript +
+          // buildElevatedLaunchCommand）。spawn + stdout 监听 + exit 处理（startupResolved 门控、
+          // 双启动流防护）+ waitForPidFile 留此处。未注入 service 时走原 inline 兜底。
+          if (this.privilegeService) {
+            const wd = this.privilegeService.generateWatchdogScript();
+            const built = this.privilegeService.buildElevatedLaunchCommand({
+              singboxPath: this.singboxPath,
+              configPath: this.configPath,
+              pidFile,
+              startupLogFile,
+              stopFlag,
+              wrapper: wd.path,
+              watchdog: wd.path,
+              parentPid,
+              parentName: '',
+              fwd,
+            });
+            command = built.command;
+            args = built.args;
+          } else {
+            const wrapper = this.getWrapperScriptPath();
+            this.writeWrapperScript();
+            command = '/usr/bin/osascript';
+            args = [
+              '-e',
+              `do shell script "/bin/bash '${wrapper}' '${this.singboxPath}' '${this.configPath}' '${startupLogFile}' '${pidFile}' '${stopFlag}' ${parentPid} '${fwd}' >/dev/null 2>&1 &" with administrator privileges`,
+            ];
+          }
           this.logToManager(
             'info',
-            `TUN 模式需要管理员权限${this.currentConfig?.allowLan ? '及开启 IP 转发' : ''}，正在请求...`
+            `TUN 模式需要管理员权限${this.currentConfig?.allowLan ? '及开启 IP 转发' : ''}，正在请求（仅此一次，后续启停免授权）...`
           );
         } else if (this.needsWindowsUAC()) {
-          // Windows TUN 模式: 使用 PowerShell 请求 UAC 权限运行
-          // 使用 Start-Process -Verb RunAs 来请求管理员权限
+          // Windows TUN 模式：UAC 一次授权 → 以管理员跑「看护脚本」托管 sing-box（镜像 macOS
+          // osascript 看护路径）。正常停止经 stopflag 零 UAC；GUI 崩溃/强杀由看护脚本按父 PID
+          // 联动收割，杜绝提权孤儿。UAC 次数与旧实现一致（每次 TUN 启动仍 1 次）。
           const pidFile = getSingBoxPidPath();
-          command = 'powershell.exe';
-
-          // PowerShell 脚本：以管理员权限启动 sing-box 并记录 PID
-          // 使用数组构建脚本避免模板字符串中 $ 被 JS 解析
-          // 详细日志输出到 singbox_startup.log 帮助诊断启动问题
           const startupLogFile = path.join(getUserDataPath(), 'singbox_startup.log');
-          const singboxPathEsc = this.singboxPath.replace(/'/g, "''");
-          const configPathEsc = this.configPath.replace(/'/g, "''");
-          const pidFileEsc = pidFile.replace(/'/g, "''");
-          const logFileEsc = startupLogFile.replace(/'/g, "''");
+          const stopFlag = this.getStopFlagPath();
+          const parentPid = process.pid; // Electron 主进程 PID：父死即看护脚本收割 sing-box
+          // 父进程名（无扩展名，对应 PS Get-Process 的 ProcessName）：配合 PID 校验防 PID 复用误判
+          const parentName = path.basename(process.execPath, path.extname(process.execPath));
+          const fwd = this.currentConfig?.allowLan ? '1' : '0';
 
-          // Windows 局域网转发支持
-          const forwardPsCmd = this.currentConfig?.allowLan
-            ? 'Set-NetIPInterface -Forwarding Enabled; Set-NetIPInterface -AddressFamily IPv6 -Forwarding Enabled; '
-            : '';
+          // 清掉上轮残留 stopflag
+          try {
+            require('fs').unlinkSync(stopFlag);
+          } catch {
+            /* 不存在则忽略 */
+          }
 
-          const psScript = [
-            "$ErrorActionPreference = 'Stop'",
-            "$logFile = '" + logFileEsc + "'",
-            "$pidFile = '" + pidFileEsc + "'",
-            "$singboxPath = '" + singboxPathEsc + "'",
-            "$configPath = '" + configPathEsc + "'",
-            'try {',
-            "  'Starting sing-box...' | Out-File -FilePath $logFile -Encoding UTF8",
-            forwardPsCmd
-              ? "  'Enabling IP Forwarding...' | Out-File -FilePath $logFile -Append -Encoding UTF8"
-              : '',
-            forwardPsCmd,
-            "  'SingboxPath: ' + $singboxPath | Out-File -FilePath $logFile -Append -Encoding UTF8",
-            "  'ConfigPath: ' + $configPath | Out-File -FilePath $logFile -Append -Encoding UTF8",
-            "  if (-not (Test-Path $singboxPath)) { 'ERROR: sing-box not found' | Out-File -FilePath $logFile -Append -Encoding UTF8; exit 1 }",
-            "  if (-not (Test-Path $configPath)) { 'ERROR: config not found' | Out-File -FilePath $logFile -Append -Encoding UTF8; exit 1 }",
-            "  'Starting with UAC...' | Out-File -FilePath $logFile -Append -Encoding UTF8",
-            "  $process = Start-Process -FilePath $singboxPath -ArgumentList 'run','-c',$configPath -Verb RunAs -PassThru -WindowStyle Hidden",
-            '  if ($process -and $process.Id) {',
-            "    'Process started PID: ' + $process.Id | Out-File -FilePath $logFile -Append -Encoding UTF8",
-            '    $process.Id | Out-File -FilePath $pidFile -Encoding ASCII -NoNewline',
-            '    exit 0',
-            '  } else {',
-            "    'ERROR: Start-Process returned null' | Out-File -FilePath $logFile -Append -Encoding UTF8",
-            '    exit 1',
-            '  }',
-            '} catch {',
-            "  'ERROR: ' + $_.Exception.Message | Out-File -FilePath $logFile -Append -Encoding UTF8",
-            '  exit 1',
-            '}',
-          ].join('; ');
+          // T16 子 commit 4：看护脚本写出 + 提权命令构造委托 service（同 macOS 分支）。未注入时走原 inline 兜底。
+          if (this.privilegeService) {
+            const wd = this.privilegeService.generateWatchdogScript();
+            const built = this.privilegeService.buildElevatedLaunchCommand({
+              singboxPath: this.singboxPath,
+              configPath: this.configPath,
+              pidFile,
+              startupLogFile,
+              stopFlag,
+              wrapper: wd.path,
+              watchdog: wd.path,
+              parentPid,
+              parentName,
+              fwd,
+            });
+            command = built.command;
+            args = built.args;
+          } else {
+            this.writeWindowsWatchdogScript();
+            const watchdog = this.getWindowsWatchdogScriptPath();
+            // 外层 powershell（非提权）只负责发起 UAC：Start-Process -Verb RunAs 拉起提权 powershell
+            // 执行看护脚本。参数经 -File 传递（不走 -Command 内联，避免多层转义）；-ArgumentList 不会
+            // 给含空格元素自动加引号 → 路径元素显式内嵌双引号（FlowZ 路径不含单/双引号）。
+            // 授权成功外层立即退 0（不 -Wait，看护脚本常驻）；取消 UAC 时 Start-Process 抛错 → 退 1，
+            // 与旧实现的退出码协议一致（见下方 singboxProcess 'exit' 处理）。PID 文件由提权侧写出，
+            // waitForPidFile 协议不变。
+            const q = (s: string) => `'"${s.replace(/'/g, "''")}"'`;
+            const watchdogArgs = [
+              "'-NoProfile'",
+              // -NonInteractive：看护脚本含 Mandatory 参数，若引号链失效缺参，避免在隐藏窗口交互式提示→永久挂起
+              "'-NonInteractive'",
+              "'-ExecutionPolicy'",
+              "'Bypass'",
+              "'-WindowStyle'",
+              "'Hidden'",
+              "'-File'",
+              q(watchdog),
+              q(this.singboxPath),
+              q(this.configPath),
+              q(pidFile),
+              q(stopFlag),
+              `'${parentPid}'`,
+              q(parentName),
+              q(startupLogFile),
+              `'${fwd}'`,
+            ].join(',');
+            const logFileEsc = startupLogFile.replace(/'/g, "''");
+            const psScript = [
+              "$ErrorActionPreference = 'Stop'",
+              'try {',
+              '  Start-Process -FilePath powershell.exe -Verb RunAs -WindowStyle Hidden ' +
+                '-ArgumentList ' +
+                watchdogArgs,
+              '  exit 0',
+              '} catch {',
+              "  'ERROR launching watchdog: ' + $_.Exception.Message | Out-File -FilePath '" +
+                logFileEsc +
+                "' -Encoding UTF8",
+              '  exit 1',
+              '}',
+            ].join('; ');
 
-          args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', psScript];
+            command = 'powershell.exe';
+            args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', psScript];
+          }
           this.logToManager(
             'info',
             `TUN 模式需要管理员权限${
               this.currentConfig?.allowLan ? '及开启 IP 转发' : ''
-            }，正在请求 UAC 授权...`
+            }，正在请求 UAC 授权（仅启动这一次，停止/退出免授权）...`
           );
         } else {
           // 系统代理模式或 Linux：直接运行
@@ -2888,7 +5170,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
         // 监听进程事件
         this.singboxProcess.on('error', (error) => {
-          console.error('sing-box process error:', error);
+          this.logToManager('error', `sing-box process error: ${error.message}`);
+          // 同 exit 分支：置位阻止 1s setTimeout 误判成功发幻影 started（H1/L-2）。
+          startupResolved = true;
           const friendlyError = this.parseLaunchError(error);
           this.logToManager('error', friendlyError);
           this.handleProcessError(error);
@@ -2896,7 +5180,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         });
 
         this.singboxProcess.on('exit', (code, signal) => {
-          console.log(`sing-box process exited with code ${code}, signal ${signal}`);
+          this.logToManager('info', `sing-box process exited with code ${code}, signal ${signal}`);
 
           // 对于 macOS TUN 模式，osascript 退出码为 0 表示成功启动了后台进程
           if (this.needsOsascript()) {
@@ -2905,12 +5189,14 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
               // PID 文件读取由 setTimeout 中的 waitForPidFile 统一处理
               return; // 不调用 handleProcessExit，因为 sing-box 还在运行
             } else {
-              // osascript 执行失败（用户取消或其他错误）
+              // osascript 执行失败（用户取消或其他错误）：包装进程退出 ≠ 运行中崩溃 → 只 reject 交外层 retry，
+              // **不**调 handleProcessExit（否则触发 attemptAutoRestart，与外层 retry 双启动流并发，且用户取消密码框
+              // 还会多收 AUTO_RESTARTING + 自动重启失败 串扰，H2）。置 startupResolved 让 setTimeout 干净跳过。
+              startupResolved = true;
               const errorMessage =
                 code === 1 ? '用户取消了管理员权限请求' : `启动失败，退出码: ${code}`;
               this.logToManager('error', errorMessage);
               reject(new Error(errorMessage));
-              this.handleProcessExit(code, signal);
               return;
             }
           }
@@ -2922,29 +5208,42 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
               // PID 文件读取由 setTimeout 中的 waitForPidFile 统一处理
               return; // 不调用 handleProcessExit，因为 sing-box 还在运行
             } else {
-              // PowerShell 执行失败（用户取消 UAC 或其他错误）
+              // PowerShell/UAC 执行失败（用户取消或其他错误）：包装进程退出 ≠ 运行中崩溃 → 只 reject 交外层 retry，
+              // 不调 handleProcessExit（同 osascript 分支，避免双启动流 + 取消授权后的自动重启串扰，H2）。
+              startupResolved = true;
               const errorMessage =
                 code === 1 ? '用户取消了管理员权限请求' : `UAC 授权失败，退出码: ${code}`;
               this.logToManager('error', errorMessage);
               reject(new Error(errorMessage));
-              this.handleProcessExit(code, signal);
               return;
             }
           }
 
-          // 如果在启动阶段就退出了，说明启动失败
-          const startupTime = Date.now() - (this.startTime?.getTime() || Date.now());
-          if (startupTime < 2000 && code !== null && code !== 0) {
-            const errorMessage = this.parseStartupError(code, this.lastErrorOutput);
+          // 启动未判定成功(resolve)前退出 = 启动失败：只 reject 交外层 retry，**不**走 handleProcessExit
+          // 的自动重启，杜绝「外层 retry + attemptAutoRestart」双启动流并发竞跑（端口占用风暴的确定性放大源）。
+          if (!startupResolved) {
+            // 置位（本 attempt 已判定=失败）：阻止 1s setTimeout 见残留 singboxProcess&&pid 误判成功 →
+            // 发幻影 'started'（污染核心更新基线 + UI 撒谎）+ 泄漏健康检查（10s 后见死 PID 触发 attemptAutoRestart，
+            // 与外层 retry 并发——T1 要杀的双启动流换入口复活，H1）。
+            startupResolved = true;
+            const errorMessage =
+              code !== null && code !== 0
+                ? this.parseStartupError(code, this.lastErrorOutput)
+                : `sing-box 启动期退出 (code=${code}, signal=${signal})`;
             this.logToManager('error', errorMessage);
             reject(new Error(errorMessage));
+            return;
           }
 
+          // 已成功启动后退出 = 运行中崩溃 → 走崩溃恢复（自动重启 / 终态）
           this.handleProcessExit(code, signal);
         });
 
         // 等待一小段时间确保进程启动成功
         setTimeout(async () => {
+          // 本 attempt 已判定（启动期退出已 reject 并置 startupResolved）→ 不再发 'started'（修 H1 幻影启动）。
+          // startupResolved 是本次 startSingBoxProcess 的局部量，故跨 retry 各 attempt 互不污染。
+          if (startupResolved) return;
           // macOS TUN 模式或 Windows TUN 模式：检查 singboxPid（从 PID 文件读取）
           // 其他模式：检查 singboxProcess 和 pid
           const isMacTunMode = this.needsOsascript();
@@ -2967,6 +5266,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
                 startTime: this.startTime,
               });
               this.logToManager('info', 'sing-box 进程启动成功');
+              startupResolved = true;
               resolve();
             } else {
               const error = '启动 sing-box 进程失败：无法获取进程 PID';
@@ -2988,6 +5288,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
                 startTime: this.startTime,
               });
               this.logToManager('info', 'sing-box 进程启动成功');
+              startupResolved = true;
               resolve();
             } else {
               const error = '启动 sing-box 进程失败：进程未能正常启动';
@@ -3083,38 +5384,86 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   /**
    * 停止 sing-box 进程
    */
-  private async stopSingBoxProcess(): Promise<void> {
-    // macOS TUN 模式：sing-box 以 root 权限在后台运行，需要用 osascript 终止
+  private async stopSingBoxProcess(opts?: { quitting?: boolean }): Promise<void> {
+    // 杀核前先静默 clash_api 客户端（停 StatsService 轮询 + RST 掉其到 9090 的 keep-alive 连接）：让 client 主动
+    // 关闭 → 9090 不进 TIME_WAIT → 下次用户态 sing-box 免撞 root TIME_WAIT 等 30s（P0-2 治本）。同步、不阻塞。
+    try {
+      this.quiesceClashClients?.();
+    } catch {
+      /* 忽略 */
+    }
+    // 同时 RST 掉 ProxyManager 自己到 9090 的 keep-alive 连接（reassert/hotSwitch 的专属 agent），与 StatsService
+    // 一并收口 → 杀核前所有 9090 client 主动关 → 9090 不进 root TIME_WAIT（P0-2 收口全量，含原 undici 池漏网）。
+    this.destroyClashApiAgent();
+
+    // macOS TUN 模式：sing-box 以 root 权限在后台运行，需要用 osascript 终止。
+    // T16 子 commit 3：实现迁入 PlatformPrivilegeService.stopElevated（darwin 分支），此处 delegate。
+    // 进程状态收尾（finishStop）据返回 stopped 统一做：true→finishStop，false→不收尾（取消授权不谎报已停止，M3）。
+    // STOP_AUTH_CANCELLED 事件副作用由 service 内部 ctx.onStopAuthCancelled 触发（service 不持 IPC 通道）。
     if (this.singboxPid && process.platform === 'darwin') {
-      return this.stopSingBoxWithSudo();
+      if (this.privilegeService) {
+        const { stopped } = await this.privilegeService.stopElevated(this.singboxPid, opts);
+        if (stopped) this.finishStop();
+        return;
+      }
+      return this.stopSingBoxWithSudo(opts);
     }
 
-    // Windows TUN 模式：sing-box 以管理员权限在后台运行，使用 taskkill 终止
+    // Windows TUN 模式：sing-box 以管理员权限在后台运行，使用 taskkill 终止。
+    // T16 子 commit 3：实现迁入 PlatformPrivilegeService.stopElevated（win32 分支），此处 delegate（同上）。
     if (this.singboxPid && process.platform === 'win32') {
-      return this.stopSingBoxOnWindows();
+      if (this.privilegeService) {
+        const { stopped } = await this.privilegeService.stopElevated(this.singboxPid, opts);
+        if (stopped) this.finishStop();
+        return;
+      }
+      return this.stopSingBoxOnWindows(opts);
     }
 
     if (!this.singboxProcess) {
       return;
     }
 
+    const proc = this.singboxProcess;
+    // 防御：进程已退出（exitCode/signalCode 非 null，或 pid 已不存活）→ 'exit' 早已发过，再挂 once('exit') 永不触发
+    // → stop() 永挂 → 下次/退出语境卡死（修「二次点击卡死」根因 A 的兜底）。直接收尾。
+    if (
+      proc.exitCode !== null ||
+      proc.signalCode !== null ||
+      (proc.pid != null && !this.isProcessAlive(proc.pid))
+    ) {
+      this.logToManager('info', 'sing-box 进程已退出，直接收尾（不等 exit 事件）');
+      this.cleanup();
+      return;
+    }
+
     return new Promise((resolve) => {
-      const proc = this.singboxProcess!;
+      let settled = false;
+      const done = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(killTimeout);
+        clearTimeout(hardCap);
+        this.cleanup();
+        resolve();
+      };
 
       // 设置超时强制终止
       const killTimeout = setTimeout(() => {
         if (proc.killed === false) {
-          console.warn('sing-box process did not exit gracefully, force killing');
+          this.logToManager('warn', 'sing-box process did not exit gracefully, force killing');
           proc.kill('SIGKILL');
         }
       }, 5000);
 
+      // 硬上限：无论如何 8s 内必 settle（绝不允许 stop 永挂拖死 start/退出链）
+      const hardCap = setTimeout(() => {
+        this.logToManager('warn', 'stop 等待进程退出超时（8s），强制收尾');
+        done();
+      }, 8000);
+
       // 监听退出事件
-      proc.once('exit', () => {
-        clearTimeout(killTimeout);
-        this.cleanup();
-        resolve();
-      });
+      proc.once('exit', done);
 
       // 发送 SIGTERM 信号优雅终止
       proc.kill('SIGTERM');
@@ -3124,60 +5473,93 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   /**
    * 使用 sudo 停止 sing-box 进程（macOS TUN 模式）
    */
-  private async stopSingBoxWithSudo(): Promise<void> {
+  private async stopSingBoxWithSudo(opts?: { quitting?: boolean }): Promise<void> {
     if (!this.singboxPid) {
       this.cleanup();
       return;
     }
 
     const pidToKill = this.singboxPid;
-    this.logToManager('info', `正在停止 sing-box 进程 (PID: ${pidToKill})...`);
 
+    // helper 路径：经 socket 让 root daemon 停 sing-box，零提权（PR-M2）。
+    if (this.startedViaHelper && this.helperManager) {
+      this.logToManager('info', `正在经提权 helper 停止 sing-box (PID: ${pidToKill})（免授权）...`);
+      if (this.isProcessAlive(pidToKill)) {
+        await this.helperManager.stopCore();
+        // 8s（非退出）覆盖 helper terminateChild 的「TERM→等≤5s→KILL」完整窗口 + 收割余量：
+        // 原 5s 会在 helper 即将 SIGKILL 时正好超时 → 误判「helper 停止未生效」→ 多弹一次 osascript 强杀。
+        await this.waitForProcessExit(pidToKill, opts?.quitting ? 3000 : 8000);
+      }
+      if (this.isProcessAlive(pidToKill)) {
+        if (opts?.quitting) {
+          // 退出语境零弹框：helper 未生效也不弹 osascript，交由 teardownForQuit 的 helper.cleanup() 兜底回收
+          this.logToManager('warn', 'helper 停止未生效，退出语境跳过提权弹框（cleanup 兜底）');
+        } else {
+          // 极少触发：helper 未生效 → 退回 osascript 强杀（一次授权）。取消授权(进程仍活) → 不谎报已停止。
+          this.logToManager('warn', 'helper 停止未生效，退回提权强制终止');
+          if (!(await this.forceKillOrReportCancelled(pidToKill))) return;
+        }
+      } else {
+        this.logToManager('info', 'sing-box 已由提权 helper 停止（免授权）');
+      }
+      this.finishStop();
+      return;
+    }
+
+    // M1-a：进程已不在 → 直接收尾，免一次提权授权框
+    if (!this.isProcessAlive(pidToKill)) {
+      this.logToManager('info', 'sing-box 进程已不在，跳过提权终止');
+      this.finishStop();
+      return;
+    }
+
+    // M1-b：写 stopflag，由 root 看护脚本自杀 sing-box —— 停止无需再次提权
+    this.logToManager('info', `正在停止 sing-box (PID: ${pidToKill})，通知看护脚本...`);
+    try {
+      require('fs').writeFileSync(this.getStopFlagPath(), '');
+    } catch (e) {
+      this.logToManager('warn', `写 stopflag 失败: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    if (await this.waitForProcessExit(pidToKill, opts?.quitting ? 3000 : 8000)) {
+      this.logToManager('info', 'sing-box 已由看护脚本停止（无需提权）');
+      this.finishStop();
+      return;
+    }
+
+    // Fallback：看护脚本未在预期内收口（异常/旧式直起）→ 退回 osascript 提权终止
+    if (opts?.quitting) {
+      // 退出语境零弹框：跳过 osascript，残留 sing-box 由下次启动的 killOrphanedProcessesMac 清扫
+      this.logToManager('warn', '看护脚本未及时停止，退出语境跳过提权弹框（下次启动清扫孤儿）');
+      this.finishStop();
+      return;
+    }
+    this.logToManager('warn', '看护脚本未及时停止 sing-box，退回提权终止');
     return new Promise((resolve) => {
-      // 先尝试 SIGTERM 优雅终止
       const killProcess = spawn('/usr/bin/osascript', [
         '-e',
         `do shell script "kill -TERM ${pidToKill}" with administrator privileges`,
       ]);
 
       killProcess.on('exit', async (code) => {
+        let ok = true;
         if (code === 0) {
-          // 等待进程退出
           await this.waitForProcessExit(pidToKill, 3000);
-
-          // 检查进程是否真的退出了
           if (this.isProcessAlive(pidToKill)) {
             this.logToManager('warn', '进程未响应 SIGTERM，尝试强制终止...');
-            await this.forceKillProcess(pidToKill);
+            ok = await this.forceKillOrReportCancelled(pidToKill);
           } else {
             this.logToManager('info', 'sing-box 进程已停止');
           }
         } else {
           this.logToManager('warn', `停止 sing-box 进程可能失败，退出码: ${code}`);
-          // 尝试强制终止
-          await this.forceKillProcess(pidToKill);
+          ok = await this.forceKillOrReportCancelled(pidToKill);
         }
-
-        // 清理 PID 文件
-        const fsSync = require('fs');
-        try {
-          fsSync.unlinkSync(this.getPidFilePath());
-        } catch {
-          // 忽略错误
-        }
-
-        this.cleanup();
-
-        // 触发停止事件
-        this.emit('stopped');
-        this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
-
+        if (ok) this.finishStop(); // 取消授权(进程仍活) → 不谎报已停止（M3）
         resolve();
       });
 
       killProcess.on('error', async (error) => {
         this.logToManager('error', `停止 sing-box 进程失败: ${error.message}`);
-        // 尝试强制终止
         await this.forceKillProcess(pidToKill);
         this.cleanup();
         resolve();
@@ -3187,25 +5569,60 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
   /**
    * 停止 sing-box 进程（Windows TUN 模式）
-   * sing-box 以管理员权限（UAC）启动，停止时也需要管理员权限
-   * 使用 PowerShell Start-Process -Verb RunAs 来请求 UAC 权限执行 taskkill
+   * 主路径（批2 Win-B）：写 stopflag → 提权看护脚本 ~1s 内 Stop-Process 收割 —— 停止零 UAC。
+   * 兜底：等待超时（跨版本旧直起无看护 / 看护异常）且非退出语境 → RunAs taskkill（一次 UAC，
+   * 与旧版语义一致）；退出语境恪守零弹框不变量 → 仅 log 跳过（父进程消失后看护脚本自行收割，
+   * 确无看护的残留交下次启动的提权清扫）。
    */
-  private async stopSingBoxOnWindows(): Promise<void> {
+  private async stopSingBoxOnWindows(opts?: { quitting?: boolean }): Promise<void> {
     if (!this.singboxPid) {
       this.cleanup();
       return;
     }
 
     const pidToKill = this.singboxPid;
-    this.logToManager('info', `正在停止 sing-box 进程 (PID: ${pidToKill})，需要管理员权限...`);
 
+    // 进程已不在 → 直接收尾，免一次 UAC（镜像 macOS M1-a）
+    if (!this.isProcessAlive(pidToKill)) {
+      this.logToManager('info', 'sing-box 进程已不在，跳过提权终止');
+      this.finishStop();
+      return;
+    }
+
+    // 主路径：写 stopflag，由提权看护脚本收割 sing-box —— 停止无需再次 UAC
+    this.logToManager('info', `正在停止 sing-box (PID: ${pidToKill})，通知看护脚本...`);
+    try {
+      require('fs').writeFileSync(this.getStopFlagPath(), '');
+    } catch (e) {
+      this.logToManager('warn', `写 stopflag 失败: ${e instanceof Error ? e.message : String(e)}`);
+    }
+    // 看护脚本 1s 轮询 + Stop-Process，5s 覆盖足够；退出语境压到 3s（cleanupResources 8s 预算内）
+    if (await this.waitForProcessExit(pidToKill, opts?.quitting ? 3000 : 5000)) {
+      this.logToManager('info', 'sing-box 已由看护脚本停止（无需 UAC）');
+      this.finishStop();
+      return;
+    }
+
+    // 超时：看护脚本未收口（跨版本边界：旧版 Start-Process 直起无看护；或看护异常退出）
+    if (opts?.quitting) {
+      // 退出语境零弹框（跨平台不变量）：跳过 RunAs taskkill。父进程消失后看护脚本仍会 ~1s 收割；
+      // 确无看护时残留交下次启动的提权清扫（watchdog 步骤 a）。stopflag 留给看护消费/下次启动清理。
+      this.logToManager(
+        'warn',
+        `看护脚本未及时停止 sing-box（PID ${pidToKill}），退出语境跳过 UAC 弹框（父死看护/下次启动清扫兜底）`
+      );
+      this.finishStop();
+      return;
+    }
+
+    this.logToManager('warn', '看护脚本未及时停止 sing-box，退回提权 taskkill（需要 UAC 授权）...');
     return new Promise((resolve) => {
-      // 直接使用 PowerShell 以管理员权限执行 taskkill
-      // sing-box 以 UAC 启动，必须用 UAC 权限才能终止
+      // RunAs taskkill 兜底：覆盖旧版直起（无看护）与看护异常两种情形，一次 UAC（与旧版语义一致）。
+      // /FI "IMAGENAME eq sing-box.exe" 防 PID 复用误杀（值含空格→ -ArgumentList 元素须内嵌双引号；VM 实测通过）。
       const psScript =
         "Start-Process -FilePath 'taskkill' -ArgumentList '/F','/PID','" +
         pidToKill.toString() +
-        "' -Verb RunAs -Wait -WindowStyle Hidden";
+        "','/FI','\"IMAGENAME eq sing-box.exe\"' -Verb RunAs -Wait -WindowStyle Hidden";
 
       const killProcess = spawn(
         'powershell.exe',
@@ -3227,20 +5644,14 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           this.logToManager('warn', `停止进程结果: code=${code}`);
         }
 
-        // 清理 PID 文件
-        const fsSync = require('fs');
+        // 兜底路径无看护脚本消费 stopflag → 主动清掉，防下次会话看护误触发
         try {
-          fsSync.unlinkSync(this.getPidFilePath());
+          require('fs').unlinkSync(this.getStopFlagPath());
         } catch {
-          // 忽略错误
+          /* 忽略 */
         }
 
-        this.cleanup();
-
-        // 触发停止事件
-        this.emit('stopped');
-        this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
-
+        this.finishStop();
         resolve();
       });
 
@@ -3253,15 +5664,19 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
-   * 等待进程退出
+   * 等待进程退出。
+   * T16 子 commit 3：改 public 供 PlatformPrivilegeService.ctx.waitForProcessExit 回调注入（stopElevated 用）。
    */
-  private async waitForProcessExit(pid: number, timeout: number): Promise<boolean> {
+  async waitForProcessExit(pid: number, timeout: number): Promise<boolean> {
     const startTime = Date.now();
+    // win32 的 isProcessAlive 走 tasklist execSync（每次阻塞主循环 ~50-100ms）→ 放宽轮询到 400ms 降低阻塞；
+    // mac/linux 走 ps（轻量）→ 维持 100ms 更快感知退出。(批2 P2-3，VM 实测收割 0.5-0.7s 远小于超时)
+    const pollMs = process.platform === 'win32' ? 400 : 100;
     while (Date.now() - startTime < timeout) {
       if (!this.isProcessAlive(pid)) {
         return true;
       }
-      await new Promise((resolve) => setTimeout(resolve, 100));
+      await new Promise((resolve) => setTimeout(resolve, pollMs));
     }
     return !this.isProcessAlive(pid);
   }
@@ -3269,8 +5684,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   /**
    * 强制终止进程
    */
-  private async forceKillProcess(pid: number): Promise<void> {
-    return new Promise((resolve) => {
+  private async forceKillProcess(pid: number): Promise<boolean> {
+    await new Promise<void>((resolve) => {
       const killProcess = spawn('/usr/bin/osascript', [
         '-e',
         `do shell script "kill -9 ${pid}" with administrator privileges`,
@@ -3290,6 +5705,35 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         resolve();
       });
     });
+    // 复核：osascript 取消授权时进程仍活 → 返回 false，调用方据此不谎报已停止（L4）。
+    return !this.isProcessAlive(pid);
+  }
+
+  /**
+   * 提权强杀 + 诚实兜底（L4/M3）：成功（进程已死）→ 返回 true，调用方照常 finishStop。
+   * 取消授权致进程仍活 → 发 STOP_AUTH_CANCELLED 非终态提示 + 返回 false，调用方**不** finishStop（不谎报已停止）。
+   * 残留 sing-box 会被下次启动的 resolveClashApiPortConflict 按端口清掉。
+   */
+  private async forceKillOrReportCancelled(pid: number): Promise<boolean> {
+    const killed = await this.forceKillProcess(pid);
+    if (killed || !this.isProcessAlive(pid)) return true;
+    this.notifyStopAuthCancelled();
+    return false;
+  }
+
+  /**
+   * 通知「停止被取消授权」（发 STOP_AUTH_CANCELLED 非终态提示）。
+   * T16 子 commit 3：从原 forceKillOrReportCancelled 抽出事件发送副作用——service.stopElevated 检测到
+   * 取消授权（进程仍存活）时经 ctx.onStopAuthCancelled 回调触发本方法（service 不持 IPC 通道）。
+   * 原 forceKillOrReportCancelled 保留兜底版（privilegeService 未注入时），内部改调本方法去重。
+   */
+  notifyStopAuthCancelled(): void {
+    this.logToManager('error', '强制终止被取消，sing-box 仍在运行（下次启动会自动清理占用端口）');
+    this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_ERROR, {
+      message: '停止被取消授权，代理仍在运行。请重试停止或在下次启动时自动清理。',
+      errorCode: ProxyErrorCode.STOP_AUTH_CANCELLED,
+      code: -4,
+    });
   }
 
   /**
@@ -3302,96 +5746,93 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     this.pid = null;
     this.singboxPid = null;
     this.startTime = null;
+    this.startedViaHelper = false;
+    // 进程已停 → 探针端口失效，置 null 让 IpInfoService 知道代理出口不可测
+    this.probeDirectPort = null;
+    this.probeProxyPort = null;
+  }
+
+  /** 注入 macOS 提权 helper（index.ts 启动时调用）。 */
+  setHelperManager(helperManager: HelperManager): void {
+    this.helperManager = helperManager;
+  }
+
+  /** 注入系统代理管理器（index.ts 启动时调用，须为同一 singleton）。系统代理单一写者收口于 ProxyManager。 */
+  setSystemProxyManager(systemProxyManager: ISystemProxyManager): void {
+    this.systemProxyManager = systemProxyManager;
+  }
+
+  /** 注入「杀核前静默 clash_api 客户端」回调（停 StatsService + 关其 9090 连接）。防 9090 TIME_WAIT（P0-2）。 */
+  setQuiesceClashClients(cb: () => void): void {
+    this.quiesceClashClients = cb;
+  }
+
+  /** 注入 ClashApiClient（T15：clash_api 调用收口到单一 client，与 StatsService 共用 agent）。 */
+  setClashApiClient(client: ClashApiClient): void {
+    this.clashApiClient = client;
+  }
+
+  /** 注入平台提权服务（T16：原提权纯函数迁出，delegate 后调用点零改动）。镜像 setClashApiClient 注入。 */
+  setPrivilegeService(service: PlatformPrivilegeService): void {
+    this.privilegeService = service;
   }
 
   /**
-   * 清理可能残留的 sing-box 进程
-   * 这是解决"重启代理后网络不恢复"问题的关键
+   * 当前是否处于 TUN 模式（只读公开判定）。供 PlatformPrivilegeService.ctx.isTunMode 回调注入，
+   * 替代原 needsRootPrivilege 的 private currentConfig 隐式读取被外部 service 直接访问。
+   * 语义与 needsRootPrivilege 的 TUN 判定一致（不含平台门控，纯模式判定）。
    */
-  private async killOrphanedSingBoxProcesses(): Promise<void> {
-    if (process.platform === 'darwin') {
-      await this.killOrphanedProcessesMac();
-    } else if (process.platform === 'win32') {
-      await this.killOrphanedProcessesWindows();
-    }
+  isTunModeNow(): boolean {
+    return this.currentConfig?.proxyModeType === 'tun';
+  }
+
+  // ─── T16 子 commit 2：killOrphans 链迁出后的只读 getter（供 PlatformPrivilegeService.ctx 回调注入）──
+
+  /** 本次 start 是否交互式（非交互=崩溃自动重启）。供 service.escalateKillRootOrphans 非交互保护。 */
+  isStartInteractive(): boolean {
+    return this.startInteractive;
+  }
+
+  /** sing-box 配置文件路径（macOS 系统代理模式 pgrep 匹配 orphan 用）。 */
+  getConfigPath(): string {
+    return this.configPath;
+  }
+
+  /** sing-box 核心可执行路径（Linux pgrep 匹配 orphan 用）。 */
+  getSingboxPath(): string {
+    return this.singboxPath;
+  }
+
+  /** 当前管理的 sing-box PID（singboxPid || pid），供 killOrphans 排除避免误杀自己；null 表示无。 */
+  getCurrentManagedPid(): number | null {
+    return this.singboxPid || this.pid;
+  }
+
+  /** 注入 helper 引导门控回调（index.ts 启动时调用）。收敛单点，见 maybePromptHelperGate。 */
+  setHelperGate(fn: (hs: HelperStatus, config: UserConfig) => Promise<'proceed' | 'abort'>): void {
+    this.helperGate = fn;
+  }
+
+  /** 本次代理是否经 helper 启动（供「卸载 helper 前先零提权停核」判定，避免卸载后 stop 裸弹 osascript）。 */
+  isStartedViaHelper(): boolean {
+    return this.startedViaHelper;
   }
 
   /**
-   * macOS: 清理残留的 sing-box 进程
-   * 优化：排除当前正在管理的进程，避免误杀
-   *
-   * 注意：TUN 模式下 sing-box 以 root 权限运行，必须用 osascript 请求管理员权限才能终止
+   * 清理可能残留的 sing-box 进程（顶层平台分发）。
+   * T16 子 commit 2：实现迁入 PlatformPrivilegeService.killOrphans，此处 delegate。
+   * startInternal:658 调用点不变；ROOT_ORPHAN_BLOCKED 异常仍从此冒泡到 attemptAutoRestart 判终态。
    */
-  private async killOrphanedProcessesMac(): Promise<void> {
-    return new Promise((resolve) => {
-      // 使用 pgrep 查找所有 sing-box 进程
-      const pgrep = spawn('/usr/bin/pgrep', ['-f', 'sing-box']);
-      let pids = '';
-
-      pgrep.stdout.on('data', (data: Buffer) => {
-        pids += data.toString();
-      });
-
-      pgrep.on('close', async () => {
-        let pidList = pids
-          .trim()
-          .split('\n')
-          .filter((p) => p.trim())
-          .map((p) => parseInt(p.trim(), 10))
-          .filter((p) => !isNaN(p) && p > 0);
-
-        // 排除当前正在管理的进程（避免误杀）
-        const currentPid = this.singboxPid || this.pid;
-        if (currentPid) {
-          pidList = pidList.filter((p) => p !== currentPid);
-        }
-
-        if (pidList.length === 0) {
-          resolve();
-          return;
-        }
-
-        this.logToManager(
-          'warn',
-          `发现 ${pidList.length} 个残留的 sing-box 进程，正在清理: ${pidList.join(', ')}`
-        );
-
-        // TUN 模式下 sing-box 以 root 权限运行，必须用 osascript 请求管理员权限终止
-        const killCmd = pidList.map((p) => `kill -9 ${p}`).join('; ');
-        const killProcess = spawn('/usr/bin/osascript', [
-          '-e',
-          `do shell script "${killCmd}" with administrator privileges`,
-        ]);
-
-        killProcess.on('close', async (code) => {
-          if (code === 0) {
-            this.logToManager('info', '残留进程已清理');
-          } else {
-            this.logToManager('warn', `清理残留进程可能失败，退出码: ${code}`);
-          }
-          // 等待系统完全清理 TUN 接口和路由表
-          await this.waitForNetworkCleanup();
-          resolve();
-        });
-
-        killProcess.on('error', async (error) => {
-          this.logToManager('warn', `清理残留进程失败: ${error.message}`);
-          await this.waitForNetworkCleanup();
-          resolve();
-        });
-      });
-
-      pgrep.on('error', () => {
-        resolve();
-      });
-    });
+  private async killOrphanedSingBoxProcesses(isTunMode: boolean): Promise<void> {
+    await this.privilegeService?.killOrphans(isTunMode);
   }
 
   /**
-   * 等待网络清理完成
-   * sing-box 进程终止后，系统需要时间清理 TUN 接口和路由表
+   * 等待网络清理完成（sing-box 进程终止后系统清理 TUN 接口/路由表）。
+   * T16 子 commit 2：随 killOrphans 链迁出后，此方法被 PlatformPrivilegeService.ctx 回调注入；
+   * 仅 ~6 行实现 + 无私有状态依赖，留 ProxyManager（与 isProcessAlive 同属进程状态判定工具）。
    */
-  private async waitForNetworkCleanup(): Promise<void> {
+  async waitForNetworkCleanup(): Promise<void> {
     // 等待 2 秒让系统清理 TUN 接口
     await new Promise((resolve) => setTimeout(resolve, 2000));
 
@@ -3413,81 +5854,14 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
-   * Windows: 清理残留的 sing-box 进程
-   * 优化：排除当前正在管理的进程，避免误杀
-   */
-  private async killOrphanedProcessesWindows(): Promise<void> {
-    return new Promise((resolve) => {
-      const { execSync } = require('child_process');
-
-      try {
-        // 使用 wmic 获取所有 sing-box.exe 进程的 PID
-        const result = execSync(
-          'wmic process where "name=\'sing-box.exe\'" get ProcessId /format:list',
-          {
-            encoding: 'utf-8',
-            windowsHide: true,
-            stdio: ['ignore', 'pipe', 'ignore'],
-          }
-        );
-
-        // 解析 PID 列表
-        const pidMatches = result.match(/ProcessId=(\d+)/g);
-        if (!pidMatches || pidMatches.length === 0) {
-          resolve();
-          return;
-        }
-
-        let pidList = pidMatches
-          .map((m: string) => parseInt(m.replace('ProcessId=', ''), 10))
-          .filter((p: number) => !isNaN(p) && p > 0);
-
-        // 排除当前正在管理的进程
-        const currentPid = this.singboxPid || this.pid;
-        if (currentPid) {
-          pidList = pidList.filter((p: number) => p !== currentPid);
-        }
-
-        if (pidList.length === 0) {
-          resolve();
-          return;
-        }
-
-        this.logToManager(
-          'warn',
-          `发现 ${pidList.length} 个残留的 sing-box 进程，正在清理: ${pidList.join(', ')}`
-        );
-
-        // 逐个终止进程
-        for (const pid of pidList) {
-          try {
-            execSync(`taskkill /F /PID ${pid}`, {
-              windowsHide: true,
-              stdio: 'ignore',
-            });
-          } catch {
-            // 忽略单个进程终止失败
-          }
-        }
-
-        this.logToManager('info', '残留进程已清理');
-
-        // 等待一小段时间让系统清理
-        setTimeout(resolve, 500);
-      } catch {
-        // wmic 命令失败，可能没有残留进程
-        resolve();
-      }
-    });
-  }
-
-  /**
    * 检查进程是否存活
    *
    * 统一使用系统命令检测进程，避免 Node.js process.kill(pid, 0) 在检测
    * 特权进程时的不可靠性（macOS/Windows TUN 模式下 sing-box 以管理员权限运行）
+   *
+   * T16 子 commit 2：改 public 供 PlatformPrivilegeService.ctx 回调注入（killOrphans 复核存活用）。
    */
-  private isProcessAlive(pid: number): boolean {
+  isProcessAlive(pid: number): boolean {
     try {
       const { execSync } = require('child_process');
 
@@ -3549,11 +5923,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       return;
     }
 
-    // TUN 模式下只检查 singboxPid（sing-box 的实际 PID）
-    // 系统代理模式下检查 pid（直接启动的进程 PID）
-    // 注意：TUN 模式下 this.pid 是 osascript/PowerShell 的 PID，不是 sing-box 的
-    const isTunMode = this.currentConfig?.proxyModeType === 'tun';
-    const activePid = isTunMode ? this.singboxPid : this.singboxPid || this.pid;
+    // 判定依据与 getStatus 一致：经包装进程(osascript/UAC)启动才取 singboxPid，否则取 pid。
+    // 修复 Linux TUN（直接 spawn，singboxPid 恒 null）下健康检查/自动重启完全失效（issue #33）。
+    const wrapperMode = this.needsOsascript() || this.needsWindowsUAC();
+    const activePid = wrapperMode ? this.singboxPid : this.singboxPid || this.pid;
 
     if (!activePid) {
       return;
@@ -3571,6 +5944,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       this.singboxProcess = null;
       this.pid = null;
       this.singboxPid = null;
+      // 进程已死 → 复位 helper 标志，避免随后自动重启若回退非 helper 路径时，停止仍误走 helper 分支。
+      this.startedViaHelper = false;
       this.stopLogFileWatcher();
 
       // 尝试自动重启
@@ -3585,11 +5960,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
         this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_ERROR, {
           message: 'sing-box 进程多次异常退出，请检查网络或服务器配置后手动重启',
+          errorCode: ProxyErrorCode.RESTART_LIMIT_REACHED,
           code: -1,
         });
 
         this.emit('stopped');
         this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
+
+        // 终态：清掉曾指向我们的系统代理，避免进程已死但系统代理仍指向死端口致全网断（marker 门控、单飞）。
+        void this.ensureSystemProxyCleared();
 
         // 完全清理
         this.cleanup();
@@ -3625,6 +6004,25 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     this.autoRestartSuppressed = suppressed;
   }
 
+  /** 核心更新二进制替换窗口内置位（CoreUpdateService.installCoreFromDir 调）：拒绝手动启动/重启/切模式，防撞半替换核。 */
+  setCoreSwapInProgress(inProgress: boolean): void {
+    this.coreSwapInProgress = inProgress;
+  }
+
+  /**
+   * core-swap 手动轴门控：内核二进制替换进行中时拒绝手动 start/restart/switchMode。抛带 CORE_UPDATE_IN_PROGRESS
+   * code 的错，经 IPC 链（register wrappedHandler 转 ApiResponse.code）让渲染端提示「内核更新中」（H-2：勿静默 reject
+   * 致 UI 卡「未连接」）。仅拦手动轴——崩溃轴（install-vs-autoRestart）已由 shouldAutoRestart 检 autoRestartSuppressed 覆盖。
+   */
+  private rejectIfCoreSwapInProgress(action: string): void {
+    if (this.coreSwapInProgress) {
+      this.logToManager('warn', `内核更新进行中，已拒绝手动${action}（防撞半替换核）`);
+      const err = new Error('内核更新进行中，请稍候再试') as Error & { code?: ProxyErrorCode };
+      err.code = ProxyErrorCode.CORE_UPDATE_IN_PROGRESS;
+      throw err;
+    }
+  }
+
   /** 当前配置是否含 naive 节点（naive 依赖随 app 打包的 libcronet，核心更新可能引入 ABI 漂移）。 */
   hasNaiveNodes(): boolean {
     return (this.currentConfig?.servers || []).some(
@@ -3643,28 +6041,74 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     if (!this.currentConfig) {
       return;
     }
+    // 用户已主动停止 → 不再自动重启（M3）。覆盖「自循环 setTimeout 唤醒」与「健康检查再次触发」两个入口。
+    // 不是裸 return：若标记是「自动重启 start 腿窗口内用户停止」遗留（stop 因 refs null 早退而 start 已完成），
+    // 此后二次崩溃会走到这里——必须做终态收尾（emit stopped + 清系统代理 + cleanup），否则 UI 卡「已连接」、
+    // systemProxy 指向死端口静默断网（M-1′）。幂等：cleanup 后 refs 清空、健康检查不再触发。
+    if (this.autoRestartAborted) {
+      this.finalizeUserAbortedRestart();
+      return;
+    }
+    // 快照生命周期世代：退避后比对，若被更新的 start/stop 接管则让位（M-2′）。在 isRestarting 置位前取，
+    // 这样本方法稍后自己调的 start() 对 gen 的递增不影响本次比对基线。
+    const myGen = this.lifecycleGeneration;
 
     this.isRestarting = true;
+    this.restartingGen = myGen; // 记在途腿世代，供 handleProcessExit 判 supersede（M-2′-G1）
     this.restartCount++;
     this.lastRestartTime = Date.now();
 
+    // 退避：第 1 次 2s、第 2 次 5s、第 3 次 15s——端口/helper 等外部资源需时间释放，固定 2s 纯刷屏。
+    const backoffMs = this.restartCount <= 1 ? 2000 : this.restartCount === 2 ? 5000 : 15000;
     this.logToManager(
       'warn',
-      `正在尝试自动重启 sing-box (第 ${this.restartCount}/${ProxyManager.MAX_RESTART_COUNT} 次)...`
+      `正在尝试自动重启 sing-box (第 ${this.restartCount}/${ProxyManager.MAX_RESTART_COUNT} 次，${Math.round(backoffMs / 1000)}s 后)...`
     );
 
     // 通知前端正在重启
     this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_ERROR, {
       message: `sing-box 进程异常退出，正在自动重启 (${this.restartCount}/${ProxyManager.MAX_RESTART_COUNT})...`,
+      errorCode: ProxyErrorCode.AUTO_RESTARTING,
+      errorParams: { attempt: this.restartCount, max: ProxyManager.MAX_RESTART_COUNT },
       code: -2, // 特殊代码表示正在重启
     });
 
+    let retryScheduled = false;
     try {
-      // 等待一小段时间让系统清理
-      await new Promise((resolve) => setTimeout(resolve, 2000));
+      // 退避等待，让系统/端口/helper 释放
+      await new Promise((resolve) => setTimeout(resolve, backoffMs));
 
-      // 重新启动
-      await this.start(this.currentConfig);
+      // 退避期间用户已主动停止 → 放弃本次自动重启（用户意图优先，M3：否则停了又被拉起）。
+      if (this.autoRestartAborted) {
+        this.finalizeUserAbortedRestart();
+        return; // finally 复位 isRestarting；retryScheduled 仍 false → 不再自循环调度
+      }
+      // 退避期间已有更新的 start/stop 接管生命周期（如用户手动 start——它会 reset autoRestartAborted 绕过上面的
+      // 检查）→ 让位，不起第二条 start 流（杜绝双启动流互杀进程/撞 9090/误清对方系统代理，M-2′）。
+      // 注：stop 接管会先置 autoRestartAborted=true 走上面的 abort 分支，故到这里的 supersede 必是 start 接管。
+      if (this.lifecycleGeneration !== myGen) {
+        // 精确判据用 crashWhileSuperseded（仅 handleProcessExit 真崩溃时置位），不用 refs 快照——否则「接管 start
+        // 尚未 spawn（如卡在 helper 引导框）refs 暂为 null」会被误判成接管已死 → 补发重启与接管 start 双流。
+        const recover = this.crashWhileSuperseded;
+        this.crashWhileSuperseded = false;
+        if (recover) {
+          // 接管会话在本腿退避期内崩溃、其崩溃信号被本腿 isRestarting dedup 吞掉 → 无人恢复 → 补发一次自动重启
+          // 兜底，避免 limbo/死端口断网（M-2′-G1）。schedGen + refs 守卫：补发前若又被新操作接管/已起来则不补。
+          this.logToManager('warn', '接管会话在退避期内崩溃，补发一次自动重启兜底');
+          const schedGen = this.lifecycleGeneration;
+          setTimeout(() => {
+            if (this.lifecycleGeneration !== schedGen) return; // 已被更新的 start/stop 接管
+            if (this.singboxProcess || this.singboxPid) return; // 期间已起来
+            void this.attemptAutoRestart();
+          }, 0);
+        } else {
+          this.logToManager('info', '自动重启已让位（检测到更新的启动/停止操作接管）');
+        }
+        return; // finally 复位 isRestarting
+      }
+
+      // 重新启动（崩溃自动重启：interactive:false，禁 helper 引导模态，防崩溃循环弹窗风暴）
+      await this.start(this.currentConfig, { interactive: false });
 
       this.logToManager('info', 'sing-box 自动重启成功');
 
@@ -3678,24 +6122,154 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       const errorMessage = error instanceof Error ? error.message : String(error);
       this.logToManager('error', `自动重启失败: ${errorMessage}`);
 
-      // 如果还有重试机会，会在下次健康检查时再次尝试
-      if (this.restartCount >= ProxyManager.MAX_RESTART_COUNT) {
-        this.emit('error', {
-          message: `自动重启失败: ${errorMessage}`,
-          code: -1,
-        });
-
-        this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_ERROR, {
-          message: `自动重启失败，请手动重启: ${errorMessage}`,
-          code: -1,
-        });
-
-        this.emit('stopped');
-        this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
-        this.cleanup();
+      // 不可恢复（helper 不可用 / 权限 / gate 取消）或已达上限 → 立即终态；否则退避后再试。
+      // 修 limbo：原实现 count<MAX 时什么都不做，而 performHealthCheck 因 pid 已清空永不再触发 →
+      // UI 永久卡在 AUTO_RESTARTING(x/3)、且系统代理永不回滚。现由本方法自循环驱动重试直到成功或终态。
+      if (
+        this.restartCount >= ProxyManager.MAX_RESTART_COUNT ||
+        this.isUnrecoverableRestartError(errorMessage)
+      ) {
+        await this.giveUpAutoRestart(errorMessage);
+      } else {
+        retryScheduled = true;
       }
     } finally {
       this.isRestarting = false;
+      this.restartingGen = -1; // 本腿离场 → 清在途世代（M-2′-G1）
+    }
+
+    // isRestarting 已复位后再调度下一次（否则被入口幂等去重挡掉）；退避在下一次 attemptAutoRestart 内部按计数计算。
+    // 快照世代并在 fire 时比对：覆盖「finally 复位 isRestarting 到本回调 fire」之间的 macrotask 缝隙——
+    // 该缝隙内 refs=null+isRestarting=false，stop() 不置 autoRestartAborted，仅靠世代变化拦下重试（L-1′）。
+    if (retryScheduled) {
+      const schedGen = this.lifecycleGeneration;
+      setTimeout(() => {
+        if (this.lifecycleGeneration !== schedGen) return; // 调度后已被 start/stop 接管 → 不再重试
+        void this.attemptAutoRestart();
+      }, 0);
+    }
+  }
+
+  /**
+   * 自动重启被用户主动停止打断 → 终态收尾：emit stopped + 清系统代理（marker 门控，非主动 stop 语境 stopping=false
+   * → 会真清，覆盖「racy start 已重设 systemProxy」的情形）+ cleanup。修 M-1′ 静默 limbo/断网。
+   */
+  private finalizeUserAbortedRestart(): void {
+    this.crashWhileSuperseded = false; // 用户已停止 → 不需补发，清陈旧标记（M-2′-G1 防陈旧）
+    // 注：重复 emit stopped 幂等无害（渲染端 stopProxy 还有 IPC resolve 兜底），不加「已干净则跳过」守卫——
+    // 否则 M3「退避期停止、marker 已被前置清理、refs 已 null」会被守卫吞掉这次必要的 stopped 事件。
+    this.logToManager('info', '自动重启已取消（用户主动停止）');
+    this.emit('stopped');
+    this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
+    void this.ensureSystemProxyCleared();
+    this.cleanup();
+  }
+
+  /**
+   * 自动重启彻底放弃 → 终态：上报错误 + emit stopped + 清理。
+   * 系统代理失败回滚由 ensureSystemProxyCleared 在此统一收口（T3 注入 systemProxyManager 后挂入）。
+   */
+  private async giveUpAutoRestart(errorMessage: string): Promise<void> {
+    this.crashWhileSuperseded = false; // 已终态放弃 → 清陈旧补发标记（M-2′-G1 防陈旧）
+    this.emit('error', { message: `自动重启失败: ${errorMessage}`, code: -1 });
+    this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_ERROR, {
+      message: `自动重启失败，请手动重启: ${errorMessage}`,
+      errorCode: ProxyErrorCode.AUTO_RESTART_FAILED,
+      code: -1,
+    });
+    this.emit('stopped');
+    this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
+    await this.ensureSystemProxyCleared();
+    // 场景 B：TUN 自动重启（非交互、无法弹引导框）因提权助手被系统「后台活动」关闭而终态失败 →
+    // 桌面通知引导用户恢复（native Notification 无窗口依赖，托盘态/窗口关闭也能送达）。
+    await this.maybeNotifyHelperBackgroundDisabled();
+    this.cleanup();
+  }
+
+  /**
+   * 提权助手被「后台活动」(BTM, macOS 13+) 关闭致 TUN 终态失败时，发桌面通知引导用户去系统设置重新允许 /
+   * 在 app 内修复并启动。仅 darwin + 确为 backgroundDisabled 才发，避免对普通失败误报。通知失败不影响终态。
+   */
+  private async maybeNotifyHelperBackgroundDisabled(): Promise<void> {
+    if (process.platform !== 'darwin' || !this.helperManager) return;
+    try {
+      const hs = await this.helperManager.getStatus().catch(() => null);
+      if (!hs?.backgroundDisabled) return;
+      if (!Notification.isSupported()) return;
+      const n = new Notification({
+        title: 'FlowZ 提权助手被系统关闭',
+        body: '「允许在后台」中本应用的提权助手被关闭，TUN 自动启动失败。请在「系统设置 > 通用 > 登录项与扩展」重新打开；点按本通知可直接打开设置。',
+      });
+      n.on('click', () => void shell.openExternal(LOGIN_ITEMS_SETTINGS_URL).catch(() => {}));
+      n.show();
+    } catch {
+      /* 通知失败不影响终态 */
+    }
+  }
+
+  /** 不可恢复的自动重启错误（helper 不可用 / 权限 / gate 取消 / 孤儿占端口未清）→ 不再重试，立即终态。 */
+  private isUnrecoverableRestartError(message: string): boolean {
+    const m = message.toLowerCase();
+    return (
+      m.includes('权限') ||
+      m.includes('permission') ||
+      m.includes('helper_gate_aborted') ||
+      m.includes('提权助手不可用') ||
+      m.includes('提权助手引导') ||
+      m.includes('root_orphan_blocked') ||
+      m.includes('root 残留') ||
+      m.includes('clash_api_port_busy') ||
+      m.includes('clash_api 端口 9090')
+    );
+  }
+
+  /**
+   * 系统代理统一清理收口（public）：仅当系统代理确由 FlowZ 设置（marker 在 + 实查指向我们）才 disable，
+   * 杜绝失败/崩溃/外部死亡后系统代理指向死端口致全网断，也不误清用户自配代理。
+   * 调用方：① ProxyManager 内部终态（giveUp / 健康检查达上限 / handleProcessExit 信号死·崩溃 / 去抖重启 catch /
+   * restart 的 start 腿失败）；② index.ts 'stopped'/'error' 监听器（外部死亡兜底）；③ IPC PROXY_STOP / 托盘 onStop
+   * （用户主动停止，stop() 前置调用）。统一经此 → 不再有「无门控直 disableProxy」的 Writer C（修 C1 竞态 + M4 stomp）。
+   * 门控：stopping（主动停止/重启中跳过，由 start reconcile 或前置清理负责，免与 enable 并发打架）+ 单飞 + marker。
+   */
+  async ensureSystemProxyCleared(): Promise<void> {
+    if (this.stopping) return; // 主动停止/重启中 → 跳过，避免清了又被 start() reconcile 设回的竞态
+    if (this.clearingSystemProxy) return; // 单飞：多路终态并发只清一次
+    const mgr = this.systemProxyManager;
+    if (!mgr) return;
+    // 仅当系统代理确由 FlowZ 设置（marker 在）才动手 → 杜绝误清用户自配代理
+    const marker = SystemProxyBase.readMarker();
+    if (!marker) return;
+
+    this.clearingSystemProxy = true;
+    try {
+      const status = await mgr.getProxyStatus().catch(() => null);
+      // 与启动期 marker 恢复同口径：精确 host:port 或 host 匹配（兜 mac socks 端口与 http 端口不同的情形）
+      const markerHost = marker.ourHostPort.split(':')[0];
+      const pointsToUs = (p?: string): boolean =>
+        !!p && (p === marker.ourHostPort || p.split(':')[0] === markerHost);
+      const stillOurs =
+        !!status?.enabled &&
+        (pointsToUs(status.httpProxy) ||
+          pointsToUs(status.httpsProxy) ||
+          pointsToUs(status.socksProxy));
+
+      if (stillOurs) {
+        // 系统代理仍指向我们的（已死的）端口 → disable：内部 restore 原始（已被 stripSelf 置 null → 简单关）+ 删 marker
+        await mgr.disableProxy();
+        this.logToManager('info', '终态已清除系统代理（曾指向 FlowZ，避免死端口致全网断）');
+      } else {
+        // 已关 / 用户手改指向别处 → 仅清失真 marker；但若期间已被新一轮 enable 写了新 marker（host:port 变了）
+        // 则保留，防误删新会话 marker 致其兜底全瞎（C1 的 marker 删除竞态防护）。
+        const cur = SystemProxyBase.readMarker();
+        if (cur && cur.ourHostPort === marker.ourHostPort) SystemProxyBase.clearMarkerFile();
+      }
+    } catch (e) {
+      this.logToManager(
+        'warn',
+        `终态清除系统代理失败: ${e instanceof Error ? e.message : String(e)}`
+      );
+    } finally {
+      this.clearingSystemProxy = false;
     }
   }
 
@@ -3822,47 +6396,19 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
-   * 将规则文件复制到 User Data 目录
-   * 解决 macOS TUN 模式下特权进程无法读取 Downloads/Documents 目录的问题
+   * 将内置规则文件落地到 User Data 运行时目录。
+   * 解决 macOS TUN 模式下特权进程无法读取 Downloads/Documents 目录的问题。
+   *
+   * seed-if-missing-or-invalid（不再无条件覆盖）：仅当运行时文件缺失/损坏时从出厂版补种，
+   * 已存在的合法文件原样保留——否则「规则资源」页对内置项的网络更新会在下次启动被出厂版静默回滚。
+   * 内容更新由 sing-box ≥1.10 fswatch 热重载，不经此处。详见 builtin-geo-rulesets.seedBuiltinRuleSets。
    */
   private async copyRuleSetsToUserData(): Promise<void> {
-    const rulesDir = this.getRuleSetRuntimeDir();
-
-    // 确保目录存在
     try {
-      if (!require('fs').existsSync(rulesDir)) {
-        require('fs').mkdirSync(rulesDir, { recursive: true });
-      }
+      await seedBuiltinRuleSets();
     } catch (error) {
-      this.logToManager('error', `创建规则目录失败: ${error}`);
-      return;
-    }
-
-    // 与 generateRouteConfig 引用同一真值表：dest 文件名即 route 里 path 指向的文件名
-    const filesToCopy = this.getLocalGeoRuleSets().map((rs) => ({
-      src: rs.srcPath,
-      dest: rs.fileName,
-    }));
-
-    const fs = require('fs/promises');
-
-    for (const file of filesToCopy) {
-      try {
-        const destPath = path.join(rulesDir, file.dest);
-
-        // 检查源文件是否存在
-        if (!require('fs').existsSync(file.src)) {
-          this.logToManager('warn', `源规则文件不存在: ${file.src}`);
-          continue;
-        }
-
-        // 复制文件（覆盖）
-        await fs.copyFile(file.src, destPath);
-        // this.logToManager('debug', `已复制规则文件: ${file.dest}`);
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        this.logToManager('error', `复制规则文件失败 ${file.dest}: ${errorMessage}`);
-      }
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      this.logToManager('error', `内置规则补种失败: ${errorMessage}`);
     }
   }
 
@@ -3983,12 +6529,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
       // 空消息不记录（如私有 IP 超时）
       if (friendlyMessage) {
-        this.logToManager(logInfo.level, friendlyMessage);
+        this.logToManager(logInfo.level, friendlyMessage, 'sing-box');
       }
     } else {
       // 无法解析的日志，尝试对原始行也进行标签转换
       const resolvedLine = this.resolveTagsToNames(line);
-      this.logToManager('info', resolvedLine);
+      this.logToManager('info', resolvedLine, 'sing-box');
     }
   }
 
@@ -4088,7 +6634,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 过滤掉日志中的时间戳部分进行对比（例如：+0800 2026-04-05 12:05:01 ）
     // 这样即便 stdout 和 logFile 的时间戳有微秒级差异，也能正确去重
     const stripTimestamp = (msg: string) =>
-      msg.replace(/\+\d{4}\s\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\s/, '');
+      msg.replace(/[+-]\d{4}\s\d{4}-\d{2}-\d{2}\s\d{2}:\d{2}:\d{2}\s/, '');
     const cleanMessage = stripTimestamp(trimmedMessage);
 
     // 1. 如果新消息与缓冲区中的任意消息内容（忽略时间戳）相同，则认为是重复
@@ -4122,26 +6668,26 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private parseSingBoxLog(
     line: string
   ): { level: 'debug' | 'info' | 'warn' | 'error' | 'fatal'; message: string } | null {
-    // sing-box 日志格式示例：
-    // 2024-01-01 12:00:00 INFO message
-    // 2024-01-01 12:00:00 [INFO] message
-
-    // 尝试匹配日志级别
-    const levelMatch = line.match(/\b(DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\b/i);
-    if (!levelMatch) {
+    // sing-box 日志格式（timestamp:true 恒带时间戳，含可选时区前缀）：
+    //   +0800 2026-04-05 12:00:00 INFO message
+    //   2026-04-05 12:00:00 INFO message
+    //   2026-04-05 12:00:00 [INFO] message
+    // 关键修复：级别 token 锚定到「行首时间戳紧随其后」的位置，而非全行任意位置匹配 —— 否则 message 正文里
+    // 出现的 error/fatal/warn 等词会把整行误标成该级别（如 "INFO downloaded geosite, 0 fatal" 被误判 FATAL）。
+    const m = line.match(
+      /^(?:[+-]\d{4}\s+)?\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+\[?(DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\]?\s/i
+    );
+    if (!m) {
       return null;
     }
 
-    let level = levelMatch[1].toUpperCase();
+    let level = m[1].toUpperCase();
     if (level === 'WARNING') {
       level = 'WARN';
     }
 
-    // 提取消息内容（去掉时间戳和级别）
-    const message = line
-      .replace(/^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}/, '')
-      .replace(/\[?(DEBUG|INFO|WARN|WARNING|ERROR|FATAL)\]?/i, '')
-      .trim();
+    // message = 时间戳 + 级别之后的剩余内容（m[0] 含到级别后的那个空白）
+    const message = line.slice(m[0].length).trim();
 
     return {
       level: level.toLowerCase() as 'debug' | 'info' | 'warn' | 'error' | 'fatal',
@@ -4195,8 +6741,45 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 翻译错误消息为友好的中文提示
    * 返回格式：友好提示 + 原始错误（如果有翻译）
    */
+  /** 当前配置的全部节点域名集（address + serverName，去 IP 字面量，小写）。错误归因判定被解析域名是否为节点域名。 */
+  private collectNodeDomains(): Set<string> {
+    const set = new Set<string>();
+    for (const s of this.currentConfig?.servers || []) {
+      for (const d of [s.address, s.tlsSettings?.serverName]) {
+        if (d && !isIpv4Host(d) && !isIpv6Host(d)) set.add(d.toLowerCase());
+      }
+    }
+    return set;
+  }
+
+  /**
+   * #57 DNS 解析失败归因。sing-box 节点域名 dial 解析失败的典型日志形如：
+   *   `lookup xxx.trycloudflare.com: SERVFAIL` / `... no such host` / `... i/o timeout`。
+   * 命中 `lookup ` + (servfail|no such host|i/o timeout) 视为 DNS lookup 失败；按被解析域名是否属节点域名集
+   * 区分 'node'（引导用户切换节点域名解析器档位自救）/ 'generic'（普通 DNS 失败）。未命中返回 null。
+   * 注意：'i/o timeout' 在 lookup 语境下属 DNS 失败，故本判定须先于通用 timeout 分支，避免误归类为连接超时。
+   */
+  private matchDnsLookupFailure(lowerMessage: string): 'node' | 'generic' | null {
+    if (!lowerMessage.includes('lookup ')) return null;
+    if (
+      !(
+        lowerMessage.includes('servfail') ||
+        lowerMessage.includes('no such host') ||
+        lowerMessage.includes('i/o timeout')
+      )
+    ) {
+      return null;
+    }
+    // 提取 `lookup <domain>` 的域名（到首个空白/冒号止），与节点域名集比对。
+    const m = lowerMessage.match(/lookup\s+([^\s:]+)/);
+    const domain = m ? m[1] : '';
+    if (domain && this.collectNodeDomains().has(domain)) return 'node';
+    return 'generic';
+  }
+
   private translateErrorMessage(message: string): string {
-    console.error(message);
+    // （删除原 console.error(message)：该函数对每条解析后的 sing-box 日志行都会调用，原样 dump 到主进程
+    //   控制台 = 与 logManager 正常记录重复的纯噪音，且无视 logLevel 过滤。诊断改看 app.log / 渲染端日志面板。）
     const lowerMessage = message.toLowerCase();
 
     // 常见错误模式匹配
@@ -4209,6 +6792,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       lowerMessage.includes('connect: connection refused')
     ) {
       return `连接被拒绝：无法连接到代理服务器，请检查服务器地址和端口是否正确 [${message}]`;
+    }
+
+    // #57：DNS lookup 失败须先于通用 timeout 分支（`lookup x: i/o timeout` 属 DNS 失败而非连接超时）。
+    const dnsLookup = this.matchDnsLookupFailure(lowerMessage);
+    if (dnsLookup === 'node') {
+      return `节点域名解析失败：无法解析代理节点域名（可能是当前 DNS 对该域名返回 SERVFAIL）。可在 设置→网络 切换节点域名解析器为 DNSPod 或系统 DNS 后重试 [${message}]`;
+    }
+    if (dnsLookup === 'generic') {
+      return `DNS 解析失败：无法解析服务器域名，请检查 DNS 设置 [${message}]`;
     }
 
     if (lowerMessage.includes('timeout') || lowerMessage.includes('timed out')) {
@@ -4261,14 +6853,85 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
+   * 与 translateErrorMessage 同序镜像分类，仅并行产出结构化错误码；translateErrorMessage 的输出
+   * （含日志路径）保持逐字不变，零回归风险。新增 includes 分支顺序必须与上面一致。
+   */
+  private classifyCoreError(message: string): ProxyErrorCode {
+    const lowerMessage = message.toLowerCase();
+    if (lowerMessage.includes('report handshake success: connection refused'))
+      return ProxyErrorCode.DEST_CONNECTION_REFUSED;
+    if (
+      lowerMessage.includes('connection refused') ||
+      lowerMessage.includes('connect: connection refused')
+    )
+      return ProxyErrorCode.CONNECTION_REFUSED;
+    // #57：与 translateErrorMessage 同序镜像——DNS lookup 失败先于通用 timeout 分支（防 `lookup x: i/o timeout` 误归类）。
+    // node/generic 同复用既有 DNS_RESOLVE_FAILED 错误码（不加枚举，零 UI 联动），文案区分在 translate 侧。
+    if (this.matchDnsLookupFailure(lowerMessage) !== null) return ProxyErrorCode.DNS_RESOLVE_FAILED;
+    if (lowerMessage.includes('timeout') || lowerMessage.includes('timed out'))
+      return ProxyErrorCode.CONNECTION_TIMEOUT;
+    if (lowerMessage.includes('dns') && lowerMessage.includes('fail'))
+      return ProxyErrorCode.DNS_RESOLVE_FAILED;
+    if (
+      (lowerMessage.includes('certificate') ||
+        lowerMessage.includes('tls') ||
+        lowerMessage.includes('ssl')) &&
+      !lowerMessage.includes('anytls') &&
+      !lowerMessage.includes('shadowtls')
+    )
+      return ProxyErrorCode.TLS_CERT_ERROR;
+    if (lowerMessage.includes('authentication failed') || lowerMessage.includes('auth fail'))
+      return ProxyErrorCode.AUTH_FAILED;
+    if (lowerMessage.includes('permission denied') || lowerMessage.includes('access denied'))
+      return ProxyErrorCode.PERMISSION_DENIED;
+    if (
+      lowerMessage.includes('address already in use') ||
+      lowerMessage.includes('bind: address already in use')
+    )
+      return ProxyErrorCode.PORT_IN_USE;
+    if (lowerMessage.includes('invalid config') || lowerMessage.includes('config error'))
+      return ProxyErrorCode.CONFIG_INVALID;
+    return ProxyErrorCode.UNKNOWN;
+  }
+
+  /** 退出码 → 错误码（镜像 parseExitError 的 switch）。 */
+  private classifyExitCode(code: number): ProxyErrorCode {
+    switch (code) {
+      case 1:
+        return ProxyErrorCode.STARTUP_FAILED;
+      case 2:
+        return ProxyErrorCode.CONFIG_INVALID;
+      case 126:
+        return ProxyErrorCode.BINARY_NOT_EXECUTABLE;
+      case 127:
+        return ProxyErrorCode.BINARY_NOT_FOUND;
+      case 137:
+        return ProxyErrorCode.PROCESS_KILLED;
+      default:
+        return ProxyErrorCode.PROCESS_EXITED;
+    }
+  }
+
+  /** handleProcessExit 用：优先 lastErrorOutput 分类，无果再按退出码（与 parseExitError 取值同序）。 */
+  private classifyExitError(code: number): ProxyErrorCode {
+    if (this.lastErrorOutput) {
+      const c = this.classifyCoreError(this.lastErrorOutput);
+      if (c !== ProxyErrorCode.UNKNOWN) return c;
+    }
+    return this.classifyExitCode(code);
+  }
+
+  /**
    * 记录日志到 LogManager
    */
   private logToManager(
     level: 'debug' | 'info' | 'warn' | 'error' | 'fatal',
-    message: string
+    message: string,
+    source: string = 'ProxyManager'
   ): void {
     if (this.logManager) {
-      this.logManager.addLog(level, message, 'sing-box');
+      // T6：编排维度默认 'ProxyManager'；sing-box 内核 stdout 经 parseAndLogLine 传 'sing-box' 区分。
+      this.logManager.addLog(level, message, source);
     }
   }
 
@@ -4287,6 +6950,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 发送到前端
     this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_ERROR, {
       message: errorMessage,
+      errorCode: this.classifyCoreError(error.message),
       error: error.message,
     });
   }
@@ -4310,6 +6974,13 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       // 仅当 shouldAutoRestart 放行（未被核心更新校验窗口抑制、未达上限）时重启；否则下沉到 error 上报，
       // 由主进程做核心回滚 / 放弃恢复。崩溃不触发换节点（换节点交给心跳连通性检测）。
       if (this.shouldAutoRestart()) {
+        // 若有在途自动重启腿但它已被更新的 start 接管(supersede=世代已变)、注定让位 → 标记崩溃，
+        // 让那条腿醒来补发一次重启；否则本崩溃信号会被 attemptAutoRestart 入口的 isRestarting dedup 吞掉、
+        // 接管会话死后无人恢复 → limbo/死端口断网（M-2′-G1）。下面的 attemptAutoRestart 在 supersede 时会被
+        // dedup 早退（无害），真正的恢复由让位腿消费 crashWhileSuperseded 完成。
+        if (this.isRestarting && this.lifecycleGeneration !== this.restartingGen) {
+          this.crashWhileSuperseded = true;
+        }
         this.singboxProcess = null;
         this.pid = null;
         this.singboxPid = null;
@@ -4328,15 +6999,19 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       // 发送到前端
       this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_ERROR, {
         message: errorMessage,
+        errorCode: this.classifyExitError(code),
         code,
         signal,
       });
     } else {
-      // 正常退出，触发停止事件
+      // 正常退出 / 被信号终止（SIGTERM/SIGKILL）：触发停止事件
       this.emit('stopped');
       this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_STOPPED, {});
     }
 
+    // 终态收口（自动重启分支已在上方 return，到此即进程不再拉起）：清掉曾指向我们的系统代理。
+    // 覆盖「外部 SIGKILL / OOM / 达上限异常退出」——主动停止已由 IPC/托盘前置 disable（marker 门控下此处幂等 no-op）。
+    void this.ensureSystemProxyCleared();
     this.cleanup();
   }
 
@@ -4398,158 +7073,5 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    */
   private getSingBoxPath(): string {
     return resourceManager.getSingBoxPath();
-  }
-
-  /**
-   * 设置系统代理
-   */
-  private async setSystemProxy(config: UserConfig): Promise<void> {
-    const port = config.httpPort || 2080;
-    const host = '127.0.0.1';
-
-    this.logToManager('info', `正在设置系统代理 (${host}:${port})...`);
-
-    if (process.platform === 'win32') {
-      try {
-        const { exec } = require('child_process');
-        const runCommand = (cmd: string) =>
-          new Promise((resolve, reject) => {
-            exec(cmd, (error: any) => {
-              if (error) reject(error);
-              else resolve(null);
-            });
-          });
-
-        // 启用代理
-        await runCommand(
-          `reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyEnable /t REG_DWORD /d 1 /f`
-        );
-        // 设置代理服务器
-        await runCommand(
-          `reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyServer /t REG_SZ /d "${host}:${port}" /f`
-        );
-        // 设置代理忽略列表（例外），对每个域名同时生成三种格式以最大化兼容性：
-        //   *.domain.com → WinINet 标准格式（传统 C++ 应用如同花顺/网银客户端）
-        //   *domain.com  → Chrome/Chromium 内核专用格式（无点前缀，解决 Chrome 不认带点通配符的问题）
-        //   domain.com   → 精确根域名匹配（兜底，确保根域名本身也被旁路）
-        const domainBypassEntries = DOMESTIC_BANK_AND_STOCK_DOMAINS.flatMap((d) => {
-          const base = d.startsWith('.') ? d.slice(1) : d;
-          return [`*.${base}`, `*${base}`, base];
-        }).join(';');
-        const bypassDomains =
-          '<local>;localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;' +
-          domainBypassEntries;
-        await runCommand(
-          `reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyOverride /t REG_SZ /d "${bypassDomains}" /f`
-        );
-
-        // 核心修复：修改注册表后必须通过 WinINet API 向操作系统发送刷新广播，否则各大浏览器和后台服务（包括网银插件）会一直使用旧的代理缓存，遇到重启必失效。
-        const refreshCmd = `powershell -NoProfile -Command "$sig = '[DllImport(\\"wininet.dll\\")] public static extern bool InternetSetOption(int hInternet, int dwOption, int lpBuffer, int dwBufferLength);'; $type = Add-Type -MemberDefinition $sig -Name 'WinInet' -Namespace 'Proxy' -PassThru; $type::InternetSetOption(0, 39, 0, 0); $type::InternetSetOption(0, 37, 0, 0);"`;
-        try {
-          await runCommand(refreshCmd);
-        } catch (e) {
-          this.logToManager('warn', `WinINet 代理缓存刷新失败 (可能被阻止): ${e}`);
-        }
-
-        this.logToManager('info', 'Windows 系统代理已设置 (附带例外清单并刷新缓存)');
-      } catch (error) {
-        this.logToManager('error', `设置 Windows 系统代理失败: ${error}`);
-      }
-    } else if (process.platform === 'darwin') {
-      try {
-        const { execSync } = require('child_process');
-        const socksPort = config.socksPort || 2081;
-
-        // 动态获取所有网络服务名称，避免硬编码导致部分网卡失效
-        const servicesOutput = execSync('networksetup -listallnetworkservices').toString();
-        const services = servicesOutput
-          .split('\n')
-          .filter(
-            (s: string) =>
-              s &&
-              !s.includes('*') &&
-              s !== 'An asterisk (*) denotes that a network service is disabled.'
-          );
-
-        for (const service of services) {
-          try {
-            const s = service.trim();
-            execSync(`networksetup -setwebproxy "${s}" ${host} ${port}`);
-            execSync(`networksetup -setsecurewebproxy "${s}" ${host} ${port}`);
-            execSync(`networksetup -setsocksfirewallproxy "${s}" ${host} ${socksPort}`);
-          } catch {
-            // ignore
-          }
-        }
-        this.logToManager('info', 'macOS 系统代理已设置');
-      } catch (error) {
-        this.logToManager('error', `设置 macOS 系统代理失败: ${error}`);
-      }
-    }
-  }
-
-  /**
-   * 取消系统代理
-   */
-  private async unsetSystemProxy(): Promise<void> {
-    this.logToManager('info', '正在取消系统代理...');
-
-    if (process.platform === 'win32') {
-      try {
-        const { exec } = require('child_process');
-        const runCommand = (cmd: string) =>
-          new Promise((resolve, reject) => {
-            exec(cmd, (error: any) => {
-              if (error) reject(error);
-              else resolve(null);
-            });
-          });
-
-        // 禁用代理
-        await runCommand(
-          `reg add "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings" /v ProxyEnable /t REG_DWORD /d 0 /f`
-        );
-
-        // 核心修复：修改注册表后必须通过 WinINet API 向操作系统发送刷新广播
-        const refreshCmd = `powershell -NoProfile -Command "$sig = '[DllImport(\\"wininet.dll\\")] public static extern bool InternetSetOption(int hInternet, int dwOption, int lpBuffer, int dwBufferLength);'; $type = Add-Type -MemberDefinition $sig -Name 'WinInet' -Namespace 'Proxy' -PassThru; $type::InternetSetOption(0, 39, 0, 0); $type::InternetSetOption(0, 37, 0, 0);"`;
-        try {
-          await runCommand(refreshCmd);
-        } catch {
-          // ignore
-        }
-
-        this.logToManager('info', 'Windows 系统代理已取消 (并刷新系统缓存)');
-      } catch (error) {
-        this.logToManager('error', `取消 Windows 系统代理失败: ${error}`);
-      }
-    } else if (process.platform === 'darwin') {
-      try {
-        const { execSync } = require('child_process');
-        // 动态获取所有服务并关闭代理
-        const servicesOutput = execSync('networksetup -listallnetworkservices').toString();
-        const services = servicesOutput
-          .split('\n')
-          .filter(
-            (s: string) =>
-              s &&
-              !s.includes('*') &&
-              s !== 'An asterisk (*) denotes that a network service is disabled.'
-          );
-
-        for (const service of services) {
-          try {
-            const s = service.trim();
-            execSync(`networksetup -setwebproxystate "${s}" off`);
-            execSync(`networksetup -setsecurewebproxystate "${s}" off`);
-            execSync(`networksetup -setsocksfirewallproxystate "${s}" off`);
-          } catch {
-            // ignore
-          }
-        }
-        this.logToManager('info', 'macOS 系统代理已取消');
-      } catch (error) {
-        this.logToManager('error', `取消 macOS 系统代理失败: ${error}`);
-      }
-    }
   }
 }

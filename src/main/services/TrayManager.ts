@@ -8,8 +8,18 @@ import {
   shell,
 } from 'electron';
 import { LogManager } from './LogManager';
-import { ServerConfig, ProxyMode, SubscriptionConfig } from '../../shared/types';
+import { ServerConfig, ProxyMode, ProxyModeType, SubscriptionConfig } from '../../shared/types';
 import { groupServersBySubscription } from '../../shared/server-grouping';
+
+// 托盘菜单状态圆点（macOS 系统色，18px 抗锯齿）——替代旧的 emoji 大圆圈，更克制现代。
+const STATUS_DOT_PNG: Record<'connected' | 'disconnected' | 'error', string> = {
+  connected:
+    'iVBORw0KGgoAAAANSUhEUgAAABIAAAASCAYAAABWzo5XAAABaklEQVR4nLWUsS9DURTGv3Pf5Un7eKKLRWJjYG3ErIv9LsR/ItGXGPwdGoa+3cIsYrXUJrEYVChafb29n0Ef9dpIVH3juef8zjk551xgTJIfXwkxsVEAEJvYQcDf4QkxVeNlzaZqPHB48kEjIWnmtXMzZ7VeBQBt7dXFevyQ9RkO6jkUT7ZnMC/7ALcAKfQe64Ac4467l5tHjSxMvkHKe7JUus3PTL6d6dAvdh7bQNc5AICn1MSsD/vUvmwkUxvXpwuvKEdMYeqz/9goRJELVPNAh34xuW8l6JIQURBR6JLJfSvRoV8MVPMAUeTSQXxV1Ctz+XSnEEzbG1GSo6VABlqnaCEdmy/PerFWqtTTWPVZDYAgb1eU7+VoHQYgH2mF1kH5Xi7I25X+WDXgPKLG2xoENFXj1UqVOh0Pdegrkh2wb1cIkuzo0Fd0PKyVKnVTNV46tbGN/x8WMgMDfnciwzWWo80C//SNjKB3ueTmNzrOQ7YAAAAASUVORK5CYII=',
+  disconnected:
+    'iVBORw0KGgoAAAANSUhEUgAAABIAAAASCAYAAABWzo5XAAABmklEQVR4nLWUMW7bQBBF/wwlktgVUkQXyAGcVifIFaTCdxBSqCMMmAQMw42K2EV6Fy6WV8gJ0toHyAU2BSERJG3OpBBpKIxsIII91WL/zNvZnZkF3sjoNVFVKc9zBoD5fC5EpP9FV1VyzgXDfedcoKoHDx8dgnQnt+v1+iMQf94p1f1isfg98DkM6h3Oz799mE7DC4BOiTDdadZfX3+/8745I6JiCKN9SJqmZIyxUTT5Ya2dbTYbqKoAABHxZDLBdrv9WdebL2VZbtM01R7GPSjPc86yTMZjc2WtnRVF0YiIdj4sIloURWOtnY3H5irLMukL8ZxRn+bl5c00jvUX88i07RMR0V8Pq6oaBCMVeSqrij4lydL3sdxnAwBRxCdhGBuRFkNIdz0SaRGGsYkiPtmP5aHzsfbcbABQ1/LQNFXJHEBV/2k+VVXmAE1TlXUtD/ux3KWszrkgSZYeoFtrDQN43Id168edRrdJsvTOuaCv2puVf1iVVxoSHtA775uzLPv6ckMOYQAwHJHVavXiiBy0Y4b2fb+RY+wP33oSwpBBhJQAAAAASUVORK5CYII=',
+  error:
+    'iVBORw0KGgoAAAANSUhEUgAAABIAAAASCAYAAABWzo5XAAABQklEQVR4nK2UTUoDQRCFv+qZNmMUF+YCLgRF4tLgAfQIvfEsggRc5BxZuMkR9ACSLAWJ4MILxIX4OxPmuZAJOhmFxHnL+nlV1a+qoSbYX06BEYIDYDDIDbQQu8AUQjRnDyHSL8XnjAIrKutwb5N4ZR+AaXpj17eP5ZhKoiJAne0NGuvnyE4wa305NcF0wcfzqQ3vn8pk9p2EM4zLnTVs9QrvO0wzyMkBcDhiD1k2RG9HHN+90EUFmZu1E4KzLjmW9PC+Q5qlCGE4DIcQaZbifQdLetYlnwlRdDQb6WC3hU8eMGuCrOINBSakV7L3LRuNJ0WuK7oBoJG0iVwTqVIIwJAgck0aSft7rqsIXgr1jmYghRDZaDzB1MfHDpHxc1eEyPCxw9S30XiiEKJCtdrkr38hy2Sw2IlUolajLRP+6xtZBp8CmLpNChT41AAAAABJRU5ErkJggg==',
+};
 
 /**
  * 托盘图标状态
@@ -26,6 +36,7 @@ export interface TrayMenuData {
   subscriptions?: SubscriptionConfig[];
   selectedServerId: string | null;
   proxyMode: ProxyMode;
+  proxyModeType: ProxyModeType;
 }
 
 /**
@@ -41,6 +52,7 @@ export interface ITrayManager {
    * 销毁托盘图标
    */
   destroyTray(): void;
+  hasTray(): boolean;
 
   /**
    * 更新托盘图标状态
@@ -77,6 +89,7 @@ export class TrayManager implements ITrayManager {
   private subscriptions: SubscriptionConfig[] = [];
   private selectedServerId: string | null = null;
   private proxyMode: ProxyMode = 'smart';
+  private proxyModeType: ProxyModeType = 'systemProxy';
   // 应用内语言设置，由渲染进程通过 IPC 同步过来，默认跟随系统
   private currentLanguage: string = app.getLocale?.() || 'zh-CN';
 
@@ -87,6 +100,7 @@ export class TrayManager implements ITrayManager {
   private onQuit?: () => void;
   private onSelectServer?: (serverId: string) => void;
   private onChangeProxyMode?: (mode: ProxyMode) => void;
+  private onChangeProxyModeType?: (modeType: ProxyModeType) => void;
   private onOpenSettings?: () => void;
   private onCheckUpdate?: () => void;
   private onManageServers?: () => void;
@@ -108,6 +122,7 @@ export class TrayManager implements ITrayManager {
       onQuit?: () => void;
       onSelectServer?: (serverId: string) => void;
       onChangeProxyMode?: (mode: ProxyMode) => void;
+      onChangeProxyModeType?: (modeType: ProxyModeType) => void;
       onOpenSettings?: () => void;
       onCheckUpdate?: () => void;
       onManageServers?: () => void;
@@ -124,6 +139,7 @@ export class TrayManager implements ITrayManager {
     this.onQuit = callbacks?.onQuit;
     this.onSelectServer = callbacks?.onSelectServer;
     this.onChangeProxyMode = callbacks?.onChangeProxyMode;
+    this.onChangeProxyModeType = callbacks?.onChangeProxyModeType;
     this.onOpenSettings = callbacks?.onOpenSettings;
     this.onCheckUpdate = callbacks?.onCheckUpdate;
     this.onManageServers = callbacks?.onManageServers;
@@ -154,10 +170,15 @@ export class TrayManager implements ITrayManager {
       this.tray = new Tray(icon);
       this.tray.setToolTip('FlowZ');
 
-      // 设置托盘图标点击事件
-      this.tray.on('click', () => {
-        this.handleTrayClick();
-      });
+      // 托盘点击行为：
+      // macOS —— 单击弹出菜单（setContextMenu 原生行为，再点别处自动收回），不直接开主窗口；
+      //          主窗口仅经菜单「打开主窗口」打开（符合 macOS 菜单栏惯例）。
+      // Win/Linux —— 保留单击打开主窗口（右键弹菜单）。
+      if (process.platform !== 'darwin') {
+        this.tray.on('click', () => {
+          this.handleTrayClick();
+        });
+      }
 
       // 创建上下文菜单
       this.updateTrayMenu(false);
@@ -181,6 +202,11 @@ export class TrayManager implements ITrayManager {
       this.tray = null;
       this.logManager.addLog('info', 'Tray icon destroyed', 'TrayManager');
     }
+  }
+
+  /** 托盘图标是否真实存在（createTray 可能失败被静默吞 → this.tray=null）。供 window-all-closed 判定避免无图标僵尸驻留。 */
+  hasTray(): boolean {
+    return this.tray !== null;
   }
 
   /**
@@ -224,6 +250,7 @@ export class TrayManager implements ITrayManager {
       subscriptions: this.subscriptions,
       selectedServerId: this.selectedServerId,
       proxyMode: this.proxyMode,
+      proxyModeType: this.proxyModeType,
     });
   }
 
@@ -258,16 +285,21 @@ export class TrayManager implements ITrayManager {
     this.subscriptions = data.subscriptions || [];
     this.selectedServerId = data.selectedServerId;
     this.proxyMode = data.proxyMode;
+    this.proxyModeType = data.proxyModeType;
 
     // 状态显示：使用 emoji 区分不同状态
     // 🔵 蓝色 = 已连接，⚪ 灰色 = 已断开，🔴 红色 = 连接异常
     let statusLabel: string;
+    let statusState: 'connected' | 'disconnected' | 'error';
     if (data.hasError) {
-      statusLabel = this.t('🔴 连接异常', '🔴 Connection Error');
+      statusLabel = this.t('连接异常', 'Connection Error');
+      statusState = 'error';
     } else if (data.isProxyRunning) {
-      statusLabel = this.t('🔵 已连接', '🔵 Connected');
+      statusLabel = this.t('已连接', 'Connected');
+      statusState = 'connected';
     } else {
-      statusLabel = this.t('⚪ 已断开', '⚪ Disconnected');
+      statusLabel = this.t('已断开', 'Disconnected');
+      statusState = 'disconnected';
     }
 
     // 构建服务器子菜单（按订阅/自建分组：单组平铺，多组用嵌套子菜单——节点多时更易导航）
@@ -342,12 +374,32 @@ export class TrayManager implements ITrayManager {
       click: () => this.handleChangeProxyMode(mode),
     }));
 
+    // 接管方式（systemProxy/tun/manual）子菜单——无需打开主窗口即可切换
+    const proxyModeTypeLabels: Record<ProxyModeType, string> = {
+      systemProxy: this.t('系统代理', 'System Proxy'),
+      tun: this.t('TUN 网卡', 'TUN'),
+      manual: this.t('仅本地', 'Local Only'),
+    };
+    const proxyModeTypeSubmenu: MenuItemConstructorOptions[] = (
+      ['systemProxy', 'tun', 'manual'] as ProxyModeType[]
+    ).map((modeType) => ({
+      label: proxyModeTypeLabels[modeType],
+      type: 'radio' as const,
+      checked: data.proxyModeType === modeType,
+      click: () => this.handleChangeProxyModeType(modeType),
+    }));
+
     const contextMenu = Menu.buildFromTemplate([
       {
         label: statusLabel,
+        icon: this.statusDotIcon(statusState),
         enabled: false,
       },
       { type: 'separator' },
+      {
+        label: this.t('打开主窗口', 'Open Main Window'),
+        click: () => this.handleShowWindow(),
+      },
       {
         label: data.isProxyRunning
           ? this.t('禁用代理', 'Disable Proxy')
@@ -366,14 +418,14 @@ export class TrayManager implements ITrayManager {
         submenu: serverSubmenu,
       },
       {
-        label: this.t('代理模式', 'Proxy Mode'),
+        label: this.t('接管方式', 'Takeover'),
+        submenu: proxyModeTypeSubmenu,
+      },
+      {
+        label: this.t('分流策略', 'Routing'),
         submenu: proxyModeSubmenu,
       },
       { type: 'separator' },
-      {
-        label: this.t('打开主窗口', 'Open Main Window'),
-        click: () => this.handleShowWindow(),
-      },
       {
         label: this.t('进入轻量模式', 'Enter Lightweight Mode'),
         click: () => this.handleLightweightMode(),
@@ -427,6 +479,8 @@ export class TrayManager implements ITrayManager {
       // 高 DPI 屏幕会自动使用 @2x 版本
       if (process.platform === 'darwin') {
         icon = icon.resize({ width: 18, height: 18 });
+        // 不用模板图：模板图强制单色，会抹掉「已连接(蓝)/未连接(灰)」的颜色区分，菜单栏看起来恒亮。
+        // 连接态用彩色 app.png / 灰色 app-gray.png 区分（updateTrayIcon 按状态切换）。
       }
     } else {
       // 图标文件不存在，创建一个简单的默认图标
@@ -495,8 +549,6 @@ export class TrayManager implements ITrayManager {
     if (this.onLightweightMode) {
       this.onLightweightMode();
     } else if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-      this.mainWindow.webContents.send('lightweight-mode-active');
-
       // 销毁窗口，释放整个 Chromium 渲染进程（最大内存释放）
       this.mainWindow.destroy();
       this.logManager.addLog('info', 'Main window destroyed for lightweight mode', 'TrayManager');
@@ -512,7 +564,6 @@ export class TrayManager implements ITrayManager {
         // 手动触发 V8 GC（需要启动时已调用 v8.setFlagsFromString('--expose-gc')）
         if (typeof (global as any).gc === 'function') {
           (global as any).gc();
-          console.log('[LightweightMode] V8 GC triggered');
         }
       }, 500);
     }
@@ -573,6 +624,18 @@ export class TrayManager implements ITrayManager {
     this.logManager.addLog('info', `Proxy mode changed from tray: ${mode}`, 'TrayManager');
     if (this.onChangeProxyMode) {
       this.onChangeProxyMode(mode);
+    }
+  }
+
+  /** 托盘状态行的小圆点图标（绿/灰/红），替代旧 emoji。 */
+  private statusDotIcon(state: 'connected' | 'disconnected' | 'error'): Electron.NativeImage {
+    return nativeImage.createFromDataURL(`data:image/png;base64,${STATUS_DOT_PNG[state]}`);
+  }
+
+  private handleChangeProxyModeType(modeType: ProxyModeType): void {
+    this.logManager.addLog('info', `Takeover mode changed from tray: ${modeType}`, 'TrayManager');
+    if (this.onChangeProxyModeType) {
+      this.onChangeProxyModeType(modeType);
     }
   }
 
@@ -687,10 +750,10 @@ export class TrayManager implements ITrayManager {
   }
 
   /**
-   * 获取托盘是否已创建（用于测试）
+   * 获取托盘是否已创建（用于测试）。语义同 hasTray，委托之避免双真值源日后分叉。
    */
   isTrayCreated(): boolean {
-    return this.tray !== null;
+    return this.hasTray();
   }
 
   /**

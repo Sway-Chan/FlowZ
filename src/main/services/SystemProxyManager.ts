@@ -5,7 +5,12 @@
 
 import { exec } from 'child_process';
 import { promisify } from 'util';
+import * as fs from 'fs';
+import * as path from 'path';
 import { retry } from '../utils/retry';
+import { getUserDataPath } from '../utils/paths';
+import type { LogManager } from './LogManager';
+import type { LogLevel } from '../../shared/types';
 
 const execAsync = promisify(exec);
 
@@ -42,6 +47,9 @@ export interface ISystemProxyManager {
    * 获取代理状态
    */
   getProxyStatus(): Promise<SystemProxyStatus>;
+
+  /** 注入日志 sink（批次 B：系统代理日志改走 LogManager 进 app.log）。 */
+  setLogManager(lm: LogManager): void;
 }
 
 /**
@@ -49,6 +57,101 @@ export interface ISystemProxyManager {
  */
 export abstract class SystemProxyBase implements ISystemProxyManager {
   protected originalSettings: SystemProxyStatus | null = null;
+
+  private logManager?: LogManager;
+  setLogManager(lm: LogManager): void {
+    this.logManager = lm;
+  }
+
+  /**
+   * 统一日志出口；LogManager 未注入时 fallback console（SystemProxyManager 可能早于 LogManager 初始化，不 brick）
+   */
+  protected log(level: LogLevel, message: string): void {
+    if (this.logManager) {
+      this.logManager.addLog(level, message, 'SystemProxy');
+      return;
+    }
+    if (level === 'error' || level === 'fatal') console.error(message);
+    else if (level === 'warn') console.warn(message);
+    else console.log(message);
+  }
+
+  /** 持久化 marker 文件路径（userData/system-proxy.marker.json） */
+  private static getMarkerPath(): string {
+    return path.join(getUserDataPath(), 'system-proxy.marker.json');
+  }
+
+  /**
+   * 写入持久化 marker（enableProxy 成功后调用）
+   * 记录"系统代理由 FlowZ 设置"，供崩溃/强杀后下次启动恢复与退出兜底门控使用。
+   * 同步 fs API（文件极小）；失败仅告警，绝不抛出影响代理设置结果。
+   */
+  protected writeMarker(ourHostPort: string): void {
+    try {
+      fs.writeFileSync(
+        SystemProxyBase.getMarkerPath(),
+        JSON.stringify({ ourHostPort, at: Date.now() })
+      );
+    } catch (error) {
+      this.log('warn', `写入系统代理 marker 失败: ${error}`);
+    }
+  }
+
+  /**
+   * 删除持久化 marker（disableProxy / disableProxySync 成功后调用）
+   * 同步 fs API，可安全用于 process'exit' 等同步退出路径；失败仅告警，绝不抛出。
+   */
+  protected clearMarker(): void {
+    SystemProxyBase.clearMarkerFile();
+  }
+
+  /** 删除持久化 marker（静态入口，供启动恢复清理失效 marker）；失败仅告警，绝不抛出 */
+  static clearMarkerFile(): void {
+    try {
+      fs.rmSync(SystemProxyBase.getMarkerPath(), { force: true });
+    } catch (error) {
+      console.warn('删除系统代理 marker 失败:', error);
+    }
+  }
+
+  /** 读取持久化 marker；文件不存在或内容损坏一律返回 null（启动恢复/退出门控用） */
+  static readMarker(): { ourHostPort: string } | null {
+    try {
+      const raw = fs.readFileSync(SystemProxyBase.getMarkerPath(), 'utf-8');
+      const data = JSON.parse(raw);
+      if (data && typeof data.ourHostPort === 'string' && data.ourHostPort) {
+        return { ourHostPort: data.ourHostPort };
+      }
+      return null;
+    } catch {
+      // ENOENT / JSON 损坏 → 视为无 marker
+      return null;
+    }
+  }
+
+  /**
+   * 防自指：若"原始设置"已指向我们自己的代理（127.0.0.1:&lt;httpPort&gt; 或同 marker），返回 null（视为无原始）。
+   * 杜绝 enableProxy 把自己设的代理当原始保存 → 之后 disableProxy 的 restore 把死端口代理设回去致全网断。
+   */
+  protected static stripSelf(
+    status: SystemProxyStatus | null,
+    address: string,
+    httpPort: number
+  ): SystemProxyStatus | null {
+    if (!status?.enabled) return status;
+    const ours = `${address}:${httpPort}`;
+    const markerHostPort = SystemProxyBase.readMarker()?.ourHostPort;
+    const pointsToUs = (p?: string): boolean =>
+      !!p && (p === ours || (!!markerHostPort && p === markerHostPort));
+    if (
+      pointsToUs(status.httpProxy) ||
+      pointsToUs(status.httpsProxy) ||
+      pointsToUs(status.socksProxy)
+    ) {
+      return null;
+    }
+    return status;
+  }
 
   abstract enableProxy(address: string, httpPort: number, socksPort: number): Promise<void>;
   abstract disableProxy(): Promise<void>;
@@ -67,17 +170,22 @@ export class WindowsSystemProxy extends SystemProxyBase {
   /**
    * 启用系统代理
    */
-  async enableProxy(address: string, httpPort: number, socksPort: number): Promise<void> {
-    console.log(
-      `正在设置 Windows 系统代理: ${address}:${httpPort} (SOCKS 端口 ${socksPort} 仅供手动配置)`
-    );
+  async enableProxy(address: string, httpPort: number, _socksPort: number): Promise<void> {
+    this.log('info', '正在设置 Windows 系统代理');
 
-    // 保存原始设置
+    // marker 提前写（intent）：enable 期间崩溃也留 marker，供下次启动恢复。
+    this.writeMarker(`${address}:${httpPort}`);
+
+    // 保存原始设置（防自指：已指向我们自己的代理 → 视为无原始，杜绝 disable restore 死端口致断网）
     try {
-      this.originalSettings = await this.getProxyStatus();
-      console.log('已保存原始代理设置:', this.originalSettings);
+      this.originalSettings = SystemProxyBase.stripSelf(
+        await this.getProxyStatus(),
+        address,
+        httpPort
+      );
+      this.log('info', '已保存原始代理设置');
     } catch (error) {
-      console.warn('无法获取原始代理设置:', error);
+      this.log('warn', `无法获取原始代理设置: ${error}`);
       // 继续执行，即使无法获取原始设置
     }
 
@@ -142,7 +250,7 @@ export class WindowsSystemProxy extends SystemProxyBase {
           );
           await execAsync(
             'netsh advfirewall firewall add rule name="FlowZ_Block_QUIC" dir=out action=block protocol=UDP remoteport=443'
-          ).catch((e) => console.log('添加 QUIC 阻断防火墙规则失败:', e));
+          ).catch((e) => this.log('warn', `添加 QUIC 阻断防火墙规则失败: ${e}`));
 
           // 通知系统代理设置已更改
           await this.notifyProxyChange();
@@ -159,29 +267,25 @@ export class WindowsSystemProxy extends SystemProxyBase {
             return true;
           },
           onRetry: (error, attempt) => {
-            console.log(`设置系统代理失败，正在进行第 ${attempt} 次重试:`, error.message);
+            this.log('warn', `设置系统代理失败，正在进行第 ${attempt} 次重试: ${error.message}`);
           },
         }
       );
 
-      console.log('Windows 系统代理设置成功');
+      // marker 已在 enable 前置写入（崩溃/强杀后下次启动据此恢复）
+      this.log('info', 'Windows 系统代理设置成功');
     } catch (error) {
-      console.error('设置 Windows 系统代理失败:', error);
+      this.log('error', `设置 Windows 系统代理失败: ${error}`);
 
-      // 如果设置失败，尝试恢复原始设置
-      if (this.originalSettings) {
-        console.log('正在回滚到原始代理设置...');
-        try {
-          // 清除可能残留的防火墙规则
-          await execAsync('netsh advfirewall firewall delete rule name="FlowZ_Block_QUIC"').catch(
-            () => {}
-          );
-          await this.restoreProxySettings(this.originalSettings);
-          console.log('已成功回滚到原始代理设置');
-        } catch (rollbackError) {
-          console.error('回滚代理设置失败:', rollbackError);
-          // 即使回滚失败，也要抛出原始错误
-        }
+      // 失败兜底（fail-closed）经 disableProxy 统一收口：有真实旧代理 → 恢复；originalSettings 为 null
+      //（原本无代理 / 旧代理是我们自己被 stripSelf 置 null）→ ProxyEnable=0 简单关 + 清 QUIC 规则。
+      // 杜绝「ProxyEnable=1 + ProxyServer 半指向我们、又无 marker」的自指残留 → 崩溃后死端口断网（H3）。
+      // disableProxy 内部成功后会 clearMarker；失败则补清一次。
+      try {
+        await this.disableProxy();
+      } catch (rollbackError) {
+        this.log('error', `失败兜底关闭/恢复系统代理失败: ${rollbackError}`);
+        this.clearMarker();
       }
 
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -195,7 +299,7 @@ export class WindowsSystemProxy extends SystemProxyBase {
    * 禁用系统代理
    */
   async disableProxy(): Promise<void> {
-    console.log('正在禁用 Windows 系统代理...');
+    this.log('info', '正在禁用 Windows 系统代理');
 
     // 禁用代理时务必清除 QUIC 阻断规则
     await execAsync('netsh advfirewall firewall delete rule name="FlowZ_Block_QUIC"').catch(
@@ -205,18 +309,20 @@ export class WindowsSystemProxy extends SystemProxyBase {
     try {
       if (this.originalSettings) {
         // 恢复原始设置
-        console.log('正在恢复原始代理设置:', this.originalSettings);
+        this.log('info', '正在恢复原始代理设置');
         await this.restoreProxySettings(this.originalSettings);
         this.originalSettings = null;
-        console.log('已恢复原始代理设置');
+        this.log('info', '已恢复原始代理设置');
       } else {
         // 简单禁用代理
         await execAsync(`reg add "${this.regPath}" /v ProxyEnable /t REG_DWORD /d 0 /f`);
         await this.notifyProxyChange();
-        console.log('已禁用系统代理');
+        this.log('info', '已禁用系统代理');
       }
+      // 拆除成功 → 删除持久化 marker
+      this.clearMarker();
     } catch (error) {
-      console.error('禁用 Windows 系统代理失败:', error);
+      this.log('error', `禁用 Windows 系统代理失败: ${error}`);
       const errorMessage = error instanceof Error ? error.message : String(error);
       throw new Error(`禁用 Windows 系统代理失败: ${errorMessage}\n\n建议手动检查系统代理设置`);
     }
@@ -240,10 +346,12 @@ export class WindowsSystemProxy extends SystemProxyBase {
       execSync(`reg add "${this.regPath}" /v ProxyEnable /t REG_DWORD /d 0 /f`, {
         stdio: 'ignore',
       });
+      // 禁用成功 → 删除持久化 marker（clearMarker 内部为同步 fs API 且不抛）
+      this.clearMarker();
       // 尝试刷新设置
       execSync('ipconfig /flushdns', { stdio: 'ignore' });
     } catch (error) {
-      console.error('同步禁用 Windows 系统代理失败:', error);
+      this.log('error', `同步禁用 Windows 系统代理失败: ${error}`);
     }
   }
 
@@ -348,7 +456,7 @@ export class WindowsSystemProxy extends SystemProxyBase {
       await execAsync(`powershell -Command "${script.replace(/\n/g, ' ')}"`);
     } catch (error) {
       // 通知失败不影响代理设置，只记录警告
-      console.warn('Failed to notify proxy change:', error);
+      this.log('warn', `通知系统刷新代理设置失败: ${error}`);
     }
   }
 }
@@ -362,14 +470,21 @@ export class MacOSSystemProxy extends SystemProxyBase {
    * 启用系统代理
    */
   async enableProxy(address: string, httpPort: number, socksPort: number): Promise<void> {
-    console.log(`正在设置 macOS 系统代理: ${address}:${httpPort}`);
+    this.log('info', '正在设置 macOS 系统代理');
 
-    // 保存原始设置
+    // marker 提前写（intent）：enable 期间崩溃也留 marker，供下次启动恢复（disable 成功/失败回滚才会删）。
+    this.writeMarker(`${address}:${httpPort}`);
+
+    // 保存原始设置（防自指：已指向我们自己的代理 → 视为无原始，杜绝 disable restore 死端口致断网）
     try {
-      this.originalSettings = await this.getProxyStatus();
-      console.log('已保存原始代理设置:', this.originalSettings);
+      this.originalSettings = SystemProxyBase.stripSelf(
+        await this.getProxyStatus(),
+        address,
+        httpPort
+      );
+      this.log('info', '已保存原始代理设置');
     } catch (error) {
-      console.warn('无法获取原始代理设置:', error);
+      this.log('warn', `无法获取原始代理设置: ${error}`);
       // 继续执行，即使无法获取原始设置
     }
 
@@ -379,11 +494,11 @@ export class MacOSSystemProxy extends SystemProxyBase {
         async () => {
           // 获取所有网络服务
           const services = await this.getNetworkServices();
-          console.log(`找到 ${services.length} 个网络服务:`, services);
+          this.log('debug', `找到 ${services.length} 个网络服务`);
 
           // 为每个网络服务设置代理
           for (const service of services) {
-            console.log(`正在为网络服务 "${service}" 设置代理...`);
+            this.log('debug', `正在为网络服务 "${service}" 设置代理`);
 
             // 设置 HTTP 代理
             await execAsync(`networksetup -setwebproxy "${service}" ${address} ${httpPort}`);
@@ -437,7 +552,7 @@ export class MacOSSystemProxy extends SystemProxyBase {
               `networksetup -setproxybypassdomains "${service}" ${bypassDomains.join(' ')}`
             );
 
-            console.log(`网络服务 "${service}" 代理设置完成`);
+            this.log('debug', `网络服务 "${service}" 代理设置完成`);
           }
         },
         {
@@ -452,25 +567,25 @@ export class MacOSSystemProxy extends SystemProxyBase {
             return true;
           },
           onRetry: (error, attempt) => {
-            console.log(`设置系统代理失败，正在进行第 ${attempt} 次重试:`, error.message);
+            this.log('warn', `设置系统代理失败，正在进行第 ${attempt} 次重试: ${error.message}`);
           },
         }
       );
 
-      console.log('macOS 系统代理设置成功');
+      // marker 已在 enable 前置写入（崩溃/强杀后下次启动据此恢复）
+      this.log('info', 'macOS 系统代理设置成功');
     } catch (error) {
-      console.error('设置 macOS 系统代理失败:', error);
+      this.log('error', `设置 macOS 系统代理失败: ${error}`);
 
-      // 如果设置失败，尝试恢复原始设置
-      if (this.originalSettings) {
-        console.log('正在回滚到原始代理设置...');
-        try {
-          await this.restoreProxySettings(this.originalSettings);
-          console.log('已成功回滚到原始代理设置');
-        } catch (rollbackError) {
-          console.error('回滚代理设置失败:', rollbackError);
-          // 即使回滚失败，也要抛出原始错误
-        }
+      // 失败兜底（fail-closed）经 disableProxy 统一收口：有真实旧代理 → 恢复；originalSettings 为 null
+      //（原本无代理，或旧代理就是我们自己被 stripSelf 置 null）→ 简单关掉全部服务。杜绝「部分 service 已
+      // 半指向我们、又清掉了 marker」的自指残留——否则崩溃后所有 marker 门控失效 → 死端口断网（H3）。
+      // disableProxy 内部成功后会 clearMarker；失败则补清一次。
+      try {
+        await this.disableProxy();
+      } catch (rollbackError) {
+        this.log('error', `失败兜底关闭/恢复系统代理失败: ${rollbackError}`);
+        this.clearMarker();
       }
 
       const errorMessage = error instanceof Error ? error.message : String(error);
@@ -484,28 +599,30 @@ export class MacOSSystemProxy extends SystemProxyBase {
    * 禁用系统代理
    */
   async disableProxy(): Promise<void> {
-    console.log('正在禁用 macOS 系统代理...');
+    this.log('info', '正在禁用 macOS 系统代理');
 
     try {
       if (this.originalSettings) {
         // 恢复原始设置
-        console.log('正在恢复原始代理设置:', this.originalSettings);
+        this.log('info', '正在恢复原始代理设置');
         await this.restoreProxySettings(this.originalSettings);
         this.originalSettings = null;
-        console.log('已恢复原始代理设置');
+        this.log('info', '已恢复原始代理设置');
       } else {
         // 简单禁用代理
         const services = await this.getNetworkServices();
         for (const service of services) {
-          console.log(`正在禁用网络服务 "${service}" 的代理...`);
+          this.log('debug', `正在禁用网络服务 "${service}" 的代理`);
           await execAsync(`networksetup -setwebproxystate "${service}" off`);
           await execAsync(`networksetup -setsecurewebproxystate "${service}" off`);
           await execAsync(`networksetup -setsocksfirewallproxystate "${service}" off`);
         }
-        console.log('已禁用系统代理');
+        this.log('info', '已禁用系统代理');
       }
+      // 拆除成功 → 删除持久化 marker
+      this.clearMarker();
     } catch (error) {
-      console.error('禁用 macOS 系统代理失败:', error);
+      this.log('error', `禁用 macOS 系统代理失败: ${error}`);
       const errorMessage = error instanceof Error ? error.message : String(error);
       throw new Error(`禁用 macOS 系统代理失败: ${errorMessage}\n\n建议手动检查系统代理设置`);
     }
@@ -522,6 +639,7 @@ export class MacOSSystemProxy extends SystemProxyBase {
         .split('\n')
         .filter((s: string) => s && !s.includes('*') && !s.includes('Bluetooth'));
 
+      let allOff = true;
       for (const service of activeInterfaces) {
         try {
           execSync(`networksetup -setwebproxystate "${service}" off`, { stdio: 'ignore' });
@@ -530,11 +648,13 @@ export class MacOSSystemProxy extends SystemProxyBase {
             stdio: 'ignore',
           });
         } catch {
-          /* ignore */
+          allOff = false;
         }
       }
+      // 全部服务成功关闭才删 marker；任一失败则保留，交下次启动恢复重试（避免漏关服务而 marker 已删失去兜底）
+      if (allOff) this.clearMarker();
     } catch (error) {
-      console.error('同步禁用 macOS 系统代理失败:', error);
+      this.log('error', `同步禁用 macOS 系统代理失败: ${error}`);
     }
   }
 
@@ -670,14 +790,14 @@ export class LinuxSystemProxy extends SystemProxyBase {
    * 启用系统代理
    */
   async enableProxy(address: string, httpPort: number, socksPort: number): Promise<void> {
-    console.log(`正在设置 Linux 系统代理: ${address}:${httpPort}`);
+    this.log('info', '正在设置 Linux 系统代理');
 
     // 保存原始设置
     try {
       this.originalSettings = await this.getProxyStatus();
-      console.log('已保存原始代理设置:', this.originalSettings);
+      this.log('info', '已保存原始代理设置');
     } catch (error) {
-      console.warn('无法获取原始代理设置:', error);
+      this.log('warn', `无法获取原始代理设置: ${error}`);
     }
 
     try {
@@ -706,9 +826,11 @@ export class LinuxSystemProxy extends SystemProxyBase {
         },
         { maxRetries: 1, delay: 500 }
       );
-      console.log('Linux 系统代理设置成功');
+      // 持久化 marker：标记系统代理由 FlowZ 设置（崩溃/强杀后下次启动据此恢复）
+      this.writeMarker(`${address}:${httpPort}`);
+      this.log('info', 'Linux 系统代理设置成功');
     } catch (error) {
-      console.error('设置 Linux 系统代理失败:', error);
+      this.log('error', `设置 Linux 系统代理失败: ${error}`);
       throw error;
     }
   }
@@ -717,12 +839,14 @@ export class LinuxSystemProxy extends SystemProxyBase {
    * 禁用系统代理
    */
   async disableProxy(): Promise<void> {
-    console.log('正在禁用 Linux 系统代理...');
+    this.log('info', '正在禁用 Linux 系统代理');
     try {
       await execAsync('gsettings set org.gnome.system.proxy mode "none"');
-      console.log('已禁用系统代理');
+      this.log('info', '已禁用系统代理');
+      // 拆除成功 → 删除持久化 marker
+      this.clearMarker();
     } catch (error) {
-      console.error('禁用 Linux 系统代理失败:', error);
+      this.log('error', `禁用 Linux 系统代理失败: ${error}`);
     }
   }
 
@@ -761,6 +885,8 @@ export class LinuxSystemProxy extends SystemProxyBase {
     try {
       // GNOME
       execSync('gsettings set org.gnome.system.proxy mode "none"', { stdio: 'ignore' });
+      // GNOME 禁用成功 → 删除持久化 marker（enableProxy 仅走 GNOME 路径）
+      this.clearMarker();
     } catch {
       /* ignore */
     }

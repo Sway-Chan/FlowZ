@@ -25,4 +25,11 @@ i18n.use(initReactI18next).init({
   },
 });
 
+// 同步 <html lang>：初始化按当前语言设置，切换语言时随 languageChanged 更新。
+// index.html 中静态的 lang="zh-CN" 仅作首屏默认，运行期以此为准。
+i18n.on('languageChanged', (lng) => {
+  document.documentElement.lang = lng;
+});
+document.documentElement.lang = i18n.language;
+
 export default i18n;

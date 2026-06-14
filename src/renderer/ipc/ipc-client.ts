@@ -52,8 +52,6 @@ export class IpcClient {
    */
   async invoke<TArgs = any, TResult = any>(channel: string, args?: TArgs): Promise<TResult> {
     try {
-      console.log(`[IPC Client] Invoking: ${channel}`, args);
-
       const response = (await this.ipcRenderer.invoke(channel, args)) as ApiResponse<TResult>;
 
       if (!response.success) {
@@ -62,7 +60,6 @@ export class IpcClient {
         throw error;
       }
 
-      console.log(`[IPC Client] Success: ${channel}`, response.data);
       return response.data as TResult;
     } catch (error) {
       console.error(`[IPC Client] Error invoking ${channel}:`, error);
@@ -77,11 +74,8 @@ export class IpcClient {
    * @returns 取消监听函数
    */
   on<T = any>(channel: string, listener: (data: T) => void): () => void {
-    console.log(`[IPC Client] Registering listener for: ${channel}`);
-
     // 包装监听器以提取数据
     const wrappedListener = (_event: any, data: T) => {
-      console.log(`[IPC Client] Received event: ${channel}`, data);
       listener(data);
     };
 
@@ -106,10 +100,7 @@ export class IpcClient {
    * @param listener 事件监听器
    */
   once<T = any>(channel: string, listener: (data: T) => void): void {
-    console.log(`[IPC Client] Registering one-time listener for: ${channel}`);
-
     const wrappedListener = (_event: any, data: T) => {
-      console.log(`[IPC Client] Received one-time event: ${channel}`, data);
       listener(data);
     };
 
@@ -132,12 +123,9 @@ export class IpcClient {
           this.eventListeners.delete(channel);
         }
       }
-
-      console.log(`[IPC Client] Removed listener for: ${channel}`);
     } else {
       this.ipcRenderer.removeAllListeners(channel);
       this.eventListeners.delete(channel);
-      console.log(`[IPC Client] Removed all listeners for: ${channel}`);
     }
   }
 
@@ -149,7 +137,6 @@ export class IpcClient {
       this.ipcRenderer.removeAllListeners(channel);
     }
     this.eventListeners.clear();
-    console.log(`[IPC Client] Removed all listeners`);
   }
 
   /**

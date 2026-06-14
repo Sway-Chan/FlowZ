@@ -31,7 +31,7 @@ import { useTranslation } from 'react-i18next';
 type ServerConfigWithId = ServerConfig;
 
 export function ServerPage() {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const config = useAppStore((state) => state.config);
   const saveConfig = useAppStore((state) => state.saveConfig);
   const deleteServer = useAppStore((state) => state.deleteServer);
@@ -47,9 +47,25 @@ export function ServerPage() {
   const servers = config?.servers || [];
   const subscriptions = config?.subscriptions || [];
   const selectedServerId = config?.selectedServerId;
+  const subscriptionIds = new Set(subscriptions.map((s) => s.id));
 
-  // 手动添加的节点（无 subscriptionId）
-  const manualServers = servers.filter((s) => !s.subscriptionId);
+  // 手动添加的节点：无 subscriptionId，或 subscriptionId 指向已删订阅的孤儿（口径对齐 groupServersBySubscription）
+  const manualServers = servers.filter(
+    (s) => !s.subscriptionId || !subscriptionIds.has(s.subscriptionId)
+  );
+
+  // 默认激活 Tab = 当前选中节点所在组（自建 / 某订阅）；用户手动切 Tab 后由 override 接管。
+  // 用「派生 + override」而非 useState 惰性初值：config 异步到位前挂载不会把激活组锁死在 'manual'。
+  const selected = selectedServerId ? servers.find((s) => s.id === selectedServerId) : undefined;
+  const selectedGroupKey =
+    selected?.subscriptionId && subscriptionIds.has(selected.subscriptionId)
+      ? selected.subscriptionId
+      : 'manual';
+  const [tabOverride, setTabOverride] = useState<string | null>(null);
+  const activeTab =
+    tabOverride && (tabOverride === 'manual' || subscriptionIds.has(tabOverride))
+      ? tabOverride
+      : selectedGroupKey;
 
   const scrollContainerRef = useRef<HTMLDivElement>(null);
 
@@ -230,7 +246,7 @@ export function ServerPage() {
         <p className="text-muted-foreground mt-1">{t('servers.pageDesc')}</p>
       </div>
 
-      <Tabs defaultValue="manual">
+      <Tabs value={activeTab} onValueChange={setTabOverride}>
         {/* Tab 栏：自建节点 + 每个订阅 + 订阅管理 */}
         <div className="flex items-center gap-4">
           {/* 可滚动的 Tab 区域，两侧渐变遮罩提示还有更多内容 */}
@@ -298,7 +314,6 @@ export function ServerPage() {
         <TabsContent value="manual">
           <ServerList
             servers={manualServers}
-            subscriptions={subscriptions}
             selectedServerId={selectedServerId ?? undefined}
             onAddServer={handleAddServer}
             onEditServer={handleEditServer}
@@ -326,7 +341,7 @@ export function ServerPage() {
                     <p className="text-xs text-muted-foreground mt-0.5">
                       {t('servers.lastUpdated')}：
                       {sub.lastUpdated
-                        ? new Date(sub.lastUpdated).toLocaleString('zh-CN')
+                        ? new Date(sub.lastUpdated).toLocaleString(i18n.language)
                         : t('servers.never')}
                     </p>
                   </div>
@@ -382,7 +397,6 @@ export function ServerPage() {
                 {/* 节点列表 */}
                 <ServerList
                   servers={subServers}
-                  subscriptions={subscriptions}
                   showAddButton={false}
                   selectedServerId={selectedServerId ?? undefined}
                   onAddServer={() => {}}

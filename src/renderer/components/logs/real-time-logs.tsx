@@ -5,51 +5,88 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Input } from '@/components/ui/input';
 import { useAppStore } from '@/store/app-store';
 import { Trash2, ArrowDown, Search } from 'lucide-react';
-import { getLogs, clearLogs, addEventListener, removeEventListener } from '@/bridge/api-wrapper';
+import { getLogs, clearLogs, addEventListener } from '@/bridge/api-wrapper';
 import type { LogEntry } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
-export function RealTimeLogs() {
-  const { t } = useTranslation();
-  const [logs, setLogs] = useState<LogEntry[]>([]);
+/** 渲染端为每条日志附加单调自增 _id 作为稳定 key —— 环形缓冲淘汰首元素后剩余项 key 不变，
+ *  避免 key={index} 错位导致滚动期全量重渲染并打断文本选区。 */
+type LogRow = LogEntry & { _id: number; historical?: true };
+
+interface RealTimeLogsProps {
+  /** Tailwind height class for the scroll viewport. Defaults to fixed h-64 (home card). */
+  heightClass?: string;
+  /** How many historical lines to load on mount. */
+  initialLimit?: number;
+  /** Max in-memory ring-buffer size for live tail. */
+  maxBuffer?: number;
+}
+
+export function RealTimeLogs({
+  heightClass = 'h-64',
+  initialLimit = 50,
+  maxBuffer = 100,
+}: RealTimeLogsProps = {}) {
+  const { t, i18n } = useTranslation();
+  const [logs, setLogs] = useState<LogRow[]>([]);
   const [searchTerm, setSearchTerm] = useState('');
-  const [isAutoScroll, setIsAutoScroll] = useState(false); // 默认不自动滚动
+  const [isAutoScroll, setIsAutoScroll] = useState(true); // 默认自动滚动：打开日志页即跟随最新（上滚脱离、回底吸附逻辑不变）
   const [isUserScrolling, setIsUserScrolling] = useState(false);
   const scrollAreaRef = useRef<HTMLDivElement>(null);
   const userScrollTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const nextIdRef = useRef(0);
+  const maxBufferRef = useRef(maxBuffer);
   const connectionStatus = useAppStore((state) => state.connectionStatus);
 
-  // Load initial logs and set up real-time updates
+  // Effect ①：实时日志订阅 —— 仅挂载时订阅一次；容量经 maxBufferRef 读取，props 变化不重订阅。
   useEffect(() => {
+    const handleLogReceived = (logEntry: LogEntry) => {
+      setLogs((prev) =>
+        [...prev, { ...logEntry, _id: nextIdRef.current++ }].slice(-maxBufferRef.current)
+      );
+    };
+    const unsubscribe = addEventListener('logReceived', handleLogReceived);
+    return unsubscribe;
+  }, []);
+
+  // Effect ②：历史日志加载 —— 仅依赖 initialLimit；重载时剔除上一轮 historical 段再 prepend（替换而非重复）。
+  useEffect(() => {
+    // stale 守卫：StrictMode 双触发 / 卸载 / initialLimit 竞速时丢弃过期结果，
+    // 避免重复 prepend 与 setState-after-unmount。
+    let stale = false;
+
     const loadInitialLogs = async () => {
       try {
-        const response = await getLogs(50);
+        const response = await getLogs(initialLimit);
+        if (stale) return;
         if (response && response.success && response.data) {
-          setLogs(response.data);
+          const initial: LogRow[] = response.data.map((entry: LogEntry) => ({
+            ...entry,
+            _id: nextIdRef.current++,
+            historical: true,
+          }));
+          // 历史段置于 live 段之前；剔除旧 historical 实现「重载即替换」，对 live 先到 / StrictMode 双触发均幂等。
+          setLogs((prev) =>
+            [...initial, ...prev.filter((r) => !r.historical)].slice(-maxBufferRef.current)
+          );
         }
       } catch (error) {
         console.error('Failed to load initial logs:', error);
       }
     };
 
-    // Load initial logs
     loadInitialLogs();
 
-    // Set up real-time log listener
-    const handleLogReceived = (logEntry: LogEntry) => {
-      setLogs((prev) => {
-        const updated = [...prev, logEntry];
-        // Keep only last 100 logs
-        return updated.slice(-100);
-      });
-    };
-
-    addEventListener('logReceived', handleLogReceived);
-
     return () => {
-      removeEventListener('logReceived', handleLogReceived);
+      stale = true;
     };
-  }, []);
+  }, [initialLimit]);
+
+  // Effect ③：maxBuffer 变更 —— 只重切现有 state，不重载历史、不重订阅。
+  useEffect(() => {
+    maxBufferRef.current = maxBuffer;
+    setLogs((prev) => (prev.length > maxBuffer ? prev.slice(-maxBuffer) : prev));
+  }, [maxBuffer]);
 
   // 获取滚动元素
   const getScrollElement = useCallback(() => {
@@ -169,7 +206,10 @@ export function RealTimeLogs() {
         </div>
       </CardHeader>
       <CardContent>
-        <ScrollArea ref={scrollAreaRef} className="h-64 w-full rounded border bg-muted/30 p-3">
+        <ScrollArea
+          ref={scrollAreaRef}
+          className={`${heightClass} w-full rounded border bg-muted/30 p-3`}
+        >
           {filteredLogs.length === 0 ? (
             <div className="flex items-center justify-center h-full text-muted-foreground text-sm">
               {logs.length > 0 && searchTerm
@@ -180,11 +220,11 @@ export function RealTimeLogs() {
             </div>
           ) : (
             <div className="space-y-1 select-text cursor-text">
-              {filteredLogs.map((log, index) => {
-                const timestamp = new Date(log.timestamp).toLocaleTimeString('zh-CN');
+              {filteredLogs.map((log) => {
+                const timestamp = new Date(log.timestamp).toLocaleTimeString(i18n.language);
 
                 return (
-                  <div key={index} className="text-xs font-mono select-text">
+                  <div key={log._id} className="text-xs font-mono select-text">
                     <span className="text-muted-foreground">[{timestamp}]</span>
                     <span className={`ml-2 font-semibold ${getLevelColor(log.level)}`}>
                       {log.level.toUpperCase()}:

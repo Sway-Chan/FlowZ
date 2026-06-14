@@ -23,11 +23,6 @@ export function registerAdminHandlers(): void {
     async (_event: IpcMainInvokeEvent) => {
       const isAdmin = adminPrivilegeService.isAdmin();
       const needsElevation = adminPrivilegeService.needsElevationForTun();
-      console.log('[Admin Handlers] ADMIN_CHECK:', {
-        isAdmin,
-        platform: process.platform,
-        needsElevation,
-      });
       return {
         isAdmin,
         platform: process.platform,
@@ -35,6 +30,4 @@ export function registerAdminHandlers(): void {
       };
     }
   );
-
-  console.log('[Admin Handlers] Registered all admin IPC handlers');
 }

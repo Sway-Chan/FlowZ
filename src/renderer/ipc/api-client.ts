@@ -9,13 +9,23 @@ import type {
   UserConfig,
   ServerConfig,
   ProxyStatus,
-  SystemProxyStatus,
+  ProxyErrorCode,
+  ConnectionsSnapshot,
   LogEntry,
   TrafficStats,
-  DomainRule,
+  Rule,
   AutoStartStatus,
-  ConnectionStateInfo,
   SubscriptionConfig,
+  HelperStatus,
+  IpInfoSnapshot,
+  SystemProcessInfo,
+  RuleResourceDeleteResult,
+  RuleResourceListItem,
+  RuleResourceDownloadItem,
+  RuleResourceDownloadResult,
+  RuleResourceProgress,
+  RuleResourceCatalogResult,
+  InvalidNodeInfo,
 } from '../../shared/types';
 
 /**
@@ -54,21 +64,35 @@ export const proxyApi = {
   /**
    * 监听代理启动事件
    */
-  onStarted(listener: (data: { pid: number; timestamp: string }) => void): () => void {
+  onStarted(
+    listener: (data: {
+      pid: number | null;
+      startTime?: string | Date | null;
+      autoRestarted?: boolean;
+    }) => void
+  ): () => void {
     return ipcClient.on(IPC_CHANNELS.EVENT_PROXY_STARTED, listener);
   },
 
   /**
    * 监听代理停止事件
    */
-  onStopped(listener: (data: { timestamp: string }) => void): () => void {
+  onStopped(listener: (data: Record<string, never>) => void): () => void {
     return ipcClient.on(IPC_CHANNELS.EVENT_PROXY_STOPPED, listener);
   },
 
   /**
-   * 监听代理错误事件
+   * 监听代理错误事件。主进程各 emit 点 payload 形状不一，message 优先 / error 兜底。
    */
-  onError(listener: (data: { error: string; timestamp: string }) => void): () => void {
+  onError(
+    listener: (data: {
+      message?: string;
+      error?: string;
+      errorCode?: ProxyErrorCode;
+      code?: number;
+      signal?: string | null;
+    }) => void
+  ): () => void {
     return ipcClient.on(IPC_CHANNELS.EVENT_PROXY_ERROR, listener);
   },
 
@@ -79,6 +103,13 @@ export const proxyApi = {
     listener: (data: { reason: string; newServerName: string; latency: number }) => void
   ): () => void {
     return ipcClient.on(IPC_CHANNELS.EVENT_AUTO_NODE_SWITCHED, listener);
+  },
+
+  /**
+   * 监听启动前配置校验 gate 剔除的非法节点（空数组=本次启动无非法节点/清陈旧标灰）。
+   */
+  onInvalidNodes(listener: (data: InvalidNodeInfo[]) => void): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_PROXY_INVALID_NODES, listener);
   },
 };
 
@@ -150,6 +181,15 @@ export const configApi = {
   async setLanguage(lang: string): Promise<void> {
     return ipcClient.invoke(IPC_CHANNELS.APP_SET_LANGUAGE, lang);
   },
+};
+
+/** F29：隐私密码 API。哈希/校验全在 main；渲染端只拿 hasPassword 布尔与 verify 结果，永不接触明文/哈希。 */
+export const privacyApi = {
+  setPassword: (plain: string): Promise<{ success: boolean }> =>
+    ipcClient.invoke(IPC_CHANNELS.PRIVACY_SET_PASSWORD, { plain }),
+  unlock: (plain: string): Promise<{ ok: boolean }> =>
+    ipcClient.invoke(IPC_CHANNELS.PRIVACY_UNLOCK, { plain }),
+  hasPassword: (): Promise<boolean> => ipcClient.invoke(IPC_CHANNELS.PRIVACY_HAS_PASSWORD),
 };
 
 /**
@@ -227,21 +267,21 @@ export const rulesApi = {
   /**
    * 获取所有规则
    */
-  async getAll(): Promise<DomainRule[]> {
+  async getAll(): Promise<Rule[]> {
     return ipcClient.invoke(IPC_CHANNELS.RULES_GET_ALL);
   },
 
   /**
    * 添加规则
    */
-  async add(rule: Omit<DomainRule, 'id'>): Promise<DomainRule> {
+  async add(rule: Omit<Rule, 'id'>): Promise<Rule> {
     return ipcClient.invoke(IPC_CHANNELS.RULES_ADD, rule);
   },
 
   /**
    * 更新规则
    */
-  async update(rule: DomainRule): Promise<void> {
+  async update(rule: Rule): Promise<void> {
     return ipcClient.invoke(IPC_CHANNELS.RULES_UPDATE, rule);
   },
 
@@ -250,6 +290,11 @@ export const rulesApi = {
    */
   async delete(ruleId: string): Promise<void> {
     return ipcClient.invoke(IPC_CHANNELS.RULES_DELETE, { ruleId });
+  },
+
+  /** 重排规则：orderedIds 为全部规则 id 的新顺序 */
+  async reorder(orderedIds: string[]): Promise<void> {
+    return ipcClient.invoke(IPC_CHANNELS.RULES_REORDER, { orderedIds });
   },
 };
 
@@ -272,43 +317,10 @@ export const logsApi = {
   },
 
   /**
-   * 设置日志级别
-   */
-  async setLevel(level: LogEntry['level']): Promise<void> {
-    return ipcClient.invoke(IPC_CHANNELS.LOGS_SET_LEVEL, { level });
-  },
-
-  /**
    * 监听日志接收事件
    */
   onReceived(listener: (log: LogEntry) => void): () => void {
     return ipcClient.on(IPC_CHANNELS.EVENT_LOG_RECEIVED, listener);
-  },
-};
-
-/**
- * 系统代理管理 API
- */
-export const systemProxyApi = {
-  /**
-   * 启用系统代理
-   */
-  async enable(address: string, port: number): Promise<void> {
-    return ipcClient.invoke(IPC_CHANNELS.SYSTEM_PROXY_ENABLE, { address, port });
-  },
-
-  /**
-   * 禁用系统代理
-   */
-  async disable(): Promise<void> {
-    return ipcClient.invoke(IPC_CHANNELS.SYSTEM_PROXY_DISABLE);
-  },
-
-  /**
-   * 获取系统代理状态
-   */
-  async getStatus(): Promise<SystemProxyStatus> {
-    return ipcClient.invoke(IPC_CHANNELS.SYSTEM_PROXY_GET_STATUS);
   },
 };
 
@@ -343,13 +355,6 @@ export const statsApi = {
   },
 
   /**
-   * 重置流量统计
-   */
-  async reset(): Promise<void> {
-    return ipcClient.invoke(IPC_CHANNELS.STATS_RESET);
-  },
-
-  /**
    * 监听统计更新事件
    */
   onUpdated(listener: (stats: TrafficStats) => void): () => void {
@@ -357,15 +362,85 @@ export const statsApi = {
   },
 };
 
+/** 连接快照 API：topology 经此消费 main 单一 poller 的数据，渲染端不再直连 :9090、不持 secret。 */
+export const connectionsApi = {
+  async get(): Promise<ConnectionsSnapshot> {
+    return ipcClient.invoke(IPC_CHANNELS.CONNECTIONS_GET);
+  },
+  onUpdated(listener: (snap: ConnectionsSnapshot) => void): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_CONNECTIONS_UPDATED, listener);
+  },
+  /** 关单条连接（main 经 9090 DELETE /connections/{id}；渲染端无 secret）。 */
+  async close(id: string): Promise<{ ok: boolean }> {
+    return ipcClient.invoke(IPC_CHANNELS.CONNECTIONS_CLOSE, { id });
+  },
+  /** 关全部连接（main 经 9090 DELETE /connections，触发 ResetNetwork）。 */
+  async closeAll(): Promise<{ ok: boolean }> {
+    return ipcClient.invoke(IPC_CHANNELS.CONNECTIONS_CLOSE_ALL);
+  },
+};
+
 /**
- * 连接状态 API
+ * 系统能力 API（进程枚举等）
  */
-export const connectionApi = {
-  /**
-   * 监听连接状态变化事件
-   */
-  onStateChanged(listener: (state: ConnectionStateInfo) => void): () => void {
-    return ipcClient.on(IPC_CHANNELS.EVENT_CONNECTION_STATE_CHANGED, listener);
+export const systemApi = {
+  /** 枚举当前系统进程（聚合去重，供进程规则快速选择） */
+  async listProcesses(): Promise<SystemProcessInfo[]> {
+    return ipcClient.invoke(IPC_CHANNELS.SYSTEM_LIST_PROCESSES);
+  },
+};
+
+/**
+ * 规则资源 API（.srs 下载/管理）
+ */
+export const ruleResourcesApi = {
+  list(): Promise<RuleResourceListItem[]> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_LIST);
+  },
+  download(items: RuleResourceDownloadItem[]): Promise<RuleResourceDownloadResult[]> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_DOWNLOAD, { items });
+  },
+  redownload(id: string): Promise<RuleResourceDownloadResult> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_REDOWNLOAD, { id });
+  },
+  delete(id: string, force?: boolean): Promise<RuleResourceDeleteResult> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_DELETE, { id, force });
+  },
+  setGhProxy(prefix: string): Promise<{ ok: boolean; value?: string; error?: string }> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_SET_GH_PROXY, { prefix });
+  },
+  getCatalog(): Promise<RuleResourceCatalogResult> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_GET_CATALOG);
+  },
+  refreshCatalog(): Promise<RuleResourceCatalogResult> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_REFRESH_CATALOG);
+  },
+  setAutoUpdate(args: { enabled: boolean; intervalHours?: number }): Promise<{ ok: boolean }> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_SET_AUTO_UPDATE, args);
+  },
+  updateAll(): Promise<RuleResourceDownloadResult[]> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_UPDATE_ALL);
+  },
+  resetBuiltin(tag: string): Promise<RuleResourceDownloadResult> {
+    return ipcClient.invoke(IPC_CHANNELS.RULE_RESOURCES_RESET_BUILTIN, { tag });
+  },
+  onProgress(listener: (p: RuleResourceProgress) => void): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_RULE_RESOURCE_PROGRESS, listener);
+  },
+};
+
+/**
+ * 出口 IP 信息 API
+ */
+export const ipInfoApi = {
+  /** 获取出口 IP 快照（force 强制重测） */
+  async get(force = false): Promise<IpInfoSnapshot> {
+    return ipcClient.invoke(IPC_CHANNELS.IP_INFO_GET, { force });
+  },
+
+  /** 监听出口 IP 更新事件 */
+  onUpdated(listener: (snap: IpInfoSnapshot) => void): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_IP_INFO_UPDATED, listener);
   },
 };
 
@@ -516,23 +591,18 @@ export const coreUpdateApi = {
     latestVersion?: string;
     downloadUrl?: string;
     releaseNotes?: string;
+    /** latestVersion 是否跨当前 minor 带（如 1.13.x→1.14.x）；true 时 UI 标注跨大版本风险。 */
+    crossBand?: boolean;
     error?: string;
   }> {
-    return ipcClient.invoke('core-update:check');
+    return ipcClient.invoke(IPC_CHANNELS.CORE_UPDATE_CHECK);
   },
 
   /**
    * 更新核心
    */
   async update(downloadUrl: string): Promise<boolean> {
-    return ipcClient.invoke('core-update:update', downloadUrl);
-  },
-
-  /**
-   * 获取核心版本
-   */
-  async getVersion(): Promise<string> {
-    return ipcClient.invoke('core-update:get-version');
+    return ipcClient.invoke(IPC_CHANNELS.CORE_UPDATE_RUN, downloadUrl);
   },
 
   /**
@@ -568,10 +638,62 @@ export const coreUpdateApi = {
   },
 
   /**
-   * 手动替换核心（打开文件选择器，用户选择 sing-box 二进制）
+   * 手动替换核心。
+   * - 无参：弹文件选择器 + 预检 + 同版本检测。目标与当前同版本时返回
+   *   `{ ok:false, needConfirm:true, sameVersion, filePath }`，由 UI 弹确认框；否则直接换核返回 `{ ok:true }`。
+   * - 传 `{ filePath, force:true }`：跳过同版本确认，直接换该文件。
+   * 用户取消文件选择器时主进程返回 `{ ok:false }`（无 needConfirm），UI 静默不提示。
    */
-  async replaceManual(): Promise<boolean> {
-    return ipcClient.invoke(IPC_CHANNELS.CORE_REPLACE_MANUAL);
+  async replaceManual(opts?: {
+    filePath?: string;
+    force?: boolean;
+  }): Promise<
+    | { ok: true }
+    | { ok: false; needConfirm?: boolean; sameVersion?: string; filePath?: string; error?: string }
+  > {
+    return ipcClient.invoke(IPC_CHANNELS.CORE_REPLACE_MANUAL, opts);
+  },
+
+  /**
+   * B6：重置内核到出厂版本（恢复为随 App 出厂的内核）。
+   */
+  async resetFactory(): Promise<{ ok: boolean; error?: string }> {
+    return ipcClient.invoke(IPC_CHANNELS.CORE_RESET_FACTORY);
+  },
+
+  /**
+   * 内核自动更新状态（lastCheckAt / staged 待生效 / 跨带提示）
+   */
+  async getAutoStatus(): Promise<{
+    autoUpdateEnabled: boolean;
+    lastCheckAt: number | null;
+    staged: { version: string; stagedAt: string } | null;
+    crossBandLatest: string | null;
+  }> {
+    return ipcClient.invoke(IPC_CHANNELS.CORE_UPDATE_GET_AUTO_STATUS);
+  },
+
+  /**
+   * 用户点「立即应用」：停代理→换核→重启（唯一允许主动断流）。
+   * 返回落位结果枚举（applied→成功 / failed→失败 / discarded→已作废 / deferred→仍待生效 / noop→无暂存），
+   * 供 UI 分情况反馈（与主进程 StagedApplyResult 同形，inline 避免跨进程类型 import）。
+   */
+  async applyStaged(): Promise<'applied' | 'discarded' | 'deferred' | 'failed' | 'noop'> {
+    return ipcClient.invoke(IPC_CHANNELS.CORE_UPDATE_APPLY_STAGED);
+  },
+
+  /**
+   * 监听内核自动更新状态变更事件（staged 待生效 / 跨带提示）
+   */
+  onAutoStatusChanged(
+    listener: (data: {
+      // autoUpdateEnabled 不随事件推送（主进程同步 emit 算不出真值）；真值由 getAutoStatus 快照提供。
+      lastCheckAt: number | null;
+      staged: { version: string; stagedAt: string } | null;
+      crossBandLatest: string | null;
+    }) => void
+  ): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_CORE_AUTO_UPDATE_STATUS, listener);
   },
 };
 
@@ -655,24 +777,61 @@ export const backupApi = {
 };
 
 /**
+ * macOS 提权 helper API（免提权启停 sing-box）
+ */
+export const helperApi = {
+  /** 查询 helper 安装/就绪状态 */
+  async getStatus(force = false): Promise<HelperStatus> {
+    return ipcClient.invoke(IPC_CHANNELS.HELPER_GET_STATUS, force);
+  },
+
+  /** 安装/修复 helper（弹一次管理员授权框） */
+  async install(): Promise<{ success: boolean; error?: string; status: HelperStatus }> {
+    return ipcClient.invoke(IPC_CHANNELS.HELPER_INSTALL);
+  },
+
+  /** 卸载 helper（弹一次管理员授权框） */
+  async uninstall(): Promise<{ success: boolean; error?: string; status: HelperStatus }> {
+    return ipcClient.invoke(IPC_CHANNELS.HELPER_UNINSTALL);
+  },
+};
+
+/**
+ * 应用级 API（生命周期 / 卸载等）
+ */
+export const appApi = {
+  /**
+   * B6：完全卸载 FlowZ（清除提权 helper、受保护目录内核、用户配置、应用本体）。
+   */
+  async uninstallAll(): Promise<{ ok: boolean; error?: string }> {
+    return ipcClient.invoke(IPC_CHANNELS.APP_UNINSTALL_ALL);
+  },
+};
+
+/**
  * 统一的 API 客户端
  */
 export const api = {
   proxy: proxyApi,
   config: configApi,
+  privacy: privacyApi,
   server: serverApi,
   rules: rulesApi,
   logs: logsApi,
-  systemProxy: systemProxyApi,
   autoStart: autoStartApi,
   stats: statsApi,
-  connection: connectionApi,
+  connections: connectionsApi,
+  system: systemApi,
+  ruleResources: ruleResourcesApi,
+  ipInfo: ipInfoApi,
   version: versionApi,
   admin: adminApi,
   update: updateApi,
   coreUpdate: coreUpdateApi,
   subscription: subscriptionApi,
   backup: backupApi,
+  helper: helperApi,
+  app: appApi,
 };
 
 /**

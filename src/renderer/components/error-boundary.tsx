@@ -2,6 +2,7 @@ import { Component, ErrorInfo, ReactNode } from 'react';
 import { AlertCircle } from 'lucide-react';
 import { Button } from './ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from './ui/card';
+import i18n from '../i18n';
 
 interface Props {
   children: ReactNode;
@@ -68,16 +69,14 @@ export class ErrorBoundary extends Component<Props, State> {
             <CardHeader>
               <div className="flex items-center gap-2">
                 <AlertCircle className="h-6 w-6 text-destructive" />
-                <CardTitle>应用程序遇到错误</CardTitle>
+                <CardTitle>{i18n.t('errorBoundary.title')}</CardTitle>
               </div>
-              <CardDescription>
-                很抱歉，应用程序遇到了一个意外错误。您可以尝试刷新页面或联系技术支持。
-              </CardDescription>
+              <CardDescription>{i18n.t('errorBoundary.description')}</CardDescription>
             </CardHeader>
             <CardContent className="space-y-4">
               {this.state.error && (
                 <div className="space-y-2">
-                  <p className="text-sm font-medium">错误信息：</p>
+                  <p className="text-sm font-medium">{i18n.t('errorBoundary.errorLabel')}</p>
                   <pre className="p-3 bg-muted rounded-md text-xs overflow-auto max-h-40">
                     {this.state.error.toString()}
                   </pre>
@@ -87,7 +86,7 @@ export class ErrorBoundary extends Component<Props, State> {
               {this.state.errorInfo && (
                 <details className="space-y-2">
                   <summary className="text-sm font-medium cursor-pointer hover:underline">
-                    查看详细堆栈信息
+                    {i18n.t('errorBoundary.viewStack')}
                   </summary>
                   <pre className="p-3 bg-muted rounded-md text-xs overflow-auto max-h-60 mt-2">
                     {this.state.errorInfo.componentStack}
@@ -96,9 +95,9 @@ export class ErrorBoundary extends Component<Props, State> {
               )}
 
               <div className="flex gap-2">
-                <Button onClick={this.handleReset}>重试</Button>
+                <Button onClick={this.handleReset}>{i18n.t('errorBoundary.retry')}</Button>
                 <Button variant="outline" onClick={() => window.location.reload()}>
-                  刷新页面
+                  {i18n.t('errorBoundary.reload')}
                 </Button>
               </div>
             </CardContent>
