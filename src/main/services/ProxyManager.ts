@@ -19,6 +19,7 @@ import type {
 import { ProxyErrorCode } from '../../shared/types';
 import type { ILogManager } from './LogManager';
 import { HelperManager } from './HelperManager';
+import type { IPrivilegedHelper } from './IPrivilegedHelper';
 import { ClashApiClient } from './ClashApiClient';
 import { PlatformPrivilegeService } from './PlatformPrivilegeService';
 import { type ISystemProxyManager, SystemProxyBase } from './SystemProxyManager';
@@ -456,8 +457,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private startTime: Date | null = null;
   private pid: number | null = null;
   private singboxPid: number | null = null; // macOS TUN 模式下实际的 sing-box PID
-  // macOS 提权 helper（装一次后免提权启停）；未注入/未就绪则回退 PR-M1 osascript 看护脚本。
-  private helperManager: HelperManager | null = null;
+  // 提权 helper（macOS=HelperManager / Windows=WindowsServiceHelper，装一次后免提权启停）；未注入/未就绪
+  // 则回退平台提权路径（macOS osascript 看护脚本 / Windows 每次 UAC）。按 process.platform 在 index.ts 装配。
+  private helperManager: IPrivilegedHelper | null = null;
   // 系统代理单一写者（注入 index.ts 的同一 singleton，与 IPC handler/tray 共享 originalSettings/marker 状态）。
   // 拆双轨：ProxyManager 不再内联 networksetup/reg，统一经此调用 enableProxy/disableProxy（带 marker + 防自指）。
   private systemProxyManager: ISystemProxyManager | null = null;
@@ -992,6 +994,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       // sing-box 由 root helper 托管（非 GUI 子进程）→ 显式让 helper 停 child + 扫孤儿（覆盖跨会话残留）。
       try {
         this.helperManager ??= new HelperManager();
+        await this.helperManager.stopCore();
+        await this.helperManager.cleanup();
+      } catch {
+        /* best-effort：退出兜底，失败不阻塞退出 */
+      }
+    } else if (process.platform === 'win32' && this.helperManager) {
+      // Windows：sing-box 由 LocalSystem 服务托管 → 同样让服务停 child + 扫孤儿。用注入的 WindowsServiceHelper
+      // （不实例化 macOS 的 HelperManager）；未装/未就绪则 stopCore/cleanup 经管道 ENOENT 快速失败，无额外延迟。
+      try {
         await this.helperManager.stopCore();
         await this.helperManager.cleanup();
       } catch {
@@ -4949,6 +4960,20 @@ exit 0
       }
     }
 
+    // Windows TUN 模式 + helper 服务就绪 → 走零提权路径（镜像上方 macOS 逻辑，避免每次 UAC）。就绪即经服务起核；
+    // 启动失败 → 回退 buildWindowsUacLaunchCommand（每次 UAC）兜底，不在 helper 路径死循环。Windows 无「允许在
+    // 后台」概念（backgroundDisabled 恒 false），无需该前置判定；未装 helper → isReady=false → 落下方 UAC 路径。
+    if (this.needsWindowsUAC() && this.helperManager && (await this.helperManager.isReady())) {
+      try {
+        return await this.startViaHelper();
+      } catch (e) {
+        this.logToManager(
+          'warn',
+          `helper 服务启动失败，回退 UAC 路径: ${e instanceof Error ? e.message : String(e)}`
+        );
+      }
+    }
+
     // F10：非交互启动（崩溃自动重启）且 macOS TUN 需 osascript（helper 不可用/未就绪/路径失效）→ 不弹密码框。
     // 崩溃循环里凭空弹管理员授权（最多连弹 MAX_RESTART_COUNT 次）比断流更糟；抛含「权限」的非重试错误进入
     // 停止终态，待用户手动经 start gate 重新安装/修复 helper。交互式启动（按钮/托盘/切模式）不受影响。
@@ -5753,7 +5778,7 @@ exit 0
   }
 
   /** 注入 macOS 提权 helper（index.ts 启动时调用）。 */
-  setHelperManager(helperManager: HelperManager): void {
+  setHelperManager(helperManager: IPrivilegedHelper): void {
     this.helperManager = helperManager;
   }
 

@@ -16,6 +16,7 @@ import * as net from 'net';
 import * as path from 'path';
 import { randomBytes } from 'crypto';
 import type { HelperStatus } from '../../shared/types';
+import type { IPrivilegedHelper } from './IPrivilegedHelper';
 import type { ILogManager } from './LogManager';
 import { resourceManager } from './ResourceManager';
 import { getUserDataPath } from '../utils/paths';
@@ -50,7 +51,7 @@ export interface HelperStartResult {
   error?: string;
 }
 
-export class HelperManager {
+export class HelperManager implements IPrivilegedHelper {
   /** 路径不符 warn 仅首次记（getStatus 被设置页/首页高频调用，避免刷屏）。 */
   private pathMismatchWarned = false;
 

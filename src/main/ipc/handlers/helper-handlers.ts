@@ -8,11 +8,11 @@ import * as fs from 'fs';
 import { IPC_CHANNELS } from '../../../shared/ipc-channels';
 import type { HelperStatus } from '../../../shared/types';
 import { registerIpcHandler } from '../ipc-handler';
-import type { HelperManager } from '../../services/HelperManager';
+import type { IPrivilegedHelper } from '../../services/IPrivilegedHelper';
 import type { IProxyManager } from '../../services/ProxyManager';
 
 export function registerHelperHandlers(
-  helperManager: HelperManager,
+  helperManager: IPrivilegedHelper,
   proxyManager: IProxyManager
 ): void {
   registerIpcHandler<boolean | undefined, HelperStatus>(

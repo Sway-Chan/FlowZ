@@ -1,0 +1,308 @@
+//go:build windows
+
+// Windows 进程/网络/注册表原语：被 helper.go 的协议骨架调用，承载 macOS→Windows 的全部机制 delta。
+package main
+
+import (
+	"os"
+	"os/exec"
+	"strings"
+	"syscall"
+	"unsafe"
+
+	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
+)
+
+// startSingbox：以 CREATE_NEW_PROCESS_GROUP 启动锁定的 sing-box（exec.Command(singboxBin,"run","-c",cfg)）。
+// 新进程组是 stop 走 GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, pid) 优雅停的前提（CTRL_BREAK 按进程组投递）。
+// 早期 stdout/stderr 重定向到 app 日志文件（镜像 macOS start），便于诊断启动问题。
+func startSingbox(singboxBin, cfg, logPath string) (*exec.Cmd, *os.File, error) {
+	c := exec.Command(singboxBin, "run", "-c", cfg)
+	// CREATE_NEW_PROCESS_GROUP：使 child 成为独立进程组组长，可被定向投递 CTRL_BREAK_EVENT。
+	// 注意：CREATE_NEW_PROCESS_GROUP 会令 child 默认忽略 CTRL_C（仅 CTRL_BREAK 可达），故 stop 用 CTRL_BREAK。
+	c.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: windows.CREATE_NEW_PROCESS_GROUP,
+	}
+	var logFile *os.File
+	if logPath != "" {
+		if lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644); err == nil {
+			logFile = lf
+			c.Stdout = lf
+			c.Stderr = lf
+		}
+	}
+	if err := c.Start(); err != nil {
+		return nil, logFile, err
+	}
+	return c, logFile, nil
+}
+
+// sendCtrlBreak：向指定进程组（pid 为组长，见 CREATE_NEW_PROCESS_GROUP）投递 CTRL_BREAK_EVENT，触发 sing-box
+// 优雅退出（拆 wintun/路由/DNS）。镜像 macOS SIGTERM 的「优雅信号」语义。
+// 失败（进程已退出/非组长）返回 err，由 terminateChild 的 5s 超时 + TerminateProcess 兜底。
+func sendCtrlBreak(pid int) error {
+	return windows.GenerateConsoleCtrlEvent(windows.CTRL_BREAK_EVENT, uint32(pid))
+}
+
+// processAlive：判 ppid 是否存活。OpenProcess(SYNCHRONIZE|QUERY_LIMITED_INFORMATION) 成功且
+// GetExitCodeProcess==STILL_ACTIVE → 存活。
+// 宁漏勿误（对齐 macOS kill(ppid,0) 的「其余错误按存活处理」）：
+//   - OpenProcess 失败且为 ERROR_INVALID_PARAMETER（pid 已不存在）→ 确定已死，返回 false。
+//   - 其余打开失败（如 ACCESS_DENIED——SYSTEM 一般不会见，但保守）→ 不确定，按存活返回 true。
+//   - GetExitCodeProcess 失败 → 不确定，按存活返回 true。
+func processAlive(ppid int) bool {
+	if ppid <= 0 {
+		return false
+	}
+	const access = windows.SYNCHRONIZE | windows.PROCESS_QUERY_LIMITED_INFORMATION
+	h, err := windows.OpenProcess(access, false, uint32(ppid))
+	if err != nil {
+		// 仅在「确定不存在」时判死；其余不确定情形宁可按存活（宁漏勿误）。
+		if errno, ok := err.(syscall.Errno); ok && errno == windows.ERROR_INVALID_PARAMETER {
+			return false
+		}
+		return true
+	}
+	defer windows.CloseHandle(h)
+	var code uint32
+	if err := windows.GetExitCodeProcess(h, &code); err != nil {
+		return true // 查询失败 → 不确定 → 按存活
+	}
+	const stillActive = 259 // STILL_ACTIVE
+	return code == stillActive
+}
+
+// terminatePid：硬杀指定 pid（freeport/cleanup 用）。OpenProcess(TERMINATE) + TerminateProcess。
+func terminatePid(pid uint32) error {
+	h, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, pid)
+	if err != nil {
+		return err
+	}
+	defer windows.CloseHandle(h)
+	return windows.TerminateProcess(h, 1)
+}
+
+// processImageName：取 pid 的可执行映像全路径（QueryFullProcessImageName）。失败返回 ""。
+// 仅映像路径、不含命令行参数 → 镜像 macOS `ps -o comm=`：避免「参数里碰巧含 sing-box」被误判/误杀。
+func processImageName(pid uint32) string {
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return ""
+	}
+	defer windows.CloseHandle(h)
+	buf := make([]uint16, windows.MAX_PATH)
+	size := uint32(len(buf))
+	if err := windows.QueryFullProcessImageName(h, 0, &buf[0], &size); err != nil {
+		return ""
+	}
+	return windows.UTF16ToString(buf[:size])
+}
+
+// isLockedSingbox：判映像路径是否为安装时锁定的 sing-box 二进制（Windows 路径大小写不敏感 → EqualFold）。
+// 镜像 macOS「只杀锁定二进制」：客户端不可指定，杜绝误杀外部同名进程。
+func isLockedSingbox(image, singboxBin string) bool {
+	if image == "" || singboxBin == "" {
+		return false
+	}
+	return strings.EqualFold(image, singboxBin)
+}
+
+// killAllSingbox：杀所有运行中的「锁定 singbox」实例（cleanup / 兜底收割用）。
+// 枚举系统进程快照（CreateToolhelp32Snapshot），按映像全路径 EqualFold 匹配 singboxBin → TerminateProcess。
+// 按完整锁定路径匹配（非 basename），避免误杀同名无关进程；镜像 macOS pkill -f "<singboxBin> run" 的意图。
+// 返回杀掉的实例数。
+func killAllSingbox(singboxBin string) int {
+	if singboxBin == "" {
+		return 0
+	}
+	snap, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return 0
+	}
+	defer windows.CloseHandle(snap)
+	var pe windows.ProcessEntry32
+	pe.Size = uint32(unsafe.Sizeof(pe))
+	killed := 0
+	for err = windows.Process32First(snap, &pe); err == nil; err = windows.Process32Next(snap, &pe) {
+		pid := pe.ProcessID
+		if pid == 0 || pid == 4 { // System Idle / System：跳过
+			continue
+		}
+		// 先按 toolhelp 的 ExeFile（basename，大小写不敏感）粗筛，命中再取全路径精确比对，省去给每个进程开句柄。
+		base := windows.UTF16ToString(pe.ExeFile[:])
+		if !strings.EqualFold(base, filepathBase(singboxBin)) {
+			continue
+		}
+		img := processImageName(pid)
+		if isLockedSingbox(img, singboxBin) {
+			if terminatePid(pid) == nil {
+				killed++
+			}
+		}
+	}
+	return killed
+}
+
+// filepathBase：轻量 basename（避免在 windows 约束下引 path/filepath 仅为取末段；helper.go 已用 filepath.Base 处理其余）。
+func filepathBase(p string) string {
+	p = strings.TrimRight(p, `\/`)
+	if i := strings.LastIndexAny(p, `\/`); i >= 0 {
+		return p[i+1:]
+	}
+	return p
+}
+
+// ---- freeport：GetExtendedTcpTable 枚举 IPv4 + IPv6 的 LISTEN 持有者 pid ----
+
+// MIB_TCPROW_OWNER_PID（IPv4）：与 Windows API 内存布局逐字段对齐。
+type mibTCPRowOwnerPID struct {
+	State      uint32
+	LocalAddr  uint32
+	LocalPort  uint32 // 网络字节序，仅低 16 位有效
+	RemoteAddr uint32
+	RemotePort uint32
+	OwningPID  uint32
+}
+
+// MIB_TCP6ROW_OWNER_PID（IPv6）。
+type mibTCP6RowOwnerPID struct {
+	LocalAddr     [16]byte
+	LocalScopeID  uint32
+	LocalPort     uint32
+	RemoteAddr    [16]byte
+	RemoteScopeID uint32
+	RemotePort    uint32
+	State         uint32
+	OwningPID     uint32
+}
+
+const (
+	tcpTableOwnerPIDListener = 3 // TCP_TABLE_OWNER_PID_LISTENER
+	afINET                   = 2 // AF_INET
+	afINET6                  = 23 // AF_INET6
+	mibTCPStateListen        = 2 // MIB_TCP_STATE_LISTEN
+)
+
+var (
+	modiphlpapi             = windows.NewLazySystemDLL("iphlpapi.dll")
+	procGetExtendedTcpTable = modiphlpapi.NewProc("GetExtendedTcpTable")
+)
+
+// localPortFromNetOrder：GetExtendedTcpTable 的 LocalPort 为「主机内存中按网络序排布的 32 位」，低 16 位是端口。
+// 端口 = 高字节<<8 | 次高字节（取低 16 位的两个字节做 ntohs）。
+func localPortFromNetOrder(p uint32) uint16 {
+	b0 := byte(p)       // 低字节（网络序高位）
+	b1 := byte(p >> 8)  // 次低字节（网络序低位）
+	return uint16(b0)<<8 | uint16(b1)
+}
+
+// listenPidsForPort：返回在 port 上处于 LISTEN 的所有 owning pid（去重，IPv4+IPv6 合并）。
+// 镜像 macOS `lsof -ti tcp:<port> -sTCP:LISTEN`：仅 LISTEN 持有者，不含 ESTABLISHED 连接方。
+func listenPidsForPort(port uint16) ([]uint32, error) {
+	seen := map[uint32]bool{}
+	var out []uint32
+
+	collect := func(family uint32, parse func(table []byte) []struct {
+		pid  uint32
+		port uint16
+	}) error {
+		var size uint32
+		// 首次调用拿所需缓冲大小（返回 ERROR_INSUFFICIENT_BUFFER）。
+		r1, _, _ := procGetExtendedTcpTable.Call(
+			0, uintptr(unsafe.Pointer(&size)), 1, // sorted=TRUE
+			uintptr(family), uintptr(tcpTableOwnerPIDListener), 0,
+		)
+		if r1 != uintptr(windows.ERROR_INSUFFICIENT_BUFFER) && r1 != 0 {
+			return syscall.Errno(r1)
+		}
+		if size == 0 {
+			return nil
+		}
+		buf := make([]byte, size)
+		r1, _, _ = procGetExtendedTcpTable.Call(
+			uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 1,
+			uintptr(family), uintptr(tcpTableOwnerPIDListener), 0,
+		)
+		if r1 != 0 {
+			return syscall.Errno(r1)
+		}
+		for _, e := range parse(buf) {
+			if e.port == port && !seen[e.pid] {
+				seen[e.pid] = true
+				out = append(out, e.pid)
+			}
+		}
+		return nil
+	}
+
+	// IPv4
+	if err := collect(afINET, func(table []byte) []struct {
+		pid  uint32
+		port uint16
+	} {
+		n := *(*uint32)(unsafe.Pointer(&table[0]))
+		rows := unsafe.Slice((*mibTCPRowOwnerPID)(unsafe.Pointer(&table[4])), int(n))
+		res := make([]struct {
+			pid  uint32
+			port uint16
+		}, 0, n)
+		for i := range rows {
+			if rows[i].State != mibTCPStateListen {
+				continue
+			}
+			res = append(res, struct {
+				pid  uint32
+				port uint16
+			}{rows[i].OwningPID, localPortFromNetOrder(rows[i].LocalPort)})
+		}
+		return res
+	}); err != nil {
+		return nil, err
+	}
+
+	// IPv6
+	if err := collect(afINET6, func(table []byte) []struct {
+		pid  uint32
+		port uint16
+	} {
+		n := *(*uint32)(unsafe.Pointer(&table[0]))
+		rows := unsafe.Slice((*mibTCP6RowOwnerPID)(unsafe.Pointer(&table[4])), int(n))
+		res := make([]struct {
+			pid  uint32
+			port uint16
+		}, 0, n)
+		for i := range rows {
+			if rows[i].State != mibTCPStateListen {
+				continue
+			}
+			res = append(res, struct {
+				pid  uint32
+				port uint16
+			}{rows[i].OwningPID, localPortFromNetOrder(rows[i].LocalPort)})
+		}
+		return res
+	}); err != nil {
+		return nil, err
+	}
+
+	return out, nil
+}
+
+// enableIPForwarding：allowLan/IP 转发的最小 Windows 实现。
+// 设 HKLM\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\IPEnableRouter=1（DWORD）。
+// best-effort：失败不阻塞 start。真机必验项 —— 注册表生效通常需重启「Routing and Remote Access」服务或重启系统，
+//
+//	单设注册表未必即时转发。完整实现应另启用/配置 RRAS 或用 netsh，留待真机验证后补。
+func enableIPForwarding() {
+	k, _, err := registry.CreateKey(
+		registry.LOCAL_MACHINE,
+		`SYSTEM\CurrentControlSet\Services\Tcpip\Parameters`,
+		registry.SET_VALUE,
+	)
+	if err != nil {
+		return
+	}
+	defer k.Close()
+	_ = k.SetDWordValue("IPEnableRouter", 1)
+}

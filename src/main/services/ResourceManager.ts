@@ -126,6 +126,16 @@ export class ResourceManager {
     return path.join(this.getPlatformResourceDir(), 'com.flowz.helper');
   }
 
+  /**
+   * 获取随包内置的 Windows 提权 helper 服务二进制路径（与 sing-box.exe 同目录）。
+   * 生产/开发：<resources>/win/com.flowz.helper.exe。仅 Windows 有意义；
+   * 安装时由 WindowsServiceHelper 经 sc create 注册为 LocalSystem 服务（binPath 指向此路径，故安装后 app
+   * 移动会令 binPath 失效——与 macOS plist 烧录路径同理，可选 P2 检测）。
+   */
+  getWinHelperPath(): string {
+    return path.join(this.getPlatformResourceDir(), 'com.flowz.helper.exe');
+  }
+
   /** macOS 内核持久化的受保护目录（root-only 写，App 升级不覆盖；B 块）。helper 安装时经 --coredir 锁定它，
    *  install-core 只写此目录。仅 macOS 有意义。 */
   getProtectedCoreDir(): string {
