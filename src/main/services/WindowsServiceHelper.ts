@@ -395,11 +395,13 @@ export class WindowsServiceHelper implements IPrivilegedHelper {
       // New-Service 退避重试兜底（删除标记态 1072 窗口期）：BinaryPathName 单一字符串直达 CreateService；
       // 默认账户即 LocalSystem；-StartupType Automatic = 开机自启常驻（app 全程只发管道命令、不 start/stop 服务）。
       '$created = $false',
+      '$lastErr = $null',
       'for ($i = 0; $i -lt 10 -and -not $created; $i++) {',
       `  try { New-Service -Name ${SERVICE_NAME} -BinaryPathName $bp -StartupType Automatic | Out-Null; $created = $true }`,
-      '  catch { Start-Sleep -Milliseconds 500 }',
+      '  catch { $lastErr = $_; Start-Sleep -Milliseconds 500 }',
       '}',
-      "if (-not $created) { throw 'New-Service 失败：服务仍处于删除标记态(1072)，请稍候或重启后重试安装' }",
+      // 失败抛**真实异常**（不用硬编码 1072 文案盖掉真因——非 1072 失败如路径非法/权限也要透出真原因，闭合 MED-2）
+      `if (-not $created) { throw "New-Service 失败（重试 10 次；多为 sc delete 标记删除态 1072 竞态，若持续请重启）：$($lastErr.Exception.Message)" }`,
       `& sc.exe start ${SERVICE_NAME} | Out-Null`,
     ].join('\n');
   }
@@ -434,7 +436,9 @@ export class WindowsServiceHelper implements IPrivilegedHelper {
         inner,
         `  "0" | Out-File -FilePath '${this.psq(flagPath)}' -Encoding ascii`,
         '} catch {',
-        `  $_.Exception.Message | Out-File -FilePath '${this.psq(errPath)}' -Encoding utf8`,
+        // 用 .NET WriteAllText（默认 UTF-8 无 BOM）写异常信息——避免 PS5.1 `Out-File -Encoding utf8` 的 BOM
+        // 在 app 回传文案前残留零宽字符（MED-B）。
+        `  [System.IO.File]::WriteAllText('${this.psq(errPath)}', $_.Exception.Message)`,
         `  "1" | Out-File -FilePath '${this.psq(flagPath)}' -Encoding ascii`,
         '}',
       ].join('\n');
