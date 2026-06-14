@@ -44,6 +44,19 @@ module.exports = {
           DEFAULT: "hsl(var(--info))",
           foreground: "hsl(var(--info-foreground))",
         },
+        // badge 色相（分类/协议标识）：需 /15 bg + /30 border 透明度 → 用 <alpha-value> 形式
+        // （success/warning/info 为实心用、不带 alpha；此处带 alpha 是 badge 透明度的必需，非风格变体）。
+        "badge-blue": "hsl(var(--badge-blue) / <alpha-value>)",
+        "badge-purple": "hsl(var(--badge-purple) / <alpha-value>)",
+        "badge-orange": "hsl(var(--badge-orange) / <alpha-value>)",
+        "badge-cyan": "hsl(var(--badge-cyan) / <alpha-value>)",
+        "badge-green": "hsl(var(--badge-green) / <alpha-value>)",
+        "badge-teal": "hsl(var(--badge-teal) / <alpha-value>)",
+        "badge-indigo": "hsl(var(--badge-indigo) / <alpha-value>)",
+        "badge-rose": "hsl(var(--badge-rose) / <alpha-value>)",
+        "badge-slate": "hsl(var(--badge-slate) / <alpha-value>)",
+        "badge-sky": "hsl(var(--badge-sky) / <alpha-value>)",
+        "badge-amber": "hsl(var(--badge-amber) / <alpha-value>)",
         muted: {
           DEFAULT: "hsl(var(--muted))",
           foreground: "hsl(var(--muted-foreground))",

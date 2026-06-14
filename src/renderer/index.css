@@ -27,6 +27,18 @@
     --warning-foreground: 0 0% 100%;
     --info: 217.2 91.2% 59.8%;
     --info-foreground: 0 0% 100%;
+    /* badge 色相 token（分类/协议标识，与上方语义色同模式）：明=~600 阶（深色读字）；主题切换由本块/.dark 块切换驱动，消费端无需 dark: 变体 */
+    --badge-blue: 221.2 83.2% 53.3%;
+    --badge-purple: 271.5 81.3% 55.9%;
+    --badge-orange: 20.5 90.2% 48.2%;
+    --badge-cyan: 192 91% 36.5%;
+    --badge-green: 142.1 76.2% 36.3%;
+    --badge-teal: 174.7 83.9% 31.6%;
+    --badge-indigo: 243.4 75.4% 58.6%;
+    --badge-rose: 346.8 77.2% 49.8%;
+    --badge-slate: 215.3 19.3% 34.5%;
+    --badge-sky: 200.4 98% 39.4%;
+    --badge-amber: 37.7 92.1% 50.2%;
     --border: 214 20% 84%;
     --input: 214 22% 80%;
     --ring: 217.2 91.2% 59.8%;
@@ -57,6 +69,18 @@
     --warning-foreground: 0 0% 10%;
     --info: 217.2 91.2% 65%;
     --info-foreground: 0 0% 10%;
+    /* badge 色相 token（暗=~400 阶，浅色读字，与暗语义色同梯度） */
+    --badge-blue: 213.1 93.9% 67.8%;
+    --badge-purple: 270 95.2% 75.3%;
+    --badge-orange: 27 96% 61%;
+    --badge-cyan: 187.9 85.7% 53.3%;
+    --badge-green: 141.9 69.2% 58%;
+    --badge-teal: 172 66% 50%;
+    --badge-indigo: 234.5 89.5% 73.9%;
+    --badge-rose: 351.3 94.5% 71.4%;
+    --badge-slate: 214.3 20.2% 65.1%;
+    --badge-sky: 198.4 93.2% 59.6%;
+    --badge-amber: 42.7 96.3% 56.5%;
     --border: 0 0% 24%;
     --input: 0 0% 27%;
     --ring: 0 0% 83.1%;

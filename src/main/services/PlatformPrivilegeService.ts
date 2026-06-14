@@ -588,8 +588,8 @@ exit 0
 
       killProcess.on('error', async (error) => {
         this.ctx.log('error', `停止 sing-box 进程失败: ${error.message}`);
-        // spawn 失败兜底：尽力强杀，结果仍以复核存活为准
-        const ok = await this.forceKillElevated(pid);
+        // spawn 失败（osascript 无法启动，非用户取消授权）：尽力强杀但不发 STOP_AUTH_CANCELLED（MED-2，避免误报）。
+        const ok = await this.forceKillElevated(pid, false);
         resolve({ stopped: ok });
       });
     });
@@ -697,7 +697,7 @@ exit 0
    * 「取消授权→发 STOP_AUTH_CANCELLED 事件」原内联于 forceKillOrReportCancelled，现由 stopElevatedDarwin
    * 据本方法返回 false 触发 ctx.onStopAuthCancelled（保留 M3 语义，service 不持 IPC 通道）。
    */
-  private async forceKillElevated(pid: number): Promise<boolean> {
+  private async forceKillElevated(pid: number, reportCancelled = true): Promise<boolean> {
     await new Promise<void>((resolve) => {
       const killProcess = spawn('/usr/bin/osascript', [
         '-e',
@@ -718,9 +718,10 @@ exit 0
         resolve();
       });
     });
-    // 复核：osascript 取消授权时进程仍活 → 返回 false。若返回 false，调用方触发 onStopAuthCancelled。
+    // 复核：osascript 取消授权时进程仍活 → 返回 false，并发 STOP_AUTH_CANCELLED。
+    // reportCancelled=false：spawn 失败兜底路径（osascript 无法启动，非用户取消授权）不发该事件，避免误报「停止被取消授权」（MED-2）。
     const stopped = !this.ctx.isProcessAlive(pid);
-    if (!stopped) {
+    if (!stopped && reportCancelled) {
       this.ctx.onStopAuthCancelled();
     }
     return stopped;
@@ -962,9 +963,11 @@ exit 0
       // -NonInteractive：看护脚本含 Mandatory 参数，若引号链失效缺参，避免在隐藏窗口交互式提示→永久挂起
       "'-NonInteractive'",
       "'-ExecutionPolicy'",
-      "'-Bypass'",
+      // 值 token 不带前导横线：elevated powershell 会把 '-Bypass'/'-Hidden' 当参数名而非 ExecutionPolicy/
+      // WindowStyle 的值 → ExecutionPolicy 未设 Bypass、WindowStyle 未设 Hidden → 看护脚本被拦/可见窗口闪现。
+      "'Bypass'",
       "'-WindowStyle'",
-      "'-Hidden'",
+      "'Hidden'",
       "'-File'",
       q(watchdog),
       q(singboxPath),
