@@ -7,9 +7,13 @@
  */
 import { WindowsServiceHelper } from '../WindowsServiceHelper';
 
+// 「非 Windows 安全降级」只在非 Windows 宿主可测：helper 直接读 process.platform（无注入点），
+// 在 Windows CI runner（win32）上该降级路径不可达 → 跳过；其逻辑由 macOS/Linux runner 覆盖。
+const describeNonWin = process.platform === 'win32' ? describe.skip : describe;
+
 describe('WindowsServiceHelper', () => {
-  describe('非 Windows 平台安全降级', () => {
-    // 测试宿主为 Linux（process.platform !== 'win32'）→ 所有方法降级，不连 SCM/管道。
+  describeNonWin('非 Windows 平台安全降级', () => {
+    // 测试宿主非 Windows（process.platform !== 'win32'）→ 所有方法降级，不连 SCM/管道。
     const helper = new WindowsServiceHelper();
 
     it('getStatus 返回 supported=false 的空状态', async () => {
