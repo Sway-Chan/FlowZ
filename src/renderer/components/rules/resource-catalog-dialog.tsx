@@ -32,10 +32,10 @@ type CatalogFilter = 'all' | 'geosite' | 'geoip' | 'lite';
 const CATALOG_FILTERS: CatalogFilter[] = ['all', 'geosite', 'geoip', 'lite'];
 
 export const RESOURCE_CATEGORY_BADGE: Record<RuleResourceCategory, string> = {
-  geosite: 'border-transparent bg-blue-600/15 text-blue-700 dark:text-blue-300',
-  'geosite-lite': 'border-transparent bg-blue-600/10 text-blue-600 dark:text-blue-300',
-  geoip: 'border-transparent bg-purple-600/15 text-purple-700 dark:text-purple-300',
-  'geoip-lite': 'border-transparent bg-purple-600/10 text-purple-600 dark:text-purple-300',
+  geosite: 'border-transparent bg-badge-blue/15 text-badge-blue',
+  'geosite-lite': 'border-transparent bg-badge-blue/10 text-badge-blue',
+  geoip: 'border-transparent bg-badge-purple/15 text-badge-purple',
+  'geoip-lite': 'border-transparent bg-badge-purple/10 text-badge-purple',
   custom: 'border-transparent bg-muted text-muted-foreground',
 };
 
