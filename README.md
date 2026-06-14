@@ -45,7 +45,7 @@
 - ✅ 开机自启动 + 自动连接 + 静默启动
 
 **系统与可靠性**
-- ✅ **macOS 零授权链**：root 看护 helper，启停 / 退出 / 崩溃回收免重复 UAC 授权
+- ✅ **零授权提权链（macOS + Windows）**：装一次提权 helper / 服务后，TUN 模式启停 / 切换节点 / 退出 / 崩溃回收**免每次授权**（macOS root daemon · Windows LocalSystem 服务 · 命名管道/socket + token 鉴权）
 - ✅ **退出零残留**：跨平台清理 sing-box 进程 / Wintun 适配器 / 系统代理注册表，崩溃 / 注销 / 关机兜底
 - ✅ 自动更新：下载完整性校验 + 启动预检 + 失败自动回滚 + 问题版本跳过
 - ✅ 跨平台：Windows / macOS（Apple Silicon + Intel）/ Linux
@@ -54,15 +54,45 @@
 
 ## 🖼 界面预览
 
-<img src="https://cdn.nodeimage.com/i/YvkiEO6sI7ex8UzWTGobq2U3UCwo7pnv.webp" alt="preview">
-<img src="https://cdn.nodeimage.com/i/JjgOVR72FVDe8IdenWOvQgYmRmy3XljX.webp" alt="preview">
-<img src="https://cdn.nodeimage.com/i/OkMsmCuA4kTzOxpUfI5kbHrctJgou781.webp" alt="preview">
-<img src="https://cdn.nodeimage.com/i/ZfewzdJUYN3wkLbLL3DieXND5DD63lhT.webp" alt="preview">
-<img src="https://cdn.nodeimage.com/i/7Th2DdFQ52V3xNg67ecS88zOfqV5KWJ1.webp" alt="preview">
-<img src="https://cdn.nodeimage.com/i/eF2PxEG9figyhXJe6EqRbu7TtcucVDLH.webp" alt="preview">
-<img src="https://cdn.nodeimage.com/i/ihpRZpWuW3MgQR8kkEKmZl2u6ANrXXcw.webp" alt="preview">
-<img src="https://cdn.nodeimage.com/i/sicWxjH9z3ZyVFWPEDNYvYWl0cYMASdR.webp" alt="preview">
-<img src="https://cdn.nodeimage.com/i/CyL0QX2SvBCPZxonMkVws5pSPGpNtPVm.webp" alt="preview">
+> 截图为内置 demo 数据，非真实订阅 / 节点。
+
+### 首页 · 连接总览
+所见即所得的连接状态、节点切换、实时速率与连接拓扑。浅色 / 深色双主题：
+
+| 浅色主题 | 深色主题 |
+|:---:|:---:|
+| <img src="docs/screenshots/home-light.webp" width="100%"> | <img src="docs/screenshots/home-dark.webp" width="100%"> |
+
+### 节点与订阅
+订阅一键导入、节点卡片管理、协议标识、批量测速与排序：
+
+<img src="docs/screenshots/servers.webp" width="100%">
+
+### 应用分流 · 路由规则
+按应用一键指定 代理 / 直连 / 阻止；规则支持多条件组合（域名 / IP / 端口 / 进程 / geosite 等 13 类，OR/AND）+ 拖拽排序 + 改值零重启：
+
+| 应用分流 | 路由规则 |
+|:---:|:---:|
+| <img src="docs/screenshots/app-routing.webp" width="100%"> | <img src="docs/screenshots/rules.webp" width="100%"> |
+
+### 规则资源
+内置 geosite/geoip 精选清单 + 远程 `.srs` 规则集下载与定期更新：
+
+<img src="docs/screenshots/rule-resources.webp" width="100%">
+
+### 连接诊断 · 实时日志
+逐连接速率 / 规则命中 / 节点链；分级实时日志：
+
+| 连接信息 | 实时日志 |
+|:---:|:---:|
+| <img src="docs/screenshots/connections.webp" width="100%"> | <img src="docs/screenshots/logs.webp" width="100%"> |
+
+### 设置 · 一次授权零提权
+精细设置；**装一次提权 helper / 服务后，TUN 模式启停免每次授权**（Windows 一次 UAC / macOS 一次密码）：
+
+| 设置 | Windows 提权服务 | macOS 提权 helper |
+|:---:|:---:|:---:|
+| <img src="docs/screenshots/settings.webp" width="100%"> | <img src="docs/screenshots/helper-windows.webp" width="100%"> | <img src="docs/screenshots/helper-macos.webp" width="100%"> |
 
 ---
 
