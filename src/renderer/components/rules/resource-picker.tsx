@@ -25,10 +25,11 @@ export function ResourcePicker({ value, onChange, onRequestClose }: ResourcePick
   const [urlInput, setUrlInput] = useState('');
 
   useEffect(() => {
+    // 内置（随包）+ 外置（已下载）都列出：两者都是本地 .srs，均可经 res:<id> 引用（内置 id=builtin:<tag>，
+    // 后端 generateCustomRules 解析为随包 runtime 路径）。按 builtin 分组渲染。
     api.ruleResources
       .list()
-      // 内置 geo 规则集由智能分流固定引用、不走 res: 自定义引用，排除出选择器
-      .then((items) => setResources(items.filter((r) => !r.builtin)))
+      .then(setResources)
       .catch(() => {});
   }, []);
 
@@ -68,32 +69,57 @@ export function ResourcePicker({ value, onChange, onRequestClose }: ResourcePick
           </Button>
         </div>
       ) : (
-        <div className="max-h-40 overflow-auto rounded-md border">
-          <div className="divide-y divide-border/60">
-            {resources.map((r) => (
-              <label
-                key={r.id}
-                className="flex cursor-pointer items-center gap-3 px-3 py-2 hover:bg-muted/50"
-              >
-                <Checkbox
-                  checked={value.includes(`res:${r.id}`)}
-                  onCheckedChange={() => toggleRes(r.id)}
-                />
-                <span className="min-w-0 flex-1 truncate text-sm">{r.name}</span>
-                {!r.fileExists && (
-                  <Badge
-                    variant="outline"
-                    className="border-transparent bg-destructive/15 text-xs text-destructive"
-                  >
-                    {t('ruleResources.missing', '文件缺失')}
-                  </Badge>
-                )}
-                <Badge variant="outline" className="text-xs">
-                  {t(`ruleResources.category.${r.category}`, r.category)}
-                </Badge>
-              </label>
-            ))}
-          </div>
+        <div className="max-h-56 overflow-auto rounded-md border">
+          {(
+            [
+              ['builtin', resources.filter((r) => r.builtin)] as const,
+              ['external', resources.filter((r) => !r.builtin)] as const,
+            ] as const
+          ).map(([group, list]) =>
+            list.length === 0 ? null : (
+              <div key={group}>
+                <div className="bg-muted/40 px-3 py-1 text-[11px] font-medium text-muted-foreground">
+                  {group === 'builtin'
+                    ? t('ruleResources.picker.groupBuiltin', '内置 · 随包')
+                    : t('ruleResources.picker.groupExternal', '已下载')}
+                </div>
+                <div className="divide-y divide-border/60">
+                  {list.map((r) => {
+                    // 文件缺失且未被引用 → 不可新选（后端 isValidSsrFile 会跳过该规则，避免用户建一条静默失效的引用）；
+                    // 已引用的缺失项仍可取消（解除失效引用）。文件存在的项正常勾选。
+                    const isReferenced = value.includes(`res:${r.id}`);
+                    const disabled = !r.fileExists && !isReferenced;
+                    return (
+                      <label
+                        key={r.id}
+                        className={`flex items-center gap-3 px-3 py-2 ${
+                          disabled ? 'opacity-50' : 'cursor-pointer hover:bg-muted/50'
+                        }`}
+                      >
+                        <Checkbox
+                          checked={isReferenced}
+                          disabled={disabled}
+                          onCheckedChange={() => toggleRes(r.id)}
+                        />
+                        <span className="min-w-0 flex-1 truncate text-sm">{r.name}</span>
+                        {!r.fileExists && (
+                          <Badge
+                            variant="outline"
+                            className="border-transparent bg-destructive/15 text-xs text-destructive"
+                          >
+                            {t('ruleResources.missing', '文件缺失')}
+                          </Badge>
+                        )}
+                        <Badge variant="outline" className="text-xs">
+                          {t(`ruleResources.category.${r.category}`, r.category)}
+                        </Badge>
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+            )
+          )}
         </div>
       )}
 

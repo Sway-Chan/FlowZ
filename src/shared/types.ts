@@ -525,6 +525,9 @@ export interface UserConfig {
   appRules?: AppRule[];
   // 应用分流总开关；undefined=true（兼容老配置，升级不静默失效）。false → appRules 完全不进 route 生成/TUN 排除/geo 收集。
   appRoutingEnabled?: boolean;
+  // 应用分流默认预设一次性注入标记：首次为内置预设注入默认「代理·跟全局」规则后置 true。
+  // 防每次启动回灌（用户删掉某预设规则后不会被重新补回）。新装由 createDefaultConfig 直接置 true。
+  appRulesSeeded?: boolean;
 
   // 用户自定义的应用分流预设
   customAppPresets?: CustomAppPreset[];
@@ -537,6 +540,11 @@ export interface UserConfig {
   bypassLAN?: boolean; // 绕过局域网（将内网 IP 设置为直连）
   blockQuic?: boolean; // 阻止 QUIC（对代理向 UDP 443 执行 reject，逼浏览器回退 TCP）；默认关；节点无关，对所有协议一视同仁
   tlsFragment?: boolean; // 全局 TLS 分片：对所有 TLS 节点切分 ClientHello 抗 SNI-DPI；默认关
+  // 节点测速端点 URL（经各节点代理 GET 量 TTFB）。默认 generate_204（见 shared/speed-test）；用户可自配，兼容 http/https。
+  // 非法值由 SpeedTestService 经 resolveSpeedTestTarget 回落默认，不阻断测速。
+  speedTestUrl?: string;
+  // fake-ip-filter 默认清单（NTP/STUN/Captive 等在 FakeIP 下会坏的域名 → 真实解析）。默认开（undefined/true=开），仅 false=关。
+  fakeIpFilter?: boolean;
   // 核心更新：仅在配置生成器已验证的 sing-box minor 版本带内自动更新（默认 true）。关闭后允许自动
   // 更新跨越 minor（如 1.13→1.14），但跨 minor 的 schema 变更可能导致配置不兼容、需手动处理。
   restrictCoreUpdateToCompatibleMinor?: boolean;

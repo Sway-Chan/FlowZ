@@ -183,12 +183,35 @@ func handle(conn net.Conn) {
 			fmt.Fprintln(conn, "OK notrunning")
 		}
 	case "cleanup":
-		// 杀掉所有运行中的「锁定 singbox」实例（含外部路径遗留的孤儿），让 app 免手动清理。
+		// 先摘自家 child 并精准收割（与 stop/uninstall 单一收割权模型一致），再 killAllSingbox 兜底外部孤儿。
 		// 按锁定二进制完整路径匹配映像，避免误杀无关进程（镜像 macOS `singboxBin+" run"` 意图）。
+		if child != nil && child.Process != nil {
+			c, done := child, childDone
+			child, childDone = nil, nil
+			go terminateChild(c, done) // 不持 mu 收割（见 stop 注释）
+		}
 		n := killAllSingbox(singboxBin)
-		child, childDone = nil, nil
 		_ = n
 		fmt.Fprintln(conn, "OK cleaned")
+	case "uninstall":
+		// 自卸载（app 卸载/更新时调用）：收割 child → 派生脱离本进程的 SYSTEM 旁路（停删 FlowZHelper 服务 +
+		// 删 supportDir，含外置的 helper.exe 自身 + helper.token）→ 回 OK → 自退。
+		// 镜像 macOS HelperManager 卸载语义（bootout + rm plist/helper/support），但 Windows 须借旁路进程完成
+		// 两件本进程无法自完成的事：① 自删「正在运行因而被锁定」的 helper.exe；② 停删「自身所属」的 SCM 服务
+		// （sc delete 要服务先停，而本进程正是服务主进程）。详见 winproc.go spawnSelfUninstall。
+		if child != nil && child.Process != nil {
+			c, done := child, childDone
+			child, childDone = nil, nil
+			go terminateChild(c, done) // 不持 mu 收割（见 stop 注释）
+		}
+		_ = killAllSingbox(singboxBin) // 兜底清外部孤儿 sing-box（占 9090/TUN），与 cleanup 对齐
+		spawnSelfUninstall()
+		fmt.Fprintln(conn, "OK uninstalling")
+		// 给回复 flush + 旁路 ping 延迟留窗口后自退；os.Exit 使服务进程消失 → SCM 标记停止 → 旁路 sc delete 生效。
+		go func() {
+			time.Sleep(800 * time.Millisecond)
+			os.Exit(0)
+		}()
 	case "freeport":
 		// 按端口（GetExtendedTcpTable）定位 LISTEN 持有者：是锁定 sing-box 才 TerminateProcess，否则回报占用者名字（不杀）。
 		// 镜像 macOS v4「不杀无辜」：覆盖外部 / 旧路径 / 改过 singboxBin 路径的端口占用者。
@@ -225,8 +248,9 @@ func handle(conn net.Conn) {
 				foreign = append(foreign, name)
 			}
 		}
+		// 混合占用（sing-box+foreign 同端口，极罕见）回 foreign：诚实告知 app 端口仍被外部占——sing-box 虽已
+		// terminatePid，但 foreign 残留→app 重试绑定仍失败，回 foreign 让 app 知端口未真正释放（与 macOS helper 一致）。
 		if len(foreign) > 0 {
-			// 占用者非锁定 sing-box → 不杀、回报名字（app 据此给「<port> 被 X 占用」的诚实终态）
 			fmt.Fprintf(conn, "OK foreign %s\n", strings.Join(foreign, " | "))
 		} else {
 			fmt.Fprintf(conn, "OK killed %s\n", strings.Join(killed, ","))

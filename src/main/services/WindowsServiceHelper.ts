@@ -25,8 +25,7 @@ import * as path from 'path';
 import { randomBytes } from 'crypto';
 import type { HelperStatus } from '../../shared/types';
 import type { ILogManager } from './LogManager';
-import type { HelperStartResult } from './HelperManager';
-import type { IPrivilegedHelper } from './IPrivilegedHelper';
+import type { IPrivilegedHelper, HelperStartResult } from './IPrivilegedHelper';
 import { resourceManager } from './ResourceManager';
 import { getUserDataPath } from '../utils/paths';
 
@@ -323,7 +322,12 @@ export class WindowsServiceHelper implements IPrivilegedHelper {
     }
   }
 
-  /** 卸载服务：UAC 提权跑 sc stop + sc delete + 删 token；并删客户端 token 副本。 */
+  /**
+   * 卸载服务。优先**管道 uninstall（零 UAC）**：helper 以 SYSTEM 收割 child → 派生旁路自停删服务 + 删 ProgramData
+   * （含外置 helper.exe 自身 + helper.token，见 helper.go uninstall / winproc.go spawnSelfUninstall）→ 轮询确认服务真消失。
+   * 管道不可用 / 自卸载未在预期内完成 → 回退**提权 PS（一次 UAC）**兜底（sc stop/delete + 删 ProgramData）。
+   * 最后删客户端 token 副本。镜像「日常启停零提权」的同一 token 鉴权边界（卸载也走零提权主路径）。
+   */
   async uninstall(): Promise<{ success: boolean; error?: string; status: HelperStatus }> {
     if (!this.supported) {
       return {
@@ -334,16 +338,42 @@ export class WindowsServiceHelper implements IPrivilegedHelper {
     }
     this.mutationInFlight = true;
     try {
-      const result = await this.runElevatedPowerShell(this.buildUninstallScript());
-      if (!result.success) {
-        return { success: false, error: result.error, status: await this.computeStatus() };
+      // 1) 管道自卸载（零 UAC）。仅 helper 就绪（有 token + 管道可达）时可行。
+      let done = false;
+      if (this.token()) {
+        try {
+          const resp = await this.sendCommand(['uninstall'], 5000);
+          if (resp.startsWith('OK')) {
+            // 自卸载是异步收尾（helper ~800ms 后自退 → 旁路 ping 延迟后 sc delete + rmdir，合计约 3-4s）。
+            // 轮询至多 ~6s 确认服务真从 SCM 消失，再判成功，避免「OK 但服务残留」被当成功。
+            for (let i = 0; i < 15; i++) {
+              await new Promise((r) => setTimeout(r, 400));
+              if (!(await this.queryService()).exists) {
+                done = true;
+                break;
+              }
+            }
+          }
+        } catch {
+          /* 管道不可用（未装/未就绪/超时）→ 回退提权 */
+        }
+      }
+      // 2) 回退：提权 PS（管道路径不可用，或自卸载未在预期内完成 → 诚实兜底，宁可一次 UAC 也要真卸干净）。
+      if (!done) {
+        const result = await this.runElevatedPowerShell(this.buildUninstallScript());
+        if (!result.success) {
+          return { success: false, error: result.error, status: await this.computeStatus() };
+        }
       }
       try {
         fs.unlinkSync(this.tokenFilePath());
       } catch {
         /* 不存在则忽略 */
       }
-      this.log('info', 'helper 服务已卸载');
+      this.log(
+        'info',
+        done ? 'helper 服务经管道自卸载（零提权）' : 'helper 服务已卸载（提权兜底）'
+      );
       const status = await this.computeStatus();
       this.lastStableStatus = status;
       return { success: true, status };
@@ -359,10 +389,12 @@ export class WindowsServiceHelper implements IPrivilegedHelper {
   }
 
   /**
-   * 安装脚本体（在 runElevatedPowerShell 的 $ErrorActionPreference=Stop + try/catch 包裹内跑）：写受保护 token
-   * （ACL：SYSTEM + Administrators，去继承）→ 幂等清旧服务并**轮询等其真正消失** → New-Service **1072 退避重试**
-   * 创建（BinaryPathName 单一 .NET 字符串直达 CreateService，真双引号锁定 exe + 三参，默认 LocalSystem，Automatic
-   * 开机自启）→ sc start。
+   * 安装脚本体（在 runElevatedPowerShell 的 $ErrorActionPreference=Stop + try/catch 包裹内跑）：**锁目录 ACL**
+   * （$support 去继承、仅 SYSTEM/Admin 私有，机密性的唯一来源）→ 删旧+写 token（继承目录锁、刻意不单独只读，否则
+   * 重装 Set-Content 覆盖被拒——真机根因）→ 幂等清旧服务并**轮询等其真正消失** → **把 helper.exe 外置复制到
+   * ProgramData 并锁 ACL**（U1，与 app 生命周期解耦的根因修复）→ New-Service **1072 退避重试**创建（BinaryPathName
+   * 单一 .NET 字符串直达 CreateService，真双引号锁定 exe + 三参，默认 LocalSystem，Automatic 开机自启）→ sc start。
+   * 全程幂等可重入：重装/修复覆盖旧 token、停删旧服务、覆盖旧外置副本，均能自愈已损状态。
    */
   private buildInstallScript(
     exe: string,
@@ -370,28 +402,65 @@ export class WindowsServiceHelper implements IPrivilegedHelper {
     confDir: string,
     token: string
   ): string {
+    // 外置 helper.exe 到 ProgramData（U1，根因修复）：旧实现把服务 binPath 指向 **app 目录内**的 helper.exe，致
+    //   ① app 更新：NSIS 覆盖被「正在运行的服务锁定」的 helper.exe → 占用失败/残留；
+    //   ② app 卸载：NSIS 删 app 文件却留下仍指向已删路径的 SCM 服务（孤儿服务 + 残留 ProgramData token）。
+    // 镜像 macOS「把 helper 复制出 .app 到 /Library/PrivilegedHelperTools」范式：安装期把 helper.exe 复制到
+    // SUPPORT_DIR（ProgramData\FlowZ），服务 binPath 指向该**外置副本** → 二进制与 app 目录彻底解耦，
+    // 更新随便覆盖 app、卸载由 helper 自卸载/NSIS 钩子清服务+ProgramData（见 helper.go uninstall / 卸载钩子）。
+    // 用 path.win32.basename 取末段：exe 恒为 Windows 反斜杠路径，在 POSIX 测试宿主上普通 path.basename 不识别
+    // 反斜杠会整串返回；win32 变体在两种宿主都正确剥出 com.flowz.helper.exe（与 getWinHelperPath 的名字保持耦合）。
+    const helperDst = path.join(SUPPORT_DIR, path.win32.basename(exe));
     // BinaryPathName(ImagePath)：各含空格路径用**真双引号**包裹，经 New-Service 单一字符串直达 Win32 CreateService。
     // 不可用 `sc.exe create binPath= "\"..\""`：PS 原样把 `\"` 传给 sc → 服务启动经 CommandLineToArgvW 时 `\"`
     // 退化为字面引号 → 含空格安装路径（默认 C:\Program Files\FlowZ）下 argv 碎裂、flag 值带字面引号 → 服务侧
     // singboxBin/confDir/supportDir 全污染（isLockedSingbox/cfgAllowed/tokenValue 全失效）。
-    const binPath = `"${exe}" --singbox "${singboxPath}" --confdir "${confDir}" --support "${SUPPORT_DIR}"`;
+    // 注：binPath 指向 ProgramData 外置副本（$helperDst，无空格）；--singbox 仍可能含空格（app 安装目录）→ 仍需真双引号。
+    const binPath = `"${helperDst}" --singbox "${singboxPath}" --confdir "${confDir}" --support "${SUPPORT_DIR}"`;
     const tokenFile = path.join(SUPPORT_DIR, 'helper.token');
     return [
       `$support = '${this.psq(SUPPORT_DIR)}'`,
       `$tokenFile = '${this.psq(tokenFile)}'`,
+      `$helperSrc = '${this.psq(exe)}'`,
+      `$helperDst = '${this.psq(helperDst)}'`,
       `$bp = '${this.psq(binPath)}'`,
       'New-Item -ItemType Directory -Force -Path $support | Out-Null',
-      // 写 token（无 BOM ASCII），随后设 ACL：去继承、仅 SYSTEM + Administrators 读
+      // 先锁**目录**ACL（防本地提权 + 闭 token TOCTOU）：ProgramData 默认 ACL 经继承给 Users「创建文件」+ 父级
+      // FILE_DELETE_CHILD + CREATOR OWNER 完全控制 → 普通用户能删/替换这个以 SYSTEM 运行的 helper.exe（重启即 SYSTEM
+      // 任意码执行，Pritunl/NetBird 同类 CVE）。文件级 ACL 挡不住：删子文件由父目录 FILE_DELETE_CHILD 授权，非文件自身
+      // DACL。故去继承（清掉 CREATOR OWNER + Users 创建/删子权）、仅留 SYSTEM/Administrators 完全控制并以 (OI)(CI)
+      // 下传 → 目录内 token/exe **出生即** SYSTEM/Admin 私有（Users 无任何访问：既不能替换 exe，也读不到 token，
+      // 无「写后到设 ACL 之间 token 短暂可读」的竞态窗口）。对齐 macOS helper 落在 root-only 写的受保护目录。
+      'icacls $support /inheritance:r | Out-Null',
+      'icacls $support /grant:r "SYSTEM:(OI)(CI)(F)" "Administrators:(OI)(CI)(F)" | Out-Null',
+      // 先删任何残留旧 token 再写：重装/修复时旧 token 可能是「Admin 只读」（旧版 ACL）或部分失败安装的残留，
+      // 而 Set-Content 覆盖一个 Admin 只读的现存文件会被拒（真机实测「对…helper.token 的访问被拒绝」的根因）。
+      // 经目录 Admin 的 FILE_DELETE_CHILD 删旧文件**不受其自身只读 DACL 阻挡** → 随后 Set-Content 必成（自愈已损状态）。
+      'Remove-Item -Force -Path $tokenFile -ErrorAction SilentlyContinue',
+      // 写 token（无 BOM ASCII）。机密性由**目录锁**保证（Users 对 $support 零访问，根本进不来读）→ token 继承目录的
+      // SYSTEM/Admin 全权即可：SYSTEM 可读（服务鉴权用）、Admin 可写（**重装可覆盖**）。刻意不再单独给 token 上「只读」
+      // ACL——只读对机密性零增益（Users 已被目录挡死），却会令重装时 Set-Content 覆盖被拒（即上面那个真机根因）。
       `Set-Content -Path $tokenFile -Value '${this.psq(token)}' -NoNewline -Encoding ascii`,
-      'icacls $tokenFile /inheritance:r | Out-Null',
-      'icacls $tokenFile /grant:r "SYSTEM:(R)" "Administrators:(R)" | Out-Null',
       // 幂等重装：停 + 删旧服务（按名）
       `& sc.exe stop ${SERVICE_NAME} 2>$null | Out-Null`,
       `& sc.exe delete ${SERVICE_NAME} 2>$null | Out-Null`,
       // sc delete 是异步「标记删除」（须等所有句柄关闭 + 进程停才移除）→ 轮询等服务真消失，否则 New-Service 撞
-      // 1072 ERROR_SERVICE_MARKED_FOR_DELETE（重装真机高概率命中）。
+      // 1072 ERROR_SERVICE_MARKED_FOR_DELETE（重装真机高概率命中）。注：服务注销与进程映像完全解除映射之间仍有 ms 级
+      // 窗口，故旧副本解锁**靠下方 Copy-Item 的退避重试兜底**、而非仅靠本轮询（勿据此误删重试）。
       '$deadline = (Get-Date).AddSeconds(15)',
       `while ((Get-Service -Name ${SERVICE_NAME} -ErrorAction SilentlyContinue) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }`,
+      // 外置复制（U1）：旧服务已停删 → ProgramData 旧副本（若有）已解锁 → -Force 覆盖。带退避重试兜「文件仍被占用」
+      // 的解锁窗口竞态（sc delete 后进程退出有微小延迟）。失败 fail-loud（不静默留旧副本跑老逻辑）。
+      '$copied = $false',
+      'for ($i = 0; $i -lt 10 -and -not $copied; $i++) {',
+      '  try { Copy-Item -LiteralPath $helperSrc -Destination $helperDst -Force; $copied = $true }',
+      '  catch { Start-Sleep -Milliseconds 300 }',
+      '}',
+      'if (-not $copied) { throw "复制 helper.exe 到 ProgramData 失败（旧服务二进制可能仍被占用，请稍后重试或重启后再装）" }',
+      // 显式收紧外置副本 ACL（兜底）：目录已锁 SYSTEM/Admin 私有、本副本继承之即足够；这里再去继承 + 仅 SYSTEM/Admin
+      // 完全控制，确保 Users 对这个**以 SYSTEM 运行**的二进制零访问（不可写/不可替换 → 杜绝本地提权）。
+      'icacls $helperDst /inheritance:r | Out-Null',
+      'icacls $helperDst /grant:r "SYSTEM:(F)" "Administrators:(F)" | Out-Null',
       // New-Service 退避重试兜底（删除标记态 1072 窗口期）：BinaryPathName 单一字符串直达 CreateService；
       // 默认账户即 LocalSystem；-StartupType Automatic = 开机自启常驻（app 全程只发管道命令、不 start/stop 服务）。
       '$created = $false',

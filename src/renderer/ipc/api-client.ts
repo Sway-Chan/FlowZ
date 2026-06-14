@@ -258,6 +258,28 @@ export const serverApi = {
   async speedTest(serverIds?: string[]): Promise<Record<string, number>> {
     return ipcClient.invoke(IPC_CHANNELS.SERVER_SPEED_TEST, { serverIds });
   },
+
+  /**
+   * 订阅测速单个节点完成事件（流式增量显示，不等队列）。
+   * listener: (data: { serverId: string; latency: number }) => void
+   * 返回取消订阅函数。
+   */
+  onSpeedTestResult(
+    listener: (data: { serverId: string; latency: number }) => void
+  ): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_SPEED_TEST_RESULT, listener);
+  },
+
+  /**
+   * 订阅测速进度事件（已测/成功/总数，参考 mihomo zashboard）。
+   * listener: (data: { tested: number; ok: number; total: number }) => void
+   * 返回取消订阅函数。
+   */
+  onSpeedTestProgress(
+    listener: (data: { tested: number; ok: number; total: number }) => void
+  ): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_SPEED_TEST_PROGRESS, listener);
+  },
 };
 
 /**

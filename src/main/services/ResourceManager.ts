@@ -127,10 +127,11 @@ export class ResourceManager {
   }
 
   /**
-   * 获取随包内置的 Windows 提权 helper 服务二进制路径（与 sing-box.exe 同目录）。
-   * 生产/开发：<resources>/win/com.flowz.helper.exe。仅 Windows 有意义；
-   * 安装时由 WindowsServiceHelper 经 sc create 注册为 LocalSystem 服务（binPath 指向此路径，故安装后 app
-   * 移动会令 binPath 失效——与 macOS plist 烧录路径同理，可选 P2 检测）。
+   * 获取随包内置的 Windows 提权 helper 服务二进制路径（与 sing-box.exe 同目录，安装期的**复制源**）。
+   * 生产/开发：<resources>/win/com.flowz.helper.exe。仅 Windows 有意义。
+   * 安装时由 WindowsServiceHelper 把它**复制外置**到 ProgramData\FlowZ 再注册为 LocalSystem 服务，binPath 指向
+   * 外置副本（非此 app 内路径）——故 app 更新/移动不影响服务、卸载由 helper 自卸载/NSIS 钩子清外置副本。
+   * 镜像 macOS HelperManager 把 helper 复制出 .app 到 /Library/PrivilegedHelperTools 的范式。
    */
   getWinHelperPath(): string {
     return path.join(this.getPlatformResourceDir(), 'com.flowz.helper.exe');
@@ -169,6 +170,11 @@ export class ResourceManager {
       return path.join(process.cwd(), 'resources', filename);
     }
     return path.join(process.resourcesPath, filename);
+  }
+
+  /** 随包 data 目录内任意资源文件的出厂路径（供内置 app 分流 geo .srs 等通用 bundle 项取 bundledPath）。 */
+  getDataResourcePath(fileName: string): string {
+    return path.join(this.getDataResourceDir(), fileName);
   }
 
   /**

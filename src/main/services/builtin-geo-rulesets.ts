@@ -32,6 +32,48 @@ export interface BuiltinGeoRuleSet {
   sourceUrl: string;
 }
 
+/**
+ * 内置应用分流预设（APP_PRESETS）引用的 geo 标签 —— 随包 bundle 成本地 rule_set。
+ * 目的：应用分流**离线可用、无启动期下载、不会因源 404 FATAL**；自动更新+fswatch 热加载保持新鲜。
+ * 机制：getLocalGeoRuleSets 把它们注入为 type:'local'，与 generateRouteConfig 的远程 app-rule rule_set **同 tag 撞名**，
+ *   经 rule_set 去重（本地优先于远程）自动改用本地副本——故无需改 app-rule 生成逻辑。源 = MetaCubeX/meta-rules-dat@sing
+ *   （与远程 app-rule rule_set 同源；文件已随包于 resources/data）。
+ */
+const APP_GEOSITE_TAGS = [
+  'youtube',
+  'netflix',
+  'tiktok',
+  'telegram',
+  'twitter',
+  'instagram',
+  'openai',
+  'anthropic',
+  'category-ai',
+  'google',
+  'github',
+  'spotify',
+  'steam',
+  'epicgames',
+  'riot',
+  'disney',
+  'private',
+];
+const APP_GEOIP_TAGS = ['netflix', 'telegram', 'twitter', 'private'];
+
+const MRD_GEO_RAW = 'https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo';
+const appGeoEntry = (cat: 'geosite' | 'geoip', tag: string): BuiltinGeoRuleSet => {
+  // category-ai 在 MetaCubeX 用 category-ai-!cn（裸 category-ai 不单独成 .srs）；tag 仍为 geosite-category-ai（与 app-rule 生成对齐）。
+  const srcName = cat === 'geosite' && tag === 'category-ai' ? 'category-ai-!cn' : tag;
+  const fileName = `${cat}-${srcName}.srs`;
+  return {
+    tag: `${cat}-${tag}`,
+    fileName,
+    category: cat,
+    bundledPath: () => resourceManager.getDataResourcePath(fileName),
+    sourceUrl: `${MRD_GEO_RAW}/${cat}/${srcName}.srs`,
+  };
+};
+
 export const BUILTIN_GEO_RULESETS: BuiltinGeoRuleSet[] = [
   {
     tag: 'geosite-cn',
@@ -55,6 +97,9 @@ export const BUILTIN_GEO_RULESETS: BuiltinGeoRuleSet[] = [
     bundledPath: () => resourceManager.getGeoIPPath(),
     sourceUrl: 'https://raw.githubusercontent.com/SagerNet/sing-geoip/rule-set/geoip-cn.srs',
   },
+  // 内置应用分流预设的 geo（随包，本地优先）
+  ...APP_GEOSITE_TAGS.map((t) => appGeoEntry('geosite', t)),
+  ...APP_GEOIP_TAGS.map((t) => appGeoEntry('geoip', t)),
 ];
 
 /** 本地 geo 规则集运行时目录（内置 .srs 拷贝落地处）。copy 与 route 生成共用，单一真值。 */
@@ -67,6 +112,23 @@ export const builtinIdFor = (tag: string): string => `${BUILTIN_ID_PREFIX}${tag}
 export const builtinTagFromId = (id: string): string => id.slice(BUILTIN_ID_PREFIX.length);
 export const findBuiltin = (tag: string): BuiltinGeoRuleSet | undefined =>
   BUILTIN_GEO_RULESETS.find((b) => b.tag === tag);
+
+/**
+ * 解析 `res:builtin:<tag>` 引用为 rule_set 定义所需的元数据：tag=复用 b.tag（与 getLocalGeoRuleSets 注入的本地
+ * rule_set 同 tag，route 装配末尾按 tag 去重 keep-first），fileName=运行时文件名。
+ *
+ * **纯函数（不查 FS）**：非内置 id / 未知 tag → null。FS 守卫（isValidSrsFile）由调用方在拼出 runtime 路径后施加，
+ * 与 getLocalGeoRuleSets 的「缺失即跳过」一致（不引用不存在的 rule_set，否则 sing-box initialize rule-set FATAL）。
+ * 抽成纯函数便于单测（见 __tests__/builtin-ruleset-ref.test.ts），与 ProxyManager.generateCustomRules 的 res: 分支共享单一真值。
+ */
+export function resolveBuiltinRuleSetRefMeta(
+  resId: string
+): { tag: string; fileName: string } | null {
+  if (!isBuiltinId(resId)) return null;
+  const b = findBuiltin(builtinTagFromId(resId));
+  if (!b) return null;
+  return { tag: b.tag, fileName: b.fileName };
+}
 
 /** SRS 文件魔数校验（'SRS' = 0x53 0x52 0x53），拦半写/损坏文件。同步读前 3 字节。 */
 export function isValidSrsFile(p: string): boolean {

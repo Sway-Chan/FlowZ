@@ -838,7 +838,12 @@ if (gotTheLock) {
     updateService = new UpdateService(logManager);
     coreUpdateService = new CoreUpdateService(logManager);
     subscriptionService = new SubscriptionService(protocolParser, logManager);
-    speedTestService = new SpeedTestService(logManager);
+    // 注入全协议出站构造器（懒引用 proxyManager，测速时才调用、此时其已就绪）：测速统一走经代理 urltest 真实测速。
+    speedTestService = new SpeedTestService(logManager, (s, tag) =>
+      proxyManager
+        ? (proxyManager.buildSpeedTestOutbound(s, tag) as Record<string, unknown> | null)
+        : null
+    );
     // 批次 B：把日志 sink 注入「原本裸 console、不进 app.log」的服务，补排障盲区（系统代理/配置/资源/协议）
     configManager.setLogManager(logManager);
     protocolParser.setLogManager(logManager);
@@ -1411,8 +1416,29 @@ if (gotTheLock) {
             'Main'
           );
 
-          // 复用 SpeedTestService，自动处理 TCP 和 UDP 协议
-          const results = await speedTestService.testAllServers(config.servers);
+          // 复用 SpeedTestService（互斥：与 UI 入口并发时复用同一次测速，避免起两个临时 sing-box）。
+          // onResult/onProgress 流式推 renderer（与 UI 入口一致，latencyMap/进度实时更新）→ 托盘与 UI 测速结果互通。
+          const results = await speedTestService.testAllServers(
+            config.servers,
+            (serverId, latency) => {
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send(IPC_CHANNELS.EVENT_SPEED_TEST_RESULT, {
+                  serverId,
+                  latency: latency === null ? -1 : latency,
+                });
+              }
+            },
+            (tested, ok, total) => {
+              if (mainWindow && !mainWindow.isDestroyed()) {
+                mainWindow.webContents.send(IPC_CHANNELS.EVENT_SPEED_TEST_PROGRESS, {
+                  tested,
+                  ok,
+                  total,
+                });
+              }
+            },
+            config.speedTestUrl // 与 UI 入口一致用用户配置的测速端点（否则托盘测速仍走默认 generate_204）
+          );
 
           logManager.addLog('info', 'Speed test completed for all servers', 'Main');
 

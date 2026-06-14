@@ -93,7 +93,7 @@ interface AppState {
   // Actions
   setCurrentView: (view: string) => void;
   setSettingsSection: (section: string) => void;
-  setLatencyMap: (map: Record<string, number>) => void;
+  setLatencyMap: (map: Record<string, number> | ((prev: Record<string, number>) => Record<string, number>)) => void;
   setPrivacyMode: (value: boolean) => void;
   setAvailableAppUpdate: (info: UpdateInfo | null) => void;
   setAvailableCoreUpdate: (info: AvailableCoreUpdate | null) => void;
@@ -157,7 +157,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         view === 'settings' && s.currentView !== 'settings' ? s.currentView : s.settingsReturnView,
     })),
   setSettingsSection: (section) => set({ settingsSection: section }),
-  setLatencyMap: (map) => set({ latencyMap: map }),
+  setLatencyMap: (map) =>
+    set((state) => ({
+      latencyMap: typeof map === 'function' ? map(state.latencyMap) : map,
+    })),
   setAvailableAppUpdate: (info) => set({ availableAppUpdate: info }),
   setAvailableCoreUpdate: (info) => set({ availableCoreUpdate: info }),
   setPrivacyMode: async (value) => {

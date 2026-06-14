@@ -4,6 +4,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"os/exec"
 	"strings"
@@ -37,7 +38,11 @@ func startSingbox(singboxBin, cfg, logPath string) (*exec.Cmd, *os.File, error) 
 	}
 	// 防孤儿安全网（H1）：确保常驻 job 存在，并把刚起的 child assign 进去。
 	// 必须在 Start 成功后（此刻 child 必活、pid 必指向本 child，无复用窗口）；best-effort 不阻断 start。
-	if err := ensureJob(); err == nil && c.Process != nil {
+	if err := ensureJob(); err != nil {
+		// 防孤儿安全网建失败：child 不在 Job 内，helper 崩溃时仅 watchParent 兜底（覆盖面窄）。
+		// best-effort 不阻断 start；记 stderr 便于真机诊断（SCM 服务日志可见，持续失败=孤儿风险升高）。
+		fmt.Fprintf(os.Stderr, "ensureJob failed: %v (child pid=%d not under job)\n", err, c.Process.Pid)
+	} else if c.Process != nil {
 		assignToJob(c.Process.Pid)
 	}
 	return c, logFile, nil
@@ -206,6 +211,37 @@ func killAllSingbox(singboxBin string) int {
 		}
 	}
 	return killed
+}
+
+// spawnSelfUninstall：派生一个脱离本进程生命周期的 SYSTEM 旁路 cmd，完成 helper 自身无法自完成的卸载收尾：
+// 停并删 SCM 服务（serviceName）、删 supportDir（含外置的 com.flowz.helper.exe 自身 + helper.token）。
+//
+// 为何必须借旁路进程：
+//   - 正在运行的 helper.exe 被自身锁定，无法自删 → 由「等 helper 退出解锁后」的旁路删；
+//   - sc delete 要服务先停，而本进程正是服务主进程 → 由旁路在 helper os.Exit 后执行。
+//
+// 关键安全/生命周期点：
+//   - DETACHED_PROCESS：cmd 无 console、不随 helper 退出被收（不是 helper 的 console 子进程）。
+//   - 不 assignToJob：故不受 hJob 的 KILL_ON_JOB_CLOSE 连坐（helper 一死即被杀就前功尽弃）。
+//   - 继承 helper 的 SYSTEM token（子进程默认继承父 token）→ 有权 sc delete / 删 ProgramData。
+//   - ping 作延迟（非 timeout —— timeout 需 console，DETACHED 下会失败）；删两次兜 exe 解锁竞态。
+//   - 命令行经 SysProcAttr.CmdLine **原样下发**（绕过 Go syscall.EscapeArg）：否则 EscapeArg 会把 rmdir 路径的内层
+//     `"` 转义成 `\"`，而 cmd.exe 不识别 `\"` 反转义 → strip-first-last 后 rmdir 收到非法路径 `\C:\...\` → 目录删不掉
+//     （外置 helper.exe + token 残留）。命令行拼装与该引号推理详见 selfUninstallCmdLine（含纯函数单测）。
+//
+// best-effort：失败也只是残留服务/目录，由 app 侧 NSIS 卸载钩子 / APP_UNINSTALL_ALL 兜底（纵深）。
+func spawnSelfUninstall() {
+	// lpApplicationName 用绝对 cmd.exe 路径（不依赖 SYSTEM 服务的 %PATH%）；CmdLine 的 argv[0] 仍写 cmd（cmd 自身忽略）。
+	cmdExe := os.Getenv("ComSpec")
+	if cmdExe == "" {
+		cmdExe = os.Getenv("SystemRoot") + `\System32\cmd.exe`
+	}
+	c := exec.Command(cmdExe)
+	c.SysProcAttr = &syscall.SysProcAttr{
+		CreationFlags: windows.DETACHED_PROCESS | windows.CREATE_NEW_PROCESS_GROUP,
+		CmdLine:       selfUninstallCmdLine(serviceName, supportDir),
+	}
+	_ = c.Start() // 不 assignToJob、不 Wait —— 旁路须比 helper 活得久
 }
 
 // filepathBase：轻量 basename（避免在 windows 约束下引 path/filepath 仅为取末段；helper.go 已用 filepath.Base 处理其余）。

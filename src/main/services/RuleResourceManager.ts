@@ -124,7 +124,8 @@ export class RuleResourceManager {
         size,
         downloadedAt: meta[b.tag]?.updatedAt || '', // 无记录=出厂版 → UI 显示「—」
         fileExists: exists,
-        referencedBy: 0, // 内置由智能分流固定引用，UI 以 builtin 标识展示，不计 res: 引用数
+        // 内置可被自定义规则经 res:builtin:<tag> 引用（D），计真实引用数；为 0 时 UI 回落显示「智能分流」（应用分流预设默认引用）。
+        referencedBy: this.referencingRules(config, builtinIdFor(b.tag)).length,
         builtin: true,
       };
     });

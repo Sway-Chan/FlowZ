@@ -1,15 +1,14 @@
 /**
- * 速度测试服务
- * TCP 协议使用 TCP Ping（极速），UDP 协议 (Hysteria2/TUIC) 使用临时 sing-box HTTP 代理测速
+ * 速度测试服务（真实测速）：**所有协议**统一经临时 sing-box 的各自 HTTP 代理出口、GET generate_204 测 urltest TTFB，
+ * 验证完整链路（连接+鉴权+中继+响应），等价 mihomo/clash 的 `/proxies/{name}/delay`。
+ * 关键:端口通≠代理可用——裸 TCP ping 只测到入口的 RTT、测不出鉴权/协议/中继失败,故不再用于真实测速。
  *
- * 设计理念：
- * - TCP 节点：直接 Socket 握手测延迟，1-2 秒出全部结果
- * - UDP 节点：spawn 单个临时 sing-box 进程，为每个节点创建独立的 HTTP 代理入口，
- *   通过 HTTP 请求测量真实全链路延迟（与 NekoBox 的 urltest 机制等效）
+ * 出站由 index.ts 注入 ProxyManager.buildSpeedTestOutbound 构造（全协议）。未注入（单测/兜底）时退回旧的 TCP ping + UDP 代理拆分。
  */
 
 import * as net from 'net';
 import * as http from 'http';
+import * as tls from 'tls';
 import * as path from 'path';
 import * as fs from 'fs/promises';
 import { spawn, ChildProcess } from 'child_process';
@@ -17,6 +16,7 @@ import type { ServerConfig } from '../../shared/types';
 import type { LogManager } from './LogManager';
 import { resourceManager } from './ResourceManager';
 import { getUserDataPath } from '../utils/paths';
+import { resolveSpeedTestTarget, type SpeedTestTarget } from '../../shared/speed-test';
 
 /** 基于 UDP/QUIC 的协议，需要走真实代理测速 */
 const UDP_PROTOCOLS = new Set(['hysteria2', 'tuic']);
@@ -29,43 +29,86 @@ export interface SpeedTestResult {
 
 export class SpeedTestService {
   private logManager: LogManager;
-  private readonly MAX_CONCURRENT = 5; // TCP 并发数
+  private readonly MAX_CONCURRENT = 5; // TCP 并发数（仅兜底裸 ping 路径）
+  /** 经代理 urltest 的预热/正式测速并发上限：大订阅时分波，避免 N 路握手同时打出→请求风暴假超时。
+   *  小订阅(≤此值)等价全并行、零额外延迟；32=轻量 204 + sing-box 惰性拨号下的舒适区。 */
+  private static readonly PROXY_TEST_CONCURRENCY = 32;
+  /**
+   * 出站构造器（由 index.ts 注入 ProxyManager.buildSpeedTestOutbound）：注入后**所有协议**统一走「临时 sing-box
+   * 经代理 urltest」真实测速（端口通≠代理可用，裸 TCP ping 测不出鉴权/中继失败）；返回 null=该节点不可用（如 naive
+   * 缺 libcronet）→ 跳过。未注入（兜底/单测）时退回旧的 TCP ping + UDP 代理拆分。
+   */
+  private buildOutboundFn?: (server: ServerConfig, tag: string) => Record<string, unknown> | null;
 
-  constructor(logManager: LogManager) {
+  /** 进行中的测速 Promise：双入口（UI/托盘）并发时复用同一次测速，避免起两个临时 sing-box（端口/资源冲突）。
+   *  第二个调用方等待同一份最终结果（不收流式 onResult，末尾 results 同步覆盖即可）。 */
+  private currentTest: Promise<Map<string, number | null>> | null = null;
+
+  constructor(
+    logManager: LogManager,
+    buildOutboundFn?: (server: ServerConfig, tag: string) => Record<string, unknown> | null
+  ) {
     this.logManager = logManager;
+    this.buildOutboundFn = buildOutboundFn;
   }
 
   /**
-   * 测试所有服务器（混合策略）
+   * 测试所有服务器（混合策略）。
+   * @param onResult 可选逐节点回调：每测完一个节点即回传（serverId, latency），供 UI 流式增量显示
+   *   （惰性、谁有结果谁先显示，等价 mihomo）。不传则仅在末尾用返回的 Map 一次性更新。
    */
-  async testAllServers(servers: ServerConfig[]): Promise<Map<string, number | null>> {
+  async testAllServers(
+    servers: ServerConfig[],
+    onResult?: (serverId: string, latency: number | null) => void,
+    onProgress?: (tested: number, ok: number, total: number) => void,
+    testUrl?: string
+  ): Promise<Map<string, number | null>> {
     if (servers.length === 0) {
       return new Map();
     }
+    // 双入口（UI/托盘）并发复用同一次测速，避免起两个临时 sing-box（端口/资源冲突）。
+    // second caller 拿同一份 final results，但其 onResult/onProgress 不触发（流式只由 first caller 驱动）；
+    // 可接受：数据最终正确，且 EVENT_SPEED_TEST_RESULT/PROGRESS 是 IPC broadcast，second caller 的 renderer
+    // 订阅仍能收到 first caller 推的事件（latencyMap/进度照常更新）。
+    if (this.currentTest) return this.currentTest;
+    this.currentTest = this.doTestAllServers(servers, onResult, onProgress, testUrl).finally(() => {
+      this.currentTest = null;
+    });
+    return this.currentTest;
+  }
 
-    // 按协议分组
+  private async doTestAllServers(
+    servers: ServerConfig[],
+    onResult?: (serverId: string, latency: number | null) => void,
+    onProgress?: (tested: number, ok: number, total: number) => void,
+    testUrl?: string
+  ): Promise<Map<string, number | null>> {
+    // 生产路径（注入了出站构造器）：**所有协议**统一走临时 sing-box 经代理 urltest，真实测速。
+    if (this.buildOutboundFn) {
+      this.logManager.addLog(
+        'info',
+        `开始测速: ${servers.length} 个节点（经代理 urltest）`,
+        'SpeedTest'
+      );
+      const results = await this.testServersViaProxy(servers, onResult, onProgress, testUrl);
+      const ok = [...results.values()].filter((v) => v !== null).length;
+      // 仅汇总，不逐节点列明（结果由 UI 节点延迟徽标承载）。
+      this.logManager.addLog('info', `测速完成：成功 ${ok}/${servers.length}`, 'SpeedTest');
+      return results;
+    }
+
+    // 兜底路径（未注入构造器，如单测）：旧的 TCP 裸 ping + UDP 代理拆分。
     const tcpServers = servers.filter((s) => !UDP_PROTOCOLS.has(s.protocol.toLowerCase()));
     const udpServers = servers.filter((s) => UDP_PROTOCOLS.has(s.protocol.toLowerCase()));
-
-    this.logManager.addLog(
-      'info',
-      `开始测速: TCP=${tcpServers.length} 个, UDP=${udpServers.length} 个`,
-      'SpeedTest'
-    );
-
     const results = new Map<string, number | null>();
-
-    // TCP 和 UDP 并行测试
     const [tcpResults, udpResults] = await Promise.all([
-      this.testTcpServers(tcpServers),
+      this.testTcpServers(tcpServers, onResult),
       udpServers.length > 0
-        ? this.testUdpServersViaProxy(udpServers)
+        ? this.testServersViaProxy(udpServers, onResult, undefined, testUrl)
         : new Map<string, number | null>(),
     ]);
-
     for (const [id, latency] of tcpResults) results.set(id, latency);
     for (const [id, latency] of udpResults) results.set(id, latency);
-
     this.logManager.addLog('info', '测速完成', 'SpeedTest');
     return results;
   }
@@ -74,7 +117,10 @@ export class SpeedTestService {
   //  TCP Ping（原有逻辑，保持不变）
   // ═══════════════════════════════════════════════════════════════
 
-  private async testTcpServers(servers: ServerConfig[]): Promise<Map<string, number | null>> {
+  private async testTcpServers(
+    servers: ServerConfig[],
+    onResult?: (serverId: string, latency: number | null) => void
+  ): Promise<Map<string, number | null>> {
     const results = new Map<string, number | null>();
     if (servers.length === 0) return results;
 
@@ -84,6 +130,7 @@ export class SpeedTestService {
 
       batchResults.forEach((result) => {
         results.set(result.serverId, result.latency);
+        onResult?.(result.serverId, result.latency);
         if (result.error) {
           this.logManager.addLog(
             'warn',
@@ -158,45 +205,62 @@ export class SpeedTestService {
   // ═══════════════════════════════════════════════════════════════
 
   /**
-   * 使用临时 sing-box 实例测试 UDP 协议节点
-   *
-   * 工作流程：
-   * 1. 为每个 UDP 节点分配一个 HTTP 代理入站端口
-   * 2. 生成 sing-box 配置：N 个 HTTP inbound + N 个 outbound + 路由规则
-   * 3. spawn 单个临时 sing-box 进程
-   * 4. 通过各自的 HTTP 代理发送 HTTP 请求测量延迟
-   * 5. 清理临时进程和配置文件
+   * 经临时 sing-box 真实测速（全协议）：每个可用节点起独立 HTTP 入站 → 该节点出站，GET 测速端点（默认 generate_204，
+   * 可经 testUrl 自配，兼容 http/https）测 TTFB。不可用节点（naive 缺 libcronet 等）预先剔除为 null、不进临时核。
+   * @param onResult 可选逐节点回调：每测完一个节点即回传（serverId, latency），供 UI 流式增量显示。
+   * @param testUrl 可选测速端点 URL（非法回落默认 generate_204）。
    */
-  private async testUdpServersViaProxy(
-    servers: ServerConfig[]
+  private async testServersViaProxy(
+    servers: ServerConfig[],
+    onResult?: (serverId: string, latency: number | null) => void,
+    onProgress?: (tested: number, ok: number, total: number) => void,
+    testUrl?: string
   ): Promise<Map<string, number | null>> {
     const results = new Map<string, number | null>();
+    // 进度计数：每个节点得出结果（含 null/不可用/失败）即 tested++，成功 ok++；total 含不可用节点。
+    let tested = 0;
+    let ok = 0;
+    const total = servers.length;
+    const report = (id: string, latency: number | null) => {
+      onResult?.(id, latency);
+      tested++;
+      if (latency !== null) ok++;
+      onProgress?.(tested, ok, total);
+    };
     let singboxProcess: ChildProcess | null = null;
     let configFilePath: string | null = null;
 
+    // 构造各节点出站；不可用（naive 缺 libcronet / 异常）→ 直接 null，不进临时核（避免预初始化 FATAL 拖垮整批）。
+    const getOutbound =
+      this.buildOutboundFn ?? ((s: ServerConfig, t: string) => this.buildOutbound(s, t));
+    const usable: { server: ServerConfig; tag: string; outbound: Record<string, unknown> }[] = [];
+    for (const s of servers) {
+      const tag = `out-${s.id.slice(0, 8)}`;
+      const ob = getOutbound(s, tag);
+      if (ob) usable.push({ server: s, tag, outbound: ob });
+      else {
+        results.set(s.id, null);
+        report(s.id, null);
+      }
+    }
+    if (usable.length === 0) return results;
+
+    // 解析测速端点（一次，预热+正式共用）；非法 testUrl 经 resolveSpeedTestTarget 回落默认 generate_204。
+    const target = resolveSpeedTestTarget(testUrl);
+
     try {
-      // 1. 为每个节点分配端口
-      const ports = await this.findFreePorts(servers.length);
+      // 1. 为可用节点分配 HTTP 代理端口
+      const ports = await this.findFreePorts(usable.length);
       const serverPortMap = new Map<string, number>(); // serverId → HTTP proxy port
-      servers.forEach((server, idx) => {
-        serverPortMap.set(server.id, ports[idx]);
-      });
+      usable.forEach((u, idx) => serverPortMap.set(u.server.id, ports[idx]));
 
-      this.logManager.addLog(
-        'info',
-        `为 ${servers.length} 个 UDP 节点分配了 HTTP 代理端口: ${ports.join(', ')}`,
-        'SpeedTest'
-      );
-
-      // 2. 生成临时 sing-box 配置
-      const config = this.generateProxyTestConfig(servers, serverPortMap);
+      // 2. 生成临时 sing-box 配置（每节点独立 HTTP 入站 → 该节点出站）
+      const config = this.generateProxyTestConfig(usable, serverPortMap);
 
       // 3. 写入临时配置文件
       const userDataPath = getUserDataPath();
       configFilePath = path.join(userDataPath, `speedtest_${Date.now()}.json`);
       await fs.writeFile(configFilePath, JSON.stringify(config, null, 2));
-
-      this.logManager.addLog('info', `临时测速配置已写入: ${configFilePath}`, 'SpeedTest');
 
       // 4. 启动临时 sing-box 进程
       const singboxPath = resourceManager.getSingBoxPath();
@@ -223,58 +287,47 @@ export class SpeedTestService {
         }
       });
 
-      // 5. 等待 sing-box 就绪（尝试连接第一个 HTTP 代理端口）
-      // 超时设为 10s，因为如果主进程有应用分流规则（如 Twitter），
-      // sing-box 启动时需要下载对应的 rule_set，在网络较慢时可能耗时 5-8s。
-      const firstPort = ports[0];
-      const ready = await this.waitForPortReady(firstPort, 10000);
-
+      // 5. 等待 sing-box 就绪（连第一个 HTTP 代理端口）。应用分流规则集下载可能耗时，给 10s。
+      const ready = await this.waitForPortReady(ports[0], 10000);
       if (!ready || processExited) {
         this.logManager.addLog(
           'warn',
           `sing-box 测速进程未就绪: ${stderrOutput.slice(0, 500)}`,
           'SpeedTest'
         );
-        for (const server of servers) results.set(server.id, null);
+        for (const u of usable) {
+          results.set(u.server.id, null);
+          report(u.server.id, null);
+        }
         return results;
       }
 
-      this.logManager.addLog('info', 'sing-box 测速进程已就绪，开始测速...', 'SpeedTest');
-
-      // 6. 预热阶段：并发为每个节点建立 QUIC 连接 + DNS 缓存
-      //    第一次请求包含 DNS 解析 + QUIC 握手的冷启动开销，不计入延迟
-      this.logManager.addLog('info', '预热中（建立连接）...', 'SpeedTest');
-      const warmupPromises = servers.map(async (server) => {
-        const proxyPort = serverPortMap.get(server.id)!;
-        await this.sendHttpProxyRequest(proxyPort, 8000);
+      // 6. 预热：建立连接 + DNS 缓存（冷启动开销不计入延迟）。并发上限见 PROXY_TEST_CONCURRENCY。
+      await this.runWithLimit(usable, SpeedTestService.PROXY_TEST_CONCURRENCY, async (u) => {
+        await this.sendProxyRequest(serverPortMap.get(u.server.id)!, 8000, target);
       });
-      await Promise.all(warmupPromises);
 
-      // 7. 正式测速：连接已建立，测量纯 HTTP 往返延迟（与 NekoBox urltest 一致）
-      this.logManager.addLog('info', '开始正式测速...', 'SpeedTest');
-      const testPromises = servers.map(async (server) => {
-        const proxyPort = serverPortMap.get(server.id)!;
+      // 7. 正式测速：经各自代理出站测 urltest TTFB。并发上限避免大订阅 N 路握手同时打出→请求风暴假超时；
+      //    小订阅(≤上限)等价全并行、零额外延迟。每测完一个节点立即回调 onResult（UI 流式显示），不等队列。
+      await this.runWithLimit(usable, SpeedTestService.PROXY_TEST_CONCURRENCY, async (u) => {
+        const port = serverPortMap.get(u.server.id)!;
         try {
-          const latency = await this.sendHttpProxyRequest(proxyPort, 5000);
-          results.set(server.id, latency);
-          if (latency !== null) {
-            this.logManager.addLog('info', `[${server.name}] 延迟: ${latency}ms`, 'SpeedTest');
-          } else {
-            this.logManager.addLog('warn', `[${server.name}] 测速超时`, 'SpeedTest');
-          }
-        } catch (err) {
-          const msg = err instanceof Error ? err.message : String(err);
-          this.logManager.addLog('warn', `[${server.name}] 测速失败: ${msg}`, 'SpeedTest');
-          results.set(server.id, null);
+          const latency = await this.sendProxyRequest(port, 5000, target);
+          results.set(u.server.id, latency);
+          report(u.server.id, latency);
+        } catch {
+          results.set(u.server.id, null);
+          report(u.server.id, null);
         }
       });
-
-      await Promise.all(testPromises);
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
-      this.logManager.addLog('error', `UDP 测速异常: ${msg}`, 'SpeedTest');
-      for (const server of servers) {
-        if (!results.has(server.id)) results.set(server.id, null);
+      this.logManager.addLog('error', `测速异常: ${msg}`, 'SpeedTest');
+      for (const u of usable) {
+        if (!results.has(u.server.id)) {
+          results.set(u.server.id, null);
+          report(u.server.id, null);
+        }
       }
     } finally {
       // 清理临时进程
@@ -303,41 +356,24 @@ export class SpeedTestService {
   }
 
   /**
-   * 生成用于测速的 sing-box 配置
-   * 每个 UDP 节点有独立的 HTTP 代理入站 + 路由规则
+   * 生成用于测速的 sing-box 配置：每个可用节点一个独立 HTTP 代理入站 → 该节点（预构造）出站。
+   * 出站由 ProxyManager.buildSpeedTestOutbound 预构造（全协议、domain_resolver=dns-direct、已去 detour）。
    */
   private generateProxyTestConfig(
-    servers: ServerConfig[],
+    usable: { server: ServerConfig; tag: string; outbound: Record<string, unknown> }[],
     serverPortMap: Map<string, number>
   ): Record<string, unknown> {
     const inbounds: Record<string, unknown>[] = [];
     const outbounds: Record<string, unknown>[] = [];
     const routeRules: Record<string, unknown>[] = [];
 
-    for (const server of servers) {
+    for (const { server, tag, outbound } of usable) {
       const port = serverPortMap.get(server.id);
       if (!port) continue;
-
       const inboundTag = `http-in-${server.id.slice(0, 8)}`;
-      const outboundTag = `out-${server.id.slice(0, 8)}`;
-
-      // HTTP 代理入站
-      inbounds.push({
-        type: 'http',
-        tag: inboundTag,
-        listen: '127.0.0.1',
-        listen_port: port,
-      });
-
-      // 代理出站
-      outbounds.push(this.buildOutbound(server, outboundTag));
-
-      // 路由规则：将该入站的流量路由到对应的出站
-      routeRules.push({
-        inbound: [inboundTag],
-        action: 'route',
-        outbound: outboundTag,
-      });
+      inbounds.push({ type: 'http', tag: inboundTag, listen: '127.0.0.1', listen_port: port });
+      outbounds.push(outbound); // 预构造的全协议出站（tag 已为 out-<id8>）
+      routeRules.push({ inbound: [inboundTag], action: 'route', outbound: tag });
     }
 
     // 必须有 direct 出站（sing-box 启动要求）
@@ -346,22 +382,14 @@ export class SpeedTestService {
     return {
       log: { level: 'warn' },
       dns: {
-        servers: [
-          {
-            // sing-box 1.13+ 要求显式 type 字段，不能用旧的 address 格式
-            tag: 'dns-direct',
-            type: 'udp',
-            server: '223.5.5.5',
-            server_port: 53,
-          },
-        ],
+        // sing-box 1.13+ 要求显式 type；出站 domain_resolver 与 default_domain_resolver 均指向本 tag
+        servers: [{ tag: 'dns-direct', type: 'udp', server: '223.5.5.5', server_port: 53 }],
       },
       inbounds,
       outbounds,
       route: {
         rules: routeRules,
         auto_detect_interface: true,
-        // sing-box 1.13+ 需要 default_domain_resolver 来解析 outbound 的 server 域名
         default_domain_resolver: 'dns-direct',
       },
     };
@@ -441,47 +469,141 @@ export class SpeedTestService {
   // ═══════════════════════════════════════════════════════════════
 
   /**
-   * 通过 HTTP 代理发送请求并测量延迟
-   * 返回从发起请求到收到响应头的时间（TTFB）
+   * 通过本地 HTTP 代理（临时 sing-box 各节点入站）请求测速端点，量 TTFB（请求发出 → 收到响应头）。
+   * - HTTP 端点：代理绝对 URI GET（`GET http://host/path`，代理按 Host 转发）。
+   * - HTTPS 端点：代理 CONNECT 隧道 → TLS 握手 → GET；测速仅量可达性+TTFB，rejectUnauthorized=false（与 HTTP 路径不校验等价）。
    */
-  private sendHttpProxyRequest(proxyPort: number, timeout: number): Promise<number | null> {
+  private sendProxyRequest(
+    proxyPort: number,
+    timeout: number,
+    target: SpeedTestTarget
+  ): Promise<number | null> {
+    return target.https
+      ? this.sendHttpsViaProxy(proxyPort, timeout, target)
+      : this.sendHttpViaProxy(proxyPort, timeout, target);
+  }
+
+  /** HTTP 端点经代理绝对 URI GET。 */
+  private sendHttpViaProxy(
+    proxyPort: number,
+    timeout: number,
+    target: SpeedTestTarget
+  ): Promise<number | null> {
     return new Promise((resolve) => {
       const start = Date.now();
-      const timer = setTimeout(() => {
-        resolve(null);
-      }, timeout);
-
+      const timer = setTimeout(() => resolve(null), timeout);
       const req = http.get(
         {
           hostname: '127.0.0.1',
           port: proxyPort,
-          path: 'http://cp.cloudflare.com/',
-          headers: {
-            Host: 'cp.cloudflare.com',
-            Connection: 'close',
-          },
+          path: target.absoluteUri, // 代理绝对 URI（http://host[:port]/path）
+          headers: { Host: target.hostHeader, Connection: 'close' },
           timeout,
         },
         (res) => {
-          // 收到响应头即刻计算延迟（不等 body），与 NekoBox urltest 一致
           clearTimeout(timer);
-          const latency = Date.now() - start;
+          const latency = Date.now() - start; // 收到响应头即刻计算（不等 body），与 NekoBox urltest 一致
           res.resume(); // 排空响应体，防止内存泄漏
           resolve(latency);
         }
       );
-
       req.on('error', () => {
         clearTimeout(timer);
         resolve(null);
       });
-
       req.on('timeout', () => {
         clearTimeout(timer);
         req.destroy();
         resolve(null);
       });
     });
+  }
+
+  /** HTTPS 端点经代理 CONNECT 隧道 + TLS GET。 */
+  private sendHttpsViaProxy(
+    proxyPort: number,
+    timeout: number,
+    target: SpeedTestTarget
+  ): Promise<number | null> {
+    return new Promise((resolve) => {
+      const start = Date.now();
+      // 持有所有已建立句柄，finish 时统一 destroy（防 fd/socket 泄漏：大订阅并发 32 + HTTPS 时累积）。
+      let connectReq: http.ClientRequest | null = null;
+      let tunnel: net.Socket | null = null;
+      let tlsSock: tls.TLSSocket | null = null;
+      let done = false;
+      const finish = (v: number | null) => {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        // 统一清理：destroy 所有已建立的句柄（GET 已拿到 TTFB / 任何错误 / 超时均不应留挂起 socket）
+        tlsSock?.destroy();
+        tunnel?.destroy();
+        connectReq?.destroy();
+        resolve(v);
+      };
+      const timer = setTimeout(() => finish(null), timeout);
+
+      // CONNECT 端口用 target.port（不能用 hostHeader 拼 443——非标端口如 8443 会变成 host:8443:443；
+      // 也不能用 hostHeader:443——非标 hostHeader 已含端口会双端口）。CONNECT 始终显式 host:port。
+      const connectHost = `${target.host}:${target.port}`;
+      // 1. 向代理发 CONNECT 建立到 target 的 TCP 隧道
+      connectReq = http.request({
+        host: '127.0.0.1',
+        port: proxyPort,
+        method: 'CONNECT',
+        path: connectHost,
+        headers: { Host: connectHost },
+        timeout,
+      });
+      connectReq.on('error', () => finish(null));
+      connectReq.on('timeout', () => finish(null));
+      connectReq.on('connect', (res, socket) => {
+        if (res.statusCode !== 200) {
+          finish(null); // finish 内统一 destroy socket
+          return;
+        }
+        tunnel = socket;
+        // 2. 在隧道上 TLS 握手；测速仅量可达性+TTFB，不校验证书（自签/MITM 端点也能测，与 HTTP 路径等价）
+        tlsSock = tls.connect(
+          { socket, servername: target.host, rejectUnauthorized: false },
+          () => {
+            // 3. 握手完成，发 GET（首批响应 data 即响应头到达 = TTFB）
+            tlsSock?.write(
+              `GET ${target.path} HTTP/1.1\r\nHost: ${target.hostHeader}\r\nConnection: close\r\n\r\n`
+            );
+          }
+        );
+        let measured = false;
+        tlsSock.on('data', () => {
+          if (!measured) {
+            measured = true;
+            finish(Date.now() - start);
+          }
+        });
+        tlsSock.on('error', () => finish(null));
+      });
+      connectReq.end();
+    });
+  }
+
+  /**
+   * 并发上限执行（固定大小 worker 池）：最多 `limit` 个任务同时进行，其余排队。
+   * 用于预热/测速——小订阅(items≤limit)即全并行，大订阅分波，消除请求风暴假超时。
+   */
+  private async runWithLimit<T>(
+    items: T[],
+    limit: number,
+    fn: (item: T) => Promise<void>
+  ): Promise<void> {
+    let idx = 0;
+    const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (idx < items.length) {
+        const i = idx++;
+        await fn(items[i]);
+      }
+    });
+    await Promise.all(workers);
   }
 
   /**

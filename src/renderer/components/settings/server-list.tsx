@@ -142,6 +142,7 @@ export function ServerList({
   // 启动前配置校验 gate 剔除的非法节点：列表标灰 + tooltip（不禁用点击，用户仍可选/编辑/删除）。
   const invalidNodes = useAppStore((state) => state.invalidNodes);
   const [isTestingSpeed, setIsTestingSpeed] = useState(false);
+  const [speedProgress, setSpeedProgress] = useState<{ tested: number; ok: number; total: number } | null>(null);
   const [testingServerIds, setTestingServerIds] = useState<Set<string>>(new Set());
   const { t } = useTranslation();
 
@@ -168,20 +169,30 @@ export function ServerList({
 
   const handleSpeedTest = async () => {
     setIsTestingSpeed(true);
+    // 订阅声明在 try 外，确保 catch/finally 路径都能 unsubscribe（防 listener 泄漏：测速失败时曾漏清）。
+    const unsubscribeResult = api.server.onSpeedTestResult(({ serverId, latency }) => {
+      setLatencyMap((prev) => ({ ...prev, [serverId]: latency }));
+    });
+    const unsubscribeProgress = api.server.onSpeedTestProgress(({ tested, ok, total }) => {
+      setSpeedProgress({ tested, ok, total });
+    });
     try {
       toast.info(t('servers.speedTestStart'));
       const serverIdsToTest = servers.map((s) => s.id);
       const results = await api.server.speedTest(serverIdsToTest);
-      setLatencyMap(results);
+      // 末尾兜底同步（确保最终结果一致，兜底事件丢失）；函数式合并保留未测节点的历史延迟。
+      setLatencyMap((prev) => ({ ...prev, ...results }));
       toast.success(t('servers.speedTestDone'));
-      setSortKey('latency');
-      setSortOrder('asc');
+      // 不再自动排序（保留用户排序偏好，测速只更新延迟值）
     } catch (error) {
       toast.error(t('servers.speedTestFail'), {
         description: error instanceof Error ? error.message : String(error),
       });
     } finally {
+      unsubscribeResult();
+      unsubscribeProgress();
       setIsTestingSpeed(false);
+      setSpeedProgress(null);
     }
   };
 
@@ -195,9 +206,8 @@ export function ServerList({
     try {
       const results = await api.server.speedTest([serverId]);
 
-      // Update only this specific node's latency in the store
-      const newLatencyMap = { ...latencyMap, ...results };
-      setLatencyMap(newLatencyMap);
+      // Update only this specific node's latency in the store（函数式合并，避免 stale 覆盖）
+      setLatencyMap((prev) => ({ ...prev, ...results }));
 
       if (results[serverId] !== undefined) {
         toast.success(t('servers.speedTestDone'));
@@ -525,7 +535,11 @@ export function ServerList({
             disabled={isTestingSpeed}
           >
             <Zap className={`h-4 w-4 ${isTestingSpeed ? 'animate-pulse fill-current/20' : ''}`} />
-            {isTestingSpeed ? t('servers.speedTesting') : t('servers.speedTest')}
+            {isTestingSpeed
+              ? speedProgress
+                ? `${t('servers.speedTesting')} ${speedProgress.tested}/${speedProgress.total}`
+                : t('servers.speedTesting')
+              : t('servers.speedTest')}
           </Button>
 
           {/* 批量选择按钮 */}

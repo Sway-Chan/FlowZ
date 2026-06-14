@@ -1,4 +1,4 @@
-import { CustomAppPreset } from './types';
+import { CustomAppPreset, AppRule, RuleAction } from './types';
 
 /**
  * 应用分流预设列表
@@ -54,15 +54,6 @@ export const APP_PRESETS: AppPreset[] = [
     iconUrl: `${QURE_BASE}/TikTok.png`,
     geositeTags: ['tiktok'],
     processNames: ['TikTok', 'TikTok.exe'],
-    category: 'video',
-  },
-  {
-    id: 'bilibili',
-    labelKey: 'bilibili',
-    emoji: '📺',
-    iconUrl: `${QURE_BASE}/bilibili.png`,
-    geositeTags: ['bilibili'],
-    processNames: ['BiliBili', 'bilibili', 'bilibili.exe'],
     category: 'video',
   },
   // ── 社交 ──────────────────────────────────────────
@@ -158,15 +149,6 @@ export const APP_PRESETS: AppPreset[] = [
     iconUrl: `${QURE_BASE}/Spotify.png`,
     geositeTags: ['spotify'],
     processNames: ['Spotify', 'Spotify.exe'],
-    category: 'tools',
-  },
-  {
-    id: 'apple',
-    labelKey: 'apple',
-    emoji: '🍎',
-    iconUrl: `${QURE_BASE}/Apple.png`,
-    geositeTags: ['apple'],
-    processNames: ['App Store', 'Software Update', 'cloudd', 'nsurlsessiond'],
     category: 'tools',
   },
   // ── 游戏 ──────────────────────────────────────────
@@ -288,4 +270,27 @@ export function getAppPreset(
 /** 获取某个 category 下的所有预设 */
 export function getAppPresetsByCategory(category: AppPreset['category']): AppPreset[] {
   return APP_PRESETS.filter((p) => p.category === category);
+}
+
+/**
+ * 默认应用分流规则：为每个内置预设生成「代理·跟全局」规则（enabled，无 targetServerId）。
+ * 使每张卡片启动即有 rule-sel-app selector → 首次切节点即热切换，无需先手动触发一次创建规则。
+ */
+export function defaultAppRules(): AppRule[] {
+  return APP_PRESETS.map((p) => ({
+    appId: p.id,
+    action: 'proxy' as RuleAction,
+    enabled: true,
+  }));
+}
+
+/**
+ * 一次性默认注入合并（幂等）：为未配置的预设补默认规则；剔除已下线预设（如 apple/bilibili）的残留规则；
+ * 保留用户已配置的预设规则（不覆盖其 action/目标节点）与自定义 app（custom-*）。
+ */
+export function seedDefaultAppRules(existing: AppRule[]): AppRule[] {
+  const validIds = new Set(APP_PRESETS.map((p) => p.id));
+  const kept = existing.filter((r) => validIds.has(r.appId) || r.appId.startsWith('custom-'));
+  const have = new Set(kept.map((r) => r.appId));
+  return [...kept, ...defaultAppRules().filter((r) => !have.has(r.appId))];
 }

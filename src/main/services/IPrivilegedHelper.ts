@@ -12,7 +12,14 @@
  * 其余恒默认值；消费方契约见 HelperStatus 字段注释。
  */
 import type { HelperStatus } from '../../shared/types';
-import type { HelperStartResult } from './HelperManager';
+
+/** 经 helper 以特权启动 sing-box 的结果（跨平台公共，IPrivilegedHelper.startCore 返回类型）。
+ * 提取到本接口文件：消除 WindowsServiceHelper 反向依赖 macOS HelperManager（仅类型耦合）。 */
+export interface HelperStartResult {
+  ok: boolean;
+  pid?: number;
+  error?: string;
+}
 
 export interface IPrivilegedHelper {
   /** 能否零提权驱动 TUN（已装 + 就绪 + ping 通）。ProxyManager 启动路由用。 */

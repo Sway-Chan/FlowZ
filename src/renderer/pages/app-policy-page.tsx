@@ -9,8 +9,8 @@ export function AppPolicyPage() {
   const { t } = useTranslation();
   const config = useAppStore((s) => s.config);
   const saveConfig = useAppStore((s) => s.saveConfig);
-  // undefined=开启（兼容老配置）；总开关切换走 config:save → 运行中全量重启（route.rules 结构不可热改）
-  const enabled = config?.appRoutingEnabled !== false;
+  // 默认关（undefined=关闭，与后端 effectiveAppRules `!== true` 一致）；总开关切换走 config:save → 运行中全量重启
+  const enabled = config?.appRoutingEnabled === true;
 
   const toggle = (v: boolean) => {
     if (!config) return;

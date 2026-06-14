@@ -19,7 +19,7 @@ export function registerSpeedTestHandlers(
   // 服务器测速
   registerIpcHandler<{ serverIds?: string[] }, Record<string, number>>(
     IPC_CHANNELS.SERVER_SPEED_TEST,
-    async (_event: IpcMainInvokeEvent, args?: { serverIds?: string[] }) => {
+    async (event: IpcMainInvokeEvent, args?: { serverIds?: string[] }) => {
       const config = await configManager.loadConfig();
       const results: Record<string, number> = {};
 
@@ -27,7 +27,20 @@ export function registerSpeedTestHandlers(
         ? config.servers.filter((s) => args.serverIds!.includes(s.id))
         : config.servers;
 
-      const rawResults = await speedTestService.testAllServers(serversToTest);
+      // 逐节点回调：每测完一个节点立即发送 EVENT（渲染端订阅增量更新），不等队列。
+      const rawResults = await speedTestService.testAllServers(
+        serversToTest,
+        (serverId, latency) => {
+          event.sender.send(IPC_CHANNELS.EVENT_SPEED_TEST_RESULT, {
+            serverId,
+            latency: latency === null ? -1 : latency,
+          });
+        },
+        (tested, ok, total) => {
+          event.sender.send(IPC_CHANNELS.EVENT_SPEED_TEST_PROGRESS, { tested, ok, total });
+        },
+        config.speedTestUrl
+      );
 
       for (const [id, latency] of rawResults.entries()) {
         results[id] = latency === null ? -1 : latency;

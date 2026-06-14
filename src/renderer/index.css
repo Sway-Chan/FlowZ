@@ -282,7 +282,8 @@
     background-color: hsl(var(--background));
     border-radius: 12px 0 0 12px;
     position: relative;
-    transform: translateZ(0);
+    /* 移除 transform: translateZ(0)：Windows 分数 DPI(125/150%)下它把含文字的卡片提升为 GPU 层、按整数光栅化再缩放
+       → 文字发虚（Electron-on-Windows 头号糊字原因）。isolation: isolate 已提供堆叠上下文、不强制糊层。 */
     isolation: isolate;
     /* 恢复原有的边框和阴影，创造立体的卡片感 */
     border-left: 1px solid hsl(var(--border));
@@ -355,8 +356,10 @@
      from a long background session on Windows.                    */
 
   .app-shell {
+    /* 保留 will-change: background（修「长时间后台后 Windows GPU 缓存致背景不重绘」）；移除 transform: translateZ(0)
+       —— 它把整个 shell（含全部文字）提升为 GPU 层，分数 DPI 下文字发虚。若背景重绘问题复现，改用 ::before 伪元素
+       单独承载背景做 GPU 合成（只糊纯色背景、不碰文字），而非提升整棵子树。 */
     will-change: background;
-    transform: translateZ(0);
   }
 
   html.platform-darwin .app-shell {

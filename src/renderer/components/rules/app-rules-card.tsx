@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAppStore } from '@/store/app-store';
 import { Card, CardContent } from '@/components/ui/card';
@@ -16,8 +16,25 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog';
 import { APP_PRESETS, type AppPreset } from '../../../shared/app-rules-preset';
-import type { AppRule, RuleAction, CustomAppPreset } from '../../../shared/types';
-import { Plus, Trash2, Search, LayoutGrid, List, Image as ImageIcon } from 'lucide-react';
+import type {
+  AppRule,
+  RuleAction,
+  CustomAppPreset,
+  RuleResourceCatalogItem,
+  RuleResourceListItem,
+} from '../../../shared/types';
+import { api } from '@/ipc/api-client';
+import { GeoTagPicker } from './geo-tag-picker';
+import { geoCategoryOptions, localGeoTagSet } from './geo-tag-picker-utils';
+import {
+  Plus,
+  Trash2,
+  Search,
+  LayoutGrid,
+  List,
+  Image as ImageIcon,
+  ChevronDown,
+} from 'lucide-react';
 import { toast } from 'sonner';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { useEffect } from 'react';
@@ -37,8 +54,14 @@ export function AppRulesCard() {
   const [newAppName, setNewAppName] = useState('');
   const [newAppEmoji, setNewAppEmoji] = useState('🌐');
   const [newAppIconUrl, setNewAppIconUrl] = useState('');
-  const [newAppGeosite, setNewAppGeosite] = useState('');
-  const [newAppGeoIP, setNewAppGeoIP] = useState('');
+  const [newAppGeositeTags, setNewAppGeositeTags] = useState<string[]>([]);
+  const [newAppGeoipTags, setNewAppGeoipTags] = useState<string[]>([]);
+  // geo 分类 catalog（geosite/geoip 多选选择器数据源）：内置/缓存即时，全量需刷新
+  const [geoCatalog, setGeoCatalog] = useState<RuleResourceCatalogItem[]>([]);
+  const [geoCatalogLoading, setGeoCatalogLoading] = useState(false);
+  const [geoCatalogRefreshing, setGeoCatalogRefreshing] = useState(false);
+  // 规则资源已下载/内置列表：标注「本地/未下载」+ 添加时判断哪些 geo 需下载进规则资源（联动）
+  const [geoLocalList, setGeoLocalList] = useState<RuleResourceListItem[]>([]);
 
   // -- 图标库状态 --
   const [iconGalleries, setIconGalleries] = useState<{ name: string; url: string }[]>([]);
@@ -64,6 +87,26 @@ export function AppRulesCard() {
   useEffect(() => {
     localStorage.setItem('flowz_app_view_mode', viewMode);
   }, [viewMode]);
+
+  // 打开新增对话框时拉 geo 分类 catalog（getCatalog 走内置/磁盘缓存，无网络）；只拉一次，全量由刷新按钮拉
+  useEffect(() => {
+    if (!isAddDialogOpen || geoCatalog.length > 0) return;
+    setGeoCatalogLoading(true);
+    api.ruleResources
+      .getCatalog()
+      .then((r) => setGeoCatalog(r.items || []))
+      .catch(() => setGeoCatalog([]))
+      .finally(() => setGeoCatalogLoading(false));
+  }, [isAddDialogOpen, geoCatalog.length]);
+
+  // 每次打开对话框刷新「已下载/内置」列表（反映新下载），用于本地标注与添加时按需下载
+  useEffect(() => {
+    if (!isAddDialogOpen) return;
+    api.ruleResources
+      .list()
+      .then(setGeoLocalList)
+      .catch(() => setGeoLocalList([]));
+  }, [isAddDialogOpen]);
 
   useEffect(() => {
     if (!showIconGallery || iconGalleries.length > 0) return;
@@ -113,6 +156,11 @@ export function AppRulesCard() {
   const filteredIcons = searchQuery
     ? iconGalleries.filter((i) => i.name.toLowerCase().includes(searchQuery.toLowerCase()))
     : iconGalleries.slice(0, 100);
+
+  const geositeOptions = useMemo(() => geoCategoryOptions(geoCatalog, 'geosite'), [geoCatalog]);
+  const geoipOptions = useMemo(() => geoCategoryOptions(geoCatalog, 'geoip'), [geoCatalog]);
+  const localGeositeTags = useMemo(() => localGeoTagSet(geoLocalList, 'geosite'), [geoLocalList]);
+  const localGeoipTags = useMemo(() => localGeoTagSet(geoLocalList, 'geoip'), [geoLocalList]);
 
   if (!config) return null;
 
@@ -188,8 +236,21 @@ export function AppRulesCard() {
     }
   };
 
+  // 拉取远程全量 geo 分类清单（内置/缓存只含精选；与「资源库」对话框同源 MetaCubeX）
+  const refreshGeoCatalog = async () => {
+    setGeoCatalogRefreshing(true);
+    try {
+      const r = await api.ruleResources.refreshCatalog();
+      setGeoCatalog(r.items || []);
+    } catch {
+      toast.error(t('rules.customApp.geoRefreshFailed', '刷新分类清单失败'));
+    } finally {
+      setGeoCatalogRefreshing(false);
+    }
+  };
+
   const handleAddCustomApp = async () => {
-    if (!newAppName.trim() || !newAppGeosite.trim()) {
+    if (!newAppName.trim() || newAppGeositeTags.length === 0) {
       toast.error(t('rules.customApp.fillNameAndGeosite'));
       return;
     }
@@ -200,26 +261,40 @@ export function AppRulesCard() {
       name: newAppName.trim(),
       emoji: newAppEmoji.trim() || '🌐',
       iconUrl: newAppIconUrl.trim() || undefined,
-      geositeTags: newAppGeosite
-        .split(',')
-        .map((s) => s.trim())
-        .filter(Boolean),
-      geoipTags: newAppGeoIP
-        ? newAppGeoIP
-            .split(',')
-            .map((s) => s.trim())
-            .filter(Boolean)
-        : undefined,
+      geositeTags: newAppGeositeTags,
+      geoipTags: newAppGeoipTags.length > 0 ? newAppGeoipTags : undefined,
     };
 
     try {
       await saveConfig({
         ...config,
         customAppPresets: [...customPresets, newPreset],
+        // 同注入默认 appRule（代理·跟全局），使 rule-sel-app selector 随本次添加重启一并 materialize →
+        // 首次切节点即热切换，与内置预设卡片一致（否则首次设策略还要再重启一次）。删除时 handleDeleteCustomApp 一并清理。
+        appRules: [...appRules, { appId: newId, action: 'proxy', enabled: true }],
       });
     } catch {
       toast.error(t('common.saveFailed'));
       return;
+    }
+
+    // 联动规则资源：所选 geo 中尚未本地（内置/已下载）的分类 → 下载进规则资源 → 可见 + 路由生成复用本地副本
+    // （见 ProxyManager.localResPath）。fire-and-forget：失败也不影响添加，路由层会回落远程下载兜底。
+    const toDownload = [
+      ...newAppGeositeTags
+        .filter((tg) => !localGeositeTags.has(tg))
+        .map((tg) => ({ catalogId: `geosite-${tg}` })),
+      ...newAppGeoipTags
+        .filter((tg) => !localGeoipTags.has(tg))
+        .map((tg) => ({ catalogId: `geoip-${tg}` })),
+    ];
+    if (toDownload.length > 0) {
+      void api.ruleResources.download(toDownload).catch(() => {});
+      toast.info(
+        t('rules.customApp.geoDownloading', '正在下载 {{n}} 个分类规则集到规则资源', {
+          n: toDownload.length,
+        })
+      );
     }
 
     setIsAddDialogOpen(false);
@@ -227,8 +302,8 @@ export function AppRulesCard() {
     setNewAppName('');
     setNewAppEmoji('🌐');
     setNewAppIconUrl('');
-    setNewAppGeosite('');
-    setNewAppGeoIP('');
+    setNewAppGeositeTags([]);
+    setNewAppGeoipTags([]);
     toast.success(t('rules.customApp.addSuccess'));
   };
 
@@ -311,9 +386,13 @@ export function AppRulesCard() {
                   <SelectTrigger
                     className={`${viewMode === 'comfortable' ? 'h-[110px] p-3.5' : 'h-[88px] p-2.5'} w-full flex flex-col items-start rounded-xl border border-muted-foreground/10 transition-all duration-300 shadow-none focus:ring-0 [&>svg]:hidden bg-muted/40 hover:bg-muted/60 relative overflow-hidden`}
                   >
-                    {/* 左上脚标：Surge 风格 */}
+                    {/* 可点击 affordance：span 包裹避开 [&>svg]:hidden；pointer-events-none 不挡点击；hover 提亮 */}
+                    <span className="pointer-events-none absolute right-2 top-2 text-muted-foreground/40 transition-colors group-hover:text-primary">
+                      <ChevronDown className="h-3.5 w-3.5" />
+                    </span>
+                    {/* 左上脚标：策略选择器入口提示。提升可见度（10px/80% 半粗）+ hover 提亮，与右上 chevron 联动暗示可点击 */}
                     <div
-                      className={`text-[8px] text-muted-foreground/50 font-medium tracking-tight uppercase leading-none mt-0.5 mb-1 ${viewMode === 'comfortable' ? 'ml-1.5' : 'ml-2.5'}`}
+                      className={`text-[10px] text-muted-foreground/80 font-semibold tracking-tight leading-none mt-0.5 mb-1 transition-colors group-hover:text-primary ${viewMode === 'comfortable' ? 'ml-1.5' : 'ml-2.5'}`}
                     >
                       {t('rules.appRulesManualSelection')}
                     </div>
@@ -638,29 +717,41 @@ export function AppRulesCard() {
                     className="col-span-3 h-10 rounded-lg bg-muted/20 border-none focus-visible:ring-1"
                   />
                 </div>
-                <div className="grid grid-cols-4 items-center gap-4">
-                  <Label htmlFor="geosite" className="text-right">
-                    Geosite
-                  </Label>
-                  <Input
-                    id="geosite"
-                    value={newAppGeosite}
-                    onChange={(e) => setNewAppGeosite(e.target.value)}
-                    placeholder={t('rules.customApp.geositePlaceholder')}
-                    className="col-span-3 h-10 rounded-lg bg-muted/20 border-none focus-visible:ring-1"
-                  />
+                <div className="grid grid-cols-4 items-start gap-4">
+                  <Label className="pt-3 text-right">Geosite</Label>
+                  <div className="col-span-3">
+                    <GeoTagPicker
+                      options={geositeOptions}
+                      value={newAppGeositeTags}
+                      onChange={setNewAppGeositeTags}
+                      localTags={localGeositeTags}
+                      loading={geoCatalogLoading}
+                      refreshing={geoCatalogRefreshing}
+                      onRefresh={refreshGeoCatalog}
+                      placeholder={t(
+                        'rules.customApp.geoSearchPlaceholder',
+                        '搜索分类，如 youtube'
+                      )}
+                    />
+                  </div>
                 </div>
-                <div className="grid grid-cols-4 items-center gap-4">
-                  <Label htmlFor="geoip" className="text-right">
-                    GeoIP
-                  </Label>
-                  <Input
-                    id="geoip"
-                    value={newAppGeoIP}
-                    onChange={(e) => setNewAppGeoIP(e.target.value)}
-                    placeholder={t('rules.customApp.geoipPlaceholder')}
-                    className="col-span-3 h-10 rounded-lg bg-muted/20 border-none focus-visible:ring-1"
-                  />
+                <div className="grid grid-cols-4 items-start gap-4">
+                  <Label className="pt-3 text-right">GeoIP</Label>
+                  <div className="col-span-3">
+                    <GeoTagPicker
+                      options={geoipOptions}
+                      value={newAppGeoipTags}
+                      onChange={setNewAppGeoipTags}
+                      localTags={localGeoipTags}
+                      loading={geoCatalogLoading}
+                      refreshing={geoCatalogRefreshing}
+                      onRefresh={refreshGeoCatalog}
+                      placeholder={t(
+                        'rules.customApp.geoSearchPlaceholder',
+                        '搜索分类，如 youtube'
+                      )}
+                    />
+                  </div>
                 </div>
               </div>
               <DialogFooter>

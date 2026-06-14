@@ -16,7 +16,7 @@ import * as net from 'net';
 import * as path from 'path';
 import { randomBytes } from 'crypto';
 import type { HelperStatus } from '../../shared/types';
-import type { IPrivilegedHelper } from './IPrivilegedHelper';
+import type { IPrivilegedHelper, HelperStartResult } from './IPrivilegedHelper';
 import type { ILogManager } from './LogManager';
 import { resourceManager } from './ResourceManager';
 import { getUserDataPath } from '../utils/paths';
@@ -44,12 +44,6 @@ const LOADED_PROBE_TTL_MS = 10_000;
 const SM_HOLD_MS = 30_000;
 /** SMAppService 探测缓存 TTL：3s（与设置卡轮询同步）。比 launchctl 的 10s 短——开关变化要尽快反映，osascript ~33ms 廉价。 */
 const SM_CACHE_TTL_MS = 3_000;
-
-export interface HelperStartResult {
-  ok: boolean;
-  pid?: number;
-  error?: string;
-}
 
 export class HelperManager implements IPrivilegedHelper {
   /** 路径不符 warn 仅首次记（getStatus 被设置页/首页高频调用，避免刷屏）。 */

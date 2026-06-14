@@ -59,6 +59,8 @@ export function RuleResourcesPage() {
 
   const [items, setItems] = useState<RuleResourceListItem[]>([]);
   const [progress, setProgress] = useState<Map<string, RuleResourceProgress>>(new Map());
+  // 已下载列表 TAB 区分：全部 / 内置（随包）/ 外置（用户下载）。与资源库对话框同款分段控件。
+  const [listTab, setListTab] = useState<'all' | 'builtin' | 'external'>('all');
   const [catalogOpen, setCatalogOpen] = useState(false);
   const [urlOpen, setUrlOpen] = useState(false);
   const [customMode, setCustomMode] = useState(false);
@@ -93,7 +95,14 @@ export function RuleResourcesPage() {
     return unsub;
   }, [refresh]);
 
-  const downloadedIds = new Set(items.map((i) => i.id));
+  // 「本地已有」= 下载记录在 且 磁盘文件实际存在（fileExists）；文件被删 → 不在此集 → 资源库对话框回到可勾选可重下。
+  // 用全集 items（非 filteredItems）构建，确保对话框判定不受当前 TAB 过滤影响。
+  const presentIds = new Set(items.filter((i) => i.fileExists).map((i) => i.id));
+  // TAB 过滤：内置 = 随包资源（builtin:true）；外置 = 用户下载。
+  const filteredItems =
+    listTab === 'all'
+      ? items
+      : items.filter((i) => (listTab === 'builtin' ? i.builtin : !i.builtin));
 
   const handleDownload = async (downloadItems: RuleResourceDownloadItem[]) => {
     if (downloadItems.length === 0) return;
@@ -181,9 +190,9 @@ export function RuleResourcesPage() {
     return t(`ruleResources.time${cap}`, '{{n}} 前', { n: ago.n });
   };
 
-  // 自动更新设置
-  const autoUpdate = config?.ruleResourceAutoUpdate === true;
-  const intervalHours = config?.ruleResourceUpdateIntervalHours ?? 24;
+  // 自动更新设置（默认开启：仅显式 false 才关；老配置 undefined 视为开）
+  const autoUpdate = config?.ruleResourceAutoUpdate !== false;
+  const intervalHours = config?.ruleResourceUpdateIntervalHours ?? 12;
   const INTERVALS = [6, 12, 24, 72, 168];
 
   const handleAutoUpdateToggle = (enabled: boolean) => {
@@ -344,23 +353,37 @@ export function RuleResourcesPage() {
       {/* 已下载资源 */}
       <Card>
         <CardHeader>
-          <div className="flex items-center justify-between">
-            <CardTitle>{t('ruleResources.downloadedTitle', '已下载资源')}</CardTitle>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={handleUpdateAll}
-              disabled={items.length === 0 || activeRows.length > 0}
-            >
-              <RefreshCw className="mr-2 h-4 w-4" />
-              {t('ruleResources.updateAll', '全部更新')}
-            </Button>
+          <div className="space-y-3">
+            <div className="flex items-center justify-between gap-3">
+              <CardTitle>{t('ruleResources.downloadedTitle', '已下载资源')}</CardTitle>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={handleUpdateAll}
+                disabled={items.length === 0 || activeRows.length > 0}
+              >
+                <RefreshCw className="mr-2 h-4 w-4" />
+                {t('ruleResources.updateAll', '全部更新')}
+              </Button>
+            </div>
+            {/* tab 下沉独占一行，整宽自适应（与「更新间隔」分段控件同款 w-full） */}
+            <SegmentedControl<'all' | 'builtin' | 'external'>
+              value={listTab}
+              onChange={setListTab}
+              options={[
+                { value: 'all', label: t('ruleResources.listTabAll', '全部') },
+                { value: 'builtin', label: t('ruleResources.listTabBuiltin', '内置') },
+                { value: 'external', label: t('ruleResources.listTabExternal', '外置') },
+              ]}
+            />
           </div>
         </CardHeader>
         <CardContent>
-          {items.length === 0 && activeRows.length === 0 && errorRows.length === 0 ? (
+          {filteredItems.length === 0 && activeRows.length === 0 && errorRows.length === 0 ? (
             <div className="py-10 text-center text-sm text-muted-foreground">
-              {t('ruleResources.empty', '暂无规则资源，点击「资源库」或「URL 下载」添加')}
+              {listTab === 'all'
+                ? t('ruleResources.empty', '暂无规则资源，点击「资源库」或「URL 下载」添加')
+                : t('ruleResources.emptyTab', '该分类下暂无资源')}
             </div>
           ) : (
             <Table>
@@ -372,7 +395,7 @@ export function RuleResourcesPage() {
                   <TableHead className="w-[110px]">
                     {t('ruleResources.colUpdated', '更新于')}
                   </TableHead>
-                  <TableHead className="w-[100px]">{t('ruleResources.colRef', '引用')}</TableHead>
+                  <TableHead className="w-[120px]">{t('ruleResources.colRef', '引用')}</TableHead>
                   <TableHead className="w-[100px] text-right">
                     {t('common.actions', '操作')}
                   </TableHead>
@@ -419,7 +442,7 @@ export function RuleResourcesPage() {
                   </TableRow>
                 ))}
                 {/* 已下载 */}
-                {items.map((item) => (
+                {filteredItems.map((item) => (
                   <TableRow key={item.id}>
                     <TableCell>
                       <div className="flex items-center gap-1.5">
@@ -455,20 +478,14 @@ export function RuleResourcesPage() {
                     >
                       {renderTimeAgo(item.downloadedAt)}
                     </TableCell>
-                    <TableCell>
-                      {item.builtin ? (
-                        <Badge variant="secondary">
-                          {t('ruleResources.builtinRef', '智能分流')}
-                        </Badge>
-                      ) : item.referencedBy > 0 ? (
-                        <Badge variant="secondary">
-                          {t('ruleResources.referencedBy', '{{n}} 条规则', {
+                    <TableCell className="text-xs text-muted-foreground">
+                      {item.referencedBy > 0
+                        ? t('ruleResources.referencedBy', '{{n}} 条规则', {
                             n: item.referencedBy,
-                          })}
-                        </Badge>
-                      ) : (
-                        <span className="text-xs text-muted-foreground">—</span>
-                      )}
+                          })
+                        : item.builtin
+                          ? t('ruleResources.builtinRef', '智能分流')
+                          : '—'}
                     </TableCell>
                     <TableCell className="text-right">
                       <div className="flex justify-end gap-1">
@@ -512,7 +529,8 @@ export function RuleResourcesPage() {
       <ResourceCatalogDialog
         open={catalogOpen}
         onOpenChange={setCatalogOpen}
-        downloadedIds={downloadedIds}
+        presentIds={presentIds}
+        builtinItems={items.filter((i) => i.builtin)}
         onDownload={handleDownload}
       />
       <ResourceUrlDialog open={urlOpen} onOpenChange={setUrlOpen} onDownload={handleDownload} />
