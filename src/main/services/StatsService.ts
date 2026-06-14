@@ -57,6 +57,10 @@ export class StatsService {
   };
   private connections: ConnectionEntry[] = [];
   private tick = 0;
+  // P1：连接页 watcher 引用计数（连接页 mount→+1 / unmount→-1，经 CONNECTIONS_WATCH/UNWATCH IPC）。
+  // 仅 >0 时才 trimConnection + 推送连接快照——「代理连着但没盯连接页」最常见稳态下省掉全量裁剪与大包广播。
+  // 计数泄漏（渲染端硬崩漏 unwatch）fail-safe：退化为始终推送 = 原行为，不破功能。
+  private connectionsWatchers = 0;
   /**
    * @param onUpdate 每次拿到新快照时回调（广播给渲染端）
    * @param clashApi clash_api(9090) 客户端（T15：与 ProxyManager 共用单一 agent，替代本服务原私有 agent + getJson）
@@ -65,12 +69,19 @@ export class StatsService {
   constructor(
     private readonly onUpdate: (stats: TrafficStats) => void,
     private readonly clashApi: ClashApiClient,
-    private readonly onConnections?: (snap: ConnectionsSnapshot) => void
+    private readonly onConnections?: (snap: ConnectionsSnapshot) => void,
+    // P2：窗口可见性谓词。无可见窗口（macOS hide / minimizeToTray / 轻量销毁 / 普通最小化）= 无任何 UI 消费者
+    // → 整轮跳过 fetch/parse/trim/广播（含首页 stats，非仅连接列表；与只门控连接列表的 P1 watcher 不同）。
+    // 缺省（未注入，如单测）= 不门控、保持原行为，与 onConnections 缺省语义对称。
+    private readonly isWindowVisible?: () => boolean
   ) {}
 
   start(): void {
     if (this.timer) return;
     this.last = null;
+    // 停核→重启时连接页可能仍 mount 着（connectionsWatchers>0，无 0→1 跃迁不经 addConnectionsWatcher 对齐）：
+    // 与 mount 对齐逻辑一致，让重启后首轮 poll 即推连接快照（否则 stop() 置 tick=0 致首帧慢一拍 ~1s）。
+    if (this.connectionsWatchers > 0) this.tick = CONNECTIONS_PUSH_DIVIDER - 1;
     this.timer = setInterval(() => void this.poll(), POLL_INTERVAL_MS);
   }
 
@@ -101,7 +112,26 @@ export class StatsService {
     return { connections: this.connections, at: Date.now() };
   }
 
+  /** 连接页订阅：引用计数 +1。0→1 时把 tick 对齐到下一轮即推，连接页 mount 后 ≤1s 见数据（不等满 divider）。 */
+  addConnectionsWatcher(): void {
+    this.connectionsWatchers++;
+    if (this.connectionsWatchers === 1) {
+      this.tick = CONNECTIONS_PUSH_DIVIDER - 1;
+    }
+  }
+
+  /** 连接页退订：引用计数 -1（钳制 ≥0，防 over-unwatch）。归 0 后下轮 poll 不再 trim/推送。 */
+  removeConnectionsWatcher(): void {
+    if (this.connectionsWatchers > 0) this.connectionsWatchers--;
+  }
+
   private async poll(): Promise<void> {
+    // P2：无可见窗口（hide / 最小化 / 轻量销毁）→ 无任何 UI 消费者，整轮跳过 fetch+parse+trim+广播（含首页 stats）。
+    // 重置 last 让窗口恢复后首轮干净再基线（避免跨隐藏窗口的大 dt 算出失真速率）。
+    if (this.isWindowVisible && !this.isWindowVisible()) {
+      this.last = null;
+      return;
+    }
     try {
       const data = await this.clashApi.getJson<{
         uploadTotal?: number;
@@ -122,17 +152,23 @@ export class StatsService {
       this.last = { up, down, at: now };
       this.snapshot.totalUpload = up;
       this.snapshot.totalDownload = down;
+      // activeConnections 只取 length（廉价、无需 trim）→ 首页连接数恒可用，与连接列表门控解耦
       this.snapshot.activeConnections = Array.isArray(data.connections)
         ? data.connections.length
         : 0;
       this.onUpdate({ ...this.snapshot });
 
-      // 连接快照：复用本次已取到的 data.connections，裁剪后按 divider 节奏推送（全局唯一 poller）
-      this.connections = Array.isArray(data.connections)
-        ? data.connections.map(trimConnection)
-        : [];
-      if (++this.tick % CONNECTIONS_PUSH_DIVIDER === 0) {
-        this.onConnections?.({ connections: this.connections, at: now });
+      // 连接列表：仅连接页有 watcher 时才 trim + 按 divider 推送（P1 主门控）。trim 移进 divider 分支
+      // （P4：消除「每 1s 裁剪但每 2s 才推」的半浪费）；无 watcher 时零裁剪、清陈旧缓存。
+      if (this.connectionsWatchers > 0) {
+        if (++this.tick % CONNECTIONS_PUSH_DIVIDER === 0) {
+          this.connections = Array.isArray(data.connections)
+            ? data.connections.map(trimConnection)
+            : [];
+          this.onConnections?.({ connections: this.connections, at: now });
+        }
+      } else if (this.connections.length > 0) {
+        this.connections = []; // 无 watcher：清缓存（CONNECTIONS_GET 回填得空，watch 后下轮即 fill）
       }
     } catch {
       /* 静默：核心未运行 / 连接被拒 */

@@ -68,6 +68,15 @@ export function registerProxyHandlers(
     return { ok: res.ok };
   });
 
+  // 连接页订阅/退订（P1 watcher 引用计数）：仅连接页打开时主进程才裁剪+推送连接快照，
+  // 「代理连着但没盯连接页」稳态下省掉全量裁剪与大包广播。fire-and-forget（渲染端不关心返回值）。
+  registerIpcHandler<void, void>(IPC_CHANNELS.CONNECTIONS_WATCH, async () => {
+    statsService?.addConnectionsWatcher();
+  });
+  registerIpcHandler<void, void>(IPC_CHANNELS.CONNECTIONS_UNWATCH, async () => {
+    statsService?.removeConnectionsWatcher();
+  });
+
   // 启动代理
   registerIpcHandler<UserConfig, void>(
     IPC_CHANNELS.PROXY_START,
