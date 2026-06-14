@@ -56,6 +56,7 @@ function App() {
       '/logs': 'logs',
       '/connections': 'connections',
       '/server': 'server',
+      '/appPolicy': 'appPolicy',
       '/ruleResources': 'ruleResources',
       '/rules': 'rules',
     };

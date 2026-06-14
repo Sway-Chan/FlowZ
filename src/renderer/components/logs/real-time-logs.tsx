@@ -160,11 +160,11 @@ export function RealTimeLogs({
   const getLevelColor = (level: LogEntry['level']) => {
     switch (level) {
       case 'error':
-        return 'text-red-500';
+        return 'text-destructive';
       case 'warn':
-        return 'text-yellow-500';
+        return 'text-warning';
       case 'info':
-        return 'text-blue-500';
+        return 'text-info';
       case 'debug':
         return 'text-gray-500';
       default:

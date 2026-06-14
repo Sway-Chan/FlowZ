@@ -363,18 +363,18 @@ export function AppRulesCard() {
                               !rule || !isEnabled
                                 ? 'text-primary'
                                 : rule.action === 'direct'
-                                  ? 'text-green-600 dark:text-green-400'
+                                  ? 'text-success'
                                   : rule.action === 'block'
-                                    ? 'text-red-600 dark:text-red-400'
+                                    ? 'text-destructive'
                                     : 'text-primary'
                             }`
                           : `text-[9px] w-full text-left font-bold tracking-normal truncate ml-2 ${
                               !rule || !isEnabled
                                 ? 'text-primary'
                                 : rule.action === 'direct'
-                                  ? 'text-green-600 dark:text-green-400'
+                                  ? 'text-success'
                                   : rule.action === 'block'
-                                    ? 'text-red-600 dark:text-red-400'
+                                    ? 'text-destructive'
                                     : 'text-primary'
                             }`
                       }
@@ -385,9 +385,9 @@ export function AppRulesCard() {
                             !rule || !isEnabled
                               ? 'bg-primary'
                               : rule.action === 'direct'
-                                ? 'bg-green-500'
+                                ? 'bg-success'
                                 : rule.action === 'block'
-                                  ? 'bg-red-500'
+                                  ? 'bg-destructive'
                                   : 'bg-primary'
                           }`}
                         />
@@ -416,13 +416,10 @@ export function AppRulesCard() {
                     <SelectItem value="proxy-default" className="text-xs font-medium text-primary">
                       {t('rules.proxy')}
                     </SelectItem>
-                    <SelectItem
-                      value="direct"
-                      className="text-xs text-green-600 dark:text-green-500"
-                    >
+                    <SelectItem value="direct" className="text-xs text-success">
                       {t('rules.direct')}
                     </SelectItem>
-                    <SelectItem value="block" className="text-xs text-red-600 dark:text-red-500">
+                    <SelectItem value="block" className="text-xs text-destructive">
                       {t('rules.block')}
                     </SelectItem>
 

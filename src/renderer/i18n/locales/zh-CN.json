@@ -55,7 +55,8 @@
     "appPolicy": "应用分流",
     "ruleResources": "规则资源",
     "rules": "路由规则",
-    "settings": "设置"
+    "settings": "设置",
+    "group": { "routing": "分流", "diagnostics": "诊断" }
   },
   "logs": {
     "pageTitle": "实时日志",

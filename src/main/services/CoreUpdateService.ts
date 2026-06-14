@@ -1151,10 +1151,16 @@ export class CoreUpdateService {
   }
 
   /**
-   * 用户手动选择本地 sing-box 二进制并替换当前核心
-   * 通过系统文件选择器让用户选取文件
+   * 用户手动选择本地 sing-box 二进制并替换当前核心（也供 resetCoreToFactory 复用）。
+   * @param opts.filePath 源文件路径（省略则弹系统文件选择器）
+   * @param opts.force 跳过同版本短路（reset 到出厂常与现役同版本，仍要覆盖）
+   * @param opts.skipBackup reset 到出厂时=true：跳过备份/验证闩/回退（现役核是用户要丢弃的，出厂核已知稳定）
    */
-  async replaceManualCore(opts?: { filePath?: string; force?: boolean }): Promise<{
+  async replaceManualCore(opts?: {
+    filePath?: string;
+    force?: boolean;
+    skipBackup?: boolean; // reset 到出厂时跳过备份/验证闩（现役核是用户要丢弃的，出厂核已知稳定）
+  }): Promise<{
     ok: boolean;
     needConfirm?: boolean;
     sameVersion?: string;
@@ -1213,9 +1219,11 @@ export class CoreUpdateService {
       // 不经 installCoreFromDir，需独立置位。内层 try/finally 精确覆盖置位+backup+写核；清位后下方恢复性 start 放行（同 updateCore）。
       try {
         this.proxyManager?.setCoreSwapInProgress(true);
-        // 备份现役核心（统一：两条写入路径都先备份，失败可 restoreBackup 回滚）
-        await this.backupCurrentCore();
-        backupMade = true;
+        // skipBackup（reset 到出厂）：不备份现役核（用户要丢弃的），写入失败直接抛错让用户重试
+        if (!opts?.skipBackup) {
+          await this.backupCurrentCore();
+          backupMade = true;
+        }
 
         // 写入新核心：macOS + helper v5 → install-core 进受保护目录；否则 → bundle 写入腿（含签名 + 落位后预检）。
         // 源已 preSrc 预检过；install-core 内 sha256 校验保证落位字节 == 预检源，无需二次预检。
@@ -1238,7 +1246,12 @@ export class CoreUpdateService {
       // → autoRollbackIfPendingUpdate 自动回滚（对齐 updateCore，手动换坏核运行时崩溃也有回滚网，修 M-1）；之前未运行
       // → 无首启可验证，直接 record。
       if (wasRunning && this.proxyManager) {
-        this.armPendingValidation(preSrc.version);
+        // skipBackup（出厂核）：不 arm 验证闩（无备份可 autoRollback），直接 record + 重启
+        if (!opts?.skipBackup) {
+          this.armPendingValidation(preSrc.version);
+        } else {
+          await this.recordSuccessfulVersion();
+        }
         this.logManager.addLog('info', '手动替换完成，正在重启代理服务...', 'CoreUpdateService');
         const cfg = this.configProvider ? await this.configProvider() : null;
         if (cfg) await this.proxyManager.start(cfg);
@@ -1306,13 +1319,15 @@ export class CoreUpdateService {
     // record 不在此做——由 replaceManualCore 统一处理（wasRunning ? 待验证闩+首启钩子 : 直接 record）
   }
 
-  /** 重置内核到出厂版本：把随 App 出厂的 bundled 核 force 落位回受保护目录（macOS-v5）/bundle，复用 replaceManualCore
-   *  的统一不变量（停代理→备份→写入→重启→失败回滚）；force 跳过同版本短路（出厂核常与现役同版本，重置仍要覆盖回去）。 */
+  /** 重置内核到出厂版本：把随 App 出厂的 bundled 核 force 落位回受保护目录（macOS-v5）/bundle。
+   *  skipBackup=true：出厂核是用户要的终态，现役核是用户要丢弃的——不备份/不验证闩/不回退（去冗余）。
+   *  force 跳过同版本短路（出厂核常与现役同版本，重置仍要覆盖回去）。 */
   async resetCoreToFactory(): Promise<{ ok: boolean; error?: string }> {
     this.logManager.addLog('info', '重置内核到出厂版本...', 'CoreUpdateService');
     const bundlePath = resourceManager.getBundledSingBoxPath();
-    const r = await this.replaceManualCore({ filePath: bundlePath, force: true });
+    const r = await this.replaceManualCore({ filePath: bundlePath, force: true, skipBackup: true });
     if (r.ok) {
+      this.pruneBackup(); // 清理旧备份（reset 到出厂 = 干净状态，残留 .bak 无意义）
       this.logManager.addLog('info', '内核已重置到出厂版本', 'CoreUpdateService');
     }
     return { ok: r.ok, error: r.error };
