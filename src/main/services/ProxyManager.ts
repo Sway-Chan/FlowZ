@@ -5455,9 +5455,29 @@ exit 0
       return this.stopSingBoxWithSudo(opts);
     }
 
-    // Windows TUN 模式：sing-box 以管理员权限在后台运行，使用 taskkill 终止。
-    // T16 子 commit 3：实现迁入 PlatformPrivilegeService.stopElevated（win32 分支），此处 delegate（同上）。
+    // Windows TUN 模式：sing-box 以 SYSTEM/管理员权限在后台运行。
     if (this.singboxPid && process.platform === 'win32') {
+      // 经 helper 服务启动的 → 经 helper.stopCore() 停（零 UAC、快）。helper 是 SYSTEM、能停自己的 SYSTEM child；
+      // 否则非提权 taskkill 杀不动 SYSTEM sing-box → 下方 stopElevated 落 RunAs taskkill 弹 UAC 且慢（先试非提权再升级）。
+      // 镜像 macOS stopSingBoxWithSudo 的 helper 分支。注意：PlatformPrivilegeService 注入的是 macHelper（Win 上
+      // supported=false），故 Windows 的 winHelper 停止必须在 ProxyManager（持 winHelper）处理，**不能**委托 stopElevated。
+      if (this.startedViaHelper && this.helperManager) {
+        const pidToKill = this.singboxPid;
+        this.logToManager('info', `正在经提权服务停止 sing-box (PID: ${pidToKill})（免 UAC）...`);
+        if (this.isProcessAlive(pidToKill)) {
+          await this.helperManager.stopCore();
+          // 覆盖 helper terminateChild 的「CTRL_BREAK→等≤2s→TerminateProcess」+ 收割余量。
+          await this.waitForProcessExit(pidToKill, opts?.quitting ? 3000 : 8000);
+        }
+        if (!this.isProcessAlive(pidToKill)) {
+          this.logToManager('info', 'sing-box 已由提权服务停止（免 UAC）');
+          this.finishStop();
+          return;
+        }
+        // helper 停未生效（极少）→ 落下方提权兜底（退出语境 stopElevated 内部跳过 UAC）。
+        this.logToManager('warn', 'helper 服务停止未生效，回退提权路径');
+      }
+      // T16 子 commit 3：实现迁入 PlatformPrivilegeService.stopElevated（win32 分支），此处 delegate（同上）。
       if (this.privilegeService) {
         const { stopped } = await this.privilegeService.stopElevated(this.singboxPid, opts);
         if (stopped) this.finishStop();
@@ -5870,6 +5890,16 @@ exit 0
    * startInternal:658 调用点不变；ROOT_ORPHAN_BLOCKED 异常仍从此冒泡到 attemptAutoRestart 判终态。
    */
   private async killOrphanedSingBoxProcesses(isTunMode: boolean): Promise<void> {
+    // Windows：先经 helper 服务(SYSTEM)清掉孤儿 sing-box（含 SYSTEM 提权孤儿，零 UAC）—— privilegeService 的
+    // 非提权 taskkill 对 SYSTEM 孤儿 Access denied 杀不动。镜像 macOS killOrphans 经 helper.cleanup 的零提权清理。
+    // 未装/未就绪则 cleanup 经管道 ENOENT 快速失败、无额外延迟、不弹框。
+    if (process.platform === 'win32' && this.helperManager) {
+      try {
+        await this.helperManager.cleanup();
+      } catch {
+        /* best-effort */
+      }
+    }
     await this.privilegeService?.killOrphans(isTunMode);
   }
 
