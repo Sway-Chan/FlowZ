@@ -32,6 +32,7 @@ import {
 import { Checkbox } from '@/components/ui/checkbox';
 import { Button } from '@/components/ui/button';
 import { Loader2 } from 'lucide-react';
+import { ServerSelectGroups } from '@/components/settings/server-select-groups';
 import { useAppStore } from '@/store/app-store';
 import type { DomainRule, RuleAction } from '../../../shared/types';
 import { useTranslation } from 'react-i18next';
@@ -326,11 +327,7 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
                         <SelectItem value="default">
                           {t('rules.defaultNodeTip', '默认 (跟随主节点)')}
                         </SelectItem>
-                        {servers.map((server) => (
-                          <SelectItem key={server.id} value={server.id}>
-                            {server.name}
-                          </SelectItem>
-                        ))}
+                        <ServerSelectGroups servers={servers} />
                       </SelectContent>
                     </Select>
                     <FormDescription>

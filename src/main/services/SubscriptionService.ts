@@ -1,5 +1,5 @@
 import { randomUUID } from 'crypto';
-import { net } from 'electron';
+import { net, session, type Session } from 'electron';
 import type { ServerConfig, SubscriptionConfig } from '../../shared/types';
 import { ProtocolParser } from './ProtocolParser';
 import { LogManager } from './LogManager';
@@ -64,10 +64,89 @@ type SingboxOutbound = {
 export class SubscriptionService {
   private protocolParser: ProtocolParser;
   private logManager: LogManager;
+  // 直连会话：强制 mode:'direct'，无视默认会话/系统代理，供 viaProxy=false 的订阅拉取使用
+  private directSession: Session | null = null;
 
   constructor(protocolParser: ProtocolParser, logManager: LogManager) {
     this.protocolParser = protocolParser;
     this.logManager = logManager;
+  }
+
+  /** 懒加载强制直连会话（默认会话在代理运行时会走代理，直连拉取须绕开它）。 */
+  private async getDirectSession(): Promise<Session> {
+    if (this.directSession) return this.directSession;
+    const s = session.fromPartition('flowz-subscription-direct');
+    await s.setProxy({ mode: 'direct' });
+    this.directSession = s;
+    return s;
+  }
+
+  /**
+   * 节点稳定指纹：协议 + 地址 + 端口 + 凭据（uuid/password/username）。
+   * 刻意排除显示名 name 与本地自定义 detour —— 订阅方常改名/调顺序，用 name 做键会把
+   * 同一物理节点误判为「删旧增新」，导致 id 抖动、selectedServerId 丢失、本地编辑被清。
+   * 凭据可区分同 host:port 的并列节点，几乎不随更新变化。
+   */
+  static serverFingerprint(s: ServerConfig): string {
+    // 凭据按协议落点取：vless/vmess/tuic→uuid；trojan/hy2/anytls→password；ss→shadowsocksSettings.password；
+    // naive/socks/http→username；ssh→sshSettings.password。覆盖嵌套落点，避免 SS 等凭据落空致同 host:port 误并。
+    const cred =
+      s.uuid ||
+      s.password ||
+      s.shadowsocksSettings?.password ||
+      s.username ||
+      s.sshSettings?.password ||
+      '';
+    return `${(s.protocol || '').toLowerCase()}|${s.address}|${s.port}|${cred}`;
+  }
+
+  /**
+   * 订阅节点对账：按稳定指纹匹配新旧节点。
+   * - 命中：原地更新（保留旧 id/createdAt），其余字段（含 name、detour）以订阅最新值为准
+   *   —— 订阅节点不保留本地 detour，需长期自定义请用「克隆到自建」。
+   * - 仅新订阅有：新增。
+   * - 仅旧配置有：删除（id 收入 deletedIds 供清理 selectedServerId）。
+   * 用桶（数组）承接同指纹的多个节点，按出现顺序成对匹配，避免 Map 覆盖丢 id。
+   */
+  static reconcileServers(
+    oldServers: ServerConfig[],
+    fetchedServers: ServerConfig[],
+    now: string
+  ): {
+    servers: ServerConfig[];
+    added: number;
+    updated: number;
+    deleted: number;
+    deletedIds: Set<string>;
+  } {
+    const oldBuckets = new Map<string, ServerConfig[]>();
+    for (const s of oldServers) {
+      const key = SubscriptionService.serverFingerprint(s);
+      const bucket = oldBuckets.get(key);
+      if (bucket) bucket.push(s);
+      else oldBuckets.set(key, [s]);
+    }
+
+    const kept: ServerConfig[] = [];
+    let added = 0;
+    let updated = 0;
+    for (const ns of fetchedServers) {
+      const key = SubscriptionService.serverFingerprint(ns);
+      const bucket = oldBuckets.get(key);
+      const old = bucket && bucket.length > 0 ? bucket.shift() : undefined;
+      if (old) {
+        kept.push({ ...ns, id: old.id, createdAt: old.createdAt, updatedAt: now });
+        updated++;
+      } else {
+        kept.push(ns);
+        added++;
+      }
+    }
+
+    const leftover: ServerConfig[] = [];
+    for (const bucket of oldBuckets.values()) leftover.push(...bucket);
+    const deletedIds = new Set(leftover.map((s) => s.id));
+    return { servers: kept, added, updated, deleted: leftover.length, deletedIds };
   }
 
   /**
@@ -274,10 +353,15 @@ export class SubscriptionService {
    */
   async fetchSubscription(
     url: string,
-    subscriptionId: string
+    subscriptionId: string,
+    viaProxy: boolean = false
   ): Promise<{ servers: ServerConfig[]; userInfo?: SubscriptionConfig['userInfo'] }> {
     try {
-      this.logManager.addLog('info', `正在拉取订阅: ${url}`, 'Subscription');
+      this.logManager.addLog(
+        'info',
+        `正在拉取订阅: ${url}（${viaProxy ? '经代理' : '直连'}）`,
+        'Subscription'
+      );
 
       // SSRF 防护：订阅地址来自用户/分享，限 http(s)、拒指向本机/内网/link-local 的字面 IP
       // （拦 file://、http://169.254.169.254 云元数据、内网回环等）。基于主机名的 DNS 旁路仍存在，
@@ -296,7 +380,15 @@ export class SubscriptionService {
         throw new Error(`订阅地址指向本机/内网/link-local，已拒绝: ${urlObj.hostname}`);
       }
 
-      const response = await net.fetch(url, {
+      // viaProxy=true 用默认会话（代理运行时即经代理）；否则用强制直连会话
+      let fetchImpl: typeof net.fetch;
+      if (viaProxy) {
+        fetchImpl = net.fetch;
+      } else {
+        const ds = await this.getDirectSession();
+        fetchImpl = ds.fetch.bind(ds);
+      }
+      const response = await fetchImpl(url, {
         headers: { 'User-Agent': 'FlowZ-Client' },
       });
 

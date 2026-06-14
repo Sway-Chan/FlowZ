@@ -31,6 +31,7 @@ import { UpdateService } from './services/UpdateService';
 import { CoreUpdateService } from './services/CoreUpdateService';
 import { SpeedTestService } from './services/SpeedTestService';
 import { AutoSwitchService } from './services/AutoSwitchService';
+import { SubscriptionScheduler } from './services/SubscriptionScheduler';
 import { ipcEventEmitter } from './ipc/ipc-events';
 import { mainEventEmitter, MAIN_EVENTS } from './ipc/main-events';
 import { initUserDataPath } from './utils/paths';
@@ -109,6 +110,7 @@ let coreUpdateService: CoreUpdateService;
 let subscriptionService: SubscriptionService;
 let speedTestService: SpeedTestService;
 let autoSwitchService: AutoSwitchService;
+let subscriptionScheduler: SubscriptionScheduler;
 
 // 全局异常捕获 - 主进程
 process.on('uncaughtException', (error: Error) => {
@@ -397,6 +399,17 @@ async function createWindow() {
   mainWindow.on('blur', startInactivityTimers);
   mainWindow.on('hide', startInactivityTimers);
 
+  // macOS：隐藏到托盘时一并清理 Dock 图标（仅驻留托盘，不占 Dock / Cmd-Tab），重新显示时恢复。
+  // 用 show/hide 事件钩子覆盖所有显示/隐藏路径（托盘打开 / 第二实例 / activate）。
+  if (process.platform === 'darwin') {
+    mainWindow.on('hide', () => {
+      app.dock?.hide();
+    });
+    mainWindow.on('show', () => {
+      void app.dock?.show();
+    });
+  }
+
   mainWindow.on('focus', () => {
     if (inactivityTimer) {
       clearTimeout(inactivityTimer);
@@ -457,6 +470,10 @@ async function cleanupResources(): Promise<void> {
   logManager.addLog('info', 'Cleaning up resources before exit...', 'Main');
 
   try {
+    // 0. 停止后台定时器（订阅调度 / 自动换节点）
+    subscriptionScheduler?.stop();
+    autoSwitchService?.destroy();
+
     // 1. 停止代理进程
     if (proxyManager) {
       const status = proxyManager.getStatus();
@@ -511,6 +528,7 @@ async function updateTrayMenuState(isProxyRunning: boolean, hasError?: boolean):
       isProxyRunning,
       hasError,
       servers: config.servers,
+      subscriptions: config.subscriptions || [],
       selectedServerId: config.selectedServerId,
       proxyMode: config.proxyMode,
     });
@@ -600,20 +618,39 @@ if (gotTheLock) {
       }
     }
 
-    // 监听代理管理器事件，更新托盘状态
-    proxyManager.on('error', async (error: Error) => {
+    // 订阅自动更新调度器：启动补更陈旧订阅 + 周期更新（不打断当前连接）
+    subscriptionScheduler = new SubscriptionScheduler(
+      configManager,
+      subscriptionService,
+      logManager,
+      () => proxyManager?.getStatus().running ?? false,
+      (cfg) => ipcEventEmitter.sendToAll('event:configChanged', { newValue: cfg })
+    );
+    subscriptionScheduler.start();
+
+    // 监听代理管理器事件，更新托盘状态。
+    // 说明：同节点「原地重启」由 ProxyManager 内部接管（handleProcessExit / 健康检查 → attemptAutoRestart，
+    // 单一计数器 + 上限 + 冷却）。'error' 仅在「自动重启被抑制（核心更新校验窗口）或已达上限」时触发，
+    // 故此处只需处理：核心回滚 → 放弃恢复并清理系统代理。崩溃不触发换节点（换节点交给心跳连通性检测）。
+    proxyManager.on('error', async (error: { message: string; code?: number }) => {
       logManager.addLog('error', `Proxy error: ${error.message}`, 'Main');
       // 发生错误时，更新托盘显示为"连接异常"
       updateTrayMenuState(false, true);
 
-      // 触发自动换节点（如果已启用）
-      if (autoSwitchService) {
-        autoSwitchService.onProxyError(error.message).catch((e) => {
-          logManager.addLog('warn', `自动换节点处理异常: ${e}`, 'Main');
-        });
+      // 1) 新核心首次启动失败（自动重启被抑制时）→ 自动回滚旧核心并重启
+      try {
+        const rolledBack = await coreUpdateService.autoRollbackIfPendingUpdate();
+        if (rolledBack) {
+          logManager.addLog('warn', '新核心启动失败，已自动回滚，正在以旧核心重启代理...', 'Main');
+          const cfg = await configManager.loadConfig();
+          await proxyManager?.start(cfg);
+          return;
+        }
+      } catch (rollbackErr) {
+        logManager.addLog('error', `自动回滚重启失败: ${rollbackErr}`, 'Main');
       }
 
-      // 进程意外退出时，清理系统代理设置，避免网络不可用
+      // 2) 放弃自动恢复（重启已达上限）：清理系统代理，避免网络不可用（错误已由 ProxyManager 投递前端）
       try {
         const proxyStatus = await systemProxyManager.getProxyStatus();
         if (proxyStatus.enabled) {
@@ -629,18 +666,6 @@ if (gotTheLock) {
           `Failed to disable system proxy after error: ${errorMessage}`,
           'Main'
         );
-      }
-
-      // 若是核心更新后新核心首次启动失败 → 自动回滚到旧核心并以旧核心重启代理
-      try {
-        const rolledBack = await coreUpdateService.autoRollbackIfPendingUpdate();
-        if (rolledBack) {
-          logManager.addLog('warn', '新核心启动失败，已自动回滚，正在以旧核心重启代理...', 'Main');
-          const cfg = await configManager.loadConfig();
-          await proxyManager?.start(cfg);
-        }
-      } catch (rollbackErr) {
-        logManager.addLog('error', `自动回滚重启失败: ${rollbackErr}`, 'Main');
       }
     });
 
@@ -1026,90 +1051,8 @@ if (gotTheLock) {
       }
     }, 5000);
 
-    // 启动后自动更新订阅（延迟 8 秒，避免干扰启动）
-    setTimeout(async () => {
-      try {
-        const config = await configManager.loadConfig();
-        if (config.autoUpdateSubscriptionOnStart) {
-          logManager.addLog('info', '启动时自动更新订阅已启用，正在更新...', 'Main');
-
-          if (!config.subscriptions || config.subscriptions.length === 0) {
-            logManager.addLog('info', '没有可更新的订阅', 'Main');
-            return;
-          }
-
-          let updatedCount = 0;
-          let failedCount = 0;
-
-          for (const subscription of config.subscriptions) {
-            if (!subscription.autoUpdate) continue;
-            try {
-              const result = await subscriptionService.fetchSubscription(
-                subscription.url,
-                subscription.id
-              );
-              const fetchedServers = result.servers;
-
-              const oldServers = config.servers.filter((s) => s.subscriptionId === subscription.id);
-              const oldServersMap = new Map<string, (typeof config.servers)[0]>();
-              oldServers.forEach((s) => {
-                oldServersMap.set(`${s.name}-${s.protocol}-${s.address}-${s.port}`, s);
-              });
-
-              const newServersToKeep = [];
-              for (const newServer of fetchedServers) {
-                const key = `${newServer.name}-${newServer.protocol}-${newServer.address}-${newServer.port}`;
-                if (oldServersMap.has(key)) {
-                  const old = oldServersMap.get(key)!;
-                  newServersToKeep.push({
-                    ...newServer,
-                    id: old.id,
-                    createdAt: old.createdAt,
-                    updatedAt: new Date().toISOString(),
-                  });
-                  oldServersMap.delete(key);
-                } else {
-                  newServersToKeep.push(newServer);
-                }
-              }
-
-              const deletedIds = new Set(Array.from(oldServersMap.values()).map((s) => s.id));
-              if (config.selectedServerId && deletedIds.has(config.selectedServerId)) {
-                config.selectedServerId = null;
-              }
-
-              const otherServers = config.servers.filter(
-                (s) => s.subscriptionId !== subscription.id
-              );
-              config.servers = [...otherServers, ...newServersToKeep];
-              subscription.lastUpdated = new Date().toISOString();
-              if (result.userInfo) subscription.userInfo = result.userInfo;
-
-              updatedCount++;
-            } catch (e: any) {
-              logManager.addLog(
-                'warn',
-                `更新订阅 [${subscription.name}] 失败: ${e.message}`,
-                'Main'
-              );
-              failedCount++;
-            }
-          }
-
-          await configManager.saveConfig(config);
-          logManager.addLog(
-            'info',
-            `启动时自动更新订阅完成。成功：${updatedCount}，失败：${failedCount}`,
-            'Main'
-          );
-
-          // 广播配置变更事件以更新 UI
-          ipcEventEmitter.sendToAll('event:configChanged', { newValue: config });
-        }
-      } catch (error) {
-        logManager.addLog('error', `启动时自动更新订阅异常: ${error}`, 'Main');
-      }
-    }, 8000);
+    // 订阅自动更新由 SubscriptionScheduler 接管（启动补更 + 周期巡检 + 退避 + 不打断连接），
+    // 取代旧的「启动后一次性 setTimeout 拉取」。详见 subscriptionScheduler.start() 调用处。
 
     // 监听配置变更事件，更新托盘菜单并自动重启代理
     mainEventEmitter.on(MAIN_EVENTS.CONFIG_CHANGED, async () => {

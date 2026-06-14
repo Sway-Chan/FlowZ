@@ -97,6 +97,7 @@ interface SingBoxLogConfig {
   level: string;
   timestamp: boolean;
   output?: string;
+  disabled?: boolean;
 }
 
 interface SingBoxDnsServer {
@@ -297,6 +298,8 @@ interface SingBoxRuleSet {
   path?: string;
   url?: string;
   download_detour?: string;
+  // remote rule_set 更新周期；不填 sing-box 用隐式默认，显式设定避免长期不更新 / 频繁拉取
+  update_interval?: string;
 }
 
 interface SingBoxRouteConfig {
@@ -318,6 +321,12 @@ const DOH_LEAK_DOMAIN_KEYWORDS = [
   'dns.quad9.net',
   'one.one.one.one',
 ];
+
+/**
+ * 远程 rule_set 更新周期：显式设定，避免依赖 sing-box 隐式默认（geo 数据约日更，
+ * 24h 在新鲜度与启动拉取频次间取平衡）。所有 type:'remote' 的 rule_set 共用此值。
+ */
+const REMOTE_RULESET_UPDATE_INTERVAL = '24h';
 
 /** 主机字符串是否为 IPv4 字面量（与 DNS/route 生成各处保持同一判定，避免分类不一致）。 */
 const isIpv4Host = (host: string): boolean => /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(host);
@@ -677,10 +686,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     if (!newConfig.selectedServerId) return false;
     // 目标节点必须已存在于运行中的 selector（= 启动时的 servers），否则 PUT 指向不存在的成员
     if (!old.servers.some((s) => s.id === newConfig.selectedServerId)) return false;
-    // Windows TUN：route_exclude_address 在 start 时仅按「选中 + appRules」节点构建；热切到其它
-    // IP-literal 节点时其 server IP 不在排除集 → Wintun 会把 sing-box 自身出向包回捕进 TUN 成环。
-    // 配置不重生成无法补排除集，故 Windows TUN 一律退回重启（由重启重生成排除集）。
-    if (process.platform === 'win32' && newConfig.proxyModeType === 'tun') return false;
+    // Windows TUN：旧版担心「热切到非排除 IP 节点 → Wintun 回捕 sing-box 自身出向包成环」而一律退回重启。
+    // 实测(2026-06-10, Win11 + sing-box 1.13.13, system 栈)证伪：route.auto_detect_interface=true 已把
+    // 出站对节点的拨号绑定到物理网卡、不回灌 TUN，与 server IP 是否在 route_exclude_address 无关 →
+    // 热切换零断流、零环路（出口 IP 实测正确切换、日志无 loop）。故 system 栈放行热切换(省去 ~1.2s 重启断流)；
+    // gvisor 栈未实测，保守仍退回重启。auto_detect_interface 在 generateRouteConfig 恒为 true，无需额外判定。
+    if (process.platform === 'win32' && newConfig.proxyModeType === 'tun') {
+      const winTunStack = newConfig.tunConfig?.stack || 'system'; // Windows 默认 system 栈
+      if (winTunStack !== 'system') return false;
+    }
     // 唯一允许变化的就是 selectedServerId：对齐它、servers 按 id 归一化后整体深比较——任何其它影响
     // 配置生成的字段（blockQuic/tlsFragment/dnsConfig/各 TUN 子字段/appRules/customRules/端口/interrupt
     // 开关 等）有差异都退回重启，避免「切节点 + 改某设置」同时发生时把那个设置静默丢掉。
@@ -916,12 +930,17 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 生成日志配置
    */
   private generateLogConfig(config: UserConfig): SingBoxLogConfig {
-    // 默认使用 debug 级别以显示路由决策（哪些请求走代理/直连）
-    // 应用层会过滤掉不重要的日志，只保留有价值的信息
+    // 日志级别由用户配置（默认 info）。level 影响是否记录访问域名/SNI（info/debug 会记，warn+ 不记）。
     const logConfig: SingBoxLogConfig = {
-      level: config.logLevel || 'debug',
+      level: config.logLevel || 'info',
       timestamp: true,
     };
+
+    // 用户关闭日志写盘：整体禁用 sing-box 日志（隐私/省盘），不再写文件
+    if (config.disableLogFile) {
+      logConfig.disabled = true;
+      return logConfig;
+    }
 
     // 在 TUN 模式下（macOS 和 Windows），使用权限提升运行时无法捕获 stdout
     // 需要将日志输出到文件，然后通过文件监控读取
@@ -1869,6 +1888,36 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   /**
    * 生成路由配置（sing-box 1.12.x / 1.13.x 兼容格式）
    */
+  /** 本地 geo 规则集运行时目录（内置 .srs 拷贝落地处）。copy 与 route 生成共用，单一真值。 */
+  private getRuleSetRuntimeDir(): string {
+    return path.join(getUserDataPath(), 'rules');
+  }
+
+  /**
+   * 内置 geo 规则集的单一真值表：tag、运行时文件名、内置源路径。
+   * copyRuleSetsToUserData（写入）与 generateRouteConfig（引用 path）共用此表，避免两处各自硬编码
+   * 目录+文件名导致漂移——改一处而另一处仍指旧路径会让 sing-box 加载本地 rule_set 失败。
+   */
+  private getLocalGeoRuleSets(): { tag: string; fileName: string; srcPath: string }[] {
+    return [
+      {
+        tag: 'geosite-cn',
+        fileName: 'geosite-cn.srs',
+        srcPath: resourceManager.getGeoSiteCNPath(),
+      },
+      {
+        tag: 'geosite-geolocation-!cn',
+        fileName: 'geosite-geolocation-!cn.srs',
+        srcPath: resourceManager.getGeoSiteNonCNPath(),
+      },
+      {
+        tag: 'geoip-cn',
+        fileName: 'geoip-cn.srs',
+        srcPath: resourceManager.getGeoIPPath(),
+      },
+    ];
+  }
+
   private generateRouteConfig(
     config: UserConfig,
     idToTagMap: Map<string, string>
@@ -2309,26 +2358,16 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       if (!routeConfig.rule_set) {
         routeConfig.rule_set = [];
       }
-      routeConfig.rule_set.push(
-        {
-          tag: 'geosite-cn',
+      // 路径取自与 copyRuleSetsToUserData 同一真值表，杜绝目录/文件名漂移
+      const runtimeDir = this.getRuleSetRuntimeDir();
+      for (const rs of this.getLocalGeoRuleSets()) {
+        routeConfig.rule_set.push({
+          tag: rs.tag,
           type: 'local',
           format: 'binary',
-          path: path.join(getUserDataPath(), 'rules', 'geosite-cn.srs'),
-        },
-        {
-          tag: 'geosite-geolocation-!cn',
-          type: 'local',
-          format: 'binary',
-          path: path.join(getUserDataPath(), 'rules', 'geosite-geolocation-!cn.srs'),
-        },
-        {
-          tag: 'geoip-cn',
-          type: 'local',
-          format: 'binary',
-          path: path.join(getUserDataPath(), 'rules', 'geoip-cn.srs'),
-        }
-      );
+          path: path.join(runtimeDir, rs.fileName),
+        });
+      }
     }
 
     // 添加自定义规则和应用分流所需的 Geosite/GeoIP rule_set
@@ -2366,7 +2405,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           url: geositeUrl,
           // 必须走直连下载，避免启动时循环依赖
           download_detour: 'direct',
-        } as any);
+          update_interval: REMOTE_RULESET_UPDATE_INTERVAL,
+        });
       }
 
       // 添加 GeoIP 远程规则集
@@ -2378,7 +2418,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           url: `https://fastly.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-${category}.srs`,
           // 必须走直连下载，避免启动时循环依赖
           download_detour: 'direct',
-        } as any);
+          update_interval: REMOTE_RULESET_UPDATE_INTERVAL,
+        });
       }
     }
 
@@ -2522,7 +2563,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         format: 'binary',
         url: ruleSet.url,
         download_detour: selectedServerTag, // 默认通过当前选中的代理下载自定义规则集
-      } as any);
+        update_interval: REMOTE_RULESET_UPDATE_INTERVAL,
+      });
 
       const singboxRule: SingBoxRouteRule = {
         action: 'route',
@@ -3594,6 +3636,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 尝试自动重启
    */
   private async attemptAutoRestart(): Promise<void> {
+    // 幂等去重：进程 exit 事件与健康检查轮询可能对同一次崩溃同时触发，已有重启在途则跳过
+    if (this.isRestarting) {
+      return;
+    }
     if (!this.currentConfig) {
       return;
     }
@@ -3780,7 +3826,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 解决 macOS TUN 模式下特权进程无法读取 Downloads/Documents 目录的问题
    */
   private async copyRuleSetsToUserData(): Promise<void> {
-    const rulesDir = path.join(getUserDataPath(), 'rules');
+    const rulesDir = this.getRuleSetRuntimeDir();
 
     // 确保目录存在
     try {
@@ -3792,11 +3838,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       return;
     }
 
-    const filesToCopy = [
-      { src: resourceManager.getGeoSiteCNPath(), dest: 'geosite-cn.srs' },
-      { src: resourceManager.getGeoSiteNonCNPath(), dest: 'geosite-geolocation-!cn.srs' },
-      { src: resourceManager.getGeoIPPath(), dest: 'geoip-cn.srs' },
-    ];
+    // 与 generateRouteConfig 引用同一真值表：dest 文件名即 route 里 path 指向的文件名
+    const filesToCopy = this.getLocalGeoRuleSets().map((rs) => ({
+      src: rs.srcPath,
+      dest: rs.fileName,
+    }));
 
     const fs = require('fs/promises');
 
@@ -4260,7 +4306,19 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
       this.logToManager('error', `sing-box异常退出: ${errorMessage}`);
 
-      // 触发错误事件
+      // 崩溃恢复主导：原地重启同节点（与健康检查复用同一内部机制，单一计数器 + 上限 + 冷却）。
+      // 仅当 shouldAutoRestart 放行（未被核心更新校验窗口抑制、未达上限）时重启；否则下沉到 error 上报，
+      // 由主进程做核心回滚 / 放弃恢复。崩溃不触发换节点（换节点交给心跳连通性检测）。
+      if (this.shouldAutoRestart()) {
+        this.singboxProcess = null;
+        this.pid = null;
+        this.singboxPid = null;
+        this.stopLogFileWatcher();
+        void this.attemptAutoRestart();
+        return; // 重启接管：保留健康检查与重启计数，不 emit error、不 cleanup
+      }
+
+      // 触发错误事件（重启被抑制或已达上限）
       this.emit('error', {
         message: errorMessage,
         code,

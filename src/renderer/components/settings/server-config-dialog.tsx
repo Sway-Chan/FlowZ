@@ -26,6 +26,7 @@ import { VmessForm } from './vmess-form';
 import { SocksForm } from './socks-form';
 import { HttpForm } from './http-form';
 import { SshForm } from './ssh-form';
+import { ServerSelectGroups } from './server-select-groups';
 import type { ServerConfig, ProtocolType } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -117,6 +118,15 @@ export function ServerConfigDialog({
           </DialogDescription>
         </DialogHeader>
 
+        {isEditing && server?.subscriptionId && (
+          <div className="rounded-md border border-amber-300/50 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-400/30 dark:bg-amber-950/40 dark:text-amber-400">
+            {t(
+              'servers.subNodeEditHint',
+              'This node belongs to a subscription. Your edits will be overwritten on the next update — use "Clone to Manual Nodes" to keep a durable copy.'
+            )}
+          </div>
+        )}
+
         <div className="space-y-6">
           <div className="space-y-2">
             <Label htmlFor="serverName">{t('servers.remarks')}</Label>
@@ -167,13 +177,7 @@ export function ServerConfigDialog({
                 <SelectItem value="direct">
                   {t('servers.directConnection', 'Direct (No Chain)')}
                 </SelectItem>
-                {servers
-                  .filter((s) => s.id !== server?.id)
-                  .map((s) => (
-                    <SelectItem key={s.id} value={s.id}>
-                      {s.name}
-                    </SelectItem>
-                  ))}
+                <ServerSelectGroups servers={servers} excludeId={server?.id} />
               </SelectContent>
             </Select>
             <p className="text-sm text-muted-foreground">

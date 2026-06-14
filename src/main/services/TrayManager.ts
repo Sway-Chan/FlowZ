@@ -8,7 +8,8 @@ import {
   shell,
 } from 'electron';
 import { LogManager } from './LogManager';
-import { ServerConfig, ProxyMode } from '../../shared/types';
+import { ServerConfig, ProxyMode, SubscriptionConfig } from '../../shared/types';
+import { groupServersBySubscription } from '../../shared/server-grouping';
 
 /**
  * 托盘图标状态
@@ -22,6 +23,7 @@ export interface TrayMenuData {
   isProxyRunning: boolean;
   hasError?: boolean;
   servers: ServerConfig[];
+  subscriptions?: SubscriptionConfig[];
   selectedServerId: string | null;
   proxyMode: ProxyMode;
 }
@@ -72,6 +74,7 @@ export class TrayManager implements ITrayManager {
   private currentState: TrayIconState = 'idle';
   private isProxyRunning: boolean = false;
   private servers: ServerConfig[] = [];
+  private subscriptions: SubscriptionConfig[] = [];
   private selectedServerId: string | null = null;
   private proxyMode: ProxyMode = 'smart';
   // 应用内语言设置，由渲染进程通过 IPC 同步过来，默认跟随系统
@@ -218,6 +221,7 @@ export class TrayManager implements ITrayManager {
     this.updateFullTrayMenu({
       isProxyRunning,
       servers: this.servers,
+      subscriptions: this.subscriptions,
       selectedServerId: this.selectedServerId,
       proxyMode: this.proxyMode,
     });
@@ -251,6 +255,7 @@ export class TrayManager implements ITrayManager {
 
     this.isProxyRunning = data.isProxyRunning;
     this.servers = data.servers;
+    this.subscriptions = data.subscriptions || [];
     this.selectedServerId = data.selectedServerId;
     this.proxyMode = data.proxyMode;
 
@@ -265,40 +270,52 @@ export class TrayManager implements ITrayManager {
       statusLabel = this.t('⚪ 已断开', '⚪ Disconnected');
     }
 
-    // 构建服务器子菜单
+    // 构建服务器子菜单（按订阅/自建分组：单组平铺，多组用嵌套子菜单——节点多时更易导航）
     const serverSubmenu: MenuItemConstructorOptions[] = [];
     const maxLabelLength = 30;
 
-    if (data.servers.length > 0) {
-      data.servers.forEach((server) => {
-        const name = server.name || server.address;
-        const protocol = (server.protocol || '').toUpperCase();
-        const latency = this.speedTestResults.get(server.id);
-        const latencyStr =
-          latency !== undefined
-            ? latency !== null
-              ? ` [${latency}ms]`
-              : ` [${this.t('超时', 'Timeout')}]`
-            : '';
-        let label = `${name}（${protocol}）${latencyStr}`;
+    const buildServerItem = (server: ServerConfig): MenuItemConstructorOptions => {
+      const name = server.name || server.address;
+      const protocol = (server.protocol || '').toUpperCase();
+      const latency = this.speedTestResults.get(server.id);
+      const latencyStr =
+        latency !== undefined
+          ? latency !== null
+            ? ` [${latency}ms]`
+            : ` [${this.t('超时', 'Timeout')}]`
+          : '';
+      let label = `${name}（${protocol}）${latencyStr}`;
+      if (label.length > maxLabelLength) {
+        label = label.substring(0, maxLabelLength - 3) + '...';
+      }
+      return {
+        label,
+        type: 'radio' as const,
+        checked: server.id === data.selectedServerId,
+        click: () => this.handleSelectServer(server.id),
+      };
+    };
 
-        if (label.length > maxLabelLength) {
-          label = label.substring(0, maxLabelLength - 3) + '...';
-        }
-
-        serverSubmenu.push({
-          label,
-          type: 'radio' as const,
-          checked: server.id === data.selectedServerId,
-          click: () => this.handleSelectServer(server.id),
-        });
-      });
-      serverSubmenu.push({ type: 'separator' });
-    } else {
+    if (data.servers.length === 0) {
       serverSubmenu.push({
         label: this.t('未配置服务器', 'No Servers Configured'),
         enabled: false,
       });
+      serverSubmenu.push({ type: 'separator' });
+    } else {
+      const groups = groupServersBySubscription(data.servers, data.subscriptions);
+      if (groups.length <= 1) {
+        // 单一来源：平铺
+        data.servers.forEach((s) => serverSubmenu.push(buildServerItem(s)));
+      } else {
+        // 多来源：每个订阅/自建一个子菜单
+        for (const g of groups) {
+          serverSubmenu.push({
+            label: g.isManual ? this.t('自建节点', 'Custom Nodes') : g.name,
+            submenu: g.servers.map(buildServerItem),
+          });
+        }
+      }
       serverSubmenu.push({ type: 'separator' });
     }
 

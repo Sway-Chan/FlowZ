@@ -332,7 +332,9 @@ export interface UserConfig {
   minimizeToTray: boolean;
   autoCheckUpdate: boolean;
   autoLightweightMode: boolean;
-  autoUpdateSubscriptionOnStart: boolean; // 启动时自动更新订阅
+  autoUpdateSubscriptionOnStart: boolean; // 订阅自动更新总开关（启动补更陈旧订阅 + 运行期周期更新）
+  subscriptionUpdateIntervalHours?: number; // 订阅自动更新周期/陈旧阈值（小时），默认 12
+  subscriptionUpdateViaProxy?: boolean; // 订阅更新是否经代理（默认 false=直连，避免冷启动鸡生蛋 + 订阅地址被墙时再开）
   rememberWindowSize?: boolean; // 记忆调整后的窗口大小
   enableIPv6?: boolean; // 启用系统全局 IPv6 解析及路由 (不建议开启)
   autoPrivacyMode?: boolean; // 自动进入隐私模式
@@ -370,6 +372,8 @@ export interface UserConfig {
 
   // 日志设置
   logLevel: LogLevel;
+  // 关闭日志写盘（sing-box log.disabled）；默认 false=写盘。关闭后应用内无法查看实时日志/基于日志的诊断
+  disableLogFile?: boolean;
 
   // UI 设置
   uiTheme?: 'light' | 'dark' | 'system';

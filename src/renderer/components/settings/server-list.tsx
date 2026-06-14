@@ -43,6 +43,7 @@ import {
   CheckSquare,
   Square,
   Copy,
+  CopyPlus,
   Zap,
   Link,
 } from 'lucide-react';
@@ -99,6 +100,14 @@ const getCountryCode = (name: string): string | null => {
   return null;
 };
 
+/** 传输层显示标签：QUIC 系协议(hysteria2/tuic/naive-HTTP3)统一显示 udp，其余按 network；缺省 tcp。 */
+const getTransportLabel = (server: ServerConfigWithId): string => {
+  const p = server.protocol?.toLowerCase();
+  if (p === 'hysteria2' || p === 'tuic') return 'udp';
+  if (p === 'naive') return server.naiveSettings?.useHttp3 ? 'udp' : 'tcp';
+  return server.network || 'tcp';
+};
+
 interface ServerListProps {
   servers: ServerConfigWithId[];
   subscriptions?: import('@/bridge/types').SubscriptionConfig[];
@@ -108,6 +117,7 @@ interface ServerListProps {
   onEditServer: (server: ServerConfigWithId) => void;
   onDeleteServer: (serverId: string) => void;
   onDeleteServers?: (serverIds: string[]) => void;
+  onCloneServer?: (server: ServerConfigWithId) => void;
   onSelectServer: (serverId: string) => void;
   onImportSuccess?: () => void;
 }
@@ -120,6 +130,7 @@ export function ServerList({
   onEditServer,
   onDeleteServer,
   onDeleteServers,
+  onCloneServer,
   onSelectServer,
   onImportSuccess,
 }: ServerListProps) {
@@ -395,10 +406,24 @@ export function ServerList({
       >
         <Copy className="h-3.5 w-3.5" />
       </Button>
+      {onCloneServer && (
+        <Button
+          variant="ghost"
+          size="sm"
+          title={t('servers.cloneToManual', 'Clone to Manual Nodes')}
+          className="h-7 w-7 p-0"
+          onClick={(e) => {
+            if (stopPropagation) e.stopPropagation();
+            onCloneServer(server);
+          }}
+        >
+          <CopyPlus className="h-3.5 w-3.5" />
+        </Button>
+      )}
       <Button
         variant="ghost"
         size="sm"
-        title={server.subscriptionId ? t('servers.copyAndEdit', 'Copy and Edit') : t('common.edit')}
+        title={t('common.edit')}
         className="h-7 w-7 p-0"
         onClick={(e) => {
           if (stopPropagation) e.stopPropagation();
@@ -786,7 +811,7 @@ export function ServerList({
                     ) : (
                       <>
                         <span>
-                          {t('servers.transport')}: {server.network || 'tcp'}
+                          {t('servers.transport')}: {getTransportLabel(server)}
                         </span>
                         <span>
                           {t('servers.encryption')}: {server.security || 'none'}
@@ -882,8 +907,8 @@ export function ServerList({
                   </div>
                   <p className="text-xs text-muted-foreground mt-0.5">
                     {server.address}:{server.port}
-                    {server.network && server.network !== 'tcp' && (
-                      <span className="ml-2">{server.network}</span>
+                    {getTransportLabel(server) !== 'tcp' && (
+                      <span className="ml-2">{getTransportLabel(server)}</span>
                     )}
                   </p>
                 </div>
