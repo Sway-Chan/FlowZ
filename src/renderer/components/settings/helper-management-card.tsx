@@ -10,9 +10,11 @@ import { useTranslation } from 'react-i18next';
 import { LOGIN_ITEMS_SETTINGS_URL } from '../../../shared/constants';
 
 /**
- * 提权助手管理卡（仅 macOS）：展示安装/就绪状态，提供安装/修复/卸载入口。
+ * 提权助手管理卡（macOS / Windows）：展示安装/就绪状态，提供安装/修复/卸载入口。
  * 与首页启动提示共享同一安装逻辑（store.installHelper / uninstallHelper）。
- * 「允许在后台」被关时：检测到 backgroundDisabled → 提示 + 一键打开系统设置引导用户手动开启（程序无法翻动
+ * backgroundDisabled / pathMismatch / upgradeable 相关 UI 仅 macOS 渲染（Windows 这些 flag 恒 false，分支自然不显示）；
+ * Windows 走「安装服务=一次 UAC、之后零提权」语义，文案（管理员授权框）平台通用。
+ * macOS「允许在后台」被关时：检测到 backgroundDisabled → 提示 + 一键打开系统设置引导用户手动开启（程序无法翻动
  * 用户关掉的 BTM allowed 位，Apple SMAppService 无此 API）。开关恢复后状态会在几秒内自动刷新（focus / 轮询触发）。
  */
 export function HelperManagementCard() {

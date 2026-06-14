@@ -28,6 +28,7 @@ import { SettingsRow } from './settings-row';
 import { HelperManagementCard } from './helper-management-card';
 
 const isMac = window.electron?.platform === 'darwin';
+const isWin = window.electron?.platform === 'win32';
 const isLinux = window.electron?.platform === 'linux';
 
 const DNS_DEFAULTS = {
@@ -212,7 +213,7 @@ export function NetworkSettings() {
 
   return (
     <div className="space-y-6">
-      {isMac && <HelperManagementCard />}
+      {(isMac || isWin) && <HelperManagementCard />}
 
       {/* DNS */}
       <Card>

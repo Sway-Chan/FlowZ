@@ -1024,7 +1024,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     options: { interactive?: boolean }
   ): Promise<void> {
     if (options.interactive === false) return; // 崩溃自动重启等：禁模态
-    if (process.platform !== 'darwin' || !isTunMode) return; // 非 macOS / 非 TUN：systemProxy 绝不弹
+    if ((process.platform !== 'darwin' && process.platform !== 'win32') || !isTunMode) return; // 非 macOS/Windows / 非 TUN：systemProxy 绝不弹
     if (!this.helperManager || !this.helperGate) return;
     const hs = await this.helperManager.getStatus().catch(() => null);
     // 关键：backgroundDisabled 时**即便 ready 也不能早退**——install-over-top 让 daemon 在跑(ready=true)但 BTM

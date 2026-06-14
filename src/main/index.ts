@@ -47,6 +47,8 @@ import { RuleResourceManager } from './services/RuleResourceManager';
 import { seedBuiltinRuleSets } from './services/builtin-geo-rulesets';
 import { RuleResourceScheduler } from './services/RuleResourceScheduler';
 import { HelperManager } from './services/HelperManager';
+import { WindowsServiceHelper } from './services/WindowsServiceHelper';
+import type { IPrivilegedHelper } from './services/IPrivilegedHelper';
 import type { HelperStatus, UserConfig, LogLevel } from '../shared/types';
 import { ipcEventEmitter } from './ipc/ipc-events';
 import { mainEventEmitter, MAIN_EVENTS } from './ipc/main-events';
@@ -178,7 +180,7 @@ let statsService: StatsService | null = null;
 let ipInfoService: IpInfoService | null = null;
 let ruleResourceManager: RuleResourceManager | null = null;
 let ruleResourceScheduler: RuleResourceScheduler | null = null;
-let helperManager: HelperManager | null = null;
+let helperManager: IPrivilegedHelper | null = null;
 let currentLanguage = 'zh-CN'; // 渲染端 APP_SET_LANGUAGE 同步，供主进程 native dialog 文案选语言
 
 /**
@@ -196,6 +198,42 @@ async function promptHelperGate(
     mainWindow.focus();
   }
   const zh = currentLanguage.toLowerCase().startsWith('zh');
+  if (process.platform === 'win32') {
+    // Windows：无「允许在后台」概念（backgroundDisabled 恒 false）。needsRepair(已装未就绪) → 修复；未装 → 安装。
+    // 任一路径仅弹一次 UAC（装服务需管理员授权）；「用 UAC 启动」= 本次回退 buildWindowsUacLaunchCommand（每次 UAC）。
+    if (hs.needsRepair) {
+      const { response } = await dialog.showMessageBox({
+        type: 'question',
+        buttons: zh
+          ? ['修复并启动', '用 UAC 启动', '取消']
+          : ['Repair & start', 'Use UAC', 'Cancel'],
+        defaultId: 0,
+        cancelId: 2,
+        message: zh ? '修复 Windows 提权服务？' : 'Repair privileged service?',
+        detail: zh
+          ? '提权服务已安装但未就绪（服务未运行或版本不符）。修复将重装服务，仅需授权一次（UAC）；也可本次用 UAC 启动。'
+          : 'The privileged service is installed but not ready. Repair reinstalls it (one UAC prompt); or start with UAC this time.',
+      });
+      if (response === 2) return 'abort';
+      if (response === 0) await helperManager.install().catch(() => {});
+      return 'proceed';
+    }
+    const { response } = await dialog.showMessageBox({
+      type: 'question',
+      buttons: zh
+        ? ['安装并启动', '用 UAC 启动', '取消']
+        : ['Install & start', 'Use UAC', 'Cancel'],
+      defaultId: 0,
+      cancelId: 2,
+      message: zh ? '安装 Windows 提权服务？' : 'Install privileged service?',
+      detail: zh
+        ? '安装后 Windows TUN 模式启停代理免每次 UAC（装服务需管理员授权一次）；也可本次用 UAC 启动。'
+        : 'After install, Windows TUN start/stop no longer needs UAC each time (installing the service needs one admin prompt); or start with UAC this time.',
+    });
+    if (response === 2) return 'abort';
+    if (response === 0) await helperManager.install().catch(() => {});
+    return 'proceed';
+  }
   if (hs.backgroundDisabled) {
     // 「登录项与扩展 / 允许在后台」开关由 BTM（Background Task Management）管，与 launchctl enable/disable 是两个
     // 独立层。用户关掉开关 = BTM disposition 置 disallowed。程序无法把它翻回开（Apple SMAppService 无写 disposition
@@ -892,10 +930,14 @@ if (gotTheLock) {
       ipcEventEmitter.sendToAll(channel, payload)
     );
 
-    // macOS 提权 helper：装一次后 TUN 模式启停 sing-box 免提权；未装则回退 PR-M1 看护脚本。
-    helperManager = new HelperManager(logManager);
+    // 提权 helper：装一次后 TUN 模式启停 sing-box 免提权；未装则回退平台提权路径（macOS osascript / Windows UAC）。
+    // macHelper 始终创建：macOS 真用（含 v5 install-core + 提权复制，注入 CoreUpdateService/PlatformPrivilegeService）；
+    // Windows/Linux 上 supported=false 安全降级（这些 macOS 专属消费者不会真用它）。模块级 helperManager（供 ProxyManager
+    // 路由 / 引导门控 / IPC 处理器）：Windows=WindowsServiceHelper，其余=macHelper。互不进入对方分支 → 跨平台零回归。
+    const macHelper = new HelperManager(logManager);
+    helperManager = process.platform === 'win32' ? new WindowsServiceHelper(logManager) : macHelper;
     proxyManager.setHelperManager(helperManager);
-    coreUpdateService.setHelperManager(helperManager); // B 块：macOS 持久化内核更新经 helper v5 install-core
+    coreUpdateService.setHelperManager(macHelper); // B 块：install-core 仅 macOS（Windows/Linux 得降级实例，不真用）
     proxyManager.setHelperGate(promptHelperGate);
     // 系统代理单一写者：注入同一 singleton（上方 756 创建），enable/clear 统一收口 ProxyManager.start()/终态。
     proxyManager.setSystemProxyManager(systemProxyManager);
@@ -933,7 +975,7 @@ if (gotTheLock) {
           proxyManager?.notifyStopAuthCancelled();
         },
       },
-      helperManager
+      macHelper
     );
     proxyManager.setPrivilegeService(privilegeService);
     coreUpdateService.setPrivilegeService(privilegeService);
