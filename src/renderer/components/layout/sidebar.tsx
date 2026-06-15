@@ -47,14 +47,30 @@ interface SidebarProps {
   onSettingsSectionChange: (section: string) => void;
 }
 
-const mainNavItems = [
-  { id: 'home', icon: Home },
-  { id: 'logs', icon: ScrollText },
-  { id: 'connections', icon: Activity },
-  { id: 'server', icon: Server },
-  { id: 'appPolicy', icon: FlowSplitIcon },
-  { id: 'ruleResources', icon: FolderDown },
-  { id: 'rules', icon: ListFilter },
+// 主导航分区（section label，非二级/折叠）：总览+节点无标签置顶；分流域、诊断域各带分区标题。
+// 顺序按心智流：配置（节点）→ 策略（分流）→ 观测（诊断）。
+const mainNavGroups: { label?: string; items: { id: string; icon: React.ElementType }[] }[] = [
+  {
+    items: [
+      { id: 'home', icon: Home },
+      { id: 'server', icon: Server },
+    ],
+  },
+  {
+    label: 'routing',
+    items: [
+      { id: 'appPolicy', icon: FlowSplitIcon },
+      { id: 'rules', icon: ListFilter },
+      { id: 'ruleResources', icon: FolderDown },
+    ],
+  },
+  {
+    label: 'diagnostics',
+    items: [
+      { id: 'connections', icon: Activity },
+      { id: 'logs', icon: ScrollText },
+    ],
+  },
 ];
 
 const settingsNavItems = [
@@ -141,10 +157,19 @@ export function Sidebar({
       ) : (
         /* ── Main navigation ── */
         <>
-          <nav className="flex-1 pb-2 app-region-no-drag space-y-[6px] overflow-hidden">
-            {mainNavItems.map((item) =>
-              renderNavItem(item, () => onViewChange(item.id), currentView === item.id)
-            )}
+          <nav className="flex-1 pb-2 app-region-no-drag overflow-hidden">
+            {mainNavGroups.map((group, gi) => (
+              <div key={gi} className="space-y-[6px]">
+                {group.label && (
+                  <div className="px-3 pb-1 pt-4 text-[11px] font-medium uppercase tracking-wider text-muted-foreground select-none">
+                    {t(`sidebar.group.${group.label}`)}
+                  </div>
+                )}
+                {group.items.map((item) =>
+                  renderNavItem(item, () => onViewChange(item.id), currentView === item.id)
+                )}
+              </div>
+            ))}
           </nav>
 
           {/* Settings pinned to bottom */}

@@ -41,6 +41,7 @@ jest.mock('../ResourceManager', () => ({
   resourceManager: {
     getSingBoxPath: () => '/tmp/flowz-fake/sing-box',
     getSingBoxUpdateTargetPath: () => '/tmp/flowz-fake/sing-box',
+    getBundledSingBoxPath: () => '/tmp/flowz-fake/sing-box-bundled',
     ensureCronetBeside: jest.fn(),
   },
 }));
@@ -360,5 +361,171 @@ describe('T2：CoreUpdateService 4 写核路径 setCoreSwapInProgress try/finall
     await expect(svc.rollbackCore()).rejects.toThrow('disk full');
     // 关键：异常路径 finally 仍清位
     expect(calls).toEqual([true, false]);
+  });
+});
+
+// ============================================================================
+// T3：replaceManualCore skipBackup 分支（resetCoreToFactory 复用）
+// ============================================================================
+//
+// 背景：reset 到出厂核时 skipBackup=true，现役核是用户要丢弃的、出厂核已知稳定 →
+//   1. 不 backupCurrentCore（backupMade 始终 false）；
+//   2. 不 armPendingValidation（无备份可 autoRollback）→ 改 recordSuccessfulVersion；
+//   3. catch 不 restoreBackup（backupMade=false，无陈旧 .bak 可恢复）。
+// 对照：skipBackup=false（手动替换）行为不变（backup + arm + catch restore）。
+//
+// 注意：arm/record 分支在 wasRunning=true 时才生效（line 1246），故 T3 用 running:true 的 proxy。
+
+describe('T3：replaceManualCore skipBackup 分支（reset 到出厂）', () => {
+  function makeLogManager() {
+    return { addLog: jest.fn() } as any;
+  }
+
+  /** running=true 触发 wasRunning 分支（arm/record + 重启）；calls 仍记录门控序列。 */
+  function makeProxyWithSpy() {
+    const calls: boolean[] = [];
+    const proxy = {
+      getStatus: jest.fn(() => ({ running: true })),
+      getCoreVersion: jest.fn().mockResolvedValue('1.13.13'),
+      buildPreflightConfigJson: () => null,
+      hasNaiveNodes: () => false,
+      setAutoRestartSuppressed: jest.fn(),
+      setCoreSwapInProgress: jest.fn((b: boolean) => calls.push(b)),
+      stop: jest.fn().mockResolvedValue(undefined),
+      start: jest.fn().mockResolvedValue(undefined),
+    } as any;
+    return { proxy, calls };
+  }
+
+  function makeSvc(proxy: any) {
+    const svc = new CoreUpdateService(makeLogManager());
+    svc.setProxyManager(proxy);
+    svc.setConfigProvider(() => Promise.resolve({ autoUpdateCore: true } as any));
+    svc.setEventSender(() => {});
+    return svc;
+  }
+
+  afterEach(() => jest.restoreAllMocks());
+
+  // --- skipBackup=true：不备份现役核 ---
+  it('skipBackup=true：backupCurrentCore 未被调（backupMade 始终 false）', async () => {
+    const { proxy } = makeProxyWithSpy();
+    const svc = makeSvc(proxy);
+    jest.spyOn(svc as any, 'preflightValidate').mockResolvedValue({ ok: true, version: '1.13.14' });
+    jest.spyOn(svc as any, 'getCurrentVersion').mockResolvedValue('1.13.13');
+    const backupSpy = jest.spyOn(svc as any, 'backupCurrentCore').mockResolvedValue(undefined);
+    jest.spyOn(svc as any, 'writeManualCoreToBundle').mockResolvedValue(undefined);
+    jest.spyOn(svc as any, 'armPendingValidation').mockImplementation(() => {});
+    jest.spyOn(svc as any, 'recordSuccessfulVersion').mockResolvedValue(undefined);
+
+    const r = await svc.replaceManualCore({
+      filePath: '/tmp/factory-sing-box',
+      force: true,
+      skipBackup: true,
+    });
+    expect(r.ok).toBe(true);
+    // 核心断言：出厂核已知稳定、现役核要丢弃 → 不备份
+    expect(backupSpy).not.toHaveBeenCalled();
+  });
+
+  // --- skipBackup=true：不 arm 验证闩，改 record 成功版本 ---
+  it('skipBackup=true：armPendingValidation 未被调、recordSuccessfulVersion 被调', async () => {
+    const { proxy } = makeProxyWithSpy();
+    const svc = makeSvc(proxy);
+    jest.spyOn(svc as any, 'preflightValidate').mockResolvedValue({ ok: true, version: '1.13.14' });
+    jest.spyOn(svc as any, 'getCurrentVersion').mockResolvedValue('1.13.13');
+    jest.spyOn(svc as any, 'backupCurrentCore').mockResolvedValue(undefined);
+    jest.spyOn(svc as any, 'writeManualCoreToBundle').mockResolvedValue(undefined);
+    const armSpy = jest.spyOn(svc as any, 'armPendingValidation').mockImplementation(() => {});
+    const recordSpy = jest
+      .spyOn(svc as any, 'recordSuccessfulVersion')
+      .mockResolvedValue(undefined);
+
+    const r = await svc.replaceManualCore({
+      filePath: '/tmp/factory-sing-box',
+      force: true,
+      skipBackup: true,
+    });
+    expect(r.ok).toBe(true);
+    // 出厂核无备份可 autoRollback → 不 arm 验证闩；直接 record 成功版本
+    expect(armSpy).not.toHaveBeenCalled();
+    expect(recordSpy).toHaveBeenCalledTimes(1);
+  });
+
+  // --- skipBackup=true：写核抛错时 catch 不 restore（无备份可恢复）---
+  it('skipBackup=true：写核抛错 → restoreBackup 未被调（backupMade=false）', async () => {
+    const { proxy } = makeProxyWithSpy();
+    const svc = makeSvc(proxy);
+    jest.spyOn(svc as any, 'preflightValidate').mockResolvedValue({ ok: true, version: '1.13.14' });
+    jest.spyOn(svc as any, 'getCurrentVersion').mockResolvedValue('1.13.13');
+    // 未 spy backupCurrentCore → 走真实路径前因 skipBackup=true 根本不进 backup 分支，backupMade=false
+    jest.spyOn(svc as any, 'writeManualCoreToBundle').mockRejectedValue(new Error('write fail'));
+    jest.spyOn(svc as any, 'disarmPendingValidation').mockImplementation(() => {});
+    const restoreSpy = jest.spyOn(svc as any, 'restoreBackup').mockResolvedValue(undefined);
+
+    const r = await svc.replaceManualCore({
+      filePath: '/tmp/factory-sing-box',
+      force: true,
+      skipBackup: true,
+    });
+    expect(r.ok).toBe(false);
+    expect(r.error).toMatch(/write fail/);
+    // 关键不变量：未备份（backupMade=false）→ 不误恢复陈旧/不存在的 .bak
+    expect(restoreSpy).not.toHaveBeenCalled();
+  });
+
+  // --- 对照：skipBackup=false（手动替换）正常 backup + arm ---
+  // 用「写核成功」路径覆盖 arm（arm 在写核成功后的 wasRunning 分支才执行）；
+  // catch restore 由上方 305 行既有用例覆盖，此处聚焦 skipBackup 分支对称性。
+  it('skipBackup=false：backupCurrentCore + armPendingValidation 正常触发（对照 skipBackup=true）', async () => {
+    const { proxy } = makeProxyWithSpy();
+    const svc = makeSvc(proxy);
+    jest.spyOn(svc as any, 'preflightValidate').mockResolvedValue({ ok: true, version: '1.13.14' });
+    jest.spyOn(svc as any, 'getCurrentVersion').mockResolvedValue('1.13.13');
+    const backupSpy = jest.spyOn(svc as any, 'backupCurrentCore').mockResolvedValue(undefined);
+    jest.spyOn(svc as any, 'writeManualCoreToBundle').mockResolvedValue(undefined);
+    const armSpy = jest.spyOn(svc as any, 'armPendingValidation').mockImplementation(() => {});
+    const recordSpy = jest
+      .spyOn(svc as any, 'recordSuccessfulVersion')
+      .mockResolvedValue(undefined);
+
+    const r = await svc.replaceManualCore({
+      filePath: '/tmp/manual-sing-box',
+      force: true,
+      skipBackup: false,
+    });
+    expect(r.ok).toBe(true);
+    // 对照断言：手动替换走完整备份+验证闩链路（与 skipBackup=true 不备份/不 arm 对称）
+    expect(backupSpy).toHaveBeenCalledTimes(1);
+    expect(armSpy).toHaveBeenCalledTimes(1);
+    // wasRunning=true + 有备份 → arm 分支，不走 record（record 是 skipBackup 或未运行时才走）
+    expect(recordSpy).not.toHaveBeenCalled();
+  });
+
+  // --- resetCoreToFactory 成功后清理旧备份 ---
+  // 验证 reset 到出厂的两个语义：① 不备份现役核（skipBackup=true，上方用例已覆盖）
+  // ② 写核成功后调 pruneBackup 清理残留 .bak（reset = 干净状态，旧备份无意义）。
+  // 直接 spy replaceManualCore（mock 返回 { ok: true }）+ spy pruneBackup，
+  // 断言 pruneBackup 被调 1 次（避免触达 replaceManualCore 内部 fs/重启副作用）。
+  it('resetCoreToFactory 成功后清理旧备份：pruneBackup 被调 1 次', async () => {
+    const { proxy } = makeProxyWithSpy();
+    const svc = makeSvc(proxy);
+    // replaceManualCore 是 reset 的核心落位腿；mock 返回 ok 走「成功后清理」分支
+    const replaceSpy = jest.spyOn(svc as any, 'replaceManualCore').mockResolvedValue({ ok: true });
+    // pruneBackup 是清理旧 .bak 的私有方法；mock 避免触达真实 fs（getBackupPath/unlink）
+    const pruneSpy = jest.spyOn(svc as any, 'pruneBackup').mockImplementation(() => {});
+
+    const r = await svc.resetCoreToFactory();
+
+    expect(r.ok).toBe(true);
+    // 落位腿：reset 强制 force+skipBackup 传 bundled 核路径
+    expect(replaceSpy).toHaveBeenCalledTimes(1);
+    expect(replaceSpy).toHaveBeenCalledWith({
+      filePath: expect.any(String),
+      force: true,
+      skipBackup: true,
+    });
+    // 关键断言：成功后清理残留 .bak
+    expect(pruneSpy).toHaveBeenCalledTimes(1);
   });
 });

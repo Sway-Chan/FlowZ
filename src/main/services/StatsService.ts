@@ -125,6 +125,16 @@ export class StatsService {
     if (this.connectionsWatchers > 0) this.connectionsWatchers--;
   }
 
+  /**
+   * 渲染端重载/重建时归零引用计数（N-2）：watcher 计数依赖连接页 mount/unmount 配对发 WATCH/UNWATCH，
+   * 渲染进程硬崩 / 整页 reload 会漏发 UNWATCH → 计数只增不减泄漏 → 稳态省裁剪的优化永久失效（fail-safe 退化为
+   * 始终推送，不破功能但白费优化）。挂渲染端 did-start-loading 调用：页面将重建，旧 watcher 全作废，清零；
+   * 重建后连接页会重新 WATCH 自然恢复计数。
+   */
+  resetConnectionsWatchers(): void {
+    this.connectionsWatchers = 0;
+  }
+
   private async poll(): Promise<void> {
     // P2：无可见窗口（hide / 最小化 / 轻量销毁）→ 无任何 UI 消费者，整轮跳过 fetch+parse+trim+广播（含首页 stats）。
     // 重置 last 让窗口恢复后首轮干净再基线（避免跨隐藏窗口的大 dt 算出失真速率）。

@@ -604,6 +604,12 @@ async function createWindow(forceShow = false) {
     logManager.addLog('error', `Window failed to load: ${errorDescription} (${errorCode})`, 'Main');
   });
 
+  // 渲染端重载/重建（reload / 渲染进程崩溃恢复）→ 归零连接页 watcher 引用计数（N-2）：旧 watcher 随页面销毁
+  // 全作废、其 UNWATCH 可能漏发，清零防计数泄漏致稳态省裁剪优化失效；重建后连接页重新 WATCH 自然恢复。
+  mainWindow.webContents.on('did-start-loading', () => {
+    statsService?.resetConnectionsWatchers();
+  });
+
   // macOS：隐藏到托盘时摘 Dock 图标（仅驻留菜单栏，不占 Dock / Cmd-Tab），重新显示时恢复。
   // 经 activation policy 状态机（见 hideDockIfMenubarOnly/restoreDockPresence），覆盖所有显隐路径。
   if (process.platform === 'darwin') {
