@@ -1,4 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from 'react';
 import {
   Table,
   TableBody,
@@ -61,6 +69,130 @@ function ruleActionVariant(action: string): 'secondary' | 'destructive' | 'defau
   return 'default';
 }
 
+/** 稳定的零速率引用：speeds 无此 id 时传入，使 ConnectionRow memo 的 speed 比较恒定（不每帧新建对象）。 */
+const ZERO_SPEED: ConnSpeed = { up: 0, down: 0 };
+
+/**
+ * 全表共享秒级 tick（P3）：时长列每秒刷新原本随父组件 setNow 触发整表 reconcile（重跑 visible.map + diff ≤500 行）。
+ * 改为模块级外部 store + useSyncExternalStore：1s tick 只重渲订阅它的各 DurationCell（纯文本），不穿透
+ * ConnectionRow 的 memo → 整行/整表不因时长刷新而 reconcile。仅有订阅者时跑 interval（无连接页=零开销）；
+ * 暂停由表 setDurationTicking(false) 冻结（与快照冻结一致）。单连接页实例，模块级状态安全。
+ */
+let durationNow = Date.now();
+let durationTimer: ReturnType<typeof setInterval> | null = null;
+let durationTicking = true;
+const durationListeners = new Set<() => void>();
+function subscribeDuration(cb: () => void): () => void {
+  durationListeners.add(cb);
+  if (!durationTimer) {
+    durationTimer = setInterval(() => {
+      if (!durationTicking) return;
+      durationNow = Date.now();
+      durationListeners.forEach((l) => l());
+    }, 1000);
+  }
+  return () => {
+    durationListeners.delete(cb);
+    if (durationListeners.size === 0 && durationTimer) {
+      clearInterval(durationTimer);
+      durationTimer = null;
+    }
+  };
+}
+function getDurationNow(): number {
+  return durationNow;
+}
+function setDurationTicking(v: boolean): void {
+  durationTicking = v;
+}
+
+/** 时长单元（P3）：订阅共享秒 tick 独立自刷新，使整行不因时长每秒变化而 reconcile（绕过 ConnectionRow memo）。 */
+const DurationCell = memo(function DurationCell({ start }: { start?: string }) {
+  const now = useSyncExternalStore(subscribeDuration, getDurationNow, getDurationNow);
+  return <>{fmtDuration(durationSec({ start } as ConnectionEntry, now))}</>;
+});
+
+interface ConnectionRowProps {
+  conn: ConnectionEntry;
+  speed: ConnSpeed;
+  onClose: (id: string) => void;
+  closeLabel: string;
+}
+
+/**
+ * 单连接行（P3）：memo 按「会变的展示字段」比较——对固定连接 id，仅上下行累计(traffic)与速率会变，
+ * 其余(规则/目标/源/链/进程)在 clash 连接创建时即定型恒不变。故 id+upload+download+speed 相等 ⇒ 整行视图不变、
+ * 跳过 reconcile（2s 快照下 idle 连接行不再无谓重渲）。时长由内嵌 DurationCell 经共享 tick 自刷新，不入本比较。
+ */
+const ConnectionRow = memo(
+  function ConnectionRow({ conn: c, speed: s, onClose, closeLabel }: ConnectionRowProps) {
+    const m = c.metadata || {};
+    const proc = m.processPath || '-';
+    const procName = proc === '-' ? '-' : proc.split(/[/\\]/).pop() || proc;
+    const rv = parseRule(c.rule, c.rulePayload);
+    return (
+      <TableRow>
+        <TableCell className="py-2">
+          <button
+            className="rounded p-1 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
+            title={closeLabel}
+            onClick={() => onClose(c.id)}
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </TableCell>
+        <TableCell className="py-2 text-xs">{typeOf(c)}</TableCell>
+        <TableCell className="py-2 font-mono text-xs">{sourceOf(c)}</TableCell>
+        <TableCell className="max-w-[220px] truncate py-2 text-xs" title={destOf(c)}>
+          {destOf(c)}
+        </TableCell>
+        <TableCell className="max-w-[200px] py-2 text-xs" title={rv.full || undefined}>
+          {rv.action ? (
+            <span className="flex items-center gap-1.5">
+              {rv.type && <span className="truncate text-muted-foreground">{rv.type}</span>}
+              <Badge
+                variant={ruleActionVariant(rv.action)}
+                className="shrink-0 px-1.5 py-0 text-[10px] font-normal"
+              >
+                {rv.action}
+              </Badge>
+            </span>
+          ) : (
+            <span className="block truncate">{rv.full || '-'}</span>
+          )}
+        </TableCell>
+        <TableCell className="max-w-[160px] truncate py-2 text-xs" title={chainOf(c)}>
+          {chainOf(c)}
+        </TableCell>
+        <TableCell className="whitespace-nowrap py-2 text-xs">
+          <span className="text-success">↓ {formatBytes(s.down)}/s</span>
+          <span className="ml-2 text-info">↑ {formatBytes(s.up)}/s</span>
+        </TableCell>
+        <TableCell className="whitespace-nowrap py-2 text-xs text-muted-foreground">
+          ↓ {formatBytes(c.download ?? 0)} / ↑ {formatBytes(c.upload ?? 0)}
+        </TableCell>
+        <TableCell className="whitespace-nowrap py-2 text-xs">
+          <DurationCell start={c.start} />
+        </TableCell>
+        <TableCell className="max-w-[180px] truncate py-2 text-xs" title={proc}>
+          {procName}
+        </TableCell>
+      </TableRow>
+    );
+  },
+  // memo 比较：只比会变的展示字段。**契约**：对固定 conn.id，chains/rule/rulePayload/metadata（→ chainOf/parseRule/
+  // destOf/sourceOf/typeOf/processPath）在 clash 连接生命周期内不可变（切节点创建新连接、不改已有 id），故不入比较。
+  // ⚠️ 若上游（trimConnection / sing-box）改为对已有 id 回填/修正这些字段，须把对应字段纳入比较，否则行静默不更新。
+  (prev, next) =>
+    prev.onClose === next.onClose &&
+    prev.closeLabel === next.closeLabel &&
+    prev.conn.id === next.conn.id &&
+    (prev.conn.upload ?? 0) === (next.conn.upload ?? 0) &&
+    (prev.conn.download ?? 0) === (next.conn.download ?? 0) &&
+    prev.speed.up === next.speed.up &&
+    prev.speed.down === next.speed.down
+);
+
 export function ConnectionsTable() {
   const { t } = useTranslation();
   const proxyRunning = useAppStore((s) => s.connectionStatus?.proxyCore?.running ?? false);
@@ -72,7 +204,6 @@ export function ConnectionsTable() {
   const [sortDir, setSortDir] = useState<SortDir>('desc');
   const [speeds, setSpeeds] = useState<Map<string, ConnSpeed>>(new Map());
   const [confirmCloseAll, setConfirmCloseAll] = useState(false);
-  const [now, setNow] = useState(Date.now());
 
   // 暂停态用 ref 让订阅回调读到最新值（订阅只挂一次，不随 paused 重订阅）。
   const pausedRef = useRef(paused);
@@ -83,6 +214,9 @@ export function ConnectionsTable() {
   // 数据：挂载 CONNECTIONS_GET 回填 + 订阅 EVENT_CONNECTIONS_UPDATED。暂停时冻结（不更新表 + 不推进速率基准）。
   useEffect(() => {
     let mounted = true;
+    // P1：通知 main「连接页已打开」→ 仅此时主进程才裁剪 + 推送连接快照（watcher 引用计数 +1）。
+    // fire-and-forget：失败不影响订阅（main 无 watcher 时退化为不推送，空态由 proxyRunning gate 兜底）。
+    void api.connections.watch().catch(() => {});
     const apply = (snap: ConnectionsSnapshot) => {
       if (pausedRef.current) return; // 本地冻结：保留当前帧
       const { speeds: s, next } = computeConnSpeeds(snap.connections, rateRef.current, snap.at);
@@ -104,17 +238,16 @@ export function ConnectionsTable() {
     return () => {
       mounted = false;
       unsub();
+      // P1：连接页关闭 → watcher 引用计数 -1，归 0 后 main 停止裁剪 + 推送（省「没盯连接页」稳态无效工作）。
+      void api.connections.unwatch().catch(() => {});
     };
   }, []);
 
-  // 时长列实时刷新与高频快照解耦：每 1s 推进 now（秒级精度足够），暂停时冻结。原随每帧快照 setNow 会把时长
-  // 刷新频率绑死在快照频率上、放大整表重渲染（LOW-B）；改为固定 1s tick，配合 filtered 不依赖 now（见上）。
+  // 时长列刷新与整表 reconcile 解耦（P3）：秒级 tick 下沉到模块级共享 store，仅 DurationCell 订阅、
+  // 自刷新文本，不再随 setNow 重跑 visible.map + reconcile ≤500 行。暂停时冻结 tick（与快照冻结一致）。
   useEffect(() => {
-    const id = setInterval(() => {
-      if (!pausedRef.current) setNow(Date.now());
-    }, 1000);
-    return () => clearInterval(id);
-  }, []);
+    setDurationTicking(!paused);
+  }, [paused]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -193,19 +326,23 @@ export function ConnectionsTable() {
     }
   };
 
-  const handleClose = async (id: string) => {
-    try {
-      const { ok } = await api.connections.close(id);
-      if (ok) {
-        // 乐观移除：下一帧快照若仍在会再回填（极少见），但即时反馈更顺手
-        setConnections((prev) => prev.filter((c) => c.id !== id));
-      } else {
+  // useCallback 稳定引用：作为 ConnectionRow 的 onClose prop，避免每次父渲染新建函数使 memo 失效。
+  const handleClose = useCallback(
+    async (id: string) => {
+      try {
+        const { ok } = await api.connections.close(id);
+        if (ok) {
+          // 乐观移除：下一帧快照若仍在会再回填（极少见），但即时反馈更顺手
+          setConnections((prev) => prev.filter((c) => c.id !== id));
+        } else {
+          toast.error(t('connections.closeFailed'));
+        }
+      } catch {
         toast.error(t('connections.closeFailed'));
       }
-    } catch {
-      toast.error(t('connections.closeFailed'));
-    }
-  };
+    },
+    [t]
+  );
 
   const handleCloseAll = async () => {
     setConfirmCloseAll(false);
@@ -315,64 +452,15 @@ export function ConnectionsTable() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {visible.map((c) => {
-                const s = speeds.get(c.id) || { up: 0, down: 0 };
-                const m = c.metadata || {};
-                const proc = m.processPath || '-';
-                const procName = proc === '-' ? '-' : proc.split(/[/\\]/).pop() || proc;
-                const rv = parseRule(c.rule, c.rulePayload);
-                return (
-                  <TableRow key={c.id}>
-                    <TableCell className="py-2">
-                      <button
-                        className="rounded p-1 text-muted-foreground transition-colors hover:bg-destructive/10 hover:text-destructive"
-                        title={t('connections.close')}
-                        onClick={() => handleClose(c.id)}
-                      >
-                        <X className="h-4 w-4" />
-                      </button>
-                    </TableCell>
-                    <TableCell className="py-2 text-xs">{typeOf(c)}</TableCell>
-                    <TableCell className="py-2 font-mono text-xs">{sourceOf(c)}</TableCell>
-                    <TableCell className="max-w-[220px] truncate py-2 text-xs" title={destOf(c)}>
-                      {destOf(c)}
-                    </TableCell>
-                    <TableCell className="max-w-[200px] py-2 text-xs" title={rv.full || undefined}>
-                      {rv.action ? (
-                        <span className="flex items-center gap-1.5">
-                          {rv.type && (
-                            <span className="truncate text-muted-foreground">{rv.type}</span>
-                          )}
-                          <Badge
-                            variant={ruleActionVariant(rv.action)}
-                            className="shrink-0 px-1.5 py-0 text-[10px] font-normal"
-                          >
-                            {rv.action}
-                          </Badge>
-                        </span>
-                      ) : (
-                        <span className="block truncate">{rv.full || '-'}</span>
-                      )}
-                    </TableCell>
-                    <TableCell className="max-w-[160px] truncate py-2 text-xs" title={chainOf(c)}>
-                      {chainOf(c)}
-                    </TableCell>
-                    <TableCell className="whitespace-nowrap py-2 text-xs">
-                      <span className="text-success">↓ {formatBytes(s.down)}/s</span>
-                      <span className="ml-2 text-info">↑ {formatBytes(s.up)}/s</span>
-                    </TableCell>
-                    <TableCell className="whitespace-nowrap py-2 text-xs text-muted-foreground">
-                      ↓ {formatBytes(c.download ?? 0)} / ↑ {formatBytes(c.upload ?? 0)}
-                    </TableCell>
-                    <TableCell className="whitespace-nowrap py-2 text-xs">
-                      {fmtDuration(durationSec(c, now))}
-                    </TableCell>
-                    <TableCell className="max-w-[180px] truncate py-2 text-xs" title={proc}>
-                      {procName}
-                    </TableCell>
-                  </TableRow>
-                );
-              })}
+              {visible.map((c) => (
+                <ConnectionRow
+                  key={c.id}
+                  conn={c}
+                  speed={speeds.get(c.id) ?? ZERO_SPEED}
+                  onClose={handleClose}
+                  closeLabel={t('connections.close')}
+                />
+              ))}
               {filtered.length > MAX_VISIBLE_ROWS && (
                 <TableRow>
                   <TableCell

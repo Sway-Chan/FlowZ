@@ -71,6 +71,8 @@ export const IPC_CHANNELS = {
   CONNECTIONS_GET: 'connections:get',
   CONNECTIONS_CLOSE: 'connections:close', // 关单条连接（main 经 9090 DELETE /connections/{id}）
   CONNECTIONS_CLOSE_ALL: 'connections:closeAll', // 关全部连接（main 经 9090 DELETE /connections，触发 ResetNetwork）
+  CONNECTIONS_WATCH: 'connections:watch', // 连接页 mount：watcher 引用计数 +1，main 开始裁剪+推送连接快照
+  CONNECTIONS_UNWATCH: 'connections:unwatch', // 连接页 unmount：watcher 引用计数 -1，归 0 后 main 停止裁剪+推送
 
   // 出口 IP 信息（本地直连出口 / 代理出口）
   IP_INFO_GET: 'ipinfo:get',

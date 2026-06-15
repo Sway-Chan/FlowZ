@@ -936,7 +936,10 @@ if (gotTheLock) {
     statsService = new StatsService(
       (stats) => ipcEventEmitter.sendToAll(IPC_CHANNELS.EVENT_STATS_UPDATED, stats),
       clashApiClient,
-      (snap) => ipcEventEmitter.sendToAll(IPC_CHANNELS.EVENT_CONNECTIONS_UPDATED, snap)
+      (snap) => ipcEventEmitter.sendToAll(IPC_CHANNELS.EVENT_CONNECTIONS_UPDATED, snap),
+      // P1/P2：窗口可见才轮询——隐藏（macOS hide / minimizeToTray）/销毁（轻量模式）时无 UI 消费者，
+      // 跳过整轮 clash_api fetch+parse+trim+广播。读模块级 mainWindow 当前值（创建/销毁会变）。
+      () => !!mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()
     );
     // 杀核前静默 clash_api 客户端：停 StatsService 轮询（client.agent 的 RST 由 stopSingBoxProcess 的
     // destroyClashApiAgent→client.destroyAgent 统一负责，单一 destroy 路径，P0-2 治本不变）。

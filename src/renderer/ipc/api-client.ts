@@ -370,6 +370,14 @@ export const connectionsApi = {
   onUpdated(listener: (snap: ConnectionsSnapshot) => void): () => void {
     return ipcClient.on(IPC_CHANNELS.EVENT_CONNECTIONS_UPDATED, listener);
   },
+  /** 连接页 mount 时订阅：通知 main 开始裁剪+推送连接快照（watcher 引用计数 +1）。fire-and-forget。 */
+  async watch(): Promise<void> {
+    return ipcClient.invoke(IPC_CHANNELS.CONNECTIONS_WATCH);
+  },
+  /** 连接页 unmount 时退订：watcher 引用计数 -1，归 0 后 main 停止裁剪+推送。fire-and-forget。 */
+  async unwatch(): Promise<void> {
+    return ipcClient.invoke(IPC_CHANNELS.CONNECTIONS_UNWATCH);
+  },
   /** 关单条连接（main 经 9090 DELETE /connections/{id}；渲染端无 secret）。 */
   async close(id: string): Promise<{ ok: boolean }> {
     return ipcClient.invoke(IPC_CHANNELS.CONNECTIONS_CLOSE, { id });
