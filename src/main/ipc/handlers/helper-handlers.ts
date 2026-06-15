@@ -4,15 +4,18 @@
  */
 
 import { IpcMainInvokeEvent, app, shell } from 'electron';
+import { spawn } from 'child_process';
 import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import { IPC_CHANNELS } from '../../../shared/ipc-channels';
 import type { HelperStatus } from '../../../shared/types';
 import { registerIpcHandler } from '../ipc-handler';
-import type { HelperManager } from '../../services/HelperManager';
+import type { IPrivilegedHelper } from '../../services/IPrivilegedHelper';
 import type { IProxyManager } from '../../services/ProxyManager';
 
 export function registerHelperHandlers(
-  helperManager: HelperManager,
+  helperManager: IPrivilegedHelper,
   proxyManager: IProxyManager
 ): void {
   registerIpcHandler<boolean | undefined, HelperStatus>(
@@ -41,39 +44,106 @@ export function registerHelperHandlers(
   registerIpcHandler<void, { ok: boolean; error?: string }>(
     IPC_CHANNELS.APP_UNINSTALL_ALL,
     async () => {
-    try {
-      // 停代理（在位 helper 零提权停核，避免卸载后裸弹 osascript）
-      if (proxyManager.getStatus().running && proxyManager.isStartedViaHelper()) {
-        await proxyManager.stop().catch(() => {});
-      }
-      // 1. 清 helper + 受保护目录（macOS：uninstall 脚本已 rm -rf /Library/Application Support/FlowZ，含受保护目录
-      //    core/，弹一次密码框；非 macOS 无 helper，跳过）
-      if (process.platform === 'darwin') {
-        const r = await helperManager.uninstall();
-        if (!r.success) {
-          return { ok: false, error: r.error || 'helper 卸载失败，已中止完全卸载' };
-        }
-      }
-      // 2. 删用户数据（config/日志等，用户目录可写、无需 root）
       try {
-        fs.rmSync(app.getPath('userData'), { recursive: true, force: true });
-      } catch {
-        /* 尽力清理 */
-      }
-      // 3. 应用本体移入废纸篓（比 rm 安全、可恢复）；仅对确为 .app 包的路径操作。
-      try {
-        const appBundle = app.getPath('exe').replace(/\/Contents\/MacOS\/[^/]+$/, '');
-        if (appBundle.endsWith('.app')) {
-          await shell.trashItem(appBundle);
+        // 停代理（在位 helper 零提权停核，避免卸载后裸弹 osascript）
+        if (proxyManager.getStatus().running && proxyManager.isStartedViaHelper()) {
+          await proxyManager.stop().catch(() => {});
         }
-      } catch {
-        /* 删不掉 .app 不阻断退出 */
+        // 1. 清 helper + 其受保护资源。
+        //    macOS：uninstall 脚本 rm -rf /Library/Application Support/FlowZ（含受保护目录 core/），弹一次密码框。
+        //    Windows：helper.uninstall 走命名管道零提权令服务自停删 + 删 ProgramData\FlowZ（含外置 helper.exe + token）；
+        //      仅在 helper 确已安装时执行——未装则跳过，避免提权兜底路径无谓弹 UAC。
+        if (process.platform === 'darwin') {
+          const r = await helperManager.uninstall();
+          if (!r.success) {
+            return { ok: false, error: r.error || 'helper 卸载失败，已中止完全卸载' };
+          }
+        } else if (process.platform === 'win32') {
+          const st = await helperManager.getStatus();
+          if (st.installed) {
+            const r = await helperManager.uninstall();
+            if (!r.success) {
+              return { ok: false, error: r.error || 'helper 卸载失败，已中止完全卸载' };
+            }
+          }
+        }
+        // 2. 删用户数据 + 应用本体。
+        //    非 win32（darwin/linux）：用户目录可写、进程内直接 rmSync userData（恢复 Linux 原行为）；mac 额外把 .app 移废纸篓。
+        //    win32：userData 与 exe 都被本进程占用，进程内 rmSync 删不掉 → 交给分离 sidecar，等本进程退出后再清。
+        if (process.platform !== 'win32') {
+          try {
+            fs.rmSync(app.getPath('userData'), { recursive: true, force: true });
+          } catch {
+            /* 尽力清理 */
+          }
+          if (process.platform === 'darwin') {
+            try {
+              const appBundle = app.getPath('exe').replace(/\/Contents\/MacOS\/[^/]+$/, '');
+              if (appBundle.endsWith('.app')) {
+                await shell.trashItem(appBundle);
+              }
+            } catch {
+              /* 删不掉 .app 不阻断退出 */
+            }
+          }
+        } else {
+          // 分离 sidecar .bat：精确轮询本进程 PID 退出（不受同名 FlowZ.exe 残留干扰）→ 删 userData → 静默唤起 NSIS
+          // 卸载器（无则 rmdir 安装目录）→ 自删。进程内删不掉的根因：app 持有 userData 句柄 + exe 自身被占用；
+          // 必须 quit 让出占用后再由独立进程清。PID 轮询 + 60s 上限，避免 imagename 误判同名进程导致无限卡死。
+          // 卸载器 /S 静默（用户已在应用内确认完全卸载）；helper 已在第 1 步零提权卸掉 → customUnInstall 钩子 sc query
+          // 落空 → 不二次弹 UAC。portable 无卸载器时 rmdir 安装目录（best-effort：装 Program Files 时普通用户无权删，残留由下次安装幂等清理兜底）。
+          try {
+            const exePath = app.getPath('exe');
+            const exeDir = path.dirname(exePath);
+            const userData = app.getPath('userData');
+            const flowzPid = process.pid;
+            let uninstaller = path.join(exeDir, 'Uninstall FlowZ.exe');
+            if (!fs.existsSync(uninstaller)) {
+              const hit = fs.readdirSync(exeDir).find((f) => /^Uninstall FlowZ.*\.exe$/i.test(f));
+              if (hit) uninstaller = path.join(exeDir, hit);
+            }
+            const hasUninstaller = fs.existsSync(uninstaller);
+            // portable 无卸载器：目录名含 FlowZ（专属目录）才 rmdir 整目录，否则只删 exe 自身
+            // （避免误删用户自选的非专属目录如 D:\Tools\，portable 仍可恢复）。
+            const portableCleanup = exeDir.toLowerCase().includes('flowz')
+              ? `rmdir /s /q "${exeDir}"`
+              : `del /f /q "${exePath}"`;
+            const batPath = path.join(os.tmpdir(), `flowz-uninstall-${flowzPid}-${Date.now()}.bat`);
+            // CRLF 行尾 + GBK 安全（纯 ASCII，路径走变量不内联中文）。
+            const lines = [
+              '@echo off',
+              `set "FLOWZ_PID=${flowzPid}"`,
+              'set "WAIT=0"',
+              ':wait',
+              // 精确等本进程 PID 退出；60×~1s=60s 上限防卡死。
+              `tasklist /fi "PID eq %FLOWZ_PID%" 2>nul | find "%FLOWZ_PID%" >nul || goto clean`,
+              'set /a WAIT+=1',
+              'if %WAIT% GEQ 60 goto clean',
+              'ping 127.0.0.1 -n 2 >nul',
+              'goto wait',
+              ':clean',
+              `rmdir /s /q "${userData}"`,
+              hasUninstaller ? `if exist "${uninstaller}" "${uninstaller}" /S` : portableCleanup,
+              'del "%~f0"',
+              '',
+            ];
+            fs.writeFileSync(batPath, lines.join('\r\n'), 'utf8');
+            spawn('cmd', ['/c', batPath], {
+              detached: true,
+              stdio: 'ignore',
+              windowsHide: true,
+              cwd: os.tmpdir(),
+            }).unref();
+          } catch {
+            /* 唤起 sidecar 失败不阻断退出（用户仍可经「添加或删除程序」卸载，含同款 helper 清理钩子） */
+          }
+        }
+        // 4. 退出（留 0.5s 让 IPC 回执先到达渲染端）
+        setTimeout(() => app.quit(), 500);
+        return { ok: true };
+      } catch (error) {
+        return { ok: false, error: error instanceof Error ? error.message : String(error) };
       }
-      // 4. 退出（留 0.5s 让 IPC 回执先到达渲染端）
-      setTimeout(() => app.quit(), 500);
-      return { ok: true };
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) };
     }
-  });
+  );
 }

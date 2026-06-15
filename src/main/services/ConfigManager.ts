@@ -16,6 +16,8 @@ import {
   migrateCustomRules,
   customRulesNeedMigration,
 } from '../../shared/rules';
+import { defaultAppRules, seedDefaultAppRules } from '../../shared/app-rules-preset';
+import { DEFAULT_SPEED_TEST_URL } from '../../shared/speed-test';
 
 /**
  * 合法服务器协议白名单（单一来源，T5）。
@@ -177,6 +179,17 @@ export class ConfigManager implements IConfigManager {
       // usesFakeIp 改为纯看开关后，TUN 存量用户若不迁移会从「恒 FakeIP-on」静默掉到 off（机场拒 IP 风险）。
       // 按迁移时刻 proxyModeType 写 effective 值，置标记防重复执行覆盖用户后续手动改的值。
       await this.migrateFakeIpToggle(config);
+
+      // 应用分流默认预设一次性注入（幂等、flag 守卫）：为未配置的内置预设注入默认「代理·跟全局」规则，
+      // 并剔除已下线预设（apple/bilibili）的残留。使每张卡片启动即有 rule-sel-app selector → 首次切节点即热切换，
+      // 无需先手动触发一次创建规则。仅执行一次（置 appRulesSeeded），之后用户可自由增删不被回灌。
+      if (!config.appRulesSeeded) {
+        config.appRules = seedDefaultAppRules(config.appRules || []);
+        config.appRulesSeeded = true;
+        await this.saveConfig(config).catch((e) =>
+          this.log('warn', `应用分流默认注入落盘失败（不阻断）: ${e}`)
+        );
+      }
 
       // 缓存配置
       this.currentConfig = config;
@@ -594,10 +607,10 @@ export class ConfigManager implements IConfigManager {
     if (config.silentStart === undefined) {
       config.silentStart = false; // 默认值
     }
-    // appRoutingEnabled 新增字段：undefined=开启（兼容老配置，不回填以减少 config 写放大；gate 用 !== false）。
+    // appRoutingEnabled：undefined=关闭（默认关；不回填以减少 config 写放大；gate 用 !== true）。
     // 纯开关字段非法值 sanitize 而非 throw——throw 在 loadConfig 路径会触发默认配置覆盖落盘致全丢，不值当。
     if (config.appRoutingEnabled !== undefined && typeof config.appRoutingEnabled !== 'boolean') {
-      this.log('warn', 'appRoutingEnabled must be a boolean; resetting to default (enabled)');
+      this.log('warn', 'appRoutingEnabled must be a boolean; resetting to default (disabled)');
       delete config.appRoutingEnabled;
     }
     // builtinGeoMeta 非法类型 sanitize 而非 throw（读取侧全容错、无爆炸半径，与 appRoutingEnabled 同型）
@@ -649,8 +662,10 @@ export class ConfigManager implements IConfigManager {
     if (config.rememberWindowSize !== undefined && typeof config.rememberWindowSize !== 'boolean') {
       throw new Error('rememberWindowSize must be a boolean');
     }
+    // 默认启用（与 DEFAULT_CONFIG 一致）：未显式设置过的配置（含旧配置缺该键）按「记忆窗口大小」默认开启；
+    // 显式设为 false 的用户配置不受影响（非 undefined，上面已放行）。
     if (config.rememberWindowSize === undefined) {
-      config.rememberWindowSize = false;
+      config.rememberWindowSize = true;
     }
 
     // bypassProcesses 是可选字段，兼容旧配置
@@ -753,7 +768,7 @@ export class ConfigManager implements IConfigManager {
       subscriptionUpdateIntervalHours: 12, // 订阅自动更新周期/陈旧阈值（小时）
       subscriptionUpdateViaProxy: false, // 默认直连拉取订阅
       mainSessionViaProxy: true, // 更新检查/规则资源默认走代理（运行时）
-      rememberWindowSize: false, // 默认不启用记忆窗口大小
+      rememberWindowSize: true, // 默认启用记忆窗口大小（用户调整后下次沿用；已显式关闭的用户配置不受影响）
       enableIPv6: false, // 默认不启用 IPv6 解析（防假死兜底）
       autoPrivacyMode: false, // 默认不启用隐私模式
       privacyPassword: '', // 默认隐私模式密码为空
@@ -767,8 +782,13 @@ export class ConfigManager implements IConfigManager {
       },
 
       customRuleSets: [], // 默认空
-      appRules: [], // 应用分流规则（实验性）默认空
-      appRoutingEnabled: true, // 应用分流总开关默认开启（仅影响新装/回落；老配置 undefined 亦视为开启）
+      appRules: defaultAppRules(), // 默认为每个内置预设注入「代理·跟全局」规则 → 卡片启动即有 selector，首次切节点即热切换
+      appRulesSeeded: true, // 新装已注入，loadConfig 迁移跳过
+      appRoutingEnabled: false, // 应用分流总开关默认关闭（仅影响新装/回落；undefined 亦视为关闭，见 effectiveAppRules/UI 读取端）
+      ruleResourceAutoUpdate: true, // 规则资源自动更新默认开启（老配置 undefined 亦视为开启，见 scheduler/UI 读取端）
+      ruleResourceUpdateIntervalHours: 12, // 自动更新间隔默认 12h
+      fakeIpFilter: true, // fake-ip-filter 默认清单默认开启（NTP/STUN/Captive 走真实解析；老配置 undefined 亦视为开）
+      speedTestUrl: DEFAULT_SPEED_TEST_URL, // 节点测速端点默认 generate_204（用户可在设置·网络改）
 
       socksPort: 2081,
       httpPort: 2080,

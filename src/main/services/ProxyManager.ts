@@ -8,6 +8,7 @@ import { spawn, ChildProcess } from 'child_process';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as net from 'net';
+import * as https from 'https';
 import { EventEmitter } from 'events';
 import type {
   UserConfig,
@@ -19,6 +20,7 @@ import type {
 import { ProxyErrorCode } from '../../shared/types';
 import type { ILogManager } from './LogManager';
 import { HelperManager } from './HelperManager';
+import type { IPrivilegedHelper } from './IPrivilegedHelper';
 import { ClashApiClient } from './ClashApiClient';
 import { PlatformPrivilegeService } from './PlatformPrivilegeService';
 import { type ISystemProxyManager, SystemProxyBase } from './SystemProxyManager';
@@ -29,6 +31,8 @@ import {
   BUILTIN_GEO_RULESETS,
   getRuleSetRuntimeDir as getRuntimeRulesDir,
   seedBuiltinRuleSets,
+  isValidSrsFile,
+  resolveBuiltinRuleSetRefMeta,
 } from './builtin-geo-rulesets';
 import { retry } from '../utils/retry';
 import { coreVersionAtLeast } from '../../shared/version';
@@ -119,6 +123,41 @@ const DOMESTIC_BANK_AND_STOCK_DOMAINS = [
   '.gw.com.cn', // 大智慧
   '.tdx.com.cn', // 通达信
 ];
+
+/**
+ * fake-ip-filter 默认清单：FakeIP 模式下被假 IP（198.18/15）弄坏的通用域名 → 强制走真实 DNS 解析（绕过 FakeIP）。
+ * **刻意内联硬编码**——fake-ip-filter 是启动必经的 DNS 规则，绝不能依赖可能 404 的远程 rule_set（重蹈 geoip-telegram FATAL）。
+ * 默认注入（config.fakeIpFilter !== false 时），按"应路由到哪个真实解析器"分组：
+ *   - 连通性探测 / Captive Portal → dns-local（系统解析，反映真实本地网络，否则系统误判断网 / 锁屏登录态卡死）
+ *   - NTP / STUN / TURN → dns-domestic（真实 DoH；校时握手与 WebRTC/P2P 需真实 IP）
+ * 本地域（.local/.arpa/.lan/.home.arpa）已由上方 dns-local 规则覆盖，不重复。
+ */
+const FAKEIP_FILTER_CAPTIVE_DOMAINS = [
+  'captive.apple.com', // Apple 连通性探测
+  'connectivitycheck.gstatic.com', // Android 连通性探测
+  'connectivitycheck.android.com',
+  'msftconnecttest.com', // Windows NCSI
+  'www.msftconnecttest.com',
+  'msftncsi.com',
+  'www.msftncsi.com',
+  'dns.msftncsi.com',
+  'detectportal.firefox.com', // Firefox captive 检测
+  'network-test.debian.org',
+  'connect.rom.miui.com', // 小米连通性
+];
+/** NTP 时间同步域名（FakeIP 下校时失败）。 */
+const FAKEIP_FILTER_NTP_SUFFIXES = [
+  'ntp.org', // pool.ntp.org 及各区域子域
+  'time.windows.com',
+  'time.apple.com',
+  'time.cloudflare.com',
+  'time.nist.gov',
+  'time.android.com',
+];
+// NTP/STUN 关键字：domain_keyword 是**裸子串**匹配，故只保留误伤面极小的 'ntp'/'stun'；刻意去掉 'turn'
+// （会误命中 saturn/return/nocturne/overturn 等正常域名 → 被强制走 dns-domestic 真实解析、绕过 FakeIP，海外域可能被污染）。
+// TURN 服务器通常同时是 STUN（stun.* 已覆盖）；NTP 域另由 FAKEIP_FILTER_NTP_SUFFIXES 的 domain_suffix 兜底。
+const FAKEIP_FILTER_NTP_STUN_KEYWORDS = ['ntp', 'stun'];
 
 /**
  * sing-box 1.12.x / 1.13.x 配置类型定义
@@ -371,6 +410,14 @@ const DOH_LEAK_DOMAIN_KEYWORDS = [
  */
 const REMOTE_RULESET_UPDATE_INTERVAL = '24h';
 
+/**
+ * 应用分流/自定义规则的远程 geo rule_set 源：MetaCubeX/meta-rules-dat 的 sing 分支，jsDelivr CDN 加速（墙内可用 +
+ * download_detour='direct' 启动期直连下载）。与规则资源 catalog（MRD_RAW_BASE）同源、保持一致。
+ * 历史 bug：旧源 SagerNet/sing-geoip 是**纯国家级** geoip，应用类 geoip（telegram/twitter/netflix 等）在该源不存在
+ * → sing-box `initialize rule-set` 取回 404 → FATAL → 代理崩溃重试。MetaCubeX 含应用类 geoip+geosite（实测全 200）。
+ */
+const MRD_GEO_JSDELIVR_BASE = 'https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/';
+
 /** 主机字符串是否为 IPv4 字面量（与 DNS/route 生成各处保持同一判定，避免分类不一致）。 */
 const isIpv4Host = (host: string): boolean => /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(host);
 
@@ -456,8 +503,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private startTime: Date | null = null;
   private pid: number | null = null;
   private singboxPid: number | null = null; // macOS TUN 模式下实际的 sing-box PID
-  // macOS 提权 helper（装一次后免提权启停）；未注入/未就绪则回退 PR-M1 osascript 看护脚本。
-  private helperManager: HelperManager | null = null;
+  // 提权 helper（macOS=HelperManager / Windows=WindowsServiceHelper，装一次后免提权启停）；未注入/未就绪
+  // 则回退平台提权路径（macOS osascript 看护脚本 / Windows 每次 UAC）。按 process.platform 在 index.ts 装配。
+  private helperManager: IPrivilegedHelper | null = null;
   // 系统代理单一写者（注入 index.ts 的同一 singleton，与 IPC handler/tray 共享 originalSettings/marker 状态）。
   // 拆双轨：ProxyManager 不再内联 networksetup/reg，统一经此调用 enableProxy/disableProxy（带 marker + 防自指）。
   private systemProxyManager: ISystemProxyManager | null = null;
@@ -495,6 +543,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     | null = null;
   // 本次 sing-box 是否经 helper 启动（决定停止走 helper socket 还是 osascript）。
   private startedViaHelper: boolean = false;
+  // 远程 geo rule_set URL 可达性缓存（应用分流/自定义 geo 规则的 remote rule_set 预检用）。
+  // 仅缓存"确定结论"：2xx→可达(6h)，404/403/410→缺失(30min，留恢复窗口)；瞬时错误不缓存。见 isRemoteRuleSetReachable。
+  private ruleSetReachCache = new Map<string, { reachable: boolean; at: number }>();
   // 本次 start 是否交互式（非交互=崩溃自动重启）：helper 不可用时非交互不裸弹 osascript（F10）。
   private startInteractive: boolean = true;
   // 重启去抖：连改多条配置（编辑多条规则/导入/迁移）合并为一次重启，避免每次编辑 ~1.2s 断流。
@@ -997,6 +1048,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       } catch {
         /* best-effort：退出兜底，失败不阻塞退出 */
       }
+    } else if (process.platform === 'win32' && this.helperManager) {
+      // Windows：sing-box 由 LocalSystem 服务托管 → 同样让服务停 child + 扫孤儿。用注入的 WindowsServiceHelper
+      // （不实例化 macOS 的 HelperManager）；未装/未就绪则 stopCore/cleanup 经管道 ENOENT 快速失败，无额外延迟。
+      try {
+        await this.helperManager.stopCore();
+        await this.helperManager.cleanup();
+      } catch {
+        /* best-effort：退出兜底，失败不阻塞退出 */
+      }
     }
   }
 
@@ -1013,7 +1073,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     options: { interactive?: boolean }
   ): Promise<void> {
     if (options.interactive === false) return; // 崩溃自动重启等：禁模态
-    if (process.platform !== 'darwin' || !isTunMode) return; // 非 macOS / 非 TUN：systemProxy 绝不弹
+    if ((process.platform !== 'darwin' && process.platform !== 'win32') || !isTunMode) return; // 非 macOS/Windows / 非 TUN：systemProxy 绝不弹
     if (!this.helperManager || !this.helperGate) return;
     const hs = await this.helperManager.getStatus().catch(() => null);
     // 关键：backgroundDisabled 时**即便 ready 也不能早退**——install-over-top 让 daemon 在跑(ready=true)但 BTM
@@ -1668,13 +1728,34 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         if (res === 'foreign') throw this.clashPortError('FOREIGN');
         p = await probe();
       }
+      if (
+        p.listening &&
+        process.platform === 'win32' &&
+        this.helperManager &&
+        (await this.helperManager.isReady())
+      ) {
+        // M5：Windows helper 就绪但首次 freePort 未清净（可能竞态/刚退 TIME_WAIT 转监听）→ 再试一次。
+        // 注：Windows 无 osascript 等价的零提权清理；helper 未装=设计现状（可选加速层），
+        // 不冒险加 RunAs taskkill（按映像名杀会误杀用户其他 sing-box 进程）。
+        this.logToManager('info', `[9090] Windows helper freePort 首次未清净，重试一次`);
+        await this.helperManager.freePort(PORT);
+        p = await probe();
+      }
       if (!p.bindBusy && !p.listening) {
         this.logToManager('info', `[9090] 活监听者已清掉，端口空闲`);
         return;
       }
       if (p.listening) {
-        // 仍有活监听者没杀掉（非交互/取消/外部）
-        this.logToManager('error', `[9090] 活监听者仍在 → 终态 BUSY`);
+        if (process.platform === 'win32') {
+          const ready = this.helperManager && (await this.helperManager.isReady());
+          this.logToManager(
+            'error',
+            `[9090] Windows 活监听者仍在 → 终态 BUSY：${ready ? 'helper freePort 重试后仍未清净' : '未装 helper，无零提权清理手段（建议安装 Windows 提权 helper）'}`
+          );
+        } else {
+          // 仍有活监听者没杀掉（非交互/取消/外部）
+          this.logToManager('error', `[9090] 活监听者仍在 → 终态 BUSY`);
+        }
         throw this.clashPortError('BUSY');
       }
       // 杀完活孤儿后 bindBusy && !listening → 它自己留下的 root TIME_WAIT → 落入 ③ 等待
@@ -2228,6 +2309,22 @@ done
       domain_suffix: ['.local', '.arpa', '.lan', '.home.arpa', ...DOMESTIC_BANK_AND_STOCK_DOMAINS],
       server: 'dns-local',
     } as SingBoxDnsRule);
+
+    // fake-ip-filter 默认清单（仅 FakeIP 开启时有意义；config.fakeIpFilter === false 可关）：NTP/STUN/Captive 等
+    // 在 FakeIP 下会坏的域名 → 在 fakeip catch-all 之前命中、改走真实解析器，绕过 FakeIP。内联硬编码、无下载依赖。
+    if (enableFakeIp && config.fakeIpFilter !== false) {
+      // 连通性探测 / Captive Portal → dns-local（系统解析，反映真实本地网络，否则系统误判断网 / 锁屏登录卡死）
+      dnsRules.push({
+        domain: FAKEIP_FILTER_CAPTIVE_DOMAINS,
+        server: 'dns-local',
+      } as SingBoxDnsRule);
+      // NTP / STUN / TURN → dns-domestic（真实 DoH；校时与 P2P 需真实 IP）。同规则内 domain_suffix/domain_keyword 为 OR。
+      dnsRules.push({
+        domain_suffix: FAKEIP_FILTER_NTP_SUFFIXES.flatMap((d) => [d, `.${d}`]),
+        domain_keyword: FAKEIP_FILTER_NTP_STUN_KEYWORDS,
+        server: 'dns-domestic',
+      } as SingBoxDnsRule);
+    }
 
     // 处理自定义规则中的 bypassFakeIP（仅 domain / domainSuffix / domainKeyword 三类域名规则有效）。
     // 可外化规则（smart/global + 已落盘 <base>.dns.json）→ 引用其 <base>-dns rule_set，值不进 DNS 配置
@@ -2880,6 +2977,26 @@ done
   }
 
   /**
+   * 供 SpeedTestService 复用：为单个节点生成**完整出站**（全协议，非仅 hy2/tuic），供临时测速 sing-box 经代理做
+   * 真实 urltest（端口通≠代理可用，裸 TCP ping 测不出鉴权/中继失败）。
+   *   - naive 缺 libcronet → 返回 null（跳过，避免临时核 FATAL 拖垮整批测速）。
+   *   - 清空 detour：测速每节点独立、不接前置代理链（前置链不可达会污染单节点延迟判定）。
+   *   - 解析器用 'dns-direct'（与 SpeedTestService 临时配置的 dns server tag 对齐）。
+   */
+  buildSpeedTestOutbound(server: ServerConfig, tag: string): SingBoxOutbound | null {
+    try {
+      if (!this.isNodeUsable(server)) return null;
+      const map = new Map<string, string>([[server.id, tag]]);
+      const ob = this.generateProxyOutbound(server, map, 'dns-direct');
+      ob.tag = tag;
+      delete ob.detour;
+      return ob;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * 生成代理 Outbound 配置（sing-box 1.12.x / 1.13.x 兼容格式）
    */
   private generateProxyOutbound(
@@ -3274,13 +3391,13 @@ done
   }
 
   /**
-   * 应用分流总开关 gate：appRoutingEnabled===false → 空（appRules 完全不进 route 生成/TUN 排除/geo 收集）；
-   * undefined/true → 现状。单一真值点，4 个消费点统一经此，保证关闭=appRules[] 逐字节等价。
+   * 应用分流总开关 gate：appRoutingEnabled !== true → 空（默认关；appRules 完全不进 route 生成/TUN 排除/geo 收集）；
+   * 仅显式 true 才启用。单一真值点，4 个消费点统一经此，保证关闭=appRules[] 逐字节等价。
    */
   private effectiveAppRules(config: UserConfig): import('../../shared/types').AppRule[] {
     // direct 模式：appRules 不进 route 生成（与 generateCustomRules 的 `proxyMode !== 'direct'` 门控对称）；
     // generateRuleSelectors 在 direct 跳过（无 rule-sel），此处返回 [] 避免 generateRouteConfig emit 死引用 outbound。
-    if (config.appRoutingEnabled === false) return [];
+    if (config.appRoutingEnabled !== true) return [];
     if ((config.proxyMode || 'smart').toLowerCase() === 'direct') return [];
     return config.appRules || [];
   }
@@ -3521,6 +3638,12 @@ done
         action: 'route',
         outbound: 'direct',
       });
+      // 私有/本地**域名**直连（geosite-private，补 ip_cidr 的域名盲区，如路由器后台域）。geosite-private 由
+      // BUILTIN_GEO_RULESETS 随包 bundle + 自动更新 fswatch 热加载；仅在本地 .srs 有效时加规则，缺失则跳过
+      // （不引用不存在的 rule_set，避免 FATAL）——与上面 getLocalGeoRuleSets 的缺失即跳过一致。
+      if (isValidSrsFile(path.join(this.getRuleSetRuntimeDir(), 'geosite-private.srs'))) {
+        rules.push({ rule_set: 'geosite-private', action: 'route', outbound: 'direct' });
+      }
     }
 
     // Bug 4 修复：删除此处重复的 QUIC 阻断规则
@@ -3772,12 +3895,11 @@ done
       // 路径取自与 copyRuleSetsToUserData 同一真值表，杜绝目录/文件名漂移
       const runtimeDir = this.getRuleSetRuntimeDir();
       for (const rs of this.getLocalGeoRuleSets()) {
-        routeConfig.rule_set.push({
-          tag: rs.tag,
-          type: 'local',
-          format: 'binary',
-          path: path.join(runtimeDir, rs.fileName),
-        });
+        const filePath = path.join(runtimeDir, rs.fileName);
+        // 缺失/损坏即跳过：不引用不存在的本地文件（否则 sing-box `initialize rule-set` FATAL）。被 app-rule 引用的
+        // app-geo 若本地缺失，其同 tag 远程 rule_set 不被去重剔除 → 自动回落远程下载（缺失即跳过 + 远程兜底）。
+        if (!isValidSrsFile(filePath)) continue;
+        routeConfig.rule_set.push({ tag: rs.tag, type: 'local', format: 'binary', path: filePath });
       }
     }
 
@@ -3798,39 +3920,58 @@ done
         routeConfig.rule_set = [];
       }
 
-      // Bug 2 修复：
-      // 1. 使用 fastly.jsdelivr.net CDN 加速，替代直连 raw.githubusercontent.com（在中国大陆常被封锁）
-      // 2. download_detour 改为 'direct'，避免循环依赖（代理需要规则集才能启动，规则集需要代理才能下载）
-      //    sing-box 启动时规则集下载必须走直连，后续更新可以走代理
-      // 3. 注意：不是所有 geosite 标签都有独立的 .srs 文件（如 geosite-bbc.srs 不存在）
-      //    如果下载失败，sing-box 会使用缓存版本，如无缓存则跳过该规则集
+      // 源 = MetaCubeX/meta-rules-dat@sing（见 MRD_GEO_JSDELIVR_BASE）：
+      // 1. jsDelivr CDN 加速，替代直连 raw.githubusercontent.com（在中国大陆常被封锁）。
+      // 2. download_detour='direct'：避免循环依赖（代理需规则集才能启动、规则集需代理才能下载）→ 启动期直连下载，
+      //    后续更新可走代理。
+      // 3. ⚠️ 已知约束：任一被引用的 .srs 在源上 404 → sing-box `initialize rule-set` **FATAL**（非"跳过"，旧注释判断有误）。
+      //    内置预设的 geosite/geoip 标签均已对 MetaCubeX 实测可达；用户自定义规则/预设引用的非常规分类仍可能 404 →
+      //    后续应加"生成期可达性预检 + 丢弃不可达 rule_set"硬化（独立项），杜绝单个坏标签崩整个代理。
 
-      // 添加 Geosite 远程规则集
+      // 联动「规则资源」：用户已在规则资源页下载的 geo（catalog id 形如 geosite-<cat>/geoip-<cat>）→ 优先用其本地副本，
+      // 避免 sing-box 重复远程下载、并让该规则集在规则资源页可见可管；缺失/损坏回落远程（行为同前）。
+      // 本地优先、且与上方随包内置同 tag 去重（末尾 keep-first）。
+      const localResPath = (tag: string): string | null => {
+        const r = (config.ruleResources || []).find((x) => x.id === tag);
+        if (!r) return null;
+        const p = path.join(getRuleResourcesPath(), r.fileName);
+        return isValidSrsFile(p) ? p : null;
+      };
+
+      // 添加 Geosite 规则集（本地优先，否则远程）
       for (const category of Array.from(customGeositeCategories)) {
-        // 构建镜像 URL：优先使用 fastly CDN，提升中国大陆可用性
-        const geositeUrl =
-          category === 'category-ai'
-            ? 'https://fastly.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-category-ai-!cn.srs'
-            : `https://fastly.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-${category}.srs`;
-
+        const tag = `geosite-${category}`;
+        const local = localResPath(tag);
+        if (local) {
+          routeConfig.rule_set.push({ tag, type: 'local', format: 'binary', path: local });
+          continue;
+        }
+        // category-ai：MetaCubeX 用 category-ai-!cn（裸 category-ai 在该源不单独成 .srs）；其余 geo/geosite/<cat>.srs。
+        const geositeFile = category === 'category-ai' ? 'category-ai-!cn' : category;
         routeConfig.rule_set.push({
-          tag: `geosite-${category}`,
+          tag,
           type: 'remote',
           format: 'binary',
-          url: geositeUrl,
+          url: `${MRD_GEO_JSDELIVR_BASE}geosite/${geositeFile}.srs`,
           // 必须走直连下载，避免启动时循环依赖
           download_detour: 'direct',
           update_interval: REMOTE_RULESET_UPDATE_INTERVAL,
         });
       }
 
-      // 添加 GeoIP 远程规则集
+      // 添加 GeoIP 规则集（本地优先，否则远程）
       for (const category of Array.from(customGeoipCategories)) {
+        const tag = `geoip-${category}`;
+        const local = localResPath(tag);
+        if (local) {
+          routeConfig.rule_set.push({ tag, type: 'local', format: 'binary', path: local });
+          continue;
+        }
         routeConfig.rule_set.push({
-          tag: `geoip-${category}`,
+          tag,
           type: 'remote',
           format: 'binary',
-          url: `https://fastly.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-${category}.srs`,
+          url: `${MRD_GEO_JSDELIVR_BASE}geoip/${category}.srs`,
           // 必须走直连下载，避免启动时循环依赖
           download_detour: 'direct',
           update_interval: REMOTE_RULESET_UPDATE_INTERVAL,
@@ -3968,22 +4109,42 @@ done
           for (const v of vals) {
             let tag: string;
             if (v.startsWith('res:')) {
-              const res = ruleResources.find((rr) => rr.id === v.slice(4));
-              if (!res) {
-                this.logToManager('warn', `ruleSet 规则引用的资源不存在，已跳过: ${v}`);
-                continue;
-              }
-              const filePath = path.join(getRuleResourcesPath(), res.fileName);
-              if (!require('fs').existsSync(filePath)) {
-                this.logToManager(
-                  'warn',
-                  `ruleSet 规则引用的资源文件缺失，已跳过: ${res.fileName}`
-                );
-                continue;
-              }
-              tag = `local-rs-${res.id}`;
-              if (!ruleSets.some((rs) => rs.tag === tag)) {
-                ruleSets.push({ tag, type: 'local', format: res.format, path: filePath });
+              const resId = v.slice(4);
+              // 内置随包资源（res:builtin:<tag>）：复用 b.tag（geosite-netflix 等），runtime 路径取自单一真值表。
+              // proxy 模式下 getLocalGeoRuleSets 已注入同 tag 本地 rule_set；此处自注入 + route 装配末尾按 tag 去重
+              // （keep-first，两者同路径同 format，行为一致），故 direct 模式或本地缺失也能自洽。文件缺失/损坏 → 跳过（不 FATAL）。
+              const builtinMeta = resolveBuiltinRuleSetRefMeta(resId);
+              if (builtinMeta) {
+                const filePath = path.join(this.getRuleSetRuntimeDir(), builtinMeta.fileName);
+                if (!isValidSrsFile(filePath)) {
+                  this.logToManager(
+                    'warn',
+                    `ruleSet 规则引用的内置资源文件缺失/损坏，已跳过: ${builtinMeta.fileName}`
+                  );
+                  continue;
+                }
+                tag = builtinMeta.tag;
+                if (!ruleSets.some((rs) => rs.tag === tag)) {
+                  ruleSets.push({ tag, type: 'local', format: 'binary', path: filePath });
+                }
+              } else {
+                const res = ruleResources.find((rr) => rr.id === resId);
+                if (!res) {
+                  this.logToManager('warn', `ruleSet 规则引用的资源不存在，已跳过: ${v}`);
+                  continue;
+                }
+                const filePath = path.join(getRuleResourcesPath(), res.fileName);
+                if (!require('fs').existsSync(filePath)) {
+                  this.logToManager(
+                    'warn',
+                    `ruleSet 规则引用的资源文件缺失，已跳过: ${res.fileName}`
+                  );
+                  continue;
+                }
+                tag = `local-rs-${res.id}`;
+                if (!ruleSets.some((rs) => rs.tag === tag)) {
+                  ruleSets.push({ tag, type: 'local', format: res.format, path: filePath });
+                }
               }
             } else {
               tag = `custom-ruleset-${ruleSetIndex++}`;
@@ -4186,6 +4347,9 @@ done
    * 写入 sing-box 配置文件
    */
   private async writeSingBoxConfig(config: SingBoxConfig): Promise<void> {
+    // 落盘前预检远程 geo rule_set 可达性，剔除确定不存在(404)的，避免 sing-box `initialize rule-set` FATAL 崩整个代理。
+    // 无 remote rule_set（默认 smart 模式 geo 走本地 bundled .srs）时零开销。
+    await this.pruneUnreachableRemoteRuleSets(config);
     const content = JSON.stringify(config, null, 2);
     await fs.writeFile(this.configPath, content, 'utf-8');
   }
@@ -4430,6 +4594,134 @@ done
         r.outbound = 'proxy-selector';
       }
     }
+  }
+
+  /**
+   * 远程 geo rule_set 可达性预检 + 剪枝（防"资源不存在→sing-box initialize rule-set 404 FATAL→整个代理崩溃"）。
+   * sing-box 对任一 remote rule_set 取回 404 会**整体 FATAL**（非跳过）。内置预设标签均已对 MetaCubeX 实测可达，
+   * 但用户自定义规则/预设引用的非常规分类仍可能 404。此处对所有 type:'remote' 的 rule_set 做 HEAD 预检：
+   *   - 确定缺失（404/403/410）→ 丢弃该 rule_set 定义 + 从路由规则的 rule_set 引用中剔除；rule_set 清空的规则整条丢弃
+   *     （即"资源不存在则该规则停止生效"，对齐需求；应用分流的 process_name 规则是独立规则、仍覆盖该 app）。
+   *   - 瞬时错误（超时/5xx/网络错）→ 乐观保留（不剪），交由 sing-box 自带下载重试/缓存（避免一次抖动丢有效路由）。
+   * 仅在存在 remote rule_set 时才有网络开销；默认 smart 模式（geo 走本地 bundled .srs）零开销。
+   */
+  private async pruneUnreachableRemoteRuleSets(singboxConfig: SingBoxConfig): Promise<void> {
+    const remote = (singboxConfig.route?.rule_set ?? []).filter(
+      (rs) => rs.type === 'remote' && typeof rs.url === 'string' && !!rs.tag
+    );
+    if (remote.length === 0) return;
+    // 总超时上限(6s)：弱网首次冷启动(无缓存)不阻塞数十秒——超时则乐观全保留(不剪,交 sing-box 下载重试)。
+    // 各 HEAD 仍有 4s 自超时,这里只是 wall-clock 兜底;Promise.all 先到用真实结果,6s 到用乐观(全 reachable)。
+    const optimistic: { tag: string; reachable: boolean }[] = remote.map((rs) => ({
+      tag: rs.tag,
+      reachable: true,
+    }));
+    let raceTimer: ReturnType<typeof setTimeout> | undefined;
+    const timeoutFallback = new Promise<{ tag: string; reachable: boolean }[]>((resolve) => {
+      raceTimer = setTimeout(() => resolve(optimistic), 6000);
+    });
+    const checks = await Promise.race([
+      Promise.all(
+        remote.map(async (rs) => ({
+          tag: rs.tag,
+          reachable: await this.isRemoteRuleSetReachable(rs.url as string),
+        }))
+      ),
+      timeoutFallback,
+    ]);
+    if (raceTimer) clearTimeout(raceTimer);
+    const unreachable = new Set(checks.filter((c) => !c.reachable).map((c) => c.tag));
+    const dropped = this.applyRuleSetPrune(singboxConfig, unreachable);
+    if (dropped.length > 0) {
+      this.logToManager(
+        'warn',
+        `规则资源：${dropped.length} 个远程规则集在源上不存在(404)，已停用相关规则以避免代理启动失败：` +
+          `${dropped.join(', ')}（应用分流仍按进程名等其余规则生效）`
+      );
+    }
+  }
+
+  /**
+   * 纯逻辑剪枝（无 I/O，可单测）：从 singbox 配置中剔除 `unreachable` 集合内的 rule_set tag —
+   *   ① 删 route.rule_set 中的对应定义；
+   *   ② 路由规则的 `rule_set`（string | string[]）剔除这些 tag；剔空则整条规则丢弃（含 logical 子规则递归）。
+   * 返回实际丢弃的 rule_set tag 列表。本地 bundled rule_set（geosite-cn 等，非 remote）永不入 `unreachable`，不受影响。
+   */
+  private applyRuleSetPrune(singboxConfig: SingBoxConfig, unreachable: Set<string>): string[] {
+    if (unreachable.size === 0 || !singboxConfig.route) return [];
+    const dropped: string[] = [];
+    if (singboxConfig.route.rule_set) {
+      singboxConfig.route.rule_set = singboxConfig.route.rule_set.filter((rs) => {
+        if (rs.tag && unreachable.has(rs.tag)) {
+          dropped.push(rs.tag);
+          return false;
+        }
+        return true;
+      });
+    }
+    const pruneRules = (rules: SingBoxRouteRule[]): SingBoxRouteRule[] =>
+      rules.filter((rule) => {
+        if (Array.isArray(rule.rules)) {
+          rule.rules = pruneRules(rule.rules);
+          // logical 规则子条件被剪空 → 整条丢（空 logical 无意义且 sing-box 不接受）
+          if (rule.type === 'logical' && rule.rules.length === 0) return false;
+        }
+        const rs = rule.rule_set;
+        if (typeof rs === 'string') {
+          if (unreachable.has(rs)) return false; // 唯一 rule_set 缺失 → 该规则停止生效
+        } else if (Array.isArray(rs)) {
+          const kept = rs.filter((t) => !unreachable.has(t));
+          if (kept.length === 0) return false; // rule_set 全缺失 → 该规则停止生效
+          if (kept.length !== rs.length) rule.rule_set = kept; // 部分保留（如 geosite 留、geoip 丢）
+        }
+        return true;
+      });
+    if (dropped.length > 0) {
+      singboxConfig.route.rules = pruneRules(singboxConfig.route.rules ?? []);
+    }
+    return dropped;
+  }
+
+  /**
+   * HEAD 预检单个远程 rule_set URL 是否存在。仅"确定缺失"(404/403/410) 返回 false→剪枝；2xx/3xx 返回 true；
+   * 瞬时错误（超时/5xx/网络错）乐观返回 true（不剪，交 sing-box 下载重试）。结果按"确定结论"缓存（见 ruleSetReachCache）。
+   */
+  private isRemoteRuleSetReachable(url: string): Promise<boolean> {
+    const now = Date.now();
+    const cached = this.ruleSetReachCache.get(url);
+    if (cached && now - cached.at < (cached.reachable ? 6 * 3600_000 : 30 * 60_000)) {
+      return Promise.resolve(cached.reachable);
+    }
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const done = (reachable: boolean, definitive: boolean) => {
+        if (settled) return;
+        settled = true;
+        if (definitive) this.ruleSetReachCache.set(url, { reachable, at: now });
+        resolve(reachable);
+      };
+      try {
+        const u = new URL(url);
+        const req = https.request(
+          { method: 'HEAD', host: u.host, path: u.pathname + u.search, timeout: 4000 },
+          (res) => {
+            const code = res.statusCode ?? 0;
+            res.resume(); // 释放 socket
+            if (code === 404 || code === 403 || code === 410) done(false, true);
+            else if (code >= 200 && code < 400) done(true, true);
+            else done(true, false); // 5xx 等瞬时 → 乐观保留、不缓存
+          }
+        );
+        req.on('timeout', () => {
+          req.destroy();
+          done(true, false);
+        });
+        req.on('error', () => done(true, false));
+        req.end();
+      } catch {
+        done(true, false);
+      }
+    });
   }
 
   /**
@@ -4965,6 +5257,20 @@ exit 0
       }
     }
 
+    // Windows TUN 模式 + helper 服务就绪 → 走零提权路径（镜像上方 macOS 逻辑，避免每次 UAC）。就绪即经服务起核；
+    // 启动失败 → 回退 buildWindowsUacLaunchCommand（每次 UAC）兜底，不在 helper 路径死循环。Windows 无「允许在
+    // 后台」概念（backgroundDisabled 恒 false），无需该前置判定；未装 helper → isReady=false → 落下方 UAC 路径。
+    if (this.needsWindowsUAC() && this.helperManager && (await this.helperManager.isReady())) {
+      try {
+        return await this.startViaHelper();
+      } catch (e) {
+        this.logToManager(
+          'warn',
+          `helper 服务启动失败，回退 UAC 路径: ${e instanceof Error ? e.message : String(e)}`
+        );
+      }
+    }
+
     // F10：非交互启动（崩溃自动重启）且 macOS TUN 需 osascript（helper 不可用/未就绪/路径失效）→ 不弹密码框。
     // 崩溃循环里凭空弹管理员授权（最多连弹 MAX_RESTART_COUNT 次）比断流更糟；抛含「权限」的非重试错误进入
     // 停止终态，待用户手动经 start gate 重新安装/修复 helper。交互式启动（按钮/托盘/切模式）不受影响。
@@ -5430,9 +5736,29 @@ exit 0
       return this.stopSingBoxWithSudo(opts);
     }
 
-    // Windows TUN 模式：sing-box 以管理员权限在后台运行，使用 taskkill 终止。
-    // T16 子 commit 3：实现迁入 PlatformPrivilegeService.stopElevated（win32 分支），此处 delegate（同上）。
+    // Windows TUN 模式：sing-box 以 SYSTEM/管理员权限在后台运行。
     if (this.singboxPid && process.platform === 'win32') {
+      // 经 helper 服务启动的 → 经 helper.stopCore() 停（零 UAC、快）。helper 是 SYSTEM、能停自己的 SYSTEM child；
+      // 否则非提权 taskkill 杀不动 SYSTEM sing-box → 下方 stopElevated 落 RunAs taskkill 弹 UAC 且慢（先试非提权再升级）。
+      // 镜像 macOS stopSingBoxWithSudo 的 helper 分支。注意：PlatformPrivilegeService 注入的是 macHelper（Win 上
+      // supported=false），故 Windows 的 winHelper 停止必须在 ProxyManager（持 winHelper）处理，**不能**委托 stopElevated。
+      if (this.startedViaHelper && this.helperManager) {
+        const pidToKill = this.singboxPid;
+        this.logToManager('info', `正在经提权服务停止 sing-box (PID: ${pidToKill})（免 UAC）...`);
+        if (this.isProcessAlive(pidToKill)) {
+          await this.helperManager.stopCore();
+          // 覆盖 helper terminateChild 的「CTRL_BREAK→等≤2s→TerminateProcess」+ 收割余量。
+          await this.waitForProcessExit(pidToKill, opts?.quitting ? 3000 : 8000);
+        }
+        if (!this.isProcessAlive(pidToKill)) {
+          this.logToManager('info', 'sing-box 已由提权服务停止（免 UAC）');
+          this.finishStop();
+          return;
+        }
+        // helper 停未生效（极少）→ 落下方提权兜底（退出语境 stopElevated 内部跳过 UAC）。
+        this.logToManager('warn', 'helper 服务停止未生效，回退提权路径');
+      }
+      // T16 子 commit 3：实现迁入 PlatformPrivilegeService.stopElevated（win32 分支），此处 delegate（同上）。
       if (this.privilegeService) {
         const { stopped } = await this.privilegeService.stopElevated(this.singboxPid, opts);
         if (stopped) this.finishStop();
@@ -5774,7 +6100,7 @@ exit 0
   }
 
   /** 注入 macOS 提权 helper（index.ts 启动时调用）。 */
-  setHelperManager(helperManager: HelperManager): void {
+  setHelperManager(helperManager: IPrivilegedHelper): void {
     this.helperManager = helperManager;
   }
 
@@ -5845,6 +6171,16 @@ exit 0
    * startInternal:658 调用点不变；ROOT_ORPHAN_BLOCKED 异常仍从此冒泡到 attemptAutoRestart 判终态。
    */
   private async killOrphanedSingBoxProcesses(isTunMode: boolean): Promise<void> {
+    // Windows：先经 helper 服务(SYSTEM)清掉孤儿 sing-box（含 SYSTEM 提权孤儿，零 UAC）—— privilegeService 的
+    // 非提权 taskkill 对 SYSTEM 孤儿 Access denied 杀不动。镜像 macOS killOrphans 经 helper.cleanup 的零提权清理。
+    // 未装/未就绪则 cleanup 经管道 ENOENT 快速失败、无额外延迟、不弹框。
+    if (process.platform === 'win32' && this.helperManager) {
+      try {
+        await this.helperManager.cleanup();
+      } catch {
+        /* best-effort */
+      }
+    }
     await this.privilegeService?.killOrphans(isTunMode);
   }
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# 交叉编译 FlowZ macOS 提权 helper（Go，无第三方依赖）到两个 mac 架构资源目录。
-# 产物随 electron-builder extraResources（resources/mac-${arch} → mac）打进 app 包。
+# 交叉编译 FlowZ 提权 helper（Go）：macOS（helper/，纯 stdlib，两 mac 架构）+ Windows（helper-win/，winio+x-sys，amd64）。
+# 产物随 electron-builder extraResources（resources/mac-${arch} → mac；resources/win）打进 app 包。
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -27,4 +27,16 @@ build() {
 
 build arm64 arm64
 build x64 amd64
+
+# Windows 提权服务 helper（独立 module helper-win/，含 vendor/ → -mod=vendor 离线构建）。
+# 输出到 resources/win/（与 sing-box.exe / libcronet.dll 同目录，对齐 ResourceManager.getWinHelperPath 与
+# getPlatformResourceDir 的 win 分支）。GOOS=windows 从任意宿主交叉编译（纯 Go + winio/x-sys，CGO 关）。
+WIN_SRC="$ROOT/helper-win"
+if [ -d "$WIN_SRC" ]; then
+  WIN_OUT="$ROOT/resources/win/com.flowz.helper.exe"
+  echo "[build-helper] win-x64 (amd64) → $WIN_OUT"
+  mkdir -p "$ROOT/resources/win"
+  ( cd "$WIN_SRC" && GOOS=windows GOARCH=amd64 CGO_ENABLED=0 \
+      go build -mod=vendor -trimpath -ldflags="-s -w" -o "$WIN_OUT" . )
+fi
 echo "[build-helper] done"

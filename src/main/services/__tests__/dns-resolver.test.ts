@@ -145,8 +145,20 @@ byteDiffDescribe(
 
         // --- B. dns.rules：除 rule1（节点域名规则）外逐字节相同；rule1 为有意全量化改动 ---
         const baseRules = base.dns.rules as AnyCfg[];
-        const curRules = cur.dns.rules as AnyCfg[];
-        expect(curRules.length).toBe(baseRules.length); // 规则条数不变（rule1 原位替换）
+        // fake-ip-filter 默认清单（默认开，基线 frozen 在其之前的有意新增）：与 rule1 同理，从逐字节对比剥离、单独断言。
+        // captive 探测 → dns-local；NTP/STUN/TURN → dns-domestic。FakeIP 档（含 fakeip server）注入 2 条，否则 0 条。
+        const allCurRules = cur.dns.rules as AnyCfg[];
+        const isFakeIpFilter = (r: AnyCfg) =>
+          (r.server === 'dns-local' &&
+            Array.isArray(r.domain) &&
+            r.domain.includes('captive.apple.com')) ||
+          (r.server === 'dns-domestic' &&
+            Array.isArray(r.domain_keyword) &&
+            (r.domain_keyword as string[]).includes('stun'));
+        const curRules = allCurRules.filter((r) => !isFakeIpFilter(r));
+        const hasFakeIp = (cur.dns.servers as AnyCfg[]).some((s) => s.tag === 'fakeip');
+        expect(allCurRules.filter(isFakeIpFilter).length).toBe(hasFakeIp ? 2 : 0);
+        expect(curRules.length).toBe(baseRules.length); // 规则条数不变（rule1 原位替换，filter 已剥离）
         // 基线 rule1：含 node-a 域名的那条
         const baseR1Idx = baseRules.findIndex(
           (r) =>

@@ -22,12 +22,14 @@ import {
 } from '@/components/ui/alert-dialog';
 import { useAppStore } from '@/store/app-store';
 import { parseDnsServerSpec } from '@shared/dns';
+import { parseSpeedTestUrl, DEFAULT_SPEED_TEST_URL } from '@shared/speed-test';
 import { toast } from 'sonner';
 import { useTranslation } from 'react-i18next';
 import { SettingsRow } from './settings-row';
 import { HelperManagementCard } from './helper-management-card';
 
 const isMac = window.electron?.platform === 'darwin';
+const isWin = window.electron?.platform === 'win32';
 const isLinux = window.electron?.platform === 'linux';
 
 const DNS_DEFAULTS = {
@@ -62,6 +64,7 @@ export function NetworkSettings() {
   const [foreignDns, setForeignDns] = useState(
     config?.dnsConfig?.foreignDns || DNS_DEFAULTS.foreignDns
   );
+  const [speedTestUrl, setSpeedTestUrl] = useState(config?.speedTestUrl || DEFAULT_SPEED_TEST_URL);
 
   // F26：config 异步到达 / 挂载期间被外部替换（托盘改配置、备份恢复、规则 CRUD 后 loadConfig）时，
   // 回填「未被用户改动」的字段；dirty 守卫（本地值 ≠ 上次种子）避免打断正在输入的用户。
@@ -73,6 +76,7 @@ export function NetworkSettings() {
     subInterval: string;
     domesticDns: string;
     foreignDns: string;
+    speedTestUrl: string;
   } | null>(null);
   useEffect(() => {
     if (!config) return;
@@ -84,6 +88,7 @@ export function NetworkSettings() {
       subInterval: config.subscriptionUpdateIntervalHours?.toString() || '12',
       domesticDns: config.dnsConfig?.domesticDns || DNS_DEFAULTS.domesticDns,
       foreignDns: config.dnsConfig?.foreignDns || DNS_DEFAULTS.foreignDns,
+      speedTestUrl: config.speedTestUrl || DEFAULT_SPEED_TEST_URL,
     };
     const prev = seededRef.current;
     setSocksPort((cur) => (prev && cur !== prev.socksPort ? cur : snap.socksPort));
@@ -95,6 +100,7 @@ export function NetworkSettings() {
     setSubInterval((cur) => (prev && cur !== prev.subInterval ? cur : snap.subInterval));
     setDomesticDns((cur) => (prev && cur !== prev.domesticDns ? cur : snap.domesticDns));
     setForeignDns((cur) => (prev && cur !== prev.foreignDns ? cur : snap.foreignDns));
+    setSpeedTestUrl((cur) => (prev && cur !== prev.speedTestUrl ? cur : snap.speedTestUrl));
     seededRef.current = snap;
   }, [
     config?.socksPort,
@@ -103,6 +109,7 @@ export function NetworkSettings() {
     config?.subscriptionUpdateIntervalHours,
     config?.dnsConfig?.domesticDns,
     config?.dnsConfig?.foreignDns,
+    config?.speedTestUrl,
   ]);
 
   if (!config) return null;
@@ -148,6 +155,21 @@ export function NetworkSettings() {
     const stored = config.dnsConfig?.[key] || DNS_DEFAULTS[key];
     if (next === stored) return; // 无变化不保存，避免无谓重启
     updateDns({ [key]: next });
+  };
+
+  // 测速端点 URL：提交时保存（onBlur，避免逐键触发）。空值→重置默认；非空须合法 http(s) URL（后端非法亦回落默认）。
+  const commitSpeedTestUrl = (raw: string) => {
+    const v = raw.trim();
+    if (v && !parseSpeedTestUrl(v)) {
+      toast.error(t('settings.network.speedTestUrlInvalid'));
+      setSpeedTestUrl(config.speedTestUrl || DEFAULT_SPEED_TEST_URL); // 回滚到已存值
+      return;
+    }
+    const next = v || DEFAULT_SPEED_TEST_URL; // 清空即重置默认
+    setSpeedTestUrl(next);
+    const stored = config.speedTestUrl || DEFAULT_SPEED_TEST_URL;
+    if (next === stored) return; // 无变化不保存
+    saveConfig({ ...config, speedTestUrl: next }).catch(() => toast.error(t('common.saveFailed')));
   };
 
   const handleSavePorts = async () => {
@@ -212,7 +234,7 @@ export function NetworkSettings() {
 
   return (
     <div className="space-y-6">
-      {isMac && <HelperManagementCard />}
+      {(isMac || isWin) && <HelperManagementCard />}
 
       {/* DNS */}
       <Card>
@@ -277,6 +299,18 @@ export function NetworkSettings() {
               </AlertDialogFooter>
             </AlertDialogContent>
           </AlertDialog>
+          <SettingsRow
+            label={t('settings.advanced.fakeIpFilter', 'fake-ip-filter 默认清单')}
+            description={t(
+              'settings.advanced.fakeIpFilterDesc',
+              'NTP / STUN / 连通性探测等域名走真实 DNS 解析、绕过 FakeIP（避免校时失败、系统误判断网 / 锁屏登录卡死）。建议开启。'
+            )}
+          >
+            <Switch
+              checked={config.fakeIpFilter !== false}
+              onCheckedChange={(c) => setBool('fakeIpFilter', c)}
+            />
+          </SettingsRow>
           <SettingsRow
             label={t('settings.advanced.nodeDomainResolver')}
             description={t('settings.advanced.nodeDomainResolverDesc')}
@@ -433,6 +467,29 @@ export function NetworkSettings() {
             <Switch
               checked={config.enableIPv6 === true}
               onCheckedChange={(c) => setBool('enableIPv6', c)}
+            />
+          </SettingsRow>
+        </CardContent>
+      </Card>
+
+      {/* 节点测速 */}
+      <Card>
+        <CardContent className="divide-y divide-border/60 pt-2">
+          <SettingsRow heading label={t('settings.network.speedTest')} />
+          <SettingsRow
+            label={t('settings.network.speedTestUrl')}
+            description={t('settings.network.speedTestUrlDesc')}
+            stacked
+          >
+            <Input
+              value={speedTestUrl}
+              onChange={(e) => setSpeedTestUrl(e.target.value)}
+              onBlur={() => commitSpeedTestUrl(speedTestUrl)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') e.currentTarget.blur();
+              }}
+              className="max-w-md font-mono text-sm"
+              placeholder={DEFAULT_SPEED_TEST_URL}
             />
           </SettingsRow>
         </CardContent>

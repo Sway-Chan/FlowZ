@@ -26,12 +26,15 @@ export class RuleResourceScheduler {
   private started = false;
   private isRunning = false;
   private backoff = new Map<string, { failures: number; nextEligibleAt: number }>();
+  /** 目录刷新「上次尝试」时刻：catalog 未成功远程拉取时 fetchedAt 恒 null，仅靠它会每 tick 重拉；
+   *  按本字段节流，失败也算一次尝试、间隔内不重试（避免离线/限流下每 30min 白打 GitHub）。 */
+  private lastCatalogRefreshAttempt = 0;
 
   private static readonly TICK_MS = 30 * 60_000;
   private static readonly STARTUP_DELAY_MS = 12_000; // 错开 SubscriptionScheduler 的 8s 启动高峰
   private static readonly BACKOFF_BASE_MS = 10 * 60_000;
   private static readonly BACKOFF_MAX_MS = 6 * 60 * 60_000;
-  private static readonly DEFAULT_INTERVAL_HOURS = 24;
+  private static readonly DEFAULT_INTERVAL_HOURS = 12;
 
   constructor(
     private readonly configManager: ConfigManager,
@@ -75,12 +78,28 @@ export class RuleResourceScheduler {
     this.isRunning = true;
     try {
       const config = await this.configManager.loadConfig();
-      if (!config.ruleResourceAutoUpdate) return; // 总开关未开
+      if (config.ruleResourceAutoUpdate === false) return; // 总开关默认开启；仅显式关闭才停（含老配置 undefined→开）
       const resources = config.ruleResources || [];
 
       const dir = getRuleResourcesPath();
       const now = Date.now();
       const intervalMs = this.intervalMs(config);
+
+      // 资源库目录(catalog)随自动更新一并刷新（绑定同一总开关；按间隔节流）。节流取「上次成功拉取(fetchedAt) 与
+      // 上次尝试 的较晚者」：fetchedAt 在未成功时恒 null，单看它会每 tick 重拉 → 用 lastCatalogRefreshAttempt 兜住失败重试。
+      // 失败静默（吞掉）——目录刷新失败不应影响 .srs 重下载主流程。
+      try {
+        const cat = await this.ruleResourceManager.getCatalog();
+        const lastCatalog = Math.max(cat.fetchedAt ?? 0, this.lastCatalogRefreshAttempt);
+        if (now - lastCatalog >= intervalMs) {
+          this.lastCatalogRefreshAttempt = now;
+          await this.ruleResourceManager.refreshCatalog();
+          this.logManager.addLog('info', `[${reason}] 资源库目录已刷新`, 'RuleResScheduler');
+        }
+      } catch (e) {
+        this.logManager.addLog('debug', `资源库目录刷新跳过: ${e}`, 'RuleResScheduler');
+      }
+
       const staleIds: string[] = [];
       for (const res of resources) {
         // 陈旧：从未记录 / 超间隔 / 磁盘文件缺失（备份恢复或手删后下一轮即自动补回）
