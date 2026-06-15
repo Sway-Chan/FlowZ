@@ -5,6 +5,7 @@
 
 import { BrowserWindow, Notification, shell } from 'electron';
 import { spawn, ChildProcess } from 'child_process';
+import { system32, powershellPath } from '../utils/win-system32';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import * as net from 'net';
@@ -404,20 +405,6 @@ const DOH_LEAK_DOMAIN_KEYWORDS = [
   'one.one.one.one',
 ];
 
-/**
- * 远程 rule_set 更新周期：显式设定，避免依赖 sing-box 隐式默认（geo 数据约日更，
- * 24h 在新鲜度与启动拉取频次间取平衡）。所有 type:'remote' 的 rule_set 共用此值。
- */
-const REMOTE_RULESET_UPDATE_INTERVAL = '24h';
-
-/**
- * 应用分流/自定义规则的远程 geo rule_set 源：MetaCubeX/meta-rules-dat 的 sing 分支，jsDelivr CDN 加速（墙内可用 +
- * download_detour='direct' 启动期直连下载）。与规则资源 catalog（MRD_RAW_BASE）同源、保持一致。
- * 历史 bug：旧源 SagerNet/sing-geoip 是**纯国家级** geoip，应用类 geoip（telegram/twitter/netflix 等）在该源不存在
- * → sing-box `initialize rule-set` 取回 404 → FATAL → 代理崩溃重试。MetaCubeX 含应用类 geoip+geosite（实测全 200）。
- */
-const MRD_GEO_JSDELIVR_BASE = 'https://fastly.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@sing/geo/';
-
 /** 主机字符串是否为 IPv4 字面量（与 DNS/route 生成各处保持同一判定，避免分类不一致）。 */
 const isIpv4Host = (host: string): boolean => /^(?:[0-9]{1,3}\.){3}[0-9]{1,3}$/.test(host);
 
@@ -493,7 +480,7 @@ export interface IProxyManager {
     event: 'started' | 'stopped' | 'error' | 'node-hot-switched',
     listener: (...args: any[]) => void
   ): void;
-  getCoreVersion(): Promise<string>;
+  getCoreVersion(force?: boolean): Promise<string>;
   buildPreflightConfigJson(targetVersion: string): string | null;
   closeConnection(id?: string): Promise<{ ok: boolean; status: number }>;
 }
@@ -726,8 +713,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // sing-box）。把「裸 spawn 撞 9090 占用 → retry 风暴」收敛为一次明确、可定位的失败。
     await this.resolveClashApiPortConflict();
 
-    // 0. 获取核心版本（用于后续生成兼容的配置文件）
-    this.coreVersion = await this.getCoreVersion();
+    // 0. 获取核心版本（用于后续生成兼容的配置文件）。force=true：内核可能已更新，启动时强制重检测刷新缓存。
+    this.coreVersion = await this.getCoreVersion(true);
     this.logToManager('info', `检测到 sing-box 核心版本: ${this.coreVersion}`);
 
     // 修复可能被 root 创建的文件权限（从 TUN 模式切换到系统代理模式时）
@@ -1392,13 +1379,18 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 两配置此键相等 ⇔ 生成的 sing-box 配置等价。供 canHotSwitch（判纯切节点）与 switchMode（判生成无关变更 → 免重启 no-op）共用。
    */
   private configGenerationNorm(c: UserConfig): string {
-    // 被启用 ruleSet 规则引用的本地资源 id 集（只有它们影响生成；未引用资源的增删不应阻断热切换）
+    // 用户路由（自定义规则 + 应用分流）仅 smart 模式影响生成（global=真·全局忽略用户分流、direct=全直连，均不 emit）。
+    // 非 smart 下其内容/增删/编辑/换节点都不改变 sing-box 配置 → 不应翻转 norm（否则运行中编辑规则误触重启断流）。
+    const userRoutingActive = (c.proxyMode || 'smart').toLowerCase() === 'smart';
+    // 被启用 ruleSet 规则引用的本地资源 id 集（只有它们影响生成；未引用资源的增删不应阻断热切换）。非 smart → 无引用。
     const ids = new Set<string>();
-    for (const r of c.customRules || []) {
-      if (!r.enabled) continue;
-      for (const cond of ruleConditions(r)) {
-        if (cond.type === 'ruleSet') {
-          for (const v of cond.values) if (v.startsWith('res:')) ids.add(v.slice(4));
+    if (userRoutingActive) {
+      for (const r of c.customRules || []) {
+        if (!r.enabled) continue;
+        for (const cond of ruleConditions(r)) {
+          if (cond.type === 'ruleSet') {
+            for (const v of cond.values) if (v.startsWith('res:')) ids.add(v.slice(4));
+          }
         }
       }
     }
@@ -1419,23 +1411,16 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       dnsConfig: c.dnsConfig ? { ...c.dnsConfig, fakeIpToggleMigrated: null } : c.dnsConfig,
       // 规则投影：禁用规则不进生成（generateCustomRules / DNS 侧均跳过 disabled）→ 内容/增删不触发重启；
       //   remarks 纯展示元数据，不影响生成。顺序保留（reorder 仍重启，语义正确）。
-      // L3：外化规则（非 direct、全 EXT 可表达）的「值」移出 norm（值变 ⇔ 文件 diff → 热重载、不重启）；
-      //   保留结构位（id/action/target/combineMode/bypassFakeIP/各 cond 的 type 与 ok=有无 matcher）。
-      //   direct 模式 / inline 规则 → 全量投影回退（值仍在 DNS/route inline 消费，值变须重启），与现状一致。
+      // 非 smart（global/direct）：用户路由不进生成 → 整体投影为 []（增删/编辑/换节点都不翻转 norm，免无谓重启）。
+      // smart：外化规则（全 EXT 可表达）的「值」移出 norm（值变 ⇔ 文件 diff → 热重载、不重启），保留结构位
+      //   （id/action/target/combineMode/bypassFakeIP/各 cond 的 type 与 ok=有无 matcher）；inline 规则保留全量值（值变须重启）。
       customRules: (() => {
-        const extProjection = (c.proxyMode || 'smart').toLowerCase() !== 'direct';
+        if (!userRoutingActive) return [];
         return (c.customRules || [])
           .filter((r) => r.enabled)
           .map((r) => {
-            if (!extProjection) {
-              // direct 模式：generateRuleSelectors 跳过（无 rule-sel），规则 outbound 直绑节点
-              // → targetServerId 在 route 消费、改值须重启 → 全量保留
-              const copy: Record<string, unknown> = { ...r };
-              delete copy.remarks;
-              return copy;
-            }
             if (planCustomRule(r).kind === 'inline') {
-              // 非 direct 的 inline 规则：rule-sel 恒存在（default=target 节点或 proxy-selector 跟全局）。
+              // smart inline 规则：rule-sel 恒存在（default=target 节点或 proxy-selector 跟全局）。
               // targetServerId 值变（换节点/节点↔默认）= rule-sel default 变（PUT 热切换）→ 移出 norm。
               // 其余值（域名/IP 等）仍在 inline route 消费、改值须重启 → 保留全量结构。
               const copy: Record<string, unknown> = { ...r };
@@ -1460,14 +1445,16 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
             };
           });
       })(),
-      // appRules 投影：targetServerId 移出 norm（rule-sel-app 恒存在，default=target 节点或 proxy-selector
-      //   跟全局，值变=PUT rule-sel-app default 热切换）；保留 appId/action/enabled 结构位（增删/换 action/换 appId 仍重启）。
-      appRules: (c.appRules || []).map((a) => ({
-        appId: a.appId,
-        action: a.action,
-        enabled: a.enabled,
-        targetServerId: null,
-      })),
+      // appRules 投影：仅 smart 生效。非 smart → []（增删/换 action 都不翻转 norm）。
+      //   smart：targetServerId 移出 norm（rule-sel-app 恒存在，值变=PUT 热切换）；保留 appId/action/enabled 结构位。
+      appRules: !userRoutingActive
+        ? []
+        : (c.appRules || []).map((a) => ({
+            appId: a.appId,
+            action: a.action,
+            enabled: a.enabled,
+            targetServerId: null,
+          })),
       ruleResources: (c.ruleResources || [])
         .filter((rr) => ids.has(rr.id))
         .map((rr) => rr.id)
@@ -1585,7 +1572,13 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   /**
    * 获取核心版本
    */
-  async getCoreVersion(): Promise<string> {
+  async getCoreVersion(force = false): Promise<string> {
+    // 缓存命中：启动时(startInternal :716)已检测并写入 this.coreVersion；此后 About 页/版本查询直接返回缓存，
+    // 不再每次都 spawn `sing-box version` 子进程（45MB 内核，Windows 进程创建+AV 扫描尤慢 → 进「关于」页转圈）。
+    // force=true 仅启动路径用（内核可能已更新 → 须重检测刷新缓存）。
+    if (!force && this.coreVersion && this.coreVersion !== 'unknown') {
+      return this.coreVersion;
+    }
     try {
       const { exec } = require('child_process');
       const util = require('util');
@@ -1594,16 +1587,18 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       const { stdout } = await execAsync(`"${this.singboxPath}" version`);
       // 输出示例: sing-box version 1.13.0 ... 或 v1.13.0 ...
       const match = stdout.match(/(?:version\s+|v)(\d+\.\d+(\.\d+)?)/i);
-      if (match) {
-        return match[1];
-      }
-
       // 备选方案：尝试直接取第一组连续的数字版本号
       const secondMatch = stdout.match(/(\d+\.\d+\.\d+)/);
-      return secondMatch ? secondMatch[1] : coreManifest.bundledCoreVersion;
+      const detected = match
+        ? match[1]
+        : secondMatch
+          ? secondMatch[1]
+          : coreManifest.bundledCoreVersion;
+      this.coreVersion = detected; // 写缓存：供后续查询命中 + config 生成 coreVersionAtLeast 复用
+      return detected;
     } catch (error) {
       this.logToManager('error', `获取核心版本失败: ${(error as any).message}`);
-      return coreManifest.bundledCoreVersion;
+      return coreManifest.bundledCoreVersion; // 不写 'unknown' 缓存，下次仍可重试
     }
   }
 
@@ -2329,13 +2324,15 @@ done
     // 处理自定义规则中的 bypassFakeIP（仅 domain / domainSuffix / domainKeyword 三类域名规则有效）。
     // 可外化规则（smart/global + 已落盘 <base>.dns.json）→ 引用其 <base>-dns rule_set，值不进 DNS 配置
     // （改值原子替换文件 → fswatch 热重载、零重启）；inline / direct 模式 / 文件缺失降级 → 仍按值提取合并（现状）。
-    if (config.customRules && enableFakeIp) {
+    // 用户路由仅 smart 生效（effectiveCustomRules）：global/direct 下 route 侧不 emit 自定义规则，其 bypassFakeIP DNS 也不应注入
+    const dnsCustomRules = this.effectiveCustomRules(config);
+    if (dnsCustomRules.length && enableFakeIp) {
       const bypassDomains: string[] = []; // type 'domain'
       const bypassSuffixes: string[] = []; // type 'domainSuffix'
       const bypassKeywords: string[] = []; // type 'domainKeyword'
       const dnsTags: string[] = [];
-      const externalize = proxyMode !== 'direct'; // direct 不外化（route 侧 generateCustomRules 不执行）
-      for (const rule of config.customRules) {
+      const externalize = proxyMode !== 'direct'; // direct 不外化（route 侧 generateCustomRules 不执行）；此处 dnsCustomRules 已 smart-only
+      for (const rule of dnsCustomRules) {
         if (!rule.enabled || !rule.bypassFakeIP) continue;
         if (externalize) {
           const plan = planCustomRule(rule);
@@ -2747,8 +2744,8 @@ done
       //   非 outbound 结构变（重启）。members 复用 proxy-selector 的可用 nodeTags（已排除 naive 缺库 / gate-invalid /
       //   detour 死引用剔除的节点）；目标无效/被 gate 剔除/无 target → default 落 proxy-selector 兜底
       //   （rule-sel 仍建、不 FATAL，与 fixRouteDeadReferences 兜底语义一致）。
-      // direct 模式不生成（generateCustomRules/effectiveAppRules 在 direct 不产出 proxy 规则 → 无消费者）。
-      if ((config.proxyMode || 'smart').toLowerCase() !== 'direct') {
+      // 仅 smart 生成：用户路由仅 smart 生效，global/direct 下 effectiveCustomRules/effectiveAppRules 为空 → 无 proxy 规则、无消费者。
+      if ((config.proxyMode || 'smart').toLowerCase() === 'smart') {
         this.generateRuleSelectors(config, idToTagMap, nodeTags, outbounds);
       }
     } else {
@@ -2963,7 +2960,7 @@ done
       });
     };
 
-    for (const rule of config.customRules || []) {
+    for (const rule of this.effectiveCustomRules(config)) {
       if (!rule.enabled) continue;
       if (rule.action !== 'proxy') continue;
       emit(`custom:${rule.id}`, `rule-sel-${rule.id}`, rule.targetServerId);
@@ -3391,14 +3388,24 @@ done
   }
 
   /**
-   * 应用分流总开关 gate：appRoutingEnabled !== true → 空（默认关；appRules 完全不进 route 生成/TUN 排除/geo 收集）；
-   * 仅显式 true 才启用。单一真值点，4 个消费点统一经此，保证关闭=appRules[] 逐字节等价。
+   * 用户路由规则 gate（单一真值）：自定义路由规则**仅 smart 模式生效**。
+   * global = 真·全局（一律走选中节点，忽略用户分流，仅保留功能性强制直连：防环 / LAN·私网 / 网银 U盾 / 节点排除）；
+   * direct = 全部直连。对齐业内（Clash/Surge/sing-box GUI）——全局模式即忽略所有用户分流规则。
+   * 消费点统一经此（route emit / 规则选择器 / geo 收集 / DNS bypassFakeIP），与 effectiveAppRules 对称。
+   */
+  private effectiveCustomRules(config: UserConfig): import('../../shared/types').Rule[] {
+    if ((config.proxyMode || 'smart').toLowerCase() !== 'smart') return [];
+    return config.customRules || [];
+  }
+
+  /**
+   * 应用分流总开关 gate：appRoutingEnabled !== true → 空（默认关）；非 smart 模式（global/direct）→ 空。
+   * 仅 smart + 显式启用才生效。单一真值点，4 个消费点（route 生成 / 规则选择器 / TUN 排除 / geo 收集）统一经此。
+   * global 忽略应用分流（真·全局走选中节点），与 effectiveCustomRules 对称。
    */
   private effectiveAppRules(config: UserConfig): import('../../shared/types').AppRule[] {
-    // direct 模式：appRules 不进 route 生成（与 generateCustomRules 的 `proxyMode !== 'direct'` 门控对称）；
-    // generateRuleSelectors 在 direct 跳过（无 rule-sel），此处返回 [] 避免 generateRouteConfig emit 死引用 outbound。
     if (config.appRoutingEnabled !== true) return [];
-    if ((config.proxyMode || 'smart').toLowerCase() === 'direct') return [];
+    if ((config.proxyMode || 'smart').toLowerCase() !== 'smart') return [];
     return config.appRules || [];
   }
 
@@ -3650,10 +3657,11 @@ done
     // 第一条 QUIC reject 规则已在上方（生成 routeConfig 之前）添加，此处重复添加会造成规则冗余
     // reject 比 block 更合适（发 TCP RST 让浏览器立即回退到 TCP，而不是静默丢弃造成等待超时）
 
-    // 3. 自定义规则（优先级次之，允许用户覆盖后续默认行为）
-    if (proxyMode !== 'direct') {
+    // 3. 自定义规则 + 应用分流（用户路由）——**仅 smart 模式**：global=真·全局忽略用户分流（一律走选中节点，
+    //    下方 smart geo 也不加、final=proxy），direct=全直连。功能性强制直连（防环/LAN/网银/节点排除）在本块之外、不受影响。
+    if (proxyMode === 'smart') {
       const { rules: customRules, ruleSets: customRuleSets } = this.generateCustomRules(
-        config.customRules || [],
+        this.effectiveCustomRules(config),
         config.customRuleSets || [],
         config.selectedServerId || undefined,
         idToTagMap,
@@ -3896,8 +3904,9 @@ done
       const runtimeDir = this.getRuleSetRuntimeDir();
       for (const rs of this.getLocalGeoRuleSets()) {
         const filePath = path.join(runtimeDir, rs.fileName);
-        // 缺失/损坏即跳过：不引用不存在的本地文件（否则 sing-box `initialize rule-set` FATAL）。被 app-rule 引用的
-        // app-geo 若本地缺失，其同 tag 远程 rule_set 不被去重剔除 → 自动回落远程下载（缺失即跳过 + 远程兜底）。
+        // 缺失/损坏即跳过：不引用不存在的本地文件（否则 sing-box `initialize rule-set` FATAL）。
+        // fail-closed：缺失不再远程兜底——引用该 tag 的路由规则由 generateRouteConfig 末尾「悬空引用剪枝」剪掉，
+        // 重新在「规则资源」页下载后定义恢复 → 规则自动恢复（应用分流仍按进程名生效）。
         if (!isValidSrsFile(filePath)) continue;
         routeConfig.rule_set.push({ tag: rs.tag, type: 'local', format: 'binary', path: filePath });
       }
@@ -3906,12 +3915,15 @@ done
     // 添加自定义规则和应用分流所需的 Geosite/GeoIP rule_set
     const { geosite: customGeositeCategories, geoip: customGeoipCategories } =
       this.getRequiredGeoCategories(
-        config.customRules || [],
+        this.effectiveCustomRules(config),
         this.effectiveAppRules(config),
         config.customAppPresets || []
       );
 
-    // direct 模式无任何规则引用这些 remote rule_set → 不注入，避免启动期白拉 fastly.jsdelivr
+    // fail-closed：自定义规则 / 应用分流引用的 geo（geosite-<cat>/geoip-<cat>）统一由「规则资源」管理——
+    // 随包内置（上方已注入本地定义）或用户在规则资源页下载的本地 .srs；运行期零远程下载、缺失绝不远程兜底。
+    // 缺失本地副本 → 不注入定义；末尾「悬空引用剪枝」剪掉引用该 tag 的规则（应用分流只掉 geo 半、进程名仍生效；
+    // 自定义规则按 AND/OR 合理坍缩）。重新在规则资源页下载后定义恢复 → 规则自动恢复（download 触发 core reload）。
     if (
       proxyMode !== 'direct' &&
       (customGeositeCategories.size > 0 || customGeoipCategories.size > 0)
@@ -3919,64 +3931,27 @@ done
       if (!routeConfig.rule_set) {
         routeConfig.rule_set = [];
       }
-
-      // 源 = MetaCubeX/meta-rules-dat@sing（见 MRD_GEO_JSDELIVR_BASE）：
-      // 1. jsDelivr CDN 加速，替代直连 raw.githubusercontent.com（在中国大陆常被封锁）。
-      // 2. download_detour='direct'：避免循环依赖（代理需规则集才能启动、规则集需代理才能下载）→ 启动期直连下载，
-      //    后续更新可走代理。
-      // 3. ⚠️ 已知约束：任一被引用的 .srs 在源上 404 → sing-box `initialize rule-set` **FATAL**（非"跳过"，旧注释判断有误）。
-      //    内置预设的 geosite/geoip 标签均已对 MetaCubeX 实测可达；用户自定义规则/预设引用的非常规分类仍可能 404 →
-      //    后续应加"生成期可达性预检 + 丢弃不可达 rule_set"硬化（独立项），杜绝单个坏标签崩整个代理。
-
-      // 联动「规则资源」：用户已在规则资源页下载的 geo（catalog id 形如 geosite-<cat>/geoip-<cat>）→ 优先用其本地副本，
-      // 避免 sing-box 重复远程下载、并让该规则集在规则资源页可见可管；缺失/损坏回落远程（行为同前）。
-      // 本地优先、且与上方随包内置同 tag 去重（末尾 keep-first）。
+      // 已下载进规则资源的本地副本（id 形如 geosite-<cat>/geoip-<cat>）→ 注入 type:'local'；缺失/损坏返回 null。
       const localResPath = (tag: string): string | null => {
         const r = (config.ruleResources || []).find((x) => x.id === tag);
         if (!r) return null;
         const p = path.join(getRuleResourcesPath(), r.fileName);
         return isValidSrsFile(p) ? p : null;
       };
-
-      // 添加 Geosite 规则集（本地优先，否则远程）
-      for (const category of Array.from(customGeositeCategories)) {
-        const tag = `geosite-${category}`;
+      // 已有本地定义（随包内置已在上方注入）→ 跳过；否则用规则资源页的本地副本；再否则缺失（不注入，末尾剪枝）。
+      const definedTags = new Set(routeConfig.rule_set.map((rs) => rs.tag));
+      const addLocalGeo = (tag: string): void => {
+        if (definedTags.has(tag)) return;
         const local = localResPath(tag);
         if (local) {
-          routeConfig.rule_set.push({ tag, type: 'local', format: 'binary', path: local });
-          continue;
+          routeConfig.rule_set!.push({ tag, type: 'local', format: 'binary', path: local });
+          definedTags.add(tag);
         }
-        // category-ai：MetaCubeX 用 category-ai-!cn（裸 category-ai 在该源不单独成 .srs）；其余 geo/geosite/<cat>.srs。
-        const geositeFile = category === 'category-ai' ? 'category-ai-!cn' : category;
-        routeConfig.rule_set.push({
-          tag,
-          type: 'remote',
-          format: 'binary',
-          url: `${MRD_GEO_JSDELIVR_BASE}geosite/${geositeFile}.srs`,
-          // 必须走直连下载，避免启动时循环依赖
-          download_detour: 'direct',
-          update_interval: REMOTE_RULESET_UPDATE_INTERVAL,
-        });
-      }
-
-      // 添加 GeoIP 规则集（本地优先，否则远程）
-      for (const category of Array.from(customGeoipCategories)) {
-        const tag = `geoip-${category}`;
-        const local = localResPath(tag);
-        if (local) {
-          routeConfig.rule_set.push({ tag, type: 'local', format: 'binary', path: local });
-          continue;
-        }
-        routeConfig.rule_set.push({
-          tag,
-          type: 'remote',
-          format: 'binary',
-          url: `${MRD_GEO_JSDELIVR_BASE}geoip/${category}.srs`,
-          // 必须走直连下载，避免启动时循环依赖
-          download_detour: 'direct',
-          update_interval: REMOTE_RULESET_UPDATE_INTERVAL,
-        });
-      }
+        // 缺失：不注入、不远程兜底 → 交末尾悬空引用剪枝（fail-closed）。
+      };
+      for (const category of Array.from(customGeositeCategories))
+        addLocalGeo(`geosite-${category}`);
+      for (const category of Array.from(customGeoipCategories)) addLocalGeo(`geoip-${category}`);
     }
 
     // 【代理向 QUIC 兜底】：放在所有直连/分流规则之后，拦截"会落到 final(代理)"的剩余 QUIC(udp443)。
@@ -3996,6 +3971,33 @@ done
         seenTags.add(rs.tag);
         return true;
       });
+    }
+
+    // fail-closed 兜底：剪掉引用「未定义 rule_set tag」的路由规则——本地 geo 缺失/损坏未注入定义即成悬空引用，
+    // 否则 sing-box `initialize rule-set` FATAL 崩整个代理。复用 applyRuleSetPrune 的三态递归剪枝（string/array/logical）：
+    // smart geo 缺失→该方向规则 skip；app 规则只掉 geo 半（进程名规则独立保留）；自定义规则 AND/OR 合理坍缩。
+    // 重下缺失资源后定义恢复 → 规则自动恢复（RuleResourceManager.download 触发 core reload）。
+    {
+      const definedTags = new Set((routeConfig.rule_set ?? []).map((rs) => rs.tag));
+      const referenced = new Set<string>();
+      const collectRefs = (rules: SingBoxRouteRule[]): void => {
+        for (const rule of rules) {
+          if (Array.isArray(rule.rules)) collectRefs(rule.rules);
+          const rs = rule.rule_set;
+          if (typeof rs === 'string') referenced.add(rs);
+          else if (Array.isArray(rs)) for (const t of rs) referenced.add(t);
+        }
+      };
+      collectRefs(routeConfig.rules);
+      const dangling = new Set(Array.from(referenced).filter((t) => !definedTags.has(t)));
+      if (dangling.size > 0) {
+        this.applyRuleSetPrune({ route: routeConfig } as SingBoxConfig, dangling);
+        this.logToManager(
+          'warn',
+          `规则资源：${Array.from(dangling).join(', ')} 缺少本地副本，已跳过引用它的规则以避免代理启动失败` +
+            `（在「规则资源」页下载后自动恢复；应用分流仍按进程名生效）`
+        );
+      }
     }
 
     return routeConfig;
@@ -4059,7 +4061,6 @@ done
   ): { rules: SingBoxRouteRule[]; ruleSets: SingBoxRuleSet[] } {
     const rules: SingBoxRouteRule[] = [];
     const ruleSets: SingBoxRuleSet[] = [];
-    let ruleSetIndex = 1;
 
     // 目的地 OR 组：这些 type 的字段在单条 default rule 内原生 OR（sing-box: domain||suffix||keyword||regex||ip_cidr）。
     const OR_GROUP = new Set(['domain', 'domainSuffix', 'domainKeyword', 'domainRegex', 'ipCidr']);
@@ -4134,10 +4135,12 @@ done
                   continue;
                 }
                 const filePath = path.join(getRuleResourcesPath(), res.fileName);
-                if (!require('fs').existsSync(filePath)) {
+                // 与 builtin 分支对齐：用 isValidSrsFile（验 SRS 魔数）而非裸 existsSync——
+                // 损坏/半写文件存在但非法时注入 local rule_set 会让 sing-box 加载 FATAL，须 fail-closed 跳过。
+                if (!isValidSrsFile(filePath)) {
                   this.logToManager(
                     'warn',
-                    `ruleSet 规则引用的资源文件缺失，已跳过: ${res.fileName}`
+                    `ruleSet 规则引用的资源文件缺失/损坏，已跳过: ${res.fileName}`
                   );
                   continue;
                 }
@@ -4147,15 +4150,13 @@ done
                 }
               }
             } else {
-              tag = `custom-ruleset-${ruleSetIndex++}`;
-              ruleSets.push({
-                tag,
-                type: 'remote',
-                format: v.toLowerCase().endsWith('.json') ? 'source' : 'binary',
-                url: v,
-                download_detour: selectedServerTag,
-                update_interval: REMOTE_RULESET_UPDATE_INTERVAL,
-              });
+              // fail-closed：远程 URL rule_set 能力已移除——所有 srs 统一由「规则资源」页管理（res:<id> 引用本地副本）。
+              // 旧配置 / 旁路写入的裸 URL 值 → 跳过（不再生成运行期远程下载），日志告知改用规则资源。
+              this.logToManager(
+                'warn',
+                `ruleSet 规则的远程 URL 已不再支持，请改用「规则资源」下载后引用，已跳过: ${v}`
+              );
+              continue;
             }
             seen.add(tag);
           }
@@ -4271,33 +4272,14 @@ done
       rules.push(finalRule);
     }
 
-    // 兼容旧的独立 customRuleSets（迁移后通常为空；保留作防御 + 顺带修原 format 硬编码 'binary' 致 .json 坏）
+    // fail-closed：legacy customRuleSets（迁移后通常为空，ConfigManager 已转成 customRules）原走运行期远程下载，
+    // 远程能力已移除 → 仅日志告知，不再生成 remote rule_set / 路由规则。
     for (const ruleSet of customRuleSets) {
       if (!ruleSet.enabled || !ruleSet.url) continue;
-
-      const tag = `custom-ruleset-${ruleSetIndex++}`;
-      ruleSets.push({
-        tag,
-        type: 'remote',
-        format: ruleSet.url.toLowerCase().endsWith('.json') ? 'source' : 'binary',
-        url: ruleSet.url,
-        download_detour: selectedServerTag,
-        update_interval: REMOTE_RULESET_UPDATE_INTERVAL,
-      });
-
-      const singboxRule: SingBoxRouteRule = {
-        action: 'route',
-        rule_set: [tag],
-      };
-      this.applyRuleAction(
-        singboxRule,
-        ruleSet.action,
-        undefined,
-        selectedServerId,
-        idToTagMap,
-        selectedServerTag
+      this.logToManager(
+        'warn',
+        `legacy 远程规则集已不再支持（请用「规则资源」），已跳过: ${ruleSet.url}`
       );
-      rules.push(singboxRule);
     }
 
     return { rules, ruleSets };
@@ -4347,8 +4329,9 @@ done
    * 写入 sing-box 配置文件
    */
   private async writeSingBoxConfig(config: SingBoxConfig): Promise<void> {
-    // 落盘前预检远程 geo rule_set 可达性，剔除确定不存在(404)的，避免 sing-box `initialize rule-set` FATAL 崩整个代理。
-    // 无 remote rule_set（默认 smart 模式 geo 走本地 bundled .srs）时零开销。
+    // 纵深防御（fail-closed 后通常为 no-op）：fail-closed 改造后 generateRouteConfig 已不生成任何 type:'remote'
+    // rule_set（所有 srs 统一本地、缺失剪悬空引用），故此处恒早退、零开销；保留作回滚锚点 + 防御任何未来/旁路
+    // 路径意外注入 remote 时仍预检 404 剔除，杜绝 sing-box `initialize rule-set` FATAL。
     await this.pruneUnreachableRemoteRuleSets(config);
     const content = JSON.stringify(config, null, 2);
     await fs.writeFile(this.configPath, content, 'utf-8');
@@ -4597,6 +4580,9 @@ done
   }
 
   /**
+   * 【fail-closed 后通常为 no-op】运行期已不生成 type:'remote' rule_set，此函数 remote.length===0 恒早退；
+   * 保留作纵深防御（防未来/旁路意外注入 remote）+ 回滚锚点。applyRuleSetPrune 仍被「悬空引用剪枝」复用。
+   *
    * 远程 geo rule_set 可达性预检 + 剪枝（防"资源不存在→sing-box initialize rule-set 404 FATAL→整个代理崩溃"）。
    * sing-box 对任一 remote rule_set 取回 404 会**整体 FATAL**（非跳过）。内置预设标签均已对 MetaCubeX 实测可达，
    * 但用户自定义规则/预设引用的非常规分类仍可能 404。此处对所有 type:'remote' 的 rule_set 做 HEAD 预检：
@@ -4662,9 +4648,17 @@ done
     const pruneRules = (rules: SingBoxRouteRule[]): SingBoxRouteRule[] =>
       rules.filter((rule) => {
         if (Array.isArray(rule.rules)) {
+          const before = rule.rules.length;
           rule.rules = pruneRules(rule.rules);
           // logical 规则子条件被剪空 → 整条丢（空 logical 无意义且 sing-box 不接受）
           if (rule.type === 'logical' && rule.rules.length === 0) return false;
+          // AND logical 任一子条件被剪掉 → 整条丢（fail-closed：缺失条件无法满足，留剩余子集会以「超集」匹配）。
+          // 关键：修「派生的嵌套 AND udp443 reject」——内层 geo logical 被剪空丢弃后，外层 AND 仅剩 {network,port}
+          // 否则坍缩成无差别全局 udp443 reject（误伤 Hysteria2/TUIC 握手与全局 QUIC）；与 generateCustomRules
+          // 的 AND fail-closed 语义一致（任一子条件丢→整条 skip）。OR / 无 mode 不受影响（少一候选项无害）。
+          if (rule.type === 'logical' && rule.mode === 'and' && rule.rules.length < before) {
+            return false;
+          }
         }
         const rs = rule.rule_set;
         if (typeof rs === 'string') {
@@ -4676,7 +4670,9 @@ done
         }
         return true;
       });
-    if (dropped.length > 0) {
+    // 以 unreachable.size 为闸（已 early-return size===0），不以 dropped.length——fail-closed 下复用此函数剪
+    // 「本地缺失、无 rule_set 定义」的悬空 tag 时 dropped 恒为 0，但仍须剪掉引用它的规则（否则悬空引用 FATAL）。
+    if (unreachable.size > 0) {
       singboxConfig.route.rules = pruneRules(singboxConfig.route.rules ?? []);
     }
     return dropped;
@@ -5422,7 +5418,7 @@ exit 0
             const psScript = [
               "$ErrorActionPreference = 'Stop'",
               'try {',
-              '  Start-Process -FilePath powershell.exe -Verb RunAs -WindowStyle Hidden ' +
+              `  Start-Process -FilePath '${powershellPath()}' -Verb RunAs -WindowStyle Hidden ` +
                 '-ArgumentList ' +
                 watchdogArgs,
               '  exit 0',
@@ -5434,7 +5430,7 @@ exit 0
               '}',
             ].join('; ');
 
-            command = 'powershell.exe';
+            command = powershellPath();
             args = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', psScript];
           }
           this.logToManager(
@@ -5967,12 +5963,12 @@ exit 0
       // RunAs taskkill 兜底：覆盖旧版直起（无看护）与看护异常两种情形，一次 UAC（与旧版语义一致）。
       // /FI "IMAGENAME eq sing-box.exe" 防 PID 复用误杀（值含空格→ -ArgumentList 元素须内嵌双引号；VM 实测通过）。
       const psScript =
-        "Start-Process -FilePath 'taskkill' -ArgumentList '/F','/PID','" +
+        `Start-Process -FilePath '${system32('taskkill.exe')}' -ArgumentList '/F','/PID','` +
         pidToKill.toString() +
         "','/FI','\"IMAGENAME eq sing-box.exe\"' -Verb RunAs -Wait -WindowStyle Hidden";
 
       const killProcess = spawn(
-        'powershell.exe',
+        powershellPath(),
         ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', psScript],
         {
           windowsHide: true,
@@ -6225,7 +6221,7 @@ exit 0
       if (process.platform === 'win32') {
         // Windows: 使用 tasklist 检测进程
         // /FI "PID eq xxx" 过滤指定 PID，/NH 不显示表头
-        const result = execSync(`tasklist /FI "PID eq ${pid}" /NH`, {
+        const result = execSync(`"${system32('tasklist.exe')}" /FI "PID eq ${pid}" /NH`, {
           encoding: 'utf-8',
           windowsHide: true,
           stdio: ['ignore', 'pipe', 'ignore'],

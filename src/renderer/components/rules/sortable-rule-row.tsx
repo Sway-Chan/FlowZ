@@ -16,10 +16,12 @@ import {
   ArrowUpToLine,
   ArrowDownToLine,
   GripVertical,
+  AlertTriangle,
 } from 'lucide-react';
 import type { Rule } from '@/bridge/types';
 import { ruleConditions } from '../../../shared/rules';
 import { TYPE_TO_CATEGORY, CATEGORY_BADGE_CLASS, RULE_TYPE_NAME } from './rule-type-meta';
+import { getRuleActionStyle } from '@/lib/rule-action-style';
 
 interface SortableRuleRowProps {
   rule: Rule;
@@ -33,6 +35,8 @@ interface SortableRuleRowProps {
   onMove: (index: number, dir: -1 | 1) => void;
   onMoveToEdge: (index: number, edge: 'top' | 'bottom') => void;
   renderExitNode: (rule: Rule) => ReactNode;
+  /** 该规则引用的规则资源本地缺失（已删除 / 文件丢失）→ 运行期被 fail-closed 跳过，列内标「资源缺失」角标。 */
+  hasMissingResource?: boolean;
 }
 
 /** 规则详情悬浮卡内容：多条件头(AND/OR) + 逐条件(类型 badge + 值) + 策略。备注列与类型列共用。 */
@@ -77,13 +81,7 @@ function RuleDetailContent({
         <span className="text-xs text-muted-foreground">{t('rules.policyLabel', '策略')}</span>
         <Badge
           variant="default"
-          className={`whitespace-nowrap ${
-            rule.action === 'direct'
-              ? 'border-transparent bg-green-600 text-white'
-              : rule.action === 'block'
-                ? 'border-transparent bg-red-600 text-white'
-                : ''
-          }`}
+          className={`whitespace-nowrap border-transparent text-white ${getRuleActionStyle(rule.action).badgeBg} ${getRuleActionStyle(rule.action).badgeBgHover}`}
         >
           {rule.action === 'proxy'
             ? t('rules.proxy')
@@ -114,6 +112,7 @@ export function SortableRuleRow({
   onMove,
   onMoveToEdge,
   renderExitNode,
+  hasMissingResource,
 }: SortableRuleRowProps) {
   const { t } = useTranslation();
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
@@ -158,24 +157,40 @@ export function SortableRuleRow({
       </TableCell>
       <TableCell>
         {/* 规则列：只显示备注名（悬浮展开完整规则）。遗留规则无备注 → 回退首值摘要（灰）。 */}
-        <HoverCard openDelay={120} closeDelay={80}>
-          <HoverCardTrigger asChild>
-            <button type="button" className="block max-w-[360px] cursor-default text-left">
-              {rule.remarks ? (
-                <span className="block truncate text-sm font-semibold text-foreground">
-                  {rule.remarks}
-                </span>
-              ) : (
-                <span className="block truncate font-mono text-sm text-muted-foreground">
-                  {rule.values.slice(0, 2).join(', ') || t('rules.unnamedRule', '未命名规则')}
-                </span>
+        <div className="flex items-center gap-1.5">
+          <HoverCard openDelay={120} closeDelay={80}>
+            <HoverCardTrigger asChild>
+              <button type="button" className="block max-w-[360px] cursor-default text-left">
+                {rule.remarks ? (
+                  <span className="block truncate text-sm font-semibold text-foreground">
+                    {rule.remarks}
+                  </span>
+                ) : (
+                  <span className="block truncate font-mono text-sm text-muted-foreground">
+                    {rule.values.slice(0, 2).join(', ') || t('rules.unnamedRule', '未命名规则')}
+                  </span>
+                )}
+              </button>
+            </HoverCardTrigger>
+            <HoverCardContent>
+              <RuleDetailContent rule={rule} t={t} renderExitNode={renderExitNode} />
+            </HoverCardContent>
+          </HoverCard>
+          {/* 资源缺失角标：引用的规则资源已删除/文件丢失 → 运行期被 fail-closed 跳过，需到「规则资源」页下载恢复。 */}
+          {hasMissingResource && (
+            <Badge
+              variant="outline"
+              className="shrink-0 gap-1 whitespace-nowrap border-transparent bg-destructive/15 text-xs text-destructive"
+              title={t(
+                'rules.resourceMissingTip',
+                '该规则引用的规则资源缺失（已删除或文件丢失），当前不生效；请到「规则资源」页下载恢复'
               )}
-            </button>
-          </HoverCardTrigger>
-          <HoverCardContent>
-            <RuleDetailContent rule={rule} t={t} renderExitNode={renderExitNode} />
-          </HoverCardContent>
-        </HoverCard>
+            >
+              <AlertTriangle className="h-3 w-3" />
+              {t('rules.resourceMissing', '资源缺失')}
+            </Badge>
+          )}
+        </div>
       </TableCell>
       <TableCell className="hidden lg:table-cell">
         {/* 类型列：首条件 badge + 多条件计数；悬浮看全部条件类型与值（与备注列共用卡片）。 */}
@@ -205,13 +220,7 @@ export function SortableRuleRow({
         <div className="flex flex-col items-start gap-1">
           <Badge
             variant="default"
-            className={`whitespace-nowrap ${
-              rule.action === 'direct'
-                ? 'border-transparent bg-green-600 text-white hover:bg-green-600/90'
-                : rule.action === 'block'
-                  ? 'border-transparent bg-red-600 text-white hover:bg-red-600/90'
-                  : ''
-            }`}
+            className={`whitespace-nowrap border-transparent text-white ${getRuleActionStyle(rule.action).badgeBg} ${getRuleActionStyle(rule.action).badgeBgHover}`}
           >
             {rule.action === 'proxy'
               ? t('rules.proxy')

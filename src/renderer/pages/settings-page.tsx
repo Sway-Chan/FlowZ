@@ -53,8 +53,9 @@ export function SettingsPage({ activeSection }: SettingsPageProps) {
   const meta = sectionTitles[activeSection] ?? sectionTitles.general;
 
   return (
-    // 限宽：避免设置项下拉框在超宽内容区横跨上千像素显得突兀（跨平台一致的阅读宽度）
-    <div className="space-y-6 max-w-3xl">
+    // 流式满宽：内容随窗口拖动自适应充满内容区（仅受全局 main 容器 max-w-[1400px] 约束），与规则/节点等其它页一致；
+    // 不再限 max-w-2xl(672)——固定窄列会在宽窗右侧留白（用户反馈：自适应充满比留白更美观）。
+    <div className="space-y-6">
       <div>
         <h2 className="text-2xl font-bold">{t(meta.titleKey, meta.defaultTitle)}</h2>
         <p className="text-muted-foreground mt-1">{t(meta.descKey, meta.defaultDesc)}</p>

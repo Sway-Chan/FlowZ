@@ -1,5 +1,7 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { useAppStore } from '@/store/app-store';
+import { api } from '@/ipc/api-client';
+import { availableResourceTagSet, missingResourceRuleIds } from '../../shared/rule-resource-refs';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -45,6 +47,8 @@ export function RulesPage() {
   const [orderDraft, setOrderDraft] = useState<string[] | null>(null);
   const [savingOrder, setSavingOrder] = useState(false);
   const [search, setSearch] = useState('');
+  // 本地可用规则资源 tag 集合（fileExists 为真者）：用于就地标注「引用了缺失资源」的规则。
+  const [availableResTags, setAvailableResTags] = useState<Set<string>>(() => new Set());
 
   const customRules = config?.customRules || [];
   const isOrderEditing = orderDraft !== null;
@@ -61,6 +65,30 @@ export function RulesPage() {
       toast.info(t('rules.orderConflict', '规则已在别处变更，已退出排序编辑'));
     }
   }, [customRules, orderDraft, t]);
+
+  // 规则资源可用性：挂载即拉一次，并随 config 变化（别处删除/恢复资源会改 config）重新计算，使「资源缺失」角标即时反映。
+  useEffect(() => {
+    let active = true;
+    api.ruleResources
+      .list()
+      .then((list) => {
+        if (active) setAvailableResTags(availableResourceTagSet(list));
+      })
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [config]);
+
+  // 用户路由仅「智能分流」模式生效（global=一律走选中节点、direct=全直连，自定义规则均不生效）。
+  const isSmartMode = (config?.proxyMode || 'smart').toLowerCase() === 'smart';
+
+  // 引用了缺失资源（已删除/文件丢失）的规则 id 集合：运行期被 fail-closed 跳过，列内标角标提示去「规则资源」页恢复。
+  // 仅 smart 模式标注——非 smart 下规则本就被模式忽略（已由顶部提示说明），再标「资源缺失·下载恢复」会误导（下载也不会让规则生效）。
+  const missingResRuleIds = useMemo(
+    () => (isSmartMode ? missingResourceRuleIds(customRules, availableResTags) : new Set<string>()),
+    [isSmartMode, customRules, availableResTags]
+  );
 
   const handleToggleRule = async (rule: Rule) => {
     try {
@@ -163,7 +191,7 @@ export function RulesPage() {
         return (
           <Badge
             variant="outline"
-            className="whitespace-nowrap border-transparent bg-red-600/15 text-xs text-red-600 dark:text-red-300"
+            className="whitespace-nowrap border-transparent bg-destructive/15 text-xs text-destructive"
             title={t('rules.targetMissingTip', '指定节点已删除，运行时回退为跟随全局选中节点')}
           >
             {t('rules.targetMissing', '节点已失效')}
@@ -195,6 +223,14 @@ export function RulesPage() {
         <div>
           <h2 className="text-2xl font-bold">{t('rules.customRules')}</h2>
           <p className="text-muted-foreground mt-1">{t('rules.customRulesDesc')}</p>
+          {!isSmartMode && (
+            <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
+              {t(
+                'rules.customRulesInactiveModeHint',
+                '当前分流模式下自定义路由规则不生效，仅「智能分流」模式生效。'
+              )}
+            </p>
+          )}
         </div>
         <Button onClick={() => setIsAddDialogOpen(true)} disabled={isOrderEditing}>
           <Plus className="mr-2 h-4 w-4" />
@@ -310,6 +346,7 @@ export function RulesPage() {
                         onMove={moveDraft}
                         onMoveToEdge={moveDraftToEdge}
                         renderExitNode={renderExitNode}
+                        hasMissingResource={missingResRuleIds.has(rule.id)}
                       />
                     ))}
                   </SortableContext>

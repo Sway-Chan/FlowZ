@@ -34,7 +34,9 @@ import {
   List,
   Image as ImageIcon,
   ChevronDown,
+  AlertTriangle,
 } from 'lucide-react';
+import { availableResourceTagSet, missingResourceAppIds } from '../../../shared/rule-resource-refs';
 import { toast } from 'sonner';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { useEffect } from 'react';
@@ -99,14 +101,22 @@ export function AppRulesCard() {
       .finally(() => setGeoCatalogLoading(false));
   }, [isAddDialogOpen, geoCatalog.length]);
 
-  // 每次打开对话框刷新「已下载/内置」列表（反映新下载），用于本地标注与添加时按需下载
+  // 「已下载/内置」列表：挂载即拉（卡片「规则集缺失」角标需要），打开对话框时刷新（反映新下载），随 config 变化重拉
+  // （别处删除/恢复资源会改 config）。用于本地标注、添加时按需下载、以及应用卡片缺失角标。
   useEffect(() => {
-    if (!isAddDialogOpen) return;
+    let active = true;
     api.ruleResources
       .list()
-      .then(setGeoLocalList)
-      .catch(() => setGeoLocalList([]));
-  }, [isAddDialogOpen]);
+      .then((list) => {
+        if (active) setGeoLocalList(list);
+      })
+      .catch(() => {
+        if (active) setGeoLocalList([]);
+      });
+    return () => {
+      active = false;
+    };
+  }, [isAddDialogOpen, config]);
 
   useEffect(() => {
     if (!showIconGallery || iconGalleries.length > 0) return;
@@ -161,11 +171,19 @@ export function AppRulesCard() {
   const geoipOptions = useMemo(() => geoCategoryOptions(geoCatalog, 'geoip'), [geoCatalog]);
   const localGeositeTags = useMemo(() => localGeoTagSet(geoLocalList, 'geosite'), [geoLocalList]);
   const localGeoipTags = useMemo(() => localGeoTagSet(geoLocalList, 'geoip'), [geoLocalList]);
+  // 本地可用规则资源 tag 集合（fileExists 为真者）：用于卡片「规则集缺失」角标判定。
+  const availableResTags = useMemo(() => availableResourceTagSet(geoLocalList), [geoLocalList]);
 
   if (!config) return null;
 
   const appRules: AppRule[] = config.appRules || [];
   const customPresets: CustomAppPreset[] = config.customAppPresets || [];
+  // 引用了缺失 geo（已删除/文件丢失）的应用 id 集合：geo 半暂不生效（进程名仍生效），卡片角标提示去「规则资源」页恢复。
+  // 仅「智能分流」模式标注——非 smart 下应用分流本就被模式忽略（由 app-policy 页顶部提示说明），再标缺失会误导。
+  const isSmartMode = (config.proxyMode || 'smart').toLowerCase() === 'smart';
+  const affectedAppIds = isSmartMode
+    ? missingResourceAppIds(appRules, availableResTags, customPresets)
+    : new Set<string>();
 
   // 合并预设列表进行渲染
   const allPresets: AppPreset[] = [
@@ -278,8 +296,9 @@ export function AppRulesCard() {
       return;
     }
 
-    // 联动规则资源：所选 geo 中尚未本地（内置/已下载）的分类 → 下载进规则资源 → 可见 + 路由生成复用本地副本
-    // （见 ProxyManager.localResPath）。fire-and-forget：失败也不影响添加，路由层会回落远程下载兜底。
+    // fail-closed 联动规则资源：所选 geo 中尚未本地（内置随包 / 已下载）的分类 → 下载进「规则资源」→ 可见可管 +
+    // 路由生成复用本地副本（见 ProxyManager.localResPath）。已无远程兜底——下载失败时该分类的 geo 半暂不生效
+    // （进程名仍生效），可在「规则资源」页重试后自动恢复；故失败须可感知（toast），不再静默吞掉。
     const toDownload = [
       ...newAppGeositeTags
         .filter((tg) => !localGeositeTags.has(tg))
@@ -289,12 +308,30 @@ export function AppRulesCard() {
         .map((tg) => ({ catalogId: `geoip-${tg}` })),
     ];
     if (toDownload.length > 0) {
-      void api.ruleResources.download(toDownload).catch(() => {});
       toast.info(
         t('rules.customApp.geoDownloading', '正在下载 {{n}} 个分类规则集到规则资源', {
           n: toDownload.length,
         })
       );
+      void api.ruleResources
+        .download(toDownload)
+        .then((results) => {
+          const fail = (results || []).filter((r) => !r.ok).length;
+          if (fail > 0) {
+            toast.warning(
+              t(
+                'rules.customApp.geoDownloadPartial',
+                '{{n}} 个分类下载失败，可在「规则资源」页重试（缺失时该分类不生效，进程名仍生效）',
+                { n: fail }
+              )
+            );
+          }
+        })
+        .catch(() => {
+          toast.error(
+            t('rules.customApp.geoDownloadFailed', '分类规则集下载失败，可在「规则资源」页重试')
+          );
+        });
     }
 
     setIsAddDialogOpen(false);
@@ -517,6 +554,19 @@ export function AppRulesCard() {
                     )}
                   </SelectContent>
                 </Select>
+
+                {/* 规则集缺失角标：该应用引用的 geo 已删除/文件丢失 → geo 半暂不生效（进程名仍生效），需到「规则资源」页恢复。 */}
+                {affectedAppIds.has(preset.id) && (
+                  <span
+                    className="absolute -top-1 -left-1 z-10 flex h-5 w-5 items-center justify-center rounded-full bg-destructive text-destructive-foreground shadow-sm"
+                    title={t(
+                      'rules.appGeoMissingTip',
+                      '该应用引用的分流规则集缺失（已删除或文件丢失），仅按进程名生效；请到「规则资源」页下载恢复'
+                    )}
+                  >
+                    <AlertTriangle className="h-3 w-3" />
+                  </span>
+                )}
 
                 {isCustom && (
                   <button

@@ -57,6 +57,28 @@ import { IPC_CHANNELS } from '../shared/ipc-channels';
 import { LOGIN_ITEMS_SETTINGS_URL } from '../shared/constants';
 import { effectiveLogLevel } from '../shared/log-level';
 
+// ── 启动计时探针（真机量化用，纯日志、零行为改动）─────────────────────────────
+// 从「本模块加载」到「窗口首次可见」的各阶段 ms，window-shown 时一行汇总到 app.log（[startup-timing]）。
+// whenReady→configLoaded→windowCreated = 主进程（A1/A2 优化空间）；windowCreated→readyToShow = 渲染端首屏。
+const STARTUP_T0 = Date.now();
+const startupMarks: Record<string, number> = {};
+let startupTimingLogged = false;
+function startupMark(label: string): void {
+  if (!startupTimingLogged && startupMarks[label] === undefined) {
+    startupMarks[label] = Date.now() - STARTUP_T0;
+  }
+}
+function logStartupTimingOnce(): void {
+  if (startupTimingLogged) return;
+  startupMark('shown');
+  startupTimingLogged = true;
+  logManager?.addLog(
+    'info',
+    `[startup-timing] ${JSON.stringify(startupMarks)}（ms，自模块加载起）`,
+    'Main'
+  );
+}
+
 // 初始化用户数据路径（必须在 app.requestSingleInstanceLock() 之前调用）
 // 以确保便携模式下，锁文件和所有 Electron 数据都重定向到正确的目录
 initUserDataPath();
@@ -589,8 +611,11 @@ async function createWindow(forceShow = false) {
     trayManager.setMainWindow(mainWindow);
   }
 
+  startupMark('windowCreated');
+
   // 窗口加载完成后显示
   mainWindow.once('ready-to-show', async () => {
+    startupMark('readyToShow');
     // 立即消费 pendingForceShow（早于任何 await，避免与并发 showWindow 竞态）：显式唤出在途 silent 启动时强制显示
     const wantShow = forceShow || pendingForceShow;
     pendingForceShow = false;
@@ -605,6 +630,7 @@ async function createWindow(forceShow = false) {
       if (wantShow || (!cfg.silentStart && !isHiddenArg && !isMacHidden)) {
         mainWindow?.show();
         logManager.addLog('info', 'Main window shown', 'Main');
+        logStartupTimingOnce();
       } else {
         logManager.addLog('info', 'Main window kept hidden (Silent Start)', 'Main');
         // 静默启动窗口从不显示 → 主动进入菜单栏-only，否则 Dock 图标空挂直到首次 show→hide（P1-2）
@@ -613,6 +639,7 @@ async function createWindow(forceShow = false) {
     } catch {
       // 如果配置加载失败，默认显示窗口
       mainWindow?.show();
+      logStartupTimingOnce();
     }
   });
 
@@ -830,6 +857,7 @@ async function updateTrayMenuState(isProxyRunning: boolean, hasError?: boolean):
 
 if (gotTheLock) {
   app.whenReady().then(async () => {
+    startupMark('whenReady');
     // 初始化服务
     configManager = new ConfigManager();
     protocolParser = new ProtocolParser();
@@ -900,6 +928,7 @@ if (gotTheLock) {
     // 加载配置并处理错误
     try {
       const config = await configManager.loadConfig();
+      startupMark('configLoaded');
       // 让 config.logLevel 对 LogManager 生效：原本 LogManager 恒留默认 'info'，config 设的 FATAL 形同虚设
       // （设置页改 logLevel 走 CONFIG_SAVE，从不经 IPC 调 setLogLevel；原 LOGS_SET_LEVEL IPC 链路已作为死代码移除）→ 设 FATAL 仍刷屏非 FATAL。
       // 经 effectiveLogLevel：隐私模式开时抬到 ≥warn，app.log 与 sing-box 一同收敛连接明细。
@@ -930,6 +959,12 @@ if (gotTheLock) {
     proxyManager.setPrivacyProvider(getPrivacyMode);
     coreUpdateService.setProxyManager(proxyManager);
     coreUpdateService.setConfigProvider(() => configManager.loadConfig());
+    // 后台预热内核版本缓存（getCoreVersion 写 this.coreVersion）：使「关于」页**首次**进入也命中缓存、
+    // 不再临时 spawn `sing-box version` 子进程导致加载转圈。
+    // 延后 ~5s 触发（C2）：spawn 50MB sing-box.exe 会再触发一次 AV 扫描，与 Windows portable 冷启动的自解压 + AV
+    // 扫描抢盘 I/O；延后避开冷启动高峰。fire-and-forget 不阻塞启动；延时内进「关于」则 IPC 走 on-demand
+    // getCoreVersion（同成本，非回归）；启动代理时(:716 force) 亦会刷新。
+    setTimeout(() => void proxyManager?.getCoreVersion().catch(() => {}), 5000);
     // 内核自动更新状态/成功提示经事件推渲染端（staged 待生效 / 跨带提示 / 落位成功复用 banner）
     coreUpdateService.setEventSender((channel, payload) =>
       ipcEventEmitter.sendToAll(channel, payload)
@@ -1206,8 +1241,8 @@ if (gotTheLock) {
     // 注册订阅处理器
     registerSubscriptionHandlers(subscriptionService, configManager);
 
-    // 注册备份与恢复处理器
-    registerBackupHandlers(configManager);
+    // 注册备份与恢复处理器（注入 ruleResourceManager：恢复后补缺失的规则资源 .srs）
+    registerBackupHandlers(configManager, ruleResourceManager);
 
     // 注册提权 helper 处理器（macOS 免提权启停）
     registerHelperHandlers(helperManager, proxyManager);
