@@ -365,16 +365,16 @@ export function ServerList({
 
   const getProtocolBadgeVariant = (protocol: string) => {
     const colors: Record<string, string> = {
-      vless: 'bg-blue-500/15 text-blue-600 border-blue-300/30',
-      trojan: 'bg-purple-500/15 text-purple-600 border-purple-300/30',
-      hysteria2: 'bg-orange-500/15 text-orange-600 border-orange-300/30',
-      shadowsocks: 'bg-green-500/15 text-green-600 border-green-300/30',
-      anytls: 'bg-teal-500/15 text-teal-600 border-teal-300/30',
-      tuic: 'bg-indigo-500/15 text-indigo-600 border-indigo-300/30',
-      naive: 'bg-rose-500/15 text-rose-600 border-rose-300/30',
-      socks: 'bg-slate-500/15 text-slate-600 border-slate-300/30',
-      http: 'bg-sky-500/15 text-sky-600 border-sky-300/30',
-      ssh: 'bg-amber-500/15 text-amber-600 border-amber-300/30',
+      vless: 'bg-badge-blue/15 text-badge-blue border-badge-blue/30',
+      trojan: 'bg-badge-purple/15 text-badge-purple border-badge-purple/30',
+      hysteria2: 'bg-badge-orange/15 text-badge-orange border-badge-orange/30',
+      shadowsocks: 'bg-badge-green/15 text-badge-green border-badge-green/30',
+      anytls: 'bg-badge-teal/15 text-badge-teal border-badge-teal/30',
+      tuic: 'bg-badge-indigo/15 text-badge-indigo border-badge-indigo/30',
+      naive: 'bg-badge-rose/15 text-badge-rose border-badge-rose/30',
+      socks: 'bg-badge-slate/15 text-badge-slate border-badge-slate/30',
+      http: 'bg-badge-sky/15 text-badge-sky border-badge-sky/30',
+      ssh: 'bg-badge-amber/15 text-badge-amber border-badge-amber/30',
     };
     return colors[protocol.toLowerCase()] || 'bg-muted text-muted-foreground';
   };
@@ -803,6 +803,7 @@ export function ServerList({
                   </div>
                   <div className="flex flex-wrap gap-1 mt-1">
                     <Badge
+                      variant="outline"
                       className={`text-xs h-4 px-1 border ${getProtocolBadgeVariant(server.protocol)}`}
                     >
                       {server.protocol.toUpperCase()}
@@ -815,7 +816,7 @@ export function ServerList({
                     {server.shadowTlsSettings && (
                       <Badge
                         variant="outline"
-                        className="text-xs h-4 px-1 text-teal-600 border-teal-300/50"
+                        className="text-xs h-4 px-1 text-badge-teal border-badge-teal/50"
                       >
                         +ST
                       </Badge>
@@ -916,6 +917,7 @@ export function ServerList({
                       {server.name}
                     </span>
                     <Badge
+                      variant="outline"
                       className={`text-[10px] h-4 px-1 flex-shrink-0 border ${getProtocolBadgeVariant(server.protocol)}`}
                     >
                       {server.protocol.toUpperCase()}
@@ -923,7 +925,7 @@ export function ServerList({
                     {server.shadowTlsSettings && (
                       <Badge
                         variant="outline"
-                        className="text-[10px] h-4 px-1 flex-shrink-0 text-teal-600 border-teal-300/50"
+                        className="text-[10px] h-4 px-1 flex-shrink-0 text-badge-teal border-badge-teal/50"
                       >
                         +ST
                       </Badge>

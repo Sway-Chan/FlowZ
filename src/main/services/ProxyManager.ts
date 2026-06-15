@@ -1630,10 +1630,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // root TIME_WAIT，用户态(systemProxy) sing-box 即使 SO_REUSEADDR 也压不过 → EADDRINUSE，持续 2MSL≈30s。
     // **TIME_WAIT 无进程可杀（lsof 抓不到），只能等它自然回收**，绝不能弹提权框（无意义且阻塞）。
     const probe = async (): Promise<{ bindBusy: boolean; listening: boolean }> => {
-      const [bindBusy, listening] = await Promise.all([
-        this.isPortBindBusy(PORT),
-        this.isPortListening(PORT),
-      ]);
+      // 串行（非 Promise.all）：isPortBindBusy 为测可绑定性会临时 listen 127.0.0.1:PORT；若与 isPortListening 并行，
+      // connect 探测会连上 bind 探测自己刚开的临时 listener → 空闲端口被误判 listening=true（Windows 真机实测 30/30
+      // 必中，致 9090 恒判 BUSY；Windows 无 helper/osascript 清理分支 → 锁死所有代理启动）。先让 bind 探测开/关
+      // listener 完全结束、再 connect → 杜绝自连（实测 0/30）。两探测无依赖、串行的额外延迟可忽略。
+      const bindBusy = await this.isPortBindBusy(PORT);
+      const listening = await this.isPortListening(PORT);
       return { bindBusy, listening };
     };
     let p = await probe();
@@ -2759,13 +2761,16 @@ done
         outbounds.splice(outbounds.indexOf(dead), 1);
         // 同步剔除所有 selector（proxy-selector + 各 rule-sel）的成员引用：rule-sel 的 members 与
         // proxy-selector 同源（generateRuleSelectors 复用 nodeTags 快照），节点被剔后须一并清理，否则
-        // rule-sel 引用幽灵 tag → sing-box 启动 FATAL。default 命中被剔 → 落剩余首个（兜底，不 FATAL）。
+        // rule-sel 引用幽灵 tag → sing-box 启动 FATAL。default 命中被剔 → rule-sel 回 proxy-selector、
+        // proxy-selector 落剩余首节点（MED-1，见 prunedSelectorDefault；不 FATAL）。
         const allSelectors = outbounds.filter(
           (o) => o.type === 'selector' && Array.isArray(o.outbounds)
         );
         for (const sel of allSelectors) {
           sel.outbounds = (sel.outbounds as string[]).filter((t) => t !== removedTag);
-          if (sel.default === removedTag) sel.default = (sel.outbounds as string[])[0];
+          if (sel.default === removedTag) {
+            sel.default = this.prunedSelectorDefault(sel.tag, sel.outbounds as string[]);
+          }
         }
         if (sid) {
           idToTagMap.delete(sid);
@@ -4373,7 +4378,7 @@ done
           throw new Error('没有可用的代理节点出站（全部节点未通过启动前配置校验）');
         }
         if (ob.default && toRemove.has(ob.default)) {
-          ob.default = ob.outbounds[0];
+          ob.default = this.prunedSelectorDefault(ob.tag, ob.outbounds);
         }
       }
     }
@@ -4398,6 +4403,17 @@ done
       }
       this.logToManager('warn', `启动前配置校验已剔除非法出站「${tag}」`);
     }
+  }
+
+  /**
+   * selector default 命中被剔节点时的回落（MED-1）：
+   * - rule-sel-*：回落 'proxy-selector'（跟全局，与 generateRuleSelectors「目标无效→proxy-selector」语义一致），
+   *   而非剩余首个**节点**——后者会令固定节点规则静默绑到「碰巧排第一的节点」、违背 anti-drift 设计意图。
+   * - proxy-selector / urltest 自身：仍落剩余首成员（首存活节点是正确兜底）。
+   * 注：rule-sel 的 outbounds 恒含 'proxy-selector'（generateRuleSelectors emit），故该回落目标必有效。
+   */
+  private prunedSelectorDefault(tag: string | undefined, remainingOutbounds: string[]): string {
+    return tag?.startsWith('rule-sel-') ? 'proxy-selector' : remainingOutbounds[0];
   }
 
   /**
@@ -5139,6 +5155,11 @@ exit 0
         this.singboxProcess = spawn(command, args, {
           stdio: ['ignore', 'pipe', 'pipe'],
           env: spawnEnv,
+          // Windows：隐藏子进程控制台窗口。GUI 进程（Electron 无控制台）spawn 控制台程序会新建并显示黑窗——
+          // TUN 模式下外层 powershell.exe（触发 UAC 的非提权壳）每次都会闪一个黑色 PS 控制台（与内层看护脚本的
+          // -WindowStyle Hidden 无关，那是 Start-Process 的子窗口）。systemProxy 直起 sing-box 同样隐藏其控制台
+          // （stdio 已 pipe，无功能影响）。macOS/Linux 忽略此项。
+          windowsHide: true,
         });
 
         // 记录启动信息

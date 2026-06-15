@@ -38,7 +38,9 @@ export function registerHelperHandlers(
   );
 
   // 完全卸载 FlowZ：清 helper + 受保护目录（root，弹一次密码框）+ 用户配置 + 应用本体（移废纸篓），然后退出。
-  registerIpcHandler<void, { ok: boolean; error?: string }>('app:uninstall-all', async () => {
+  registerIpcHandler<void, { ok: boolean; error?: string }>(
+    IPC_CHANNELS.APP_UNINSTALL_ALL,
+    async () => {
     try {
       // 停代理（在位 helper 零提权停核，避免卸载后裸弹 osascript）
       if (proxyManager.getStatus().running && proxyManager.isStartedViaHelper()) {

@@ -38,10 +38,10 @@ export const CATEGORY_ICON: Record<RuleCategory, typeof Globe> = {
 
 /** 分组 Badge 着色（域名蓝 / IP紫 / 进程橙 / 规则集青）。 */
 export const CATEGORY_BADGE_CLASS: Record<RuleCategory, string> = {
-  domain: 'border-transparent bg-blue-600/15 text-blue-700 dark:text-blue-300',
-  network: 'border-transparent bg-purple-600/15 text-purple-700 dark:text-purple-300',
-  process: 'border-transparent bg-orange-600/15 text-orange-700 dark:text-orange-300',
-  ruleset: 'border-transparent bg-cyan-600/15 text-cyan-700 dark:text-cyan-300',
+  domain: 'border-transparent bg-badge-blue/15 text-badge-blue',
+  network: 'border-transparent bg-badge-purple/15 text-badge-purple',
+  process: 'border-transparent bg-badge-orange/15 text-badge-orange',
+  ruleset: 'border-transparent bg-badge-cyan/15 text-badge-cyan',
 };
 
 /** 类型默认中文名（i18n key: rules.types.<type>.name）。 */
