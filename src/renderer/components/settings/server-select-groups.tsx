@@ -11,6 +11,8 @@ interface ServerSelectGroupsProps {
   servers: ServerConfig[];
   /** 排除某节点（用于 detour 选择器避免自指） */
   excludeId?: string;
+  /** 排除某些协议（小写）：如 detour 选择器排除 endpoint（WireGuard/Tailscale）——endpoint 不作前置代理目标 */
+  excludeProtocols?: readonly string[];
   /** option value 前缀（如应用分流用 'node-'），默认空 */
   valuePrefix?: string;
   /** SelectItem 透传类名（适配不同选择器字号） */
@@ -30,13 +32,18 @@ interface ServerSelectGroupsProps {
 export function ServerSelectGroups({
   servers,
   excludeId,
+  excludeProtocols,
   valuePrefix = '',
   itemClassName,
   selectedId,
 }: ServerSelectGroupsProps) {
   const { t } = useTranslation();
   const subscriptions = useAppStore((s) => s.config?.subscriptions || []);
-  const list = excludeId ? servers.filter((s) => s.id !== excludeId) : servers;
+  const list = servers.filter(
+    (s) =>
+      (!excludeId || s.id !== excludeId) &&
+      !(excludeProtocols && excludeProtocols.includes((s.protocol || '').toLowerCase()))
+  );
   const groups = groupServersBySubscription(list, subscriptions);
   const val = (id: string) => `${valuePrefix}${id}`;
 
@@ -74,7 +81,11 @@ export function ServerSelectGroups({
     <>
       {groups.map((g) => {
         const open = expanded.has(g.id);
-        const label = g.isManual ? t('servers.manualNodes', '自建节点') : g.name;
+        const label = g.isMesh
+          ? t('servers.meshNodes', '组网')
+          : g.isManual
+            ? t('servers.manualNodes', '自建节点')
+            : g.name;
         return (
           <SelectGroup key={g.id}>
             <div

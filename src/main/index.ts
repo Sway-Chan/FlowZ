@@ -5,7 +5,10 @@ import { ProtocolParser } from './services/ProtocolParser';
 import { LogManager } from './services/LogManager';
 import { TrayManager } from './services/TrayManager';
 import { ProxyManager } from './services/ProxyManager';
+import { DiagnosticService } from './services/DiagnosticService';
 import { createSystemProxyManager, SystemProxyBase } from './services/SystemProxyManager';
+import { createSystemDnsManager, SystemDnsBase } from './services/SystemDnsManager';
+import { localProxyPort } from '../shared/proxy-ports';
 import { resourceManager } from './services/ResourceManager';
 import { SubscriptionService } from './services/SubscriptionService';
 import { registerPrivacyHandlers } from './ipc/handlers/privacy-handlers';
@@ -26,6 +29,7 @@ import {
   registerCoreUpdateHandlers,
   setCoreUpdateService,
   registerBackupHandlers,
+  registerDiagnosticHandlers,
   registerHelperHandlers,
   registerIpInfoHandlers,
   registerSystemHandlers,
@@ -191,6 +195,7 @@ let protocolParser: ProtocolParser;
 let logManager: LogManager;
 let proxyManager: ProxyManager | null = null;
 let systemProxyManager: ReturnType<typeof createSystemProxyManager>;
+let systemDnsManager: ReturnType<typeof createSystemDnsManager>;
 let updateService: UpdateService;
 let coreUpdateService: CoreUpdateService;
 let subscriptionService: SubscriptionService;
@@ -812,6 +817,19 @@ async function runCleanup(): Promise<void> {
       console.warn('Failed to disable system proxy:', error);
     }
 
+    // 2.5 还原系统 DNS（marker 门控：仅还原 FlowZ 接管过的；非 TUN / 无接管无 marker → 不动）。
+    //     与系统代理同级：跨会话残留由启动期 marker 恢复兜，正常退出由此还原。
+    try {
+      if (systemDnsManager?.hasMarker()) {
+        logManager.addLog('info', 'Restoring system DNS...', 'Main');
+        await systemDnsManager.restoreDns();
+        logManager.addLog('info', 'System DNS restored', 'Main');
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      logManager.addLog('warn', `Failed to restore system DNS: ${errorMessage}`, 'Main');
+    }
+
     logManager.addLog('info', 'Resource cleanup completed', 'Main');
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error);
@@ -863,6 +881,7 @@ if (gotTheLock) {
     protocolParser = new ProtocolParser();
     logManager = new LogManager();
     systemProxyManager = createSystemProxyManager();
+    systemDnsManager = createSystemDnsManager();
     updateService = new UpdateService(logManager);
     coreUpdateService = new CoreUpdateService(logManager);
     subscriptionService = new SubscriptionService(protocolParser, logManager);
@@ -876,6 +895,7 @@ if (gotTheLock) {
     configManager.setLogManager(logManager);
     protocolParser.setLogManager(logManager);
     systemProxyManager.setLogManager(logManager);
+    systemDnsManager.setLogManager(logManager);
     resourceManager.setLogManager(logManager);
     // 记录应用启动日志
     logManager.addLog('info', 'Application started', 'Main');
@@ -913,6 +933,20 @@ if (gotTheLock) {
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       logManager.addLog('warn', `启动期系统代理 marker 恢复失败: ${errorMessage}`, 'Main');
+    }
+
+    // 启动期系统 DNS marker 恢复：上次会话崩溃/强杀导致 restoreDns 未执行时 marker 残留 → 把系统 DNS 还原为
+    // 接管前原始值（marker.original，[]→DHCP）。受控 IP 是真实可路由的 8.8.8.8，崩溃窗口内系统 DNS 仍能解析
+    // （只是少了 FakeIP），故此处还原非断网急救而是恢复用户原配置。常规路径仅一次同步 ENOENT 读（无 marker 即跳过）。
+    try {
+      if (SystemDnsBase.readMarker()) {
+        logManager.addLog('warn', '检测到上次会话残留的系统 DNS 接管，正在还原...', 'Main');
+        await systemDnsManager.restoreDns(); // 还原成功后内部 clearMarker
+        logManager.addLog('info', '残留系统 DNS 已还原', 'Main');
+      }
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      logManager.addLog('warn', `启动期系统 DNS marker 恢复失败: ${errorMessage}`, 'Main');
     }
 
     // macOS: 禁用 App Nap，防止系统认为应用"没有响应"
@@ -981,10 +1015,15 @@ if (gotTheLock) {
     proxyManager.setHelperGate(promptHelperGate);
     // 系统代理单一写者：注入同一 singleton（上方 756 创建），enable/clear 统一收口 ProxyManager.start()/终态。
     proxyManager.setSystemProxyManager(systemProxyManager);
+    // 系统 DNS 接管单一写者：注入同一 singleton，set（仅 TUN）/restore 统一收口 ProxyManager.start()/终态。
+    proxyManager.setSystemDnsManager(systemDnsManager);
 
-    // clash_api(9090) 专属客户端（T15：ProxyManager 与 StatsService 共用单一 keep-alive agent，消除两处 plumbing 重复）。
-    // secret 经 getter 回调读 currentConfig.clashApiSecret（reload 后自动读最新）。
-    const clashApiClient = new ClashApiClient(() => proxyManager?.getClashApiSecret() ?? '');
+    // clash_api 专属客户端（T15：ProxyManager 与 StatsService 共用单一 keep-alive agent，消除两处 plumbing 重复）。
+    // secret/port 均经 getter 回调读 currentConfig（reload 后自动读最新，改 controlPort 无需通知）。
+    const clashApiClient = new ClashApiClient(
+      () => proxyManager?.getClashApiSecret() ?? '',
+      () => proxyManager?.getClashApiPort() ?? 9090
+    );
     proxyManager.setClashApiClient(clashApiClient);
 
     // 平台提权服务（T16：纯函数/无状态方法 + killOrphans 链迁出 ProxyManager/CoreUpdateService，delegate 后调用点零改动）。
@@ -1152,7 +1191,7 @@ if (gotTheLock) {
         const running = proxyManager?.getStatus().running ?? false;
         const on = running && cfg.mainSessionViaProxy !== false;
         if (on) {
-          const proxyUrl = `http://127.0.0.1:${cfg.httpPort || 2080}`;
+          const proxyUrl = `http://127.0.0.1:${localProxyPort(cfg)}`;
           await session.defaultSession.setProxy({
             proxyRules: proxyUrl,
             // IPv6 字面量须加方括号才是合法 Chromium bypass 规则（loopback 本就隐式 bypass，[::1] 仅为显式）
@@ -1243,6 +1282,18 @@ if (gotTheLock) {
 
     // 注册备份与恢复处理器（注入 ruleResourceManager：恢复后补缺失的规则资源 .srs）
     registerBackupHandlers(configManager, ruleResourceManager);
+
+    // 注册诊断报告处理器（汇集环境/脱敏配置/日志 tail → 单 Markdown）。此处 proxyManager 已构造（非空）。
+    if (proxyManager) {
+      const diagnosticService = new DiagnosticService(
+        configManager,
+        logManager,
+        proxyManager,
+        systemProxyManager,
+        getPrivacyMode
+      );
+      registerDiagnosticHandlers(diagnosticService);
+    }
 
     // 注册提权 helper 处理器（macOS 免提权启停）
     registerHelperHandlers(helperManager, proxyManager);
@@ -1714,13 +1765,25 @@ function syncCleanupOnExit(): void {
   // marker 门控：仅当 marker 存在（FlowZ 设置过系统代理且尚未拆除）才同步强关，
   // 防每次退出无条件 stomp 用户自配/第三方系统代理（设计 通用-E）。
   // 正常退出链 cleanupResources→disableProxy 已删 marker → 此处自然跳过，不重复操作。
-  if (!SystemProxyBase.readMarker()) return;
-  try {
-    const { createSystemProxyManager } = require('./services/SystemProxyManager');
-    const sysProxy = createSystemProxyManager();
-    sysProxy.disableProxySync();
-  } catch {
-    /* ignore */
+  if (SystemProxyBase.readMarker()) {
+    try {
+      const { createSystemProxyManager } = require('./services/SystemProxyManager');
+      const sysProxy = createSystemProxyManager();
+      sysProxy.disableProxySync();
+    } catch {
+      /* ignore */
+    }
+  }
+  // 系统 DNS 同步还原（marker 门控）：仅 FlowZ 接管过的才还原；受控 IP 是真实 8.8.8.8，
+  // 即便此处漏还原也不断网（降级为真 DNS），下次启动 marker 恢复兜底。
+  if (SystemDnsBase.readMarker()) {
+    try {
+      const { createSystemDnsManager } = require('./services/SystemDnsManager');
+      const sysDns = createSystemDnsManager();
+      sysDns.restoreDnsSync();
+    } catch {
+      /* ignore */
+    }
   }
 }
 

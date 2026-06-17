@@ -26,6 +26,7 @@ import { AddressField, PortField } from './shared/basic-fields';
 import { TlsServerNameField, FingerprintField, AllowInsecureField } from './shared/tls-fields';
 import { RealityPublicKeyField, RealityShortIdField } from './shared/reality-fields';
 import { echSchemaShape, echDefaults, readEchDefault } from './shared/field-schemas';
+import { FormSection, FieldGrid, FieldSpan } from './shared/form-layout';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -112,6 +113,7 @@ export function AnyTlsForm({ serverConfig, onSubmit }: AnyTlsFormProps) {
         fingerprint: values.tlsFingerprint || 'chrome',
         allowInsecure: values.security === 'tls' ? values.tlsAllowInsecure : false,
         ech: values.ech ? true : undefined,
+        echConfig: values.echConfig?.trim() || undefined,
       },
     };
 
@@ -131,83 +133,95 @@ export function AnyTlsForm({ serverConfig, onSubmit }: AnyTlsFormProps) {
   return (
     <Form {...form}>
       <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
-        <AddressField control={form.control} t={t} />
-
-        <PortField control={form.control} t={t} placeholder="443" />
-
-        <FormField
-          control={form.control}
-          name="password"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('servers.password')}</FormLabel>
-              <FormControl>
-                <Input type="password" placeholder={t('servers.passwordPlaceholder')} {...field} />
-              </FormControl>
-              <FormMessage />
-            </FormItem>
+        <FormSection title={t('servers.basic', 'Basic')}>
+          <FieldGrid cols={2}>
+            <AddressField control={form.control} t={t} />
+            <PortField control={form.control} t={t} placeholder="443" />
+            <FieldSpan>
+              <FormField
+                control={form.control}
+                name="password"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('servers.password')}</FormLabel>
+                    <FormControl>
+                      <Input
+                        type="password"
+                        placeholder={t('servers.passwordPlaceholder')}
+                        {...field}
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </FieldSpan>
+            <FieldSpan>
+              <FormField
+                control={form.control}
+                name="security"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>{t('servers.securityType')}</FormLabel>
+                    <Select onValueChange={field.onChange} value={field.value}>
+                      <FormControl>
+                        <SelectTrigger>
+                          <SelectValue />
+                        </SelectTrigger>
+                      </FormControl>
+                      <SelectContent>
+                        <SelectItem value="tls">TLS</SelectItem>
+                        <SelectItem value="reality">Reality</SelectItem>
+                      </SelectContent>
+                    </Select>
+                    <FormDescription>{t('servers.securityTypeDesc')}</FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </FieldSpan>
+          </FieldGrid>
+          {/* Reality：security=reality 时 publicKey 为条件必填 → 放基础（不入折叠高级）。 */}
+          {isReality && (
+            <FieldGrid cols={2}>
+              <TlsServerNameField
+                control={form.control}
+                t={t}
+                labelKey="servers.realityTarget"
+                descKey="servers.realityTargetDesc"
+                placeholder="www.microsoft.com"
+              />
+              <FingerprintField control={form.control} t={t} />
+              <FieldSpan>
+                <RealityPublicKeyField control={form.control} t={t} />
+              </FieldSpan>
+              <FieldSpan>
+                <RealityShortIdField control={form.control} t={t} />
+              </FieldSpan>
+            </FieldGrid>
           )}
-        />
+        </FormSection>
 
-        <FormField
-          control={form.control}
-          name="security"
-          render={({ field }) => (
-            <FormItem>
-              <FormLabel>{t('servers.securityType')}</FormLabel>
-              <Select onValueChange={field.onChange} value={field.value}>
-                <FormControl>
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                </FormControl>
-                <SelectContent>
-                  <SelectItem value="tls">TLS</SelectItem>
-                  <SelectItem value="reality">Reality</SelectItem>
-                </SelectContent>
-              </Select>
-              <FormDescription>{t('servers.securityTypeDesc')}</FormDescription>
-              <FormMessage />
-            </FormItem>
-          )}
-        />
-
-        {/* TLS 配置 */}
+        {/* 高级仅 TLS 模式有可选项（SNI/指纹/insecure/ECH）；Reality 模式全为基础项，故无高级区。 */}
         {isTls && (
-          <>
-            <TlsServerNameField
-              control={form.control}
-              t={t}
-              labelKey="servers.sni"
-              descKey="servers.sniDesc"
-              optional
-            />
-
-            <FingerprintField control={form.control} t={t} />
-
-            <AllowInsecureField control={form.control} t={t} />
-
-            <EchField control={form.control} t={t} />
-          </>
-        )}
-
-        {/* Reality 配置 */}
-        {isReality && (
-          <>
-            <TlsServerNameField
-              control={form.control}
-              t={t}
-              labelKey="servers.realityTarget"
-              descKey="servers.realityTargetDesc"
-              placeholder="www.microsoft.com"
-            />
-
-            <RealityPublicKeyField control={form.control} t={t} />
-
-            <RealityShortIdField control={form.control} t={t} />
-
-            <FingerprintField control={form.control} t={t} />
-          </>
+          <FormSection title={t('servers.advanced', 'Advanced')} collapsible defaultOpen={false}>
+            <FieldGrid cols={2}>
+              <TlsServerNameField
+                control={form.control}
+                t={t}
+                labelKey="servers.sni"
+                descKey="servers.sniDesc"
+                optional
+              />
+              <FingerprintField control={form.control} t={t} />
+              <FieldSpan>
+                <AllowInsecureField control={form.control} t={t} />
+              </FieldSpan>
+              <FieldSpan>
+                <EchField control={form.control} t={t} />
+              </FieldSpan>
+            </FieldGrid>
+          </FormSection>
         )}
 
         <div className="flex gap-4">

@@ -20,13 +20,23 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
+import { Textarea } from '@/components/ui/textarea';
 import { useAppStore } from '@/store/app-store';
 import { parseDnsServerSpec } from '@shared/dns';
+import { controlApiPort } from '@shared/proxy-ports';
+import {
+  DEFAULT_SYSTEM_PROXY_BYPASS,
+  parseBypassList,
+  effectiveBypassList,
+} from '@shared/system-proxy-bypass';
 import { parseSpeedTestUrl, DEFAULT_SPEED_TEST_URL } from '@shared/speed-test';
 import { toast } from 'sonner';
 import { useTranslation } from 'react-i18next';
 import { SettingsRow } from './settings-row';
+import { SettingsCollapsible } from './settings-collapsible';
 import { HelperManagementCard } from './helper-management-card';
+import { ExternalControlSection } from './external-control-section';
+import { TerminalProxySection } from './terminal-proxy-section';
 
 const isMac = window.electron?.platform === 'darwin';
 const isWin = window.electron?.platform === 'win32';
@@ -46,15 +56,15 @@ export function NetworkSettings() {
   const saveConfig = useAppStore((state) => state.saveConfig);
   const { t } = useTranslation();
 
-  const [socksPort, setSocksPort] = useState(config?.socksPort?.toString() || '2081');
-  const [httpPort, setHttpPort] = useState(config?.httpPort?.toString() || '2080');
-  const [mixedPortEnabled, setMixedPortEnabled] = useState((config?.mixedPort ?? 0) > 0);
-  const [mixedPort, setMixedPort] = useState(
-    config?.mixedPort && config.mixedPort > 0 ? config.mixedPort.toString() : '7890'
+  // mixed-only：单一本地端口（同口 HTTP+SOCKS）。绑 mixedPort（旧配置回退 httpPort，新装默认 7890）。
+  const [localPort, setLocalPort] = useState(
+    (config?.mixedPort || config?.httpPort || 7890).toString()
   );
-  const [isLoading, setIsLoading] = useState(false);
+  // clash_api 外部控制端口（默认 9090，可改以解端口冲突死局）。失焦提交，外部变更时 resync。
+  const [controlPort, setControlPort] = useState(controlApiPort(config ?? {}).toString());
   // TUN 模式下 FakeIP ON→OFF 一次性风险确认弹窗开关（机场拒纯 IP 不可预判、无法客户端缓解）。
   const [fakeIpOffConfirmOpen, setFakeIpOffConfirmOpen] = useState(false);
+  // 绕过局域网 · 排除段（每行一个 CIDR）：onBlur 提交（避免逐键触发代理重启），外部变更时 resync。
   const [subInterval, setSubInterval] = useState(
     config?.subscriptionUpdateIntervalHours?.toString() || '12'
   );
@@ -65,51 +75,51 @@ export function NetworkSettings() {
     config?.dnsConfig?.foreignDns || DNS_DEFAULTS.foreignDns
   );
   const [speedTestUrl, setSpeedTestUrl] = useState(config?.speedTestUrl || DEFAULT_SPEED_TEST_URL);
+  // 系统代理「跳过代理」清单（逗号分隔文本编辑；缺省取业内默认清单）。
+  const [bypassText, setBypassText] = useState(
+    effectiveBypassList(config?.systemProxyBypass).join(', ')
+  );
 
   // F26：config 异步到达 / 挂载期间被外部替换（托盘改配置、备份恢复、规则 CRUD 后 loadConfig）时，
   // 回填「未被用户改动」的字段；dirty 守卫（本地值 ≠ 上次种子）避免打断正在输入的用户。
   const seededRef = useRef<{
-    socksPort: string;
-    httpPort: string;
-    mixedPortEnabled: boolean;
-    mixedPort: string;
+    localPort: string;
+    controlPort: string;
     subInterval: string;
     domesticDns: string;
     foreignDns: string;
     speedTestUrl: string;
+    bypassText: string;
   } | null>(null);
   useEffect(() => {
     if (!config) return;
     const snap = {
-      socksPort: config.socksPort?.toString() || '2081',
-      httpPort: config.httpPort?.toString() || '2080',
-      mixedPortEnabled: (config.mixedPort ?? 0) > 0,
-      mixedPort: config.mixedPort && config.mixedPort > 0 ? config.mixedPort.toString() : '7890',
+      localPort: (config.mixedPort || config.httpPort || 7890).toString(),
+      controlPort: controlApiPort(config).toString(),
       subInterval: config.subscriptionUpdateIntervalHours?.toString() || '12',
       domesticDns: config.dnsConfig?.domesticDns || DNS_DEFAULTS.domesticDns,
       foreignDns: config.dnsConfig?.foreignDns || DNS_DEFAULTS.foreignDns,
       speedTestUrl: config.speedTestUrl || DEFAULT_SPEED_TEST_URL,
+      bypassText: effectiveBypassList(config.systemProxyBypass).join(', '),
     };
     const prev = seededRef.current;
-    setSocksPort((cur) => (prev && cur !== prev.socksPort ? cur : snap.socksPort));
-    setHttpPort((cur) => (prev && cur !== prev.httpPort ? cur : snap.httpPort));
-    setMixedPortEnabled((cur) =>
-      prev && cur !== prev.mixedPortEnabled ? cur : snap.mixedPortEnabled
-    );
-    setMixedPort((cur) => (prev && cur !== prev.mixedPort ? cur : snap.mixedPort));
+    setLocalPort((cur) => (prev && cur !== prev.localPort ? cur : snap.localPort));
+    setControlPort((cur) => (prev && cur !== prev.controlPort ? cur : snap.controlPort));
     setSubInterval((cur) => (prev && cur !== prev.subInterval ? cur : snap.subInterval));
     setDomesticDns((cur) => (prev && cur !== prev.domesticDns ? cur : snap.domesticDns));
     setForeignDns((cur) => (prev && cur !== prev.foreignDns ? cur : snap.foreignDns));
     setSpeedTestUrl((cur) => (prev && cur !== prev.speedTestUrl ? cur : snap.speedTestUrl));
+    setBypassText((cur) => (prev && cur !== prev.bypassText ? cur : snap.bypassText));
     seededRef.current = snap;
   }, [
-    config?.socksPort,
-    config?.httpPort,
     config?.mixedPort,
+    config?.httpPort,
+    config?.controlPort,
     config?.subscriptionUpdateIntervalHours,
     config?.dnsConfig?.domesticDns,
     config?.dnsConfig?.foreignDns,
     config?.speedTestUrl,
+    config?.systemProxyBypass,
   ]);
 
   if (!config) return null;
@@ -117,6 +127,22 @@ export function NetworkSettings() {
   // 切换布尔配置项（整体回写，保留其余字段）
   const setBool = (key: keyof typeof config, value: boolean) =>
     saveConfig({ ...config, [key]: value }).catch(() => toast.error(t('common.saveFailed')));
+
+  // 系统代理「跳过代理」清单：失焦提交（解析逗号分隔→去重→存 config.systemProxyBypass）。
+  const commitBypass = () => {
+    const parsed = parseBypassList(bypassText);
+    setBypassText(parsed.join(', '));
+    saveConfig({ ...config, systemProxyBypass: parsed }).catch(() =>
+      toast.error(t('common.saveFailed'))
+    );
+  };
+  const resetBypass = () => {
+    const def = [...DEFAULT_SYSTEM_PROXY_BYPASS];
+    setBypassText(def.join(', '));
+    saveConfig({ ...config, systemProxyBypass: def }).catch(() =>
+      toast.error(t('common.saveFailed'))
+    );
+  };
 
   const updateDns = (patch: Partial<NonNullable<typeof config.dnsConfig>>) => {
     const updated = { ...config };
@@ -172,47 +198,51 @@ export function NetworkSettings() {
     saveConfig({ ...config, speedTestUrl: next }).catch(() => toast.error(t('common.saveFailed')));
   };
 
-  const handleSavePorts = async () => {
-    const socksPortNum = parseInt(socksPort, 10);
-    const httpPortNum = parseInt(httpPort, 10);
-    if (isNaN(socksPortNum) || socksPortNum < 1024 || socksPortNum > 65535) {
-      toast.error(t('settings.advanced.socksPortRange'));
+  // 本地端口：失焦即生效（mixed-only 单口 HTTP+SOCKS，只写 mixedPort）。范围/冲突给提示并回滚，不需保存按钮。
+  const commitLocalPort = () => {
+    const portNum = parseInt(localPort, 10);
+    const cur = config.mixedPort || config.httpPort || 7890;
+    const revert = () => setLocalPort(cur.toString());
+    if (isNaN(portNum) || portNum < 1024 || portNum > 65535) {
+      toast.error(t('settings.advanced.localPortRange', '端口须为 1024-65535'));
+      revert();
       return;
     }
-    if (isNaN(httpPortNum) || httpPortNum < 1024 || httpPortNum > 65535) {
-      toast.error(t('settings.advanced.httpPortRange'));
+    if (portNum === controlApiPort(config)) {
+      // 撞控制端口（clash_api）→ sing-box 两 inbound 同口必 FATAL。两者皆可改，提示改其一并回滚。
+      toast.error(
+        t('settings.advanced.portClashWithControl', '本地端口不能与控制端口相同，请改其中之一')
+      );
+      revert();
       return;
     }
-    if (socksPortNum === httpPortNum) {
-      toast.error(t('settings.advanced.portsSame'));
+    if (portNum === cur) return; // 无变化
+    setLocalPort(portNum.toString());
+    saveConfig({ ...config, mixedPort: portNum }).catch(() => toast.error(t('common.saveFailed')));
+  };
+
+  // 控制端口（clash_api external_controller）：失焦即生效。范围/与本地端口冲突给提示并回滚。
+  const commitControlPort = () => {
+    const portNum = parseInt(controlPort, 10);
+    const cur = controlApiPort(config);
+    const revert = () => setControlPort(cur.toString());
+    if (isNaN(portNum) || portNum < 1024 || portNum > 65535) {
+      toast.error(t('settings.advanced.localPortRange', '端口须为 1024-65535'));
+      revert();
       return;
     }
-    let mixedPortNum: number | undefined = undefined;
-    if (mixedPortEnabled) {
-      mixedPortNum = parseInt(mixedPort, 10);
-      if (isNaN(mixedPortNum) || mixedPortNum < 1024 || mixedPortNum > 65535) {
-        toast.error(t('settings.advanced.mixedPortRange'));
-        return;
-      }
-      if (mixedPortNum === socksPortNum || mixedPortNum === httpPortNum) {
-        toast.error(t('settings.advanced.mixedPortConflict'));
-        return;
-      }
+    if (portNum === (config.mixedPort || config.httpPort || 7890)) {
+      toast.error(
+        t('settings.advanced.portClashWithControl', '本地端口不能与控制端口相同，请改其中之一')
+      );
+      revert();
+      return;
     }
-    setIsLoading(true);
-    try {
-      await saveConfig({
-        ...config,
-        socksPort: socksPortNum,
-        httpPort: httpPortNum,
-        mixedPort: mixedPortEnabled ? mixedPortNum : 0,
-      });
-      toast.success(t('settings.advanced.portsSaved'));
-    } catch {
-      toast.error(t('settings.advanced.portsSaveFail'));
-    } finally {
-      setIsLoading(false);
-    }
+    if (portNum === cur) return; // 无变化
+    setControlPort(portNum.toString());
+    saveConfig({ ...config, controlPort: portNum }).catch(() =>
+      toast.error(t('common.saveFailed'))
+    );
   };
 
   const numInput = (
@@ -299,108 +329,88 @@ export function NetworkSettings() {
               </AlertDialogFooter>
             </AlertDialogContent>
           </AlertDialog>
-          <SettingsRow
-            label={t('settings.advanced.fakeIpFilter', 'fake-ip-filter 默认清单')}
-            description={t(
-              'settings.advanced.fakeIpFilterDesc',
-              'NTP / STUN / 连通性探测等域名走真实 DNS 解析、绕过 FakeIP（避免校时失败、系统误判断网 / 锁屏登录卡死）。建议开启。'
-            )}
-          >
-            <Switch
-              checked={config.fakeIpFilter !== false}
-              onCheckedChange={(c) => setBool('fakeIpFilter', c)}
-            />
-          </SettingsRow>
-          <SettingsRow
-            label={t('settings.advanced.nodeDomainResolver')}
-            description={t('settings.advanced.nodeDomainResolverDesc')}
-          >
-            <Select
-              value={config.dnsConfig?.nodeDomainResolver ?? 'auto'}
-              onValueChange={(v) =>
-                updateDns({
-                  nodeDomainResolver: v as NonNullable<
-                    typeof config.dnsConfig
-                  >['nodeDomainResolver'],
-                })
-              }
-            >
-              <SelectTrigger className="h-8 w-[160px]">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="auto">{t('settings.advanced.nodeResolverAuto')}</SelectItem>
-                <SelectItem value="dnspod">{t('settings.advanced.nodeResolverDnspod')}</SelectItem>
-                <SelectItem value="system">
-                  {t('settings.advanced.nodeResolverSystem')}
-                  {isLinux && config.proxyModeType === 'tun'
-                    ? ` (${t('settings.advanced.nodeResolverExperimental')})`
-                    : ''}
-                </SelectItem>
-              </SelectContent>
-            </Select>
-          </SettingsRow>
-          <SettingsRow
-            label={t('settings.advanced.mainSessionViaProxy', '更新检查走代理')}
-            description={t(
-              'settings.advanced.mainSessionViaProxyDesc',
-              '开启后，应用/内核更新检查与规则资源下载在代理运行时经代理（更新源多在 GitHub）；关闭则直连/走系统代理。注：TUN 模式下因系统层捕获，关闭不能完全直连。'
-            )}
-          >
-            <Switch
-              checked={config.mainSessionViaProxy !== false}
-              onCheckedChange={(checked) =>
-                saveConfig({ ...config, mainSessionViaProxy: checked }).catch(() =>
-                  toast.error(t('common.saveFailed'))
-                )
-              }
-            />
-          </SettingsRow>
-        </CardContent>
-      </Card>
-
-      {/* 端口 */}
-      <Card>
-        <CardContent className="divide-y divide-border/60 pt-2">
-          <SettingsRow heading label={t('settings.advanced.portSettings')} />
-          <SettingsRow
-            label={t('settings.advanced.socksPort')}
-            description={`${t('settings.advanced.default')}: 2081`}
-          >
-            {numInput(socksPort, setSocksPort)}
-          </SettingsRow>
-          <SettingsRow
-            label={t('settings.advanced.httpPort')}
-            description={`${t('settings.advanced.default')}: 2080`}
-          >
-            {numInput(httpPort, setHttpPort)}
-          </SettingsRow>
-          <SettingsRow
-            label={t('settings.advanced.mixedPort')}
-            description={t('settings.advanced.mixedPortDesc')}
-          >
-            <Switch checked={mixedPortEnabled} onCheckedChange={setMixedPortEnabled} />
-          </SettingsRow>
-          {mixedPortEnabled && (
+          <SettingsCollapsible label={t('settings.network.advancedDns', '高级 DNS')} defaultOpen>
             <SettingsRow
-              label={t('settings.advanced.mixedPortValue')}
-              description={`${t('settings.advanced.default')}: 7890`}
+              label={t('settings.advanced.fakeIpFilter', 'fake-ip-filter 默认清单')}
+              description={t(
+                'settings.advanced.fakeIpFilterDesc',
+                'NTP / STUN / 连通性探测等域名走真实 DNS 解析、绕过 FakeIP（避免校时失败、系统误判断网 / 锁屏登录卡死）。建议开启。'
+              )}
             >
-              {numInput(mixedPort, setMixedPort)}
+              <Switch
+                checked={config.fakeIpFilter !== false}
+                onCheckedChange={(c) => setBool('fakeIpFilter', c)}
+              />
             </SettingsRow>
-          )}
-          <div className="pt-3">
-            <Button onClick={handleSavePorts} disabled={isLoading}>
-              {isLoading ? t('settings.advanced.saving') : t('settings.advanced.savePortSettings')}
-            </Button>
-          </div>
+            <SettingsRow
+              label={t('settings.advanced.nodeDomainResolver')}
+              description={t('settings.advanced.nodeDomainResolverDesc')}
+            >
+              <Select
+                value={config.dnsConfig?.nodeDomainResolver ?? 'auto'}
+                onValueChange={(v) =>
+                  updateDns({
+                    nodeDomainResolver: v as NonNullable<
+                      typeof config.dnsConfig
+                    >['nodeDomainResolver'],
+                  })
+                }
+              >
+                <SelectTrigger className="h-8 w-[160px]">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="auto">{t('settings.advanced.nodeResolverAuto')}</SelectItem>
+                  <SelectItem value="dnspod">
+                    {t('settings.advanced.nodeResolverDnspod')}
+                  </SelectItem>
+                  <SelectItem value="system">
+                    {t('settings.advanced.nodeResolverSystem')}
+                    {isLinux && config.proxyModeType === 'tun'
+                      ? ` (${t('settings.advanced.nodeResolverExperimental')})`
+                      : ''}
+                  </SelectItem>
+                </SelectContent>
+              </Select>
+            </SettingsRow>
+            <SettingsRow
+              label={t('settings.advanced.takeoverSystemDns', 'TUN 接管系统 DNS')}
+              description={t(
+                'settings.advanced.takeoverSystemDnsDesc',
+                'TUN 模式下把系统 DNS 临时改为 8.8.8.8，让需代理的域名经隧道正确解析（停止/退出自动还原）。关闭后改用你原本的 DNS，内网域名解析更友好，但部分需代理域名可能解析异常。建议保持开启。'
+              )}
+            >
+              <Switch
+                checked={config.dnsConfig?.takeoverSystemDns !== false}
+                onCheckedChange={(c) => updateDns({ takeoverSystemDns: c })}
+              />
+            </SettingsRow>
+          </SettingsCollapsible>
         </CardContent>
       </Card>
 
-      {/* 连接（原「局域网设置」杂烩去杂、归位） */}
+      {/* 本地代理 / 局域网（端口 + LAN 共享 + 系统代理 bypass 同主题归并） */}
       <Card>
         <CardContent className="divide-y divide-border/60 pt-2">
-          <SettingsRow heading label={t('settings.network.connection')} />
+          <SettingsRow heading label={t('settings.advanced.localProxyLan', '本地代理 / 局域网')} />
+          <SettingsRow
+            label={t('settings.advanced.localPort', '本地端口')}
+            description={t(
+              'settings.advanced.localPortDesc',
+              '本地代理端口（同口支持 HTTP 与 SOCKS5）。新装默认 7890；系统代理与终端代理均用此端口。'
+            )}
+          >
+            {numInput(localPort, setLocalPort, 'w-[120px]', commitLocalPort)}
+          </SettingsRow>
+          <SettingsRow
+            label={t('settings.advanced.controlPort', '控制端口')}
+            description={t(
+              'settings.advanced.controlPortDesc',
+              '外部控制端口（clash API，供面板/脚本对接）。默认 9090；被其它应用占用导致代理无法启动时，改此端口即可。'
+            )}
+          >
+            {numInput(controlPort, setControlPort, 'w-[120px]', commitControlPort)}
+          </SettingsRow>
           <SettingsRow
             label={t('settings.advanced.allowLan')}
             description={t('settings.advanced.allowLanDesc')}
@@ -425,32 +435,42 @@ export function NetworkSettings() {
             />
           </SettingsRow>
           <SettingsRow
-            label={t('settings.advanced.blockQuic')}
-            description={t('settings.advanced.blockQuicDesc')}
+            stacked
+            label={t('settings.advanced.systemProxyBypass', '跳过代理（系统代理）')}
+            description={t(
+              'settings.advanced.systemProxyBypassDesc',
+              '仅系统代理模式生效：这些地址/域名直连、不走代理（逗号分隔，支持 CIDR 与域名）。TUN 模式直连由路由规则负责。'
+            )}
           >
-            <Switch
-              checked={config.blockQuic === true}
-              onCheckedChange={(c) => setBool('blockQuic', c)}
+            <Textarea
+              value={bypassText}
+              onChange={(e) => setBypassText(e.target.value)}
+              onBlur={commitBypass}
+              rows={6}
+              spellCheck={false}
+              className="w-full font-mono text-xs"
             />
+            <div className="flex justify-end">
+              <Button size="sm" onClick={resetBypass}>
+                {t('settings.advanced.systemProxyBypassReset', '恢复默认')}
+              </Button>
+            </div>
           </SettingsRow>
-          <SettingsRow
-            label={t('settings.advanced.interruptOnSwitch')}
-            description={t('settings.advanced.interruptOnSwitchDesc')}
-          >
-            <Switch
-              checked={config.interruptConnectionsOnSwitch === true}
-              onCheckedChange={(c) => setBool('interruptConnectionsOnSwitch', c)}
-            />
-          </SettingsRow>
-          <SettingsRow
-            label={t('settings.advanced.tlsFragment')}
-            description={t('settings.advanced.tlsFragmentDesc')}
-          >
-            <Switch
-              checked={config.tlsFragment === true}
-              onCheckedChange={(c) => setBool('tlsFragment', c)}
-            />
-          </SettingsRow>
+        </CardContent>
+      </Card>
+
+      {/* 外部控制 / clash API（从「高级」节迁入，与控制端口同节就近，M2） */}
+      <Card>
+        <CardContent className="divide-y divide-border/60 pt-2">
+          <ExternalControlSection />
+        </CardContent>
+      </Card>
+
+      {/* 连接 / 流量（QUIC/TLS/IPv6 流量治理 + 切换/换节点/更新路由 行为） */}
+      <Card>
+        <CardContent className="divide-y divide-border/60 pt-2">
+          <SettingsRow heading label={t('settings.network.connection')} />
+          {/* 高频项常驻；低频流量治理折叠（C4/H3） */}
           <SettingsRow
             label={t('settings.advanced.autoSwitchNode')}
             description={t('settings.advanced.autoSwitchNodeDesc')}
@@ -460,45 +480,75 @@ export function NetworkSettings() {
               onCheckedChange={(c) => setBool('autoSwitchNode', c)}
             />
           </SettingsRow>
-          <SettingsRow
-            label={<span className="text-warning">{t('settings.general.enableIPv6')}</span>}
-            description={t('settings.network.enableIPv6Desc')}
+          <SettingsCollapsible
+            label={t('settings.network.advancedTraffic', '高级流量')}
+            defaultOpen
           >
-            <Switch
-              checked={config.enableIPv6 === true}
-              onCheckedChange={(c) => setBool('enableIPv6', c)}
-            />
-          </SettingsRow>
+            <SettingsRow
+              label={t('settings.advanced.blockQuic')}
+              description={t('settings.advanced.blockQuicDesc')}
+            >
+              <Switch
+                checked={config.blockQuic === true}
+                onCheckedChange={(c) => setBool('blockQuic', c)}
+              />
+            </SettingsRow>
+            <SettingsRow
+              label={t('settings.advanced.interruptOnSwitch')}
+              description={t('settings.advanced.interruptOnSwitchDesc')}
+            >
+              <Switch
+                checked={config.interruptConnectionsOnSwitch === true}
+                onCheckedChange={(c) => setBool('interruptConnectionsOnSwitch', c)}
+              />
+            </SettingsRow>
+            <SettingsRow
+              label={t('settings.advanced.tlsFragment')}
+              description={t('settings.advanced.tlsFragmentDesc')}
+            >
+              <Switch
+                checked={config.tlsFragment === true}
+                onCheckedChange={(c) => setBool('tlsFragment', c)}
+              />
+            </SettingsRow>
+            <SettingsRow
+              label={<span className="text-warning">{t('settings.general.enableIPv6')}</span>}
+              description={t('settings.network.enableIPv6Desc')}
+            >
+              <Switch
+                checked={config.enableIPv6 === true}
+                onCheckedChange={(c) => setBool('enableIPv6', c)}
+              />
+            </SettingsRow>
+            {/* 仅 TUN + IPv6 开 + FakeIP 关 才提示：TUN 下客户端会直接试 v6，节点若无 v6 则部分站点连不通；
+                FakeIP 让节点按域名出站、规避此问题。系统代理模式经 127.0.0.1+域名(remote DNS)不犯此问题，故不提示。 */}
+            {config.proxyModeType === 'tun' &&
+              config.enableIPv6 === true &&
+              config.dnsConfig?.enableFakeIp === false && (
+                <div className="flex items-center justify-between gap-3 py-2">
+                  <p className="text-xs font-medium text-warning">
+                    {t(
+                      'settings.network.ipv6NodeFakeIpHint',
+                      '若节点不支持 IPv6，部分网站可能无法访问；建议开启 FakeIP。'
+                    )}
+                  </p>
+                  <Button
+                    size="sm"
+                    className="shrink-0"
+                    onClick={() => updateDns({ enableFakeIp: true })}
+                  >
+                    {t('settings.network.enableFakeIpAction', '开启 FakeIP')}
+                  </Button>
+                </div>
+              )}
+          </SettingsCollapsible>
         </CardContent>
       </Card>
 
-      {/* 节点测速 */}
+      {/* 更新与测速（订阅自动更新 + 更新走代理 + 节点测速端点合并为一卡，C5/L2） */}
       <Card>
         <CardContent className="divide-y divide-border/60 pt-2">
-          <SettingsRow heading label={t('settings.network.speedTest')} />
-          <SettingsRow
-            label={t('settings.network.speedTestUrl')}
-            description={t('settings.network.speedTestUrlDesc')}
-            stacked
-          >
-            <Input
-              value={speedTestUrl}
-              onChange={(e) => setSpeedTestUrl(e.target.value)}
-              onBlur={() => commitSpeedTestUrl(speedTestUrl)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') e.currentTarget.blur();
-              }}
-              className="max-w-md font-mono text-sm"
-              placeholder={DEFAULT_SPEED_TEST_URL}
-            />
-          </SettingsRow>
-        </CardContent>
-      </Card>
-
-      {/* 订阅自动更新 */}
-      <Card>
-        <CardContent className="divide-y divide-border/60 pt-2">
-          <SettingsRow heading label={t('settings.advanced.subAutoUpdate')} />
+          <SettingsRow heading label={t('settings.network.updateAndSpeedTest', '更新与测速')} />
           <SettingsRow
             label={t('settings.advanced.autoUpdateSub')}
             description={t('settings.advanced.autoUpdateSubDesc')}
@@ -538,6 +588,49 @@ export function NetworkSettings() {
               </SettingsRow>
             </>
           )}
+          {/* 更新检查走代理（L2：与订阅更新同属「更新流量是否走代理」，从连接/流量卡归并至此） */}
+          <SettingsRow
+            label={t('settings.advanced.mainSessionViaProxy', '更新检查走代理')}
+            description={t(
+              'settings.advanced.mainSessionViaProxyDesc',
+              '开启后，应用/内核更新检查与规则资源下载在代理运行时经代理（更新源多在 GitHub）；关闭则直连/走系统代理。注：TUN 模式下因系统层捕获，关闭不能完全直连。'
+            )}
+          >
+            <Switch
+              checked={config.mainSessionViaProxy !== false}
+              onCheckedChange={(checked) =>
+                saveConfig({ ...config, mainSessionViaProxy: checked }).catch(() =>
+                  toast.error(t('common.saveFailed'))
+                )
+              }
+            />
+          </SettingsRow>
+          <SettingsRow
+            label={t('settings.network.speedTestUrl')}
+            description={t('settings.network.speedTestUrlDesc')}
+            stacked
+          >
+            <Input
+              value={speedTestUrl}
+              onChange={(e) => setSpeedTestUrl(e.target.value)}
+              onBlur={() => commitSpeedTestUrl(speedTestUrl)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') e.currentTarget.blur();
+              }}
+              className="max-w-md font-mono text-sm"
+              placeholder={DEFAULT_SPEED_TEST_URL}
+            />
+          </SettingsRow>
+        </CardContent>
+      </Card>
+
+      {/* 终端代理速查表（从「高级」节迁入，默认折叠；C3/L4） */}
+      <Card>
+        <CardContent className="pt-6">
+          <TerminalProxySection
+            httpPort={(config.mixedPort || config.httpPort || 7890).toString()}
+            socksPort={(config.mixedPort || config.httpPort || 7890).toString()}
+          />
         </CardContent>
       </Card>
     </div>

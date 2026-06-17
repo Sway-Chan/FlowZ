@@ -13,30 +13,20 @@ import { readPrivacyHash, writePrivacyHash, hashPasswordSync } from '../utils/pr
 import {
   RULE_TYPE_IDS,
   validateRuleValue,
+  isValidIpCidr,
   migrateCustomRules,
   customRulesNeedMigration,
 } from '../../shared/rules';
 import { defaultAppRules, seedDefaultAppRules } from '../../shared/app-rules-preset';
 import { DEFAULT_SPEED_TEST_URL } from '../../shared/speed-test';
-
-/**
- * 合法服务器协议白名单（单一来源，T5）。
- * 从 shared/types.ts Protocol 联合类型派生——新增协议只改 types.ts，此处自动同步，
- * 消除「数组抄一遍 + 错误串再抄一遍」双重维护漂移（曾出现数组含某协议、错误串漏列的情况）。
- */
-const ALLOWED_PROTOCOLS: readonly Protocol[] = [
-  'vless',
-  'vmess',
-  'trojan',
-  'hysteria2',
-  'shadowsocks',
-  'anytls',
-  'tuic',
-  'naive',
-  'socks',
-  'http',
-  'ssh',
-];
+// 协议白名单 + 协议必填校验单一真值：与渲染侧首页连接闸门 isServerComplete 共用同一份
+// shared/server-completeness，杜绝「新增协议时主/渲染各自枚举漂移」（WireGuard 漏列致连接按钮
+// 恒置灰、anytls 曾在此漏校验，均属此类）。
+import {
+  ALL_PROTOCOLS as ALLOWED_PROTOCOLS,
+  protocolRequirementError,
+} from '../../shared/server-completeness';
+import { isAccountBasedProtocol } from '../../shared/endpoint-routes';
 
 export interface IConfigManager {
   loadConfig(): Promise<UserConfig>;
@@ -51,6 +41,7 @@ export class ConfigManager implements IConfigManager {
   private configPath: string;
   private currentConfig: UserConfig | null = null;
   private tmpSwept = false;
+  private diagnosticRestoreChecked = false;
   private logManager?: LogManager;
 
   /**
@@ -191,6 +182,22 @@ export class ConfigManager implements IConfigManager {
         );
       }
 
+      // 诊断采集还原（仅首次 loadConfig=app 启动触发，会话内 backup/诊断导出重载 config 不触发，避免误结束采集）：
+      // 上次会话留有 diagnosticCapture（含采集前快照级别）→ 还原 logLevel=prevLogLevel 后清字段。
+      // 还原到快照级别（可能是 error/warn），绝不硬编码 info。崩溃/强杀后下次启动据此自愈，不让 debug 长期记录明细。
+      if (!this.diagnosticRestoreChecked) {
+        this.diagnosticRestoreChecked = true;
+        if (config.diagnosticCapture) {
+          const prev = config.diagnosticCapture.prevLogLevel;
+          config.logLevel = prev;
+          delete config.diagnosticCapture;
+          await this.saveConfig(config).catch((e) =>
+            this.log('warn', `诊断采集还原落盘失败（不阻断）: ${e}`)
+          );
+          this.log('info', `诊断采集已结束，日志级别还原为 ${prev}`);
+        }
+      }
+
       // 缓存配置
       this.currentConfig = config;
 
@@ -294,13 +301,29 @@ export class ConfigManager implements IConfigManager {
       throw new Error('Config is null or undefined');
     }
 
-    // 自动迁移：强制将旧版本默认的高位端口（65533/65534）升级为标准端口（2080/2081）
-    // 解决方法：如果用户当前设置的是旧默认值，自动将其重置为新默认值
-    if (config.httpPort === 65533 || !config.httpPort) {
-      config.httpPort = 2080;
+    // mixed-only 迁移 + 治理：本地端口收敛为单一 mixedPort（同口 HTTP+SOCKS）。
+    // 种子：mixedPort 未设(>0) → 旧 httpPort（忽略历史 65533 哨兵；用户现 http 端口不变，仅 SOCKS app 需改指同口），
+    //       再无则新装默认 7890。幂等：mixedPort 一旦 >0 不再改写。
+    // 治理：彻底删除 deprecated httpPort/socksPort（不再写回持久化配置；运行时一律走 shared/proxy-ports#localProxyPort）。
+    if (!config.mixedPort || config.mixedPort <= 0) {
+      const legacyHttp =
+        config.httpPort && config.httpPort > 0 && config.httpPort !== 65533
+          ? config.httpPort
+          : undefined;
+      config.mixedPort = legacyHttp || 7890;
     }
-    if (config.socksPort === 65534 || !config.socksPort) {
-      config.socksPort = 2081;
+    delete config.httpPort;
+    delete config.socksPort;
+
+    // 控制端口（clash_api external_controller）：未设(>0) → 默认 9090（DEFAULT_CONTROL_PORT）。可改以解端口冲突死局。
+    // 防自撞：与本地端口同口则回退（9090，仍同则取 9091），杜绝 clash_api 与 mixed inbound 撞口致 sing-box FATAL。
+    // 作用域：此 guard 护持久化/loadConfig 路径（saveConfig 亦经 validateConfig）。运行时 start() 收到的是渲染端
+    // 内存 config、不经此重校验，那条路径的同口由 UI 两个 commit 守卫拦下。未来若加 config 导入，须在导入处复用本校验。
+    if (!config.controlPort || config.controlPort <= 0) {
+      config.controlPort = 9090;
+    }
+    if (config.controlPort === config.mixedPort) {
+      config.controlPort = config.mixedPort === 9090 ? 9091 : 9090;
     }
 
     // 自动迁移：旧版自定义规则（DomainRule: domains+ipCidr）→ 新版 Rule（type+values）。
@@ -365,6 +388,7 @@ export class ConfigManager implements IConfigManager {
     }
 
     // 验证每个服务器配置
+    let droppedCidrs = 0; // endpoint 节点的非法 CIDR（allowedIPs/routes）一律丢弃而非 throw（见循环内说明）
     for (const server of config.servers) {
       if (!server.id || typeof server.id !== 'string') {
         throw new Error('Server id is required and must be a string');
@@ -376,84 +400,60 @@ export class ConfigManager implements IConfigManager {
       if (!protocolLower || !ALLOWED_PROTOCOLS.includes(protocolLower as Protocol)) {
         throw new Error(`Server protocol must be one of: ${ALLOWED_PROTOCOLS.join(', ')}`);
       }
-      if (!server.address || typeof server.address !== 'string') {
-        throw new Error('Server address is required and must be a string');
-      }
-      if (
-        !server.port ||
-        typeof server.port !== 'number' ||
-        server.port < 1 ||
-        server.port > 65535
-      ) {
-        throw new Error('Server port must be a number between 1 and 65535');
-      }
-
-      // VLESS 特定验证
-      if (protocolLower === 'vless') {
-        if (!server.uuid || typeof server.uuid !== 'string') {
-          throw new Error('VLESS server requires uuid');
-        }
-      }
-
-      // VMess 特定验证
-      if (protocolLower === 'vmess') {
-        if (!server.uuid || typeof server.uuid !== 'string') {
-          throw new Error('VMess server requires uuid');
-        }
-      }
-
-      // Trojan 特定验证
-      if (protocolLower === 'trojan') {
-        if (!server.password || typeof server.password !== 'string') {
-          throw new Error('Trojan server requires password');
-        }
-      }
-
-      // Hysteria2 特定验证
-      if (protocolLower === 'hysteria2') {
-        if (!server.password || typeof server.password !== 'string') {
-          throw new Error('Hysteria2 server requires password');
-        }
-      }
-
-      // TUIC 特定验证
-      if (protocolLower === 'tuic') {
-        if (!server.uuid || typeof server.uuid !== 'string') {
-          throw new Error('TUIC server requires uuid');
-        }
-        if (!server.password || typeof server.password !== 'string') {
-          throw new Error('TUIC server requires password');
-        }
-      }
-
-      // Naive 特定验证
-      if (protocolLower === 'naive') {
-        if (!server.username || typeof server.username !== 'string') {
-          throw new Error('Naive server requires username');
-        }
-        if (!server.password || typeof server.password !== 'string') {
-          throw new Error('Naive server requires password');
-        }
-      }
-
-      // Shadowsocks 特定验证
-      if (protocolLower === 'shadowsocks') {
-        if (!server.shadowsocksSettings) {
-          throw new Error('Shadowsocks server requires shadowsocksSettings');
+      // 账号制协议（Tailscale，连控制面）/ custom（raw-JSON 自带 server/port）→ 豁免 address/port；其余必须有。
+      if (!isAccountBasedProtocol(protocolLower) && protocolLower !== 'custom') {
+        if (!server.address || typeof server.address !== 'string') {
+          throw new Error('Server address is required and must be a string');
         }
         if (
-          !server.shadowsocksSettings.method ||
-          typeof server.shadowsocksSettings.method !== 'string'
+          !server.port ||
+          typeof server.port !== 'number' ||
+          server.port < 1 ||
+          server.port > 65535
         ) {
-          throw new Error('Shadowsocks server requires encryption method');
-        }
-        if (
-          !server.shadowsocksSettings.password ||
-          typeof server.shadowsocksSettings.password !== 'string'
-        ) {
-          throw new Error('Shadowsocks server requires password');
+          throw new Error('Server port must be a number between 1 and 65535');
         }
       }
+
+      // 协议特有必填校验（单一真值 shared/server-completeness.protocolRequirementError，与渲染侧
+      // 首页连接闸门 isServerComplete 共用）。fail-fast：缺字段 throw（与原逐协议 throw 等价；额外补齐
+      // 了原先漏校验的 anytls 密码——与 isServerComplete 一致，且 anytls 无密码本就连不通）。
+      const protocolError = protocolRequirementError(server);
+      if (protocolError) {
+        throw new Error(protocolError);
+      }
+
+      // endpoint 节点的 CIDR/地址一律 sanitize 而非 throw：WG localAddress→endpoint.address、allowedIPs→
+      // peer.allowed_ips、TS routes→force-route ip_cidr，脏值（缺掩码、含空格、八位组/掩码越界如 10.0.0.0/40）
+      // 会让内核启动 FATAL。用 isValidIpCidr（含范围校验）丢弃非法项 + 告警，保留合法项——避免单条脏 CIDR 阻断
+      // 全部启动，也避免 throw 走 loadConfig catch 回落默认配置致用户节点全丢（与 customRules 容错同型）。
+      const sanitizeCidrs = (list: string[] | undefined): string[] | undefined => {
+        if (!Array.isArray(list)) return list;
+        const cleaned = list
+          .map((c) => (typeof c === 'string' ? c.trim() : ''))
+          .filter((c) => isValidIpCidr(c));
+        droppedCidrs += list.length - cleaned.length;
+        return cleaned;
+      };
+      if (server.wireguardSettings) {
+        // localAddress 是接口地址（进 endpoint.address），同样必须是合法 IP/CIDR，否则内核 FATAL。
+        // localAddress 为必填 string[]（protocolRequirementError 已保证此处非空数组），仅在确为数组时回写。
+        const cleanedLocal = sanitizeCidrs(server.wireguardSettings.localAddress);
+        if (Array.isArray(cleanedLocal)) server.wireguardSettings.localAddress = cleanedLocal;
+        server.wireguardSettings.allowedIPs = sanitizeCidrs(server.wireguardSettings.allowedIPs);
+      }
+      if (server.tailscaleSettings) {
+        server.tailscaleSettings.routes = sanitizeCidrs(server.tailscaleSettings.routes);
+        server.tailscaleSettings.advertiseRoutes = sanitizeCidrs(
+          server.tailscaleSettings.advertiseRoutes
+        );
+      }
+    }
+    if (droppedCidrs > 0) {
+      this.log(
+        'warn',
+        `[ConfigManager] 丢弃 ${droppedCidrs} 处非法 CIDR（endpoint allowedIPs/routes）`
+      );
     }
 
     // 验证 selectedServerId
@@ -676,11 +676,28 @@ export class ConfigManager implements IConfigManager {
       throw new Error('bypassProcesses must be an array');
     }
 
-    // 验证端口
-    if (typeof config.socksPort !== 'number' || config.socksPort < 1 || config.socksPort > 65535) {
+    // 验证端口（mixed-only：canonical = mixedPort；http/socks 为 deprecated，仅在存在时宽松校验）
+    if (typeof config.mixedPort !== 'number' || config.mixedPort < 1 || config.mixedPort > 65535) {
+      throw new Error('mixedPort must be a number between 1 and 65535');
+    }
+    if (
+      config.controlPort !== undefined &&
+      (typeof config.controlPort !== 'number' ||
+        config.controlPort < 1 ||
+        config.controlPort > 65535)
+    ) {
+      throw new Error('controlPort must be a number between 1 and 65535');
+    }
+    if (
+      config.socksPort !== undefined &&
+      (typeof config.socksPort !== 'number' || config.socksPort < 1 || config.socksPort > 65535)
+    ) {
       throw new Error('socksPort must be a number between 1 and 65535');
     }
-    if (typeof config.httpPort !== 'number' || config.httpPort < 1 || config.httpPort > 65535) {
+    if (
+      config.httpPort !== undefined &&
+      (typeof config.httpPort !== 'number' || config.httpPort < 1 || config.httpPort > 65535)
+    ) {
       throw new Error('httpPort must be a number between 1 and 65535');
     }
 
@@ -790,8 +807,9 @@ export class ConfigManager implements IConfigManager {
       fakeIpFilter: true, // fake-ip-filter 默认清单默认开启（NTP/STUN/Captive 走真实解析；老配置 undefined 亦视为开）
       speedTestUrl: DEFAULT_SPEED_TEST_URL, // 节点测速端点默认 generate_204（用户可在设置·网络改）
 
-      socksPort: 2081,
-      httpPort: 2080,
+      mixedPort: 7890, // mixed-only canonical 本地端口（同口 HTTP+SOCKS）；新装默认对齐业内 7890（存量经迁移沿用原 httpPort）。
+      controlPort: 9090, // clash_api 外部控制端口（对齐业内 9090）；可改以解端口冲突死局。
+      // 注：不再设 httpPort/socksPort（mixed-only 已治理；旧配置经 loadConfig 迁移删除这两个 deprecated 字段）。
       logLevel: 'info',
       disableLogFile: false,
       clashApiSecret: randomBytes(16).toString('hex'),

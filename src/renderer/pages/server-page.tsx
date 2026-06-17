@@ -7,7 +7,9 @@ import { SubscriptionDialog } from '@/components/settings/subscription-dialog';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
-import { Plus, RefreshCw, Rss, Server } from 'lucide-react';
+import { Plus, RefreshCw, Rss, Server, Network } from 'lucide-react';
+import { isEndpointProtocol } from '../../shared/endpoint-routes';
+import { groupServersBySubscription } from '../../shared/server-grouping';
 import {
   AlertDialog,
   AlertDialogAction,
@@ -49,21 +51,30 @@ export function ServerPage() {
   const selectedServerId = config?.selectedServerId;
   const subscriptionIds = new Set(subscriptions.map((s) => s.id));
 
-  // 手动添加的节点：无 subscriptionId，或 subscriptionId 指向已删订阅的孤儿（口径对齐 groupServersBySubscription）
-  const manualServers = servers.filter(
-    (s) => !s.subscriptionId || !subscriptionIds.has(s.subscriptionId)
-  );
+  // 自建 / 组网 / 各订阅分组**收口到共享单一真值** groupServersBySubscription——与下拉选择器、托盘菜单同一口径，
+  // 杜绝「列表页归组网、下拉归自建」漂移。自建 Tab 仅代理节点，组网 Tab = endpoint（WireGuard/WARP/Tailscale）。
+  const grouped = groupServersBySubscription(servers, subscriptions);
+  // 按组 id 统一取数（manual/mesh/订阅 id）；空组在 grouped 中被省略，回落 []（仍渲染该订阅 tab 供更新）。
+  const serversOfGroup = (id: string) => grouped.find((g) => g.id === id)?.servers ?? [];
+  const manualProxyServers = serversOfGroup('manual');
+  const meshServers = serversOfGroup('mesh');
 
-  // 默认激活 Tab = 当前选中节点所在组（自建 / 某订阅）；用户手动切 Tab 后由 override 接管。
+  // 默认激活 Tab = 当前选中节点所在组（自建 / 组网 / 某订阅）；用户手动切 Tab 后由 override 接管。
   // 用「派生 + override」而非 useState 惰性初值：config 异步到位前挂载不会把激活组锁死在 'manual'。
   const selected = selectedServerId ? servers.find((s) => s.id === selectedServerId) : undefined;
   const selectedGroupKey =
     selected?.subscriptionId && subscriptionIds.has(selected.subscriptionId)
       ? selected.subscriptionId
-      : 'manual';
+      : selected && isEndpointProtocol(selected.protocol)
+        ? 'mesh'
+        : 'manual';
   const [tabOverride, setTabOverride] = useState<string | null>(null);
   const activeTab =
-    tabOverride && (tabOverride === 'manual' || subscriptionIds.has(tabOverride))
+    tabOverride &&
+    (tabOverride === 'manual' ||
+      // 组网 Tab 仅在有组网节点时有效——删光最后一个组网节点后从 mesh 回落，避免停在无 Trigger 的空 Tab。
+      (tabOverride === 'mesh' && meshServers.length > 0) ||
+      subscriptionIds.has(tabOverride))
       ? tabOverride
       : selectedGroupKey;
 
@@ -247,7 +258,7 @@ export function ServerPage() {
       </div>
 
       <Tabs value={activeTab} onValueChange={setTabOverride}>
-        {/* Tab 栏：自建节点 + 每个订阅 + 订阅管理 */}
+        {/* Tab 栏：自建节点 + 组网 + 每个订阅（右侧固定「添加订阅」按钮，不在 TabsList 内） */}
         <div className="flex items-center gap-4">
           {/* 可滚动的 Tab 区域，两侧渐变遮罩提示还有更多内容 */}
           <div className="relative min-w-0 flex-1">
@@ -261,20 +272,31 @@ export function ServerPage() {
               className="overflow-x-auto overflow-y-hidden [&::-webkit-scrollbar]:hidden [-ms-overflow-style:none] [scrollbar-width:none] scroll-smooth"
             >
               <TabsList className="inline-flex w-max justify-start">
-                {/* 自建节点 Tab */}
+                {/* 自建节点 Tab（仅代理节点） */}
                 <TabsTrigger value="manual" className="flex items-center gap-1.5 whitespace-nowrap">
                   <Server className="h-3.5 w-3.5" />
                   {t('servers.manualNodes')}
-                  {manualServers.length > 0 && (
+                  {manualProxyServers.length > 0 && (
                     <Badge variant="secondary" className="ml-1 h-4 px-1 text-[10px]">
-                      {manualServers.length}
+                      {manualProxyServers.length}
                     </Badge>
                   )}
                 </TabsTrigger>
 
+                {/* 组网/Endpoint Tab（WireGuard/WARP/Tailscale）——有节点才显示，避免对不用组网的用户造成噪音 */}
+                {meshServers.length > 0 && (
+                  <TabsTrigger value="mesh" className="flex items-center gap-1.5 whitespace-nowrap">
+                    <Network className="h-3.5 w-3.5" />
+                    {t('servers.meshNodes')}
+                    <Badge variant="secondary" className="ml-1 h-4 px-1 text-[10px]">
+                      {meshServers.length}
+                    </Badge>
+                  </TabsTrigger>
+                )}
+
                 {/* 每个订阅一个 Tab */}
                 {subscriptions.map((sub) => {
-                  const subServers = servers.filter((s) => s.subscriptionId === sub.id);
+                  const subServers = serversOfGroup(sub.id);
                   const isUpdating = updatingSubId === sub.id;
                   return (
                     <TabsTrigger
@@ -310,10 +332,24 @@ export function ServerPage() {
           </div>
         </div>
 
-        {/* 自建节点内容 */}
+        {/* 自建节点内容（仅代理节点） */}
         <TabsContent value="manual">
           <ServerList
-            servers={manualServers}
+            servers={manualProxyServers}
+            selectedServerId={selectedServerId ?? undefined}
+            onAddServer={handleAddServer}
+            onEditServer={handleEditServer}
+            onDeleteServer={handleDeleteServer}
+            onCloneServer={handleCloneServer}
+            onSelectServer={handleSelectServer}
+            onImportSuccess={handleImportSuccess}
+          />
+        </TabsContent>
+
+        {/* 组网节点内容（WireGuard/WARP/Tailscale） */}
+        <TabsContent value="mesh">
+          <ServerList
+            servers={meshServers}
             selectedServerId={selectedServerId ?? undefined}
             onAddServer={handleAddServer}
             onEditServer={handleEditServer}
@@ -326,7 +362,7 @@ export function ServerPage() {
 
         {/* 各订阅节点内容 */}
         {subscriptions.map((sub) => {
-          const subServers = servers.filter((s) => s.subscriptionId === sub.id);
+          const subServers = serversOfGroup(sub.id);
           const isUpdating = updatingSubId === sub.id;
           return (
             <TabsContent key={sub.id} value={sub.id}>

@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { toast } from 'sonner';
 import {
   Dialog,
   DialogContent,
@@ -26,7 +27,14 @@ import { VmessForm } from './vmess-form';
 import { SocksForm } from './socks-form';
 import { HttpForm } from './http-form';
 import { SshForm } from './ssh-form';
+import { WireGuardForm } from './wireguard-form';
+import { TailscaleForm } from './tailscale-form';
+import { CustomForm } from './custom-form';
+import { WarpPanel } from './warp-panel';
 import { ServerSelectGroups } from './server-select-groups';
+import { FormSection } from './shared/form-layout';
+import { PROTOCOL_OPTIONS } from './shared/protocol-options';
+import { ENDPOINT_PROTOCOLS } from '../../../shared/endpoint-routes';
 import type { ServerConfig, ProtocolType } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -51,14 +59,24 @@ export function ServerConfigDialog({
 }: ServerConfigDialogProps) {
   const { t } = useTranslation();
   const [serverName, setServerName] = useState('');
-  const [selectedProtocol, setSelectedProtocol] = useState<ProtocolType>('vless');
+  // 'warp' 是 UI 伪协议（仅新增流的一键 WARP 入口，不进 PROTOCOL_OPTIONS/协议枚举）；选它渲染 WarpPanel，
+  // 实际保存的是普通 wireguard 节点。
+  const [selectedProtocol, setSelectedProtocol] = useState<ProtocolType | 'warp'>('vless');
   const [currentServerConfig, setCurrentServerConfig] = useState<any>(null);
   const [detour, setDetour] = useState<string | undefined>(undefined);
+  const [nameError, setNameError] = useState('');
 
   const isEditing = !!server;
 
+  // 重名软检测（非阻塞）：与其它节点同名时给琥珀提示，但不拦保存——后端 generateSingBoxConfig 用
+  // getUniqueTag 自动去重 tag（重名不破功能/切换），且订阅天然有同名节点，硬拦会误伤。排除自身（编辑不改名不报）。
+  const trimmedName = serverName.trim();
+  const isDuplicateName =
+    !!trimmedName && servers.some((s) => s.id !== server?.id && s.name.trim() === trimmedName);
+
   useEffect(() => {
     if (open) {
+      setNameError('');
       if (server) {
         setServerName(server.name);
         const normalizedProtocol = server.protocol.toLowerCase() as ProtocolType;
@@ -75,9 +93,13 @@ export function ServerConfigDialog({
   }, [server, open]);
 
   const handleSave = async (protocolConfig: any) => {
+    // 备注必填：协议表单字段由各自 zod 校验(红字)，但备注是 dialog 级 state、不在表单内——
+    // 此处显式校验并就地报错(红框+红字)，杜绝「未填备注 → 保存静默失败、无任何提示」。
     if (!serverName.trim()) {
-      throw new Error(t('servers.addressRequired'));
+      setNameError(t('servers.nameRequired', 'Name is required'));
+      return;
     }
+    setNameError('');
 
     const serverConfig = {
       name: serverName.trim(),
@@ -85,12 +107,25 @@ export function ServerConfigDialog({
       ...protocolConfig,
     };
 
-    await onSave(serverConfig);
-    onOpenChange(false);
+    try {
+      await onSave(serverConfig);
+      onOpenChange(false);
+    } catch (e) {
+      // 后端保存失败也要可见（原先 throw 被表单 submit 吞掉、无提示）。
+      toast.error(t('servers.saveFailed', 'Failed to save'), {
+        description: e instanceof Error ? e.message : String(e),
+      });
+    }
   };
 
-  const handleProtocolChange = (protocol: ProtocolType) => {
-    setSelectedProtocol(protocol);
+  const handleProtocolChange = (protocol: string) => {
+    setSelectedProtocol(protocol as ProtocolType | 'warp');
+    // WARP 一键入口：预填默认节点名（仅名称空时），使 WarpPanel 生成后 handleSave 不因缺名失败。
+    if (protocol === 'warp') {
+      if (!serverName.trim()) setServerName('Cloudflare WARP');
+      setCurrentServerConfig(null);
+      return;
+    }
     if (protocol !== currentServerConfig?.protocol) {
       setCurrentServerConfig(null);
     }
@@ -98,7 +133,7 @@ export function ServerConfigDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+      <DialogContent className="w-[92vw] max-w-3xl max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>
             {isEditing
@@ -128,67 +163,60 @@ export function ServerConfigDialog({
         )}
 
         <div className="space-y-6">
-          <div className="space-y-2">
-            <Label htmlFor="serverName">{t('servers.remarks')}</Label>
-            <Input
-              id="serverName"
-              placeholder={t('servers.remarksPlaceholder')}
-              value={serverName}
-              onChange={(e) => setServerName(e.target.value)}
-            />
-            <p className="text-sm text-muted-foreground">{t('servers.remarksDesc')}</p>
-          </div>
-
-          <div className="space-y-2">
-            <Label>{t('servers.protocol')}</Label>
-            <Select value={selectedProtocol} onValueChange={handleProtocolChange}>
-              <SelectTrigger>
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="vless">VLESS</SelectItem>
-                <SelectItem value="trojan">Trojan</SelectItem>
-                <SelectItem value="hysteria2">Hysteria2</SelectItem>
-                <SelectItem value="shadowsocks">Shadowsocks</SelectItem>
-                <SelectItem value="anytls">AnyTLS</SelectItem>
-                <SelectItem value="tuic">TUIC</SelectItem>
-                <SelectItem value="vmess">VMess</SelectItem>
-                <SelectItem value="naive">NaiveProxy</SelectItem>
-                <SelectItem value="socks">SOCKS5</SelectItem>
-                <SelectItem value="http">HTTP(S)</SelectItem>
-                <SelectItem value="ssh">SSH</SelectItem>
-              </SelectContent>
-            </Select>
-            <p className="text-sm text-muted-foreground">
-              {t('servers.selectProtocol', 'Select your proxy server protocol')}
-            </p>
-          </div>
-
-          <div className="space-y-2">
-            <Label>{t('servers.detour', 'Proxy Chain (Detour)')}</Label>
-            <Select
-              value={detour || 'direct'}
-              onValueChange={(v) => setDetour(v === 'direct' ? undefined : v)}
-            >
-              <SelectTrigger>
-                <SelectValue placeholder={t('servers.directConnection', 'Direct (No Chain)')} />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="direct">
-                  {t('servers.directConnection', 'Direct (No Chain)')}
-                </SelectItem>
-                <ServerSelectGroups servers={servers} excludeId={server?.id} selectedId={detour} />
-              </SelectContent>
-            </Select>
-            <p className="text-sm text-muted-foreground">
-              {t(
-                'servers.detourDesc',
-                'Connect to this node through another proxy server (proxy chain)'
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div className="space-y-2">
+              <Label htmlFor="serverName">{t('servers.remarks')}</Label>
+              <Input
+                id="serverName"
+                placeholder={t('servers.remarksPlaceholder')}
+                value={serverName}
+                onChange={(e) => {
+                  setServerName(e.target.value);
+                  if (nameError) setNameError('');
+                }}
+                className={nameError ? 'border-destructive focus-visible:ring-destructive' : ''}
+              />
+              {nameError ? (
+                <p className="text-sm text-destructive">{nameError}</p>
+              ) : isDuplicateName ? (
+                <p className="text-sm text-amber-600 dark:text-amber-500">
+                  {t('servers.nameDuplicate', 'A node with this name already exists')}
+                </p>
+              ) : (
+                <p className="text-sm text-muted-foreground">{t('servers.remarksDesc')}</p>
               )}
-            </p>
+            </div>
+
+            <div className="space-y-2">
+              <Label>{t('servers.protocol')}</Label>
+              <Select value={selectedProtocol} onValueChange={handleProtocolChange}>
+                <SelectTrigger>
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {/* WARP 一键入口置顶（仅新增）：用户想用 WARP 会在协议处找它，不必先懂「WARP=WireGuard」。 */}
+                  {!isEditing && (
+                    <SelectItem value="warp">
+                      {t('servers.warpOption', 'Cloudflare WARP (one-click)')}
+                    </SelectItem>
+                  )}
+                  {PROTOCOL_OPTIONS.map((p) => (
+                    <SelectItem key={p.value} value={p.value}>
+                      {p.value === 'custom' ? t('servers.protocolCustom', p.label) : p.label}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+              <p className="text-sm text-muted-foreground">
+                {t('servers.selectProtocol', 'Select your proxy server protocol')}
+              </p>
+            </div>
           </div>
 
           <div className="border-t pt-6">
+            {selectedProtocol === 'warp' && (
+              <WarpPanel onSubmit={handleSave} nameMissing={!serverName.trim()} />
+            )}
             {selectedProtocol === 'vless' && (
               <VlessForm
                 key={currentServerConfig?.id || 'new'}
@@ -310,7 +338,73 @@ export function ServerConfigDialog({
                 onSubmit={handleSave}
               />
             )}
+            {selectedProtocol === 'wireguard' && (
+              <WireGuardForm
+                key={currentServerConfig?.id || 'new'}
+                serverConfig={
+                  currentServerConfig?.protocol?.toLowerCase() === 'wireguard'
+                    ? currentServerConfig
+                    : undefined
+                }
+                onSubmit={handleSave}
+              />
+            )}
+            {selectedProtocol === 'tailscale' && (
+              <TailscaleForm
+                key={currentServerConfig?.id || 'new'}
+                serverConfig={
+                  currentServerConfig?.protocol?.toLowerCase() === 'tailscale'
+                    ? currentServerConfig
+                    : undefined
+                }
+                onSubmit={handleSave}
+              />
+            )}
+            {selectedProtocol === 'custom' && (
+              <CustomForm
+                key={currentServerConfig?.id || 'new'}
+                serverConfig={
+                  currentServerConfig?.protocol?.toLowerCase() === 'custom'
+                    ? currentServerConfig
+                    : undefined
+                }
+                onSubmit={handleSave}
+              />
+            )}
           </div>
+
+          {/* 前置代理(detour) 收进折叠 opt-in 区：默认关，编辑已有 detour 的节点时默认展开；WG 不作 detour 目标。 */}
+          <FormSection
+            title={t('servers.detour', 'Proxy Chain (Detour)')}
+            collapsible
+            defaultOpen={!!server?.detour}
+          >
+            <Select
+              value={detour || 'direct'}
+              onValueChange={(v) => setDetour(v === 'direct' ? undefined : v)}
+            >
+              <SelectTrigger>
+                <SelectValue placeholder={t('servers.directConnection', 'Direct (No Chain)')} />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="direct">
+                  {t('servers.directConnection', 'Direct (No Chain)')}
+                </SelectItem>
+                <ServerSelectGroups
+                  servers={servers}
+                  excludeId={server?.id}
+                  excludeProtocols={ENDPOINT_PROTOCOLS}
+                  selectedId={detour}
+                />
+              </SelectContent>
+            </Select>
+            <p className="text-sm text-muted-foreground">
+              {t(
+                'servers.detourDesc',
+                'Connect to this node through another proxy server (proxy chain)'
+              )}
+            </p>
+          </FormSection>
         </div>
       </DialogContent>
     </Dialog>

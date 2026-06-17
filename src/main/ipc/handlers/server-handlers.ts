@@ -4,11 +4,15 @@
  */
 
 import { IpcMainInvokeEvent } from 'electron';
+import * as fs from 'fs/promises';
+import * as path from 'path';
 import { IPC_CHANNELS } from '../../../shared/ipc-channels';
 import type { ServerConfig } from '../../../shared/types';
 import { registerIpcHandler } from '../ipc-handler';
 import { ProtocolParser } from '../../services/ProtocolParser';
 import { ConfigManager } from '../../services/ConfigManager';
+import { WarpService, type WarpWireGuardDraft } from '../../services/WarpService';
+import { getUserDataPath } from '../../utils/paths';
 
 /**
  * 注册服务器管理相关的 IPC 处理器
@@ -100,6 +104,7 @@ export function registerServerHandlers(
         throw new Error(`服务器不存在: ${args.serverId}`);
       }
 
+      const removed = config.servers[index];
       config.servers.splice(index, 1);
 
       // 如果删除的是当前选中的服务器，清除选中状态
@@ -108,6 +113,12 @@ export function registerServerHandlers(
       }
 
       await configManager.saveConfig(config);
+
+      // Tailscale 节点删除 → 清其持久 state 目录 <userData>/tailscale/<id>（best-effort，不阻断删除）。
+      if (removed?.protocol?.toLowerCase() === 'tailscale') {
+        const stateDir = path.join(getUserDataPath(), 'tailscale', args.serverId);
+        await fs.rm(stateDir, { recursive: true, force: true }).catch(() => {});
+      }
     }
   );
 
@@ -133,6 +144,15 @@ export function registerServerHandlers(
 
       config.selectedServerId = args.serverId;
       await configManager.saveConfig(config);
+    }
+  );
+
+  // Cloudflare WARP：注册匿名设备 → 返回 WireGuard 草稿（渲染端填表、用户确认后按普通 WG 节点保存）。
+  // 不落盘、不存 token；网络/TLS 细节见 WarpService。
+  registerIpcHandler<{ licenseKey?: string }, WarpWireGuardDraft>(
+    IPC_CHANNELS.WARP_REGISTER,
+    async (_event: IpcMainInvokeEvent, args: { licenseKey?: string }) => {
+      return new WarpService().register({ licenseKey: args?.licenseKey });
     }
   );
 }

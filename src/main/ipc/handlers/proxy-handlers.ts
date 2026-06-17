@@ -45,6 +45,15 @@ export function registerProxyHandlers(
       : { uploadSpeed: 0, downloadSpeed: 0, totalUpload: 0, totalDownload: 0, activeConnections: 0 }
   );
 
+  // 自定义协议兼容性 probe：当前内核能否识别该 outbound/endpoint type（sing-box check 最小 config）。
+  // 主进程子进程 + ProxyManager 内缓存 → 渲染端异步调用、UI 不阻塞。
+  registerIpcHandler<
+    { outbound: unknown; isEndpoint?: boolean },
+    { ok: boolean; indeterminate?: boolean; error?: string }
+  >(IPC_CHANNELS.KERNEL_PROBE_OUTBOUND, async (_event, args) =>
+    proxyManager.probeOutbound(args?.outbound, args?.isEndpoint)
+  );
+
   // 连接快照（topology 统一供数；窗口重建/挂载回填）
   registerIpcHandler<void, ConnectionsSnapshot>(IPC_CHANNELS.CONNECTIONS_GET, async () =>
     statsService ? statsService.getConnectionsSnapshot() : { connections: [], at: Date.now() }
@@ -66,6 +75,12 @@ export function registerProxyHandlers(
   registerIpcHandler<void, { ok: boolean }>(IPC_CHANNELS.CONNECTIONS_CLOSE_ALL, async () => {
     const res = await proxyManager.closeConnection();
     return { ok: res.ok };
+  });
+
+  // 用户主动关闭系统代理（TUN 残留提示的一键动作）：经 ProxyManager 收口 systemProxyManager.disableProxy。
+  registerIpcHandler<void, { ok: boolean }>(IPC_CHANNELS.SYSTEM_PROXY_DISABLE, async () => {
+    await proxyManager.clearSystemProxyManually();
+    return { ok: true };
   });
 
   // 连接页订阅/退订（P1 watcher 引用计数）：仅连接页打开时主进程才裁剪+推送连接快照，

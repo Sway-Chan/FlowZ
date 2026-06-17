@@ -9,6 +9,7 @@ export const IPC_CHANNELS = {
   PROXY_STOP: 'proxy:stop',
   PROXY_GET_STATUS: 'proxy:getStatus',
   PROXY_RESTART: 'proxy:restart',
+  KERNEL_PROBE_OUTBOUND: 'kernel:probeOutbound', // 自定义协议兼容性 probe（当前内核 sing-box check）
 
   // 配置管理
   CONFIG_GET: 'config:get',
@@ -32,6 +33,7 @@ export const IPC_CHANNELS = {
   SERVER_DELETE: 'server:delete',
   SERVER_GET_ALL: 'server:getAll',
   SERVER_SPEED_TEST: 'server:speedTest',
+  WARP_REGISTER: 'warp:register', // Cloudflare WARP 设备注册 → 生成 WireGuard 草稿
 
   // 订阅管理
   SUBSCRIPTION_ADD: 'subscription:add',
@@ -115,6 +117,9 @@ export const IPC_CHANNELS = {
   HELPER_INSTALL: 'helper:install',
   HELPER_UNINSTALL: 'helper:uninstall',
 
+  // 系统代理：用户主动关闭（TUN 残留提示的「关闭系统代理」一键动作）
+  SYSTEM_PROXY_DISABLE: 'systemProxy:disable',
+
   // 事件 (主进程 -> 渲染进程)
   EVENT_PROXY_STARTED: 'event:proxyStarted',
   EVENT_PROXY_STOPPED: 'event:proxyStopped',
@@ -132,6 +137,8 @@ export const IPC_CHANNELS = {
   EVENT_RULE_RESOURCE_PROGRESS: 'event:ruleResourceProgress', // 规则资源下载进度
   EVENT_SPEED_TEST_RESULT: 'event:speedTestResult', // 测速单个节点完成（流式增量显示）
   EVENT_SPEED_TEST_PROGRESS: 'event:speedTestProgress', // 测速进度（已测/成功/总数）
+  EVENT_TAILSCALE_AUTH_URL: 'event:tailscaleAuthUrl', // Tailscale 节点需交互登录：核日志抓出的登录 URL
+  EVENT_SYSTEM_PROXY_RESIDUAL: 'event:systemProxyResidual', // TUN 启动后检测到无 marker 的系统代理残留（非 FlowZ 设的）→ 一次性提示
 
   // 应用语言同步（渲染进程 -> 主进程）
   APP_SET_LANGUAGE: 'app:setLanguage',
@@ -140,6 +147,9 @@ export const IPC_CHANNELS = {
   BACKUP_EXPORT: 'backup:export',
   BACKUP_IMPORT: 'backup:import',
   BACKUP_GET_INFO: 'backup:getInfo',
+
+  // 诊断报告导出（单 Markdown，脱敏）
+  DIAGNOSTIC_EXPORT: 'diagnostic:export',
 } as const;
 
 export type IpcChannel = (typeof IPC_CHANNELS)[keyof typeof IPC_CHANNELS];

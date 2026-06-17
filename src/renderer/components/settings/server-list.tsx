@@ -53,24 +53,18 @@ import { api } from '@/ipc/api-client';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 import { useAppStore } from '@/store/app-store';
+import { PROTOCOL_OPTIONS } from './shared/protocol-options';
+import { isAccountBasedProtocol } from '../../../shared/endpoint-routes';
 
 type ServerConfigWithId = ServerConfig;
 type ViewMode = 'card' | 'list';
+
+/** 无分享链接的协议（ProtocolParser.generateUrl 无对应分支）：隐藏/排除复制按钮，避免 per-server 抛错刷屏。 */
+const NO_SHARE_LINK_PROTOCOLS = new Set(['ssh', 'wireguard', 'tailscale', 'custom']);
+const hasShareLink = (protocol: string | undefined): boolean =>
+  !NO_SHARE_LINK_PROTOCOLS.has(protocol?.toLowerCase() || '');
 type SortKey = 'name' | 'protocol' | 'latency' | 'address';
 type SortOrder = 'asc' | 'desc';
-
-const ALL_PROTOCOLS = [
-  'vless',
-  'trojan',
-  'hysteria2',
-  'shadowsocks',
-  'anytls',
-  'tuic',
-  'naive',
-  'socks',
-  'http',
-  'ssh',
-] as const;
 
 const getCountryCode = (name: string): string | null => {
   const lowerName = name.toLowerCase();
@@ -107,10 +101,20 @@ const getCountryCode = (name: string): string | null => {
 /** 传输层显示标签：QUIC 系协议(hysteria2/tuic/naive-HTTP3)统一显示 udp，其余按 network；缺省 tcp。 */
 const getTransportLabel = (server: ServerConfigWithId): string => {
   const p = server.protocol?.toLowerCase();
-  if (p === 'hysteria2' || p === 'tuic') return 'udp';
+  if (p === 'hysteria2' || p === 'tuic' || p === 'wireguard') return 'udp';
+  if (p === 'tailscale') return 'mesh';
   if (p === 'naive') return server.naiveSettings?.useHttp3 ? 'udp' : 'tcp';
   return server.network || 'tcp';
 };
+
+/** WARP 节点（一键生成的 wireguard，端点为 Cloudflare WARP relay）。无需持久标记，按端点域名判，缺则不显示。 */
+const isWarpNode = (s: ServerConfigWithId): boolean =>
+  s.protocol?.toLowerCase() === 'wireguard' &&
+  (s.address || '').toLowerCase().includes('cloudflareclient.com');
+
+/** Tailscale 节点未配置 authKey → 首次连接需浏览器交互登录，列表给提示角标降低「为何连不上」的困惑。 */
+const tailscaleNeedsLogin = (s: ServerConfigWithId): boolean =>
+  s.protocol?.toLowerCase() === 'tailscale' && !s.tailscaleSettings?.authKey?.trim();
 
 interface ServerListProps {
   servers: ServerConfigWithId[];
@@ -229,6 +233,17 @@ export function ServerList({
     }
   };
 
+  // 账号制协议（Tailscale）无 server address/port；自定义协议 server/port 在 JSON 内（缺则显类型）——
+  // 卡片副标题不展示 `undefined:undefined`。
+  const endpointLabel = (server: ServerConfigWithId): string => {
+    if (isAccountBasedProtocol(server.protocol)) return `Tailscale · ${getTransportLabel(server)}`;
+    if (server.protocol?.toLowerCase() === 'custom' && !server.address) {
+      const type = (server.customSettings?.outbound as any)?.type;
+      return `Custom · ${type || 'json'}`;
+    }
+    return `${server.address}:${server.port}`;
+  };
+
   const getLatencyColor = (latency: number | undefined) => {
     if (latency === undefined) return 'text-muted-foreground';
     if (latency === -1) return 'text-destructive';
@@ -281,9 +296,9 @@ export function ServerList({
 
   const handleBatchCopy = async () => {
     try {
-      // ssh 无分享链接，批量复制时排除（避免 per-server 抛错刷屏 toast）
+      // 无分享链接的协议（ssh/wireguard/tailscale）批量复制时排除（避免 per-server 抛错刷屏 toast）
       const selectedServersList = servers.filter(
-        (s) => selectedIds.has(s.id) && s.protocol?.toLowerCase() !== 'ssh'
+        (s) => selectedIds.has(s.id) && hasShareLink(s.protocol)
       );
       const urls: string[] = [];
       let successCount = 0;
@@ -336,6 +351,20 @@ export function ServerList({
   };
 
   // 过滤 + 排序
+  // 协议筛选项按【当前分组实际存在的协议】动态生成（保持 PROTOCOL_OPTIONS 顺序）：订阅组不再列 WG/WARP/Tailscale
+  // 等不可能出现的协议，自建/组网组也各只列自己有的——降低无意义选项的理解成本。
+  const availableProtocols = useMemo(() => {
+    const present = new Set(servers.map((s) => s.protocol?.toLowerCase()));
+    return PROTOCOL_OPTIONS.filter((p) => present.has(p.value));
+  }, [servers]);
+
+  // 当前筛选的协议在本组已不存在（切组/订阅更新后）→ 回落 all，避免筛出空列表。
+  useEffect(() => {
+    if (filterProtocol !== 'all' && !availableProtocols.some((p) => p.value === filterProtocol)) {
+      setFilterProtocol('all');
+    }
+  }, [availableProtocols, filterProtocol]);
+
   const filteredServers = useMemo(() => {
     let list = servers;
 
@@ -345,7 +374,7 @@ export function ServerList({
       list = list.filter(
         (s) =>
           s.name.toLowerCase().includes(q) ||
-          s.address.toLowerCase().includes(q) ||
+          (s.address || '').toLowerCase().includes(q) ||
           s.protocol.toLowerCase().includes(q)
       );
     }
@@ -363,7 +392,7 @@ export function ServerList({
       } else if (sortKey === 'protocol') {
         cmp = a.protocol.localeCompare(b.protocol);
       } else if (sortKey === 'address') {
-        cmp = a.address.localeCompare(b.address);
+        cmp = (a.address || '').localeCompare(b.address || '');
       } else if (sortKey === 'latency') {
         const getVal = (v: number | undefined) =>
           v === undefined ? Infinity : v === -1 ? Infinity - 1 : v;
@@ -389,6 +418,9 @@ export function ServerList({
       socks: 'bg-badge-slate/15 text-badge-slate border-badge-slate/30',
       http: 'bg-badge-sky/15 text-badge-sky border-badge-sky/30',
       ssh: 'bg-badge-amber/15 text-badge-amber border-badge-amber/30',
+      wireguard: 'bg-badge-cyan/15 text-badge-cyan border-badge-cyan/30',
+      tailscale: 'bg-badge-blue/15 text-badge-blue border-badge-blue/30',
+      custom: 'bg-badge-slate/15 text-badge-slate border-badge-slate/30',
     };
     return colors[protocol.toLowerCase()] || 'bg-muted text-muted-foreground';
   };
@@ -419,8 +451,8 @@ export function ServerList({
           {latencyMap[server.id] === -1 ? t('servers.timeout') : `${latencyMap[server.id]} ms`}
         </span>
       )}
-      {/* ssh 无分享链接(ProtocolParser.generateUrl 无 ssh 分支)，隐藏复制按钮 */}
-      {server.protocol?.toLowerCase() !== 'ssh' && (
+      {/* 无分享链接的协议(ProtocolParser.generateUrl 无对应分支)隐藏复制按钮 */}
+      {hasShareLink(server.protocol) && (
         <Button
           variant="ghost"
           size="sm"
@@ -604,9 +636,9 @@ export function ServerList({
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="all">{t('servers.allProtocols')}</SelectItem>
-            {ALL_PROTOCOLS.map((p) => (
-              <SelectItem key={p} value={p}>
-                {p.toUpperCase()}
+            {availableProtocols.map((p) => (
+              <SelectItem key={p.value} value={p.value}>
+                {p.value === 'custom' ? t('servers.protocolCustom', p.label) : p.label}
               </SelectItem>
             ))}
           </SelectContent>
@@ -814,7 +846,7 @@ export function ServerList({
                         {server.name}
                       </CardTitle>
                       <CardDescription className="text-xs mt-0.5">
-                        {server.address}:{server.port}
+                        {endpointLabel(server)}
                       </CardDescription>
                     </div>
                     {!isSelecting && renderActions(server)}
@@ -826,6 +858,22 @@ export function ServerList({
                     >
                       {server.protocol.toUpperCase()}
                     </Badge>
+                    {isWarpNode(server) && (
+                      <Badge
+                        variant="outline"
+                        className="text-xs h-4 px-1 bg-badge-sky/15 text-badge-sky border-badge-sky/30"
+                      >
+                        WARP
+                      </Badge>
+                    )}
+                    {tailscaleNeedsLogin(server) && (
+                      <Badge
+                        variant="outline"
+                        className="text-xs h-4 px-1 bg-badge-amber/15 text-badge-amber border-badge-amber/30"
+                      >
+                        {t('servers.tsNeedsLogin', 'Login needed')}
+                      </Badge>
+                    )}
                     {selectedServerId === server.id && (
                       <Badge variant="outline" className="text-xs h-4 px-1">
                         {t('servers.current')}
@@ -940,6 +988,22 @@ export function ServerList({
                     >
                       {server.protocol.toUpperCase()}
                     </Badge>
+                    {isWarpNode(server) && (
+                      <Badge
+                        variant="outline"
+                        className="text-[10px] h-4 px-1 flex-shrink-0 bg-badge-sky/15 text-badge-sky border-badge-sky/30"
+                      >
+                        WARP
+                      </Badge>
+                    )}
+                    {tailscaleNeedsLogin(server) && (
+                      <Badge
+                        variant="outline"
+                        className="text-[10px] h-4 px-1 flex-shrink-0 bg-badge-amber/15 text-badge-amber border-badge-amber/30"
+                      >
+                        {t('servers.tsNeedsLogin', 'Login needed')}
+                      </Badge>
+                    )}
                     {server.shadowTlsSettings && (
                       <Badge
                         variant="outline"
@@ -955,10 +1019,12 @@ export function ServerList({
                     )}
                   </div>
                   <p className="text-xs text-muted-foreground mt-0.5">
-                    {server.address}:{server.port}
-                    {getTransportLabel(server) !== 'tcp' && (
-                      <span className="ml-2">{getTransportLabel(server)}</span>
-                    )}
+                    {endpointLabel(server)}
+                    {!isAccountBasedProtocol(server.protocol) &&
+                      server.protocol?.toLowerCase() !== 'custom' &&
+                      getTransportLabel(server) !== 'tcp' && (
+                        <span className="ml-2">{getTransportLabel(server)}</span>
+                      )}
                   </p>
                 </div>
 

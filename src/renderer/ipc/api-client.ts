@@ -27,6 +27,7 @@ import type {
   RuleResourceCatalogResult,
   InvalidNodeInfo,
 } from '../../shared/types';
+import type { WarpWireGuardDraft } from '../../shared/warp';
 
 /**
  * 代理控制 API
@@ -59,6 +60,23 @@ export const proxyApi = {
    */
   async getStatus(): Promise<ProxyStatus> {
     return ipcClient.invoke(IPC_CHANNELS.PROXY_GET_STATUS);
+  },
+
+  /**
+   * 自定义协议兼容性 probe：当前内核能否识别该 outbound（sing-box check）。
+   */
+  async probeOutbound(
+    outbound: unknown,
+    isEndpoint?: boolean
+  ): Promise<{ ok: boolean; indeterminate?: boolean; error?: string }> {
+    return ipcClient.invoke(IPC_CHANNELS.KERNEL_PROBE_OUTBOUND, { outbound, isEndpoint });
+  },
+
+  /**
+   * 用户主动关闭系统代理（TUN 残留提示的「关闭系统代理」一键动作）。
+   */
+  async disableSystemProxy(): Promise<{ ok: boolean }> {
+    return ipcClient.invoke(IPC_CHANNELS.SYSTEM_PROXY_DISABLE);
   },
 
   /**
@@ -110,6 +128,20 @@ export const proxyApi = {
    */
   onInvalidNodes(listener: (data: InvalidNodeInfo[]) => void): () => void {
     return ipcClient.on(IPC_CHANNELS.EVENT_PROXY_INVALID_NODES, listener);
+  },
+
+  /**
+   * 监听 Tailscale 交互登录 URL（无 auth_key 的节点启动时核日志出登录 URL）。
+   */
+  onTailscaleAuth(listener: (data: { nodeName: string; url: string }) => void): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_TAILSCALE_AUTH_URL, listener);
+  },
+
+  /**
+   * 监听 TUN 启动后的「无 marker 系统代理残留」提示（非 FlowZ 设的代理仍开着，可能干扰 TUN）。
+   */
+  onSystemProxyResidual(listener: (data: { proxy: string }) => void): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_SYSTEM_PROXY_RESIDUAL, listener);
   },
 };
 
@@ -250,6 +282,13 @@ export const serverApi = {
    */
   async generateUrl(server: ServerConfig): Promise<string> {
     return ipcClient.invoke(IPC_CHANNELS.SERVER_GENERATE_URL, { server });
+  },
+
+  /**
+   * Cloudflare WARP：注册匿名设备 → 返回 WireGuard 草稿（供 WG 表单填充）。licenseKey 可选（WARP+）。
+   */
+  async registerWarp(licenseKey?: string): Promise<WarpWireGuardDraft> {
+    return ipcClient.invoke(IPC_CHANNELS.WARP_REGISTER, { licenseKey });
   },
 
   /**
@@ -805,6 +844,16 @@ export const backupApi = {
 };
 
 /**
+ * 诊断 API（导出脱敏诊断报告）
+ */
+export const diagnosticApi = {
+  /** 导出诊断报告（弹出系统文件保存对话框，单 Markdown，密钥已脱敏） */
+  async export(): Promise<{ success: boolean; filePath?: string; error?: string }> {
+    return ipcClient.invoke(IPC_CHANNELS.DIAGNOSTIC_EXPORT);
+  },
+};
+
+/**
  * macOS 提权 helper API（免提权启停 sing-box）
  */
 export const helperApi = {
@@ -858,6 +907,7 @@ export const api = {
   coreUpdate: coreUpdateApi,
   subscription: subscriptionApi,
   backup: backupApi,
+  diagnostic: diagnosticApi,
   helper: helperApi,
   app: appApi,
 };

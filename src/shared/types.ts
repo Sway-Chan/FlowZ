@@ -20,7 +20,10 @@ export type Protocol =
   | 'naive'
   | 'socks'
   | 'http'
-  | 'ssh';
+  | 'ssh'
+  | 'wireguard'
+  | 'tailscale'
+  | 'custom';
 export type Network = 'tcp' | 'ws' | 'grpc' | 'http' | 'httpupgrade';
 export type Hysteria2Network = 'tcp' | 'udp';
 export type Security = 'none' | 'tls' | 'reality';
@@ -38,6 +41,7 @@ export interface TlsSettings {
   alpn?: string[];
   fingerprint?: string;
   ech?: boolean; // Encrypted Client Hello（隐藏 SNI）；sing-box tls.ech.enabled
+  echConfig?: string; // 可选 ECHConfigList(PEM)；空=sing-box 从 DNS(HTTPS RR type65) 自取，填=下发 tls.ech.config
   fragment?: boolean; // TLS ClientHello 分片，抗 SNI-DPI；sing-box tls.fragment
 }
 
@@ -161,6 +165,47 @@ export interface SubscriptionConfig {
   };
 }
 
+/**
+ * WireGuard endpoint 设置（sing-box 1.11+ endpoint；默认 gVisor 用户态栈、零额外提权）。
+ * 单 peer 模型：peer 的 endpoint 用 ServerConfig.address/port 承载（与其他协议一致），其余 peer 参数在此。
+ */
+export interface WireGuardSettings {
+  privateKey: string; // 本地私钥（base64）
+  localAddress: string[]; // 本地隧道地址（wg-quick [Interface].Address），如 ['10.0.0.2/32','fd00::2/128']
+  peerPublicKey: string; // 对端公钥（base64）
+  preSharedKey?: string; // 可选预共享密钥（base64）
+  allowedIPs?: string[]; // 缺省 ['0.0.0.0/0','::/0']
+  persistentKeepalive?: number; // 保活间隔（秒）
+  reserved?: number[]; // 3 字节 reserved（Cloudflare WARP 等需要）
+  mtu?: number; // 缺省 1408
+}
+
+// Tailscale（sing-box endpoint，账号制 mesh，无 server address/port——连控制面）。Phase 1 userspace。
+export interface TailscaleSettings {
+  authKey?: string; // pre-auth key（可选；无则核日志出 `Waiting for authentication: <url>` 交互登录）
+  exitNode?: string; // 出口节点 name/IP（选它当全局代理时填；空=仅通 tailnet 内网/accept_routes 段）
+  exitNodeAllowLanAccess?: boolean; // 用 exit node 时本地 LAN 仍直连
+  acceptRoutes?: boolean; // 接受其它节点广告的子网路由（访问 tailnet 内网段）
+  // 经此 Tailscale 节点路由的子网（CIDR）= WG allowedIPs 的等价物（FlowZ force-route 源）。
+  // 与 advertiseRoutes 不同：advertiseRoutes 是「本机对外广告」，routes 是「把这些段的流量送进此节点」。
+  // FlowZ userspace 下自动含 tailnet 段 100.64.0.0/10 + 这里填的 advertised 子网。需配 acceptRoutes 才真正接收。
+  routes?: string[];
+  controlUrl?: string; // 默认 controlplane.tailscale.com；Headscale 自建控制面填此
+  hostname?: string; // 节点名（默认系统主机名）
+  ephemeral?: boolean; // 临时节点（离线即注销）
+  advertiseRoutes?: string[]; // 本机作子网路由器对外广告的段
+  reverseMesh?: boolean; // Phase 2：反向 mesh（system_interface=真 TUN，被组网访问）；默认 false=userspace
+}
+
+// 自定义协议（raw-JSON 透传）：用户直接填一份 sing-box outbound/endpoint JSON，FlowZ 不解析语义、只注入 tag。
+// 供第三方内核协议（如 snell）使用——「内核即权威」：能否启用由 sing-box check probe / 启动 gate 判定，FlowZ 不维护
+// type 白名单。address/port 由 JSON 内部携带，不用 ServerConfig.address/port。
+export interface CustomSettings {
+  outbound: Record<string, unknown>; // 用户填的 outbound/endpoint 对象（须含字符串 type）；tag 由 FlowZ 生成期强制覆盖
+  isEndpoint?: boolean; // 该 type 属 sing-box endpoints[]（如类 wireguard/tailscale 的第三方实现）而非 outbounds[]
+  secretKeys?: string[]; // 该 JSON 里属密钥的键名（诊断报告脱敏用：redactDeep 据此叠加打码）。无值层启发式，未声明则仅靠通用密钥黑名单兜底（psk/password/uuid 等），建议填全自定义密钥键
+}
+
 export interface ServerConfig {
   id: string;
   name: string;
@@ -203,6 +248,15 @@ export interface ServerConfig {
 
   // TUIC 特定
   tuicSettings?: TuicSettings;
+
+  // WireGuard 特定（sing-box endpoint）
+  wireguardSettings?: WireGuardSettings;
+
+  // Tailscale 特定（sing-box endpoint，账号制 mesh）
+  tailscaleSettings?: TailscaleSettings;
+
+  // 自定义协议（raw-JSON 透传，第三方内核用）
+  customSettings?: CustomSettings;
 
   // AnyTLS 特定
   anyTlsSettings?: AnyTlsSettings;
@@ -341,6 +395,12 @@ export interface DnsConfig {
   // auto（缺省）=AliDNS IP-DoH（dns-bootstrap，零行为变化）/ dnspod=DNSPod IP-DoH（dns-node，1.12.12.12）/
   // system=系统 DNS（dns-local；TUN 下 rule ctx 仍强制 IP-DoH 防递归）。旧配置无此字段 → 视为 auto。
   nodeDomainResolver?: 'auto' | 'dnspod' | 'system';
+  // TUN 模式强制接管系统 DNS（SystemDnsManager）：缺省/true=开（默认）。on-link 的 LAN/ISP DNS 不进 TUN →
+  // hijack-dns 看不到 → 需代理的域名走系统解析得到真实/错族 IP（双栈站 ERR_CONNECTION_CLOSED / 真 v6 泄漏）。
+  // 开 → TUN 启动把系统 DNS 改为可路由的 8.8.8.8 使其经 TUN 被 hijack；停止/退出/崩溃还原。
+  // 关 → 不接管（dns-local 恢复用原 LAN DNS、内网域名正常，但 TUN 下有上述泄漏风险），供有自定义/内网 DNS 的用户用。
+  // 仅 TUN 模式生效；旧配置无此字段 → 视为开。详见 docs/design/dns-ipv6-takeover.md。
+  takeoverSystemDns?: boolean;
 }
 
 // 自定义规则集（从 URL 导入）
@@ -545,11 +605,22 @@ export interface UserConfig {
   customAppPresets?: CustomAppPreset[];
 
   // 端口配置
-  socksPort: number;
-  httpPort: number;
-  mixedPort?: number; // 混合端口（可选，同时支持 HTTP 和 SOCKS5，0 或 undefined 表示禁用）
+  /** @deprecated mixed-only 架构已弃用独立端口；仅旧配置兼容 + 迁移读取（见 shared/proxy-ports）。 */
+  socksPort?: number;
+  /** @deprecated 同上；迁移时若 mixedPort 未设则以此为 mixedPort 种子。 */
+  httpPort?: number;
+  // 本地混合代理端口（mixed inbound 同口 HTTP+SOCKS）。mixed-only 架构 canonical 端口，恒 >0、无开关。
+  // 新装缺省 7890（DEFAULT_MIXED_PORT，对齐业内）；旧配置迁移自 httpPort。统一经 shared/proxy-ports#localProxyPort 取用。
+  mixedPort?: number;
+  // clash_api 外部控制端口。新装缺省 9090（DEFAULT_CONTROL_PORT，对齐业内）。可改：当 9090 被另一 clash 系应用/
+  // 任意进程占用时，FlowZ 据此改 external_controller 端口，避免 clash_api 无法 bind 的死局。统一经 shared/proxy-ports#controlApiPort 取用。
+  controlPort?: number;
   allowLan?: boolean; // 局域网共享代理（允许其他设备连接）
   bypassLAN?: boolean; // 绕过局域网（将内网 IP 设置为直连）
+  // 系统代理「忽略代理列表」(OS proxy 例外)。仅系统代理模式生效（TUN 直连走 sing-box route）。
+  // 缺省/空 → 取 shared/system-proxy-bypass#DEFAULT_SYSTEM_PROXY_BYPASS（业内聚合清单）；用户可在设置里逗号分隔编辑。
+  // mac networksetup 原样下发 CIDR+域名；win 转通配；linux gsettings ignore-hosts。详见 shared/system-proxy-bypass。
+  systemProxyBypass?: string[];
   blockQuic?: boolean; // 阻止 QUIC（对代理向 UDP 443 执行 reject，逼浏览器回退 TCP）；默认关；节点无关，对所有协议一视同仁
   tlsFragment?: boolean; // 全局 TLS 分片：对所有 TLS 节点切分 ClientHello 抗 SNI-DPI；默认关
   // 节点测速端点 URL（经各节点代理 GET 量 TTFB）。默认 generate_204（见 shared/speed-test）；用户可自配，兼容 http/https。
@@ -571,6 +642,11 @@ export interface UserConfig {
   logLevel: LogLevel;
   // 关闭日志写盘（sing-box log.disabled）；默认 false=写盘。关闭后应用内无法查看实时日志/基于日志的诊断
   disableLogFile?: boolean;
+
+  // 诊断采集（临时提级）：开启时把 logLevel 临时拉到 debug 复现问题，存档原级别供还原。
+  // 存在即「采集中」（UI 据此显示采集条）。结束采集 / 下次启动 app → 还原 logLevel=prevLogLevel 后清此字段。
+  // 还原到「采集前的快照级别」（可能是 error/warn），绝不硬编码 info。崩溃安全：持久在 config，loadConfig 启动还原。
+  diagnosticCapture?: { prevLogLevel: LogLevel };
 
   // clash_api(127.0.0.1:9090) 鉴权 secret：首次启动随机生成并持久化，统一管所有 clash_api 访问(含 external_ui)。
   // 内部调用(热切换/流量统计/拓扑)带 Authorization；防恶意网页跨域读连接历史。可在设置里查看/重置。

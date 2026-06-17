@@ -25,6 +25,8 @@ import type { IPrivilegedHelper } from './IPrivilegedHelper';
 import { ClashApiClient } from './ClashApiClient';
 import { PlatformPrivilegeService } from './PlatformPrivilegeService';
 import { type ISystemProxyManager, SystemProxyBase } from './SystemProxyManager';
+import { type ISystemDnsManager } from './SystemDnsManager';
+import { localProxyPort, controlApiPort } from '../../shared/proxy-ports';
 import { IPC_CHANNELS } from '../../shared/ipc-channels';
 import { LOGIN_ITEMS_SETTINGS_URL } from '../../shared/constants';
 import { resourceManager } from './ResourceManager';
@@ -37,6 +39,8 @@ import {
 } from './builtin-geo-rulesets';
 import { retry } from '../utils/retry';
 import { coreVersionAtLeast } from '../../shared/version';
+import { parseTailscaleAuthLine } from '../../shared/tailscale';
+import { endpointForcedRouteCidrs, isEndpointProtocol } from '../../shared/endpoint-routes';
 import { effectiveLogLevel } from '../../shared/log-level';
 import {
   getUserDataPath,
@@ -48,7 +52,11 @@ import {
   getCustomRulesDir,
 } from '../utils/paths';
 import { getAppPreset } from '../../shared/app-rules-preset';
-import { parseDnsServerSpec, type ParsedDnsServer } from '../../shared/dns';
+import {
+  parseDnsServerSpec,
+  type ParsedDnsServer,
+  BOOTSTRAP_DIRECT_DNS_IPS,
+} from '../../shared/dns';
 import { ruleConditions } from '../../shared/rules';
 import {
   EXT_TYPES,
@@ -295,7 +303,7 @@ interface SingBoxOutbound {
       public_key: string;
       short_id: string;
     };
-    ech?: { enabled: boolean };
+    ech?: { enabled: boolean; config?: string[] };
     fragment?: boolean;
   };
   // Transport
@@ -340,6 +348,43 @@ interface SingBoxOutbound {
   outbounds?: string[];
   default?: string;
   interrupt_exist_connections?: boolean;
+}
+
+interface SingBoxWireGuardPeer {
+  address: string;
+  port: number;
+  public_key: string;
+  pre_shared_key?: string;
+  allowed_ips: string[];
+  persistent_keepalive_interval?: number;
+  reserved?: number[];
+}
+
+// sing-box endpoint（1.11+）：独立于 outbound 的顶层 endpoints[] 元素，其 tag 可被 route/selector 当 outbound 引用。
+// WireGuard + Tailscale（默认用户态：WG system=false / TS system_interface=false，零提权）。
+interface SingBoxEndpoint {
+  type: string;
+  tag: string;
+  // WireGuard
+  system?: boolean;
+  mtu?: number;
+  address?: string[];
+  private_key?: string;
+  listen_port?: number;
+  peers?: SingBoxWireGuardPeer[];
+  udp_timeout?: string;
+  workers?: number;
+  // Tailscale（账号制 mesh；默认 tsnet 用户态。system_interface=Phase 2 反向 mesh）
+  auth_key?: string;
+  state_directory?: string;
+  control_url?: string;
+  hostname?: string;
+  exit_node?: string;
+  exit_node_allow_lan_access?: boolean;
+  accept_routes?: boolean;
+  ephemeral?: boolean;
+  advertise_routes?: string[];
+  system_interface?: boolean;
 }
 
 interface SingBoxRouteRule {
@@ -435,6 +480,18 @@ export function parseCheckOutboundIndex(stderr: string): number | null {
   return Number.isInteger(idx) && idx >= 0 ? idx : null;
 }
 
+/**
+ * 同 parseCheckOutboundIndex，但匹配 endpoints[N]（sing-box 顶层 endpoints[]：WireGuard/Tailscale/自定义 endpoint）。
+ * 自定义 endpoint 用不被内核支持的 type 时，check 报 `endpoints[N]: unknown endpoint type` —— 须能据此剪除该
+ * endpoint 节点（否则 idx=null 整体启动失败）。内置 WG/TS 恒兼容，历史上不触发；自定义 endpoint 才需要它。
+ */
+export function parseCheckEndpointIndex(stderr: string): number | null {
+  const m = /\bendpoints?\[(\d+)\]/.exec(stderr);
+  if (!m) return null;
+  const idx = Number(m[1]);
+  return Number.isInteger(idx) && idx >= 0 ? idx : null;
+}
+
 interface SingBoxExperimental {
   cache_file?: {
     enabled: boolean;
@@ -449,6 +506,7 @@ interface SingBoxConfig {
   dns?: SingBoxDnsConfig;
   inbounds: SingBoxInbound[];
   outbounds: SingBoxOutbound[];
+  endpoints?: SingBoxEndpoint[];
   route?: SingBoxRouteConfig;
   experimental?: SingBoxExperimental & {
     clash_api?: {
@@ -482,6 +540,10 @@ export interface IProxyManager {
   ): void;
   getCoreVersion(force?: boolean): Promise<string>;
   buildPreflightConfigJson(targetVersion: string): string | null;
+  probeOutbound(
+    outbound: unknown,
+    isEndpoint?: boolean
+  ): Promise<{ ok: boolean; indeterminate?: boolean; error?: string }>;
   closeConnection(id?: string): Promise<{ ok: boolean; status: number }>;
 }
 
@@ -496,10 +558,17 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   // 系统代理单一写者（注入 index.ts 的同一 singleton，与 IPC handler/tray 共享 originalSettings/marker 状态）。
   // 拆双轨：ProxyManager 不再内联 networksetup/reg，统一经此调用 enableProxy/disableProxy（带 marker + 防自指）。
   private systemProxyManager: ISystemProxyManager | null = null;
+  // 系统 DNS 接管单一写者（注入 index.ts 同一 singleton）：仅 TUN 模式接管（on-link LAN DNS 不进 TUN → hijack
+  // 失效，故强制系统 DNS 为可路由的受控 IP 使其经 TUN 被 hijack）。与 systemProxyManager 同生命周期点收口。
+  private systemDnsManager: ISystemDnsManager | null = null;
+  // 方案B：接管前读到的内网 LAN 解析器 IP（私网 IPv4）。仅 TUN+takeover 开时在 generateSingBoxConfig 前预读填充，
+  // 供 generateDnsConfig 把内网/captive 域名重定向到它（takeover 后 dns-local=公网解不了内网）+ rule C 直连放行防环。
+  // null=无可用 LAN 解析器（非 TUN/关/DHCP 读不到/仅公网）→ 退回 dns-local。每次 start 入口重置重读。
+  private lanResolverForDns: string | null = null;
   // 杀核前「静默 clash_api 客户端」回调（停 StatsService 轮询 + 关其到 9090 的 keep-alive 连接）：让 client 主动关
   // → 9090 不进 TIME_WAIT → 下次用户态 sing-box 免撞 root TIME_WAIT 等 30s（P0-2 治本 TIME_WAIT）。
   private quiesceClashClients: (() => void) | null = null;
-  // clash_api(9090) 专属 HTTP 客户端（T15：原 clashApiAgent 字段 + clashApiRequest/clashAuthHeaders/
+  // clash_api 专属 HTTP 客户端（端口默认 9090，可经 config.controlPort 改；T15：原 clashApiAgent 字段 + clashApiRequest/clashAuthHeaders/
   // destroyClashApiAgent 收口进 ClashApiClient，与 StatsService 共用单一 agent）。经 setClashApiClient 注入。
   private clashApiClient: ClashApiClient | null = null;
   // 平台提权服务（T16：原提权脚本生成 / 文件权限 / 提权复制等纯函数迁出，经 setPrivilegeService 注入；
@@ -507,6 +576,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private privilegeService: PlatformPrivilegeService | null = null;
   // ensureSystemProxyCleared 单飞：终态清理可能被 giveUp/健康检查/信号死多路并发触发，防重复 disable。
   private clearingSystemProxy = false;
+  // ensureSystemDnsRestored 单飞：与系统代理同终态多路并发，防重复 restore。
+  private clearingSystemDns = false;
   // 「主动停止/重启中」：stop() 期间置位，令 ensureSystemProxyCleared 跳过——避免重启 stop 腿清掉系统代理后
   // 又被 start() reconcile 设回的并发竞态（C1）。真·外部死亡时为 false → 信号死分支照常清理。
   private stopping = false;
@@ -559,6 +630,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     memberTag: string;
     targetServerId?: string;
   }[] = [];
+  // 生成侧暂存：本轮 generateOutbounds 产出的 endpoint（WireGuard 等，sing-box 顶层 endpoints[]）。
+  // 仅 generateOutbounds 写、generateSingBoxConfig 末尾读，注入 SingBoxConfig.endpoints（非持久态）。
+  private pendingEndpoints: SingBoxEndpoint[] = [];
   // 启动前配置校验 gate 标记的非法节点（坏节点会让 sing-box 整体启动 FATAL）：仅会话内存，每次
   // startInternal 清空重判（换核自动复活）。generateOutbounds 据此跳过、不进 selector；checkAndPruneConfig
   // 迭代填充并在末尾推送渲染端标灰。
@@ -780,6 +854,21 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     this.gateInvalidNodes.clear();
     this.refFixAttempted = false;
 
+    // 3.8 方案B：DNS 接管激活时,先读接管前的内网 LAN 解析器(私网 IPv4),供 generateDnsConfig 把内网/captive 域名
+    //     重定向到它(takeover 把系统 DNS 改公网 8.8.8.8 后 dns-local 解不了内网/可能环)。必须在 generateSingBoxConfig
+    //     之前读(此刻系统 DNS 尚未被 setDns 改写,scutil/netsh 反映的仍是 LAN 解析器)。无可用→null→退回 dns-local。
+    this.lanResolverForDns = null;
+    if (config.proxyModeType === 'tun' && config.dnsConfig?.takeoverSystemDns !== false) {
+      this.lanResolverForDns =
+        (await this.systemDnsManager?.getLanResolverForDns().catch(() => null)) ?? null;
+      if (this.lanResolverForDns) {
+        this.logToManager(
+          'info',
+          `DNS 接管：内网/captive 域名将经原 LAN 解析器 ${this.lanResolverForDns} 解析`
+        );
+      }
+    }
+
     // 4. 生成 sing-box 配置文件
     const singboxConfig = this.generateSingBoxConfig(config, resolvedServerIps);
 
@@ -887,11 +976,16 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       if (config.proxyModeType === 'systemProxy') {
         await this.systemProxyManager?.enableProxy(
           '127.0.0.1',
-          config.httpPort || 2080,
-          config.socksPort || 2081
+          localProxyPort(config), // mixed-only：HTTP 与 SOCKS 同口（mac 三代理同口、win 仅 http）
+          localProxyPort(config),
+          config.systemProxyBypass // 缺省 undefined → SystemProxyManager 取业内默认 bypass 清单
         );
       } else {
         await this.ensureSystemProxyCleared();
+        // 仅 TUN：清掉 FlowZ 自己的(marker)系统代理后，若仍有系统代理开着 = 无 marker 残留(外部/他软件/丢 marker)。
+        // TUN 下它会截走代理感知 app 的流量致连接异常；direct/manual 模式不接管路由，残留是用户自己的事，不提示。
+        // 不自动清(7890 等业内共用端口、无法证明归属，自动清会误伤别的代理软件)→ 一次性提示，交用户决定。
+        if (config.proxyModeType === 'tun') await this.adviseIfResidualSystemProxy();
       }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -905,6 +999,25 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           code: -3,
         });
       }
+    }
+
+    // 系统 DNS 接管收口（治本 DNS，与系统代理 reconcile 正交）：仅 TUN 模式接管——on-link 的 LAN/ISP DNS 不进
+    // TUN → hijack-dns 看不到 → 需代理的域名被系统解析器解析成真实/错族 IP。故 TUN 启动把系统 DNS 改为受控、
+    // 可路由、不在 bootstrap-direct 的 8.8.8.8，使其经 TUN 被 hijack（真进 sing-box → FakeIP/远程解析）。
+    // systemProxy/manual 模式不接管 DNS（系统代理走远程解析）→ 反向还原可能残留（覆盖 TUN→其它模式切换）。
+    // best-effort：setDns 内部失败仅告警 + 回滚，绝不抛、不阻断 TUN 启动。
+    try {
+      if (config.proxyModeType === 'tun' && config.dnsConfig?.takeoverSystemDns !== false) {
+        await this.systemDnsManager?.setDns();
+      } else {
+        // 非 TUN / 用户关掉接管开关 → 还原可能残留的受控 DNS（覆盖 TUN→其它模式切换、开→关切换）。
+        await this.ensureSystemDnsRestored();
+      }
+    } catch (e) {
+      this.logToManager(
+        'warn',
+        `系统 DNS 接管状态同步失败: ${e instanceof Error ? e.message : String(e)}`
+      );
     }
 
     // H3 修复：sing-box 的 cache_file 会持久化 selector 的 clash_api 选择，重启后缓存会覆盖 config
@@ -1494,9 +1607,14 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     this.clashApiClient?.destroyAgent();
   }
 
-  /** 当前 clash_api secret（供 StatsService 等其它主进程内部 9090 调用带鉴权）。 */
+  /** 当前 clash_api secret（供 StatsService 等其它主进程内部 clash_api 调用带鉴权）。 */
   getClashApiSecret(): string {
     return this.currentConfig?.clashApiSecret || '';
+  }
+
+  /** 当前 clash_api 控制端口（ClashApiClient/StatsService/端口冲突清理 统一取用；缺省 9090，可经 config.controlPort 改）。 */
+  getClashApiPort(): number {
+    return controlApiPort(this.currentConfig ?? {});
   }
 
   /**
@@ -1628,7 +1746,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    */
   private async allocateProbePorts(config?: UserConfig): Promise<void> {
     // 排除用户自配端口与 clash_api，避免 listen(0) 偶撞用户端口段致 sing-box bind FATAL（review P1-4）
-    const exclude = new Set<number>([9090]);
+    const exclude = new Set<number>([controlApiPort(config ?? {})]);
     if (config) {
       if (config.httpPort) exclude.add(config.httpPort);
       if (config.socksPort) exclude.add(config.socksPort);
@@ -1672,14 +1790,14 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
-   * 启动前确认 clash_api 端口(9090)可用，仍被占则**按端口**清掉占用者（L2，彻底摆脱 cmdline 匹配）。
-   * 9090 是对外契约固定端口（StatsService / external_controller / 高级设置展示与复制），不改可变端口，故唯一
-   * 正确处置是「清掉占用者，否则明确终态」。处置阶梯：① helper 就绪 → freePort（root、按端口、零提权，是 sing-box
+   * 启动前确认 clash_api 控制端口可用，仍被占则**按端口**清掉占用者（L2，彻底摆脱 cmdline 匹配）。
+   * 端口取 getClashApiPort()（默认 9090，可经 config.controlPort 改）。残留 sing-box 是自家的，正确处置是「清掉
+   * 占用者，否则明确终态 / 提示用户改 controlPort」。处置阶梯：① helper 就绪 → freePort（root、按端口、零提权，是 sing-box
    * 才杀，否则回报占用者名）；② 交互 + 无 helper → osascript 一次性按端口清；③ 兜底明确终态。所有终态码
    * ∈ 不可恢复错误（含 _FOREIGN / _AUTH_CANCELLED，均含 clash_api_port_busy 子串）→ 不进自动重启风暴。
    */
   private async resolveClashApiPortConflict(): Promise<void> {
-    const PORT = 9090;
+    const PORT = this.getClashApiPort();
     // 占用两态：listening(connect 连上=有活监听者，必有 PID，可杀) / bindBusy(bind EADDRINUSE)。
     // bindBusy 但 !listening = TIME_WAIT 类——XNU in_pcbbind 有 UID 检查：root sing-box 死后留下的 9090
     // root TIME_WAIT，用户态(systemProxy) sing-box 即使 SO_REUSEADDR 也压不过 → EADDRINUSE，持续 2MSL≈30s。
@@ -1695,30 +1813,30 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     };
     let p = await probe();
     if (!p.bindBusy && !p.listening) {
-      this.logToManager('info', `[9090] 端口空闲，正常继续`);
+      this.logToManager('info', `[clash_api] 端口空闲，正常继续`);
       return;
     }
     this.logToManager(
       'warn',
-      `[9090] 仍被占用(bindBusy=${p.bindBusy} listening=${p.listening})，进入清理（helper=${!!this.helperManager}）`
+      `[clash_api] 仍被占用(bindBusy=${p.bindBusy} listening=${p.listening})，进入清理（helper=${!!this.helperManager}）`
     );
 
     // ② 有活监听者（孤儿/外部/旧路径 sing-box）→ 按端口提权杀（freePort 零提权 / osascript 带超时）
     if (p.listening) {
       if (this.helperManager && (await this.helperManager.isReady())) {
-        this.logToManager('info', `[9090] helper 就绪 → freePort 按端口清理`);
+        this.logToManager('info', `[clash_api] helper 就绪 → freePort 按端口清理`);
         const r = await this.helperManager.freePort(PORT);
-        this.logToManager('info', `[9090] freePort 结果: ${JSON.stringify(r)}`);
+        this.logToManager('info', `[clash_api] freePort 结果: ${JSON.stringify(r)}`);
         if (r.foreign) throw this.clashPortError('FOREIGN', r.foreign);
       }
       p = await probe();
       if (p.listening && this.startInteractive && process.platform === 'darwin') {
         this.logToManager(
           'warn',
-          `[9090] freePort 未清净 → osascript 按端口清理（带超时，弹前置顶窗口）`
+          `[clash_api] freePort 未清净 → osascript 按端口清理（带超时，弹前置顶窗口）`
         );
         const res = await this.osascriptFreePort(PORT);
-        this.logToManager('info', `[9090] osascript 按端口清理结果: ${res}`);
+        this.logToManager('info', `[clash_api] osascript 按端口清理结果: ${res}`);
         if (res === 'cancelled') throw this.clashPortError('AUTH_CANCELLED');
         if (res === 'foreign') throw this.clashPortError('FOREIGN');
         p = await probe();
@@ -1732,12 +1850,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         // M5：Windows helper 就绪但首次 freePort 未清净（可能竞态/刚退 TIME_WAIT 转监听）→ 再试一次。
         // 注：Windows 无 osascript 等价的零提权清理；helper 未装=设计现状（可选加速层），
         // 不冒险加 RunAs taskkill（按映像名杀会误杀用户其他 sing-box 进程）。
-        this.logToManager('info', `[9090] Windows helper freePort 首次未清净，重试一次`);
+        this.logToManager('info', `[clash_api] Windows helper freePort 首次未清净，重试一次`);
         await this.helperManager.freePort(PORT);
         p = await probe();
       }
       if (!p.bindBusy && !p.listening) {
-        this.logToManager('info', `[9090] 活监听者已清掉，端口空闲`);
+        this.logToManager('info', `[clash_api] 活监听者已清掉，端口空闲`);
         return;
       }
       if (p.listening) {
@@ -1745,11 +1863,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           const ready = this.helperManager && (await this.helperManager.isReady());
           this.logToManager(
             'error',
-            `[9090] Windows 活监听者仍在 → 终态 BUSY：${ready ? 'helper freePort 重试后仍未清净' : '未装 helper，无零提权清理手段（建议安装 Windows 提权 helper）'}`
+            `[clash_api] Windows 活监听者仍在 → 终态 BUSY：${ready ? 'helper freePort 重试后仍未清净' : '未装 helper，无零提权清理手段（建议安装 Windows 提权 helper）'}`
           );
         } else {
           // 仍有活监听者没杀掉（非交互/取消/外部）
-          this.logToManager('error', `[9090] 活监听者仍在 → 终态 BUSY`);
+          this.logToManager('error', `[clash_api] 活监听者仍在 → 终态 BUSY`);
         }
         throw this.clashPortError('BUSY');
       }
@@ -1766,13 +1884,13 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       if (this.needsOsascript()) {
         this.logToManager(
           'info',
-          `[9090] TIME_WAIT 残留，本次以 root 启动 sing-box（SO_REUSEADDR 复用同 uid 残留）→ 跳过等待直接放行`
+          `[clash_api] TIME_WAIT 残留，本次以 root 启动 sing-box（SO_REUSEADDR 复用同 uid 残留）→ 跳过等待直接放行`
         );
         return;
       }
       this.logToManager(
         'warn',
-        `[9090] 端口处于回收中(TIME_WAIT)，等待系统释放（≤35s，无需结束进程）...`
+        `[clash_api] 端口处于回收中(TIME_WAIT)，等待系统释放（≤35s，无需结束进程）...`
       );
       this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_ERROR, {
         message:
@@ -1785,17 +1903,17 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         await new Promise((r) => setTimeout(r, 1000));
         p = await probe();
         if (!p.bindBusy && !p.listening) {
-          this.logToManager('info', `[9090] TIME_WAIT 已回收，端口空闲`);
+          this.logToManager('info', `[clash_api] TIME_WAIT 已回收，端口空闲`);
           return;
         }
         if (p.listening) break; // 期间又冒出活监听者 → 跳出走 BUSY 终态（罕见）
       }
       if (p.bindBusy && !p.listening) {
-        this.logToManager('error', `[9090] TIME_WAIT 35s 未回收 → 终态`);
+        this.logToManager('error', `[clash_api] TIME_WAIT 35s 未回收 → 终态`);
         throw this.clashPortError('BUSY_TIMEWAIT');
       }
     }
-    this.logToManager('error', `[9090] 清理后仍被占用 → 终态 BUSY`);
+    this.logToManager('error', `[clash_api] 清理后仍被占用 → 终态 BUSY`);
     throw this.clashPortError('BUSY');
   }
 
@@ -1823,12 +1941,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     });
   }
 
-  /** 构造 9090 占用终态错误（err.code 带机读码；三条消息均含「clash_api 端口 9090」→ isUnrecoverableRestartError 命中、立即终态）。 */
+  /** 构造 clash_api 端口占用终态错误（err.code 带机读码；消息均含「clash_api 端口」→ isUnrecoverableRestartError 命中、立即终态）。 */
   private clashPortError(
     kind: 'BUSY' | 'FOREIGN' | 'AUTH_CANCELLED' | 'BUSY_TIMEWAIT',
     occupant?: string
   ): Error & { code?: string } {
-    const PORT = 9090;
+    const PORT = this.getClashApiPort();
     let msg: string;
     let code: string;
     if (kind === 'FOREIGN') {
@@ -1900,7 +2018,7 @@ done
       };
       // 硬超时：授权框被遮挡/无人应答 120s → 杀 osascript 按取消处理，绝不让 start() 永挂（修卡死诱因）。
       const timer = setTimeout(() => {
-        this.logToManager('warn', `[9090] osascript 授权框 120s 未应答，按取消处理`);
+        this.logToManager('warn', `[clash_api] osascript 授权框 120s 未应答，按取消处理`);
         try {
           proc.kill('SIGKILL');
         } catch {
@@ -1992,7 +2110,7 @@ done
           store_rdrc: true,
         },
         clash_api: {
-          external_controller: '127.0.0.1:9090',
+          external_controller: `127.0.0.1:${controlApiPort(config)}`,
           external_ui: path.join(userDataPath, 'ui'),
           // 随机 secret 鉴权（持久化于 config）：内部调用带 Authorization，防恶意网页跨域读连接历史
           secret: config.clashApiSecret || '',
@@ -2000,6 +2118,12 @@ done
         },
       },
     };
+
+    // WireGuard 等 endpoint 由 generateOutbounds 收进 pendingEndpoints，注入顶层 endpoints[]（其 tag 已在
+    // proxy-selector / rule-sel / route 中作为成员被引用，与 outbound 一视同仁）。
+    if (this.pendingEndpoints.length > 0) {
+      singboxConfig.endpoints = this.pendingEndpoints;
+    }
 
     // 路由规则若指向「已被跳过/不存在的出站」（如缺 libcronet 被跳过的 naive 节点），sing-box 会以
     // "outbound not found" 启动失败。统一把这类死引用修正为 selector（修 review H2：app/custom 分流
@@ -2243,19 +2367,52 @@ done
         tag: 'fakeip',
         type: 'fakeip',
         inet4_range: '198.18.0.0/15',
-        inet6_range: 'fc00::/18',
+        // §B：关 IPv6(enableIPv6=false)时不给 FakeIP 分配 v6 段 → fakeip 对 AAAA 无段可分配即返空（真机实测，见
+        // docs/design E-1：无需改规则 query_type）；配合下方 strategy=ipv4_only → 客户端拿不到任何 v6，杜绝
+        // "双栈站 + 节点无 v6"时浏览器试 v6 失败致 ERR_CONNECTION_CLOSED。
+        ...(config.enableIPv6 ? { inet6_range: 'fc00::/18' } : {}),
       });
     }
+
+    // 方案B：DNS 接管把系统 DNS 改成公网 8.8.8.8 后，dns-local(type:local) 解不了内网域名(.lan/.home.arpa/内网域)、
+    // 反查(.arpa) 与 captive portal。接管激活且读到内网 LAN 解析器(私网 IPv4)时，建 dns-lan(udp:53 指向它)，把这些
+    // 域名重定向到它解析；其 :53 由 generateRouteConfig rule C 直连放行(防被 hijack-dns 抢走成环)。
+    const lanResolver = this.lanResolverForDns;
+    if (lanResolver) {
+      dnsServers.push({ tag: 'dns-lan', type: 'udp', server: lanResolver, server_port: 53 });
+    }
+    // Q1 死循环防护（**仅 Windows**）：Win TUN 的 strict_route(WFP) 把所有 :53 逼进 TUN；type:local 经 svchost(Win DNS
+    // 客户端，不在 route 直连进程白名单)发出的查询 → 进 TUN → hijack-dns → 命中 dns-local 规则 → 又 svchost → ∞。
+    // **死环源于 strict_route + type:local 本身，与系统 DNS 是否被改无关**（Win setDns 已收敛 no-op，见 SystemDnsManager）。
+    // macOS 安全(dns-local→mDNSResponder，在直连白名单，查询不被 hijack)；Linux 不接管。故仅 Win 下把会落 type:local 的
+    // unicast 域名改路由：银行公网→dns-domestic、内网/反查/captive→dns-lan(有 LAN 解析器)否则 dns-domestic。
+    // .local 走 mDNS/LLMNR 组播(不发 unicast)，留 dns-local。
+    // 注：winLoopRisk 暂以 takeoverSystemDns 开关为代理键(默认 on)；理想是解耦为「Win+TUN」恒判(死环与开关无关)，
+    // 待真机 nslookup 实证后再改（见 docs/design/dns-ipv6-takeover.md §A）。
+    const dnsTakeoverActive =
+      config.proxyModeType === 'tun' && config.dnsConfig?.takeoverSystemDns !== false;
+    const winLoopRisk = process.platform === 'win32' && dnsTakeoverActive;
+    // 内网/反查/captive 解析器：优先 dns-lan(直连放行的 LAN IP)；无则 Win 退 dns-domestic(避免 type:local 死环、
+    // 内网域名 NXDOMAIN 但不挂)，非 Win 退 dns-local(系统解析器=真实 LAN，正常)。
+    const internalResolverTag = lanResolver
+      ? 'dns-lan'
+      : winLoopRisk
+        ? 'dns-domestic'
+        : 'dns-local';
+    // 银行/U盾公网域名解析器：仅 Win 改 dns-domestic 绕死环；其余 dns-local（mac 经 mDNSResponder 直连解公网正常）。
+    const bankResolverTag = winLoopRisk ? 'dns-domestic' : 'dns-local';
 
     const dnsConfig: SingBoxDnsConfig = {
       servers: dnsServers,
       rules: [],
       // 默认使用国内 DNS 解析
       final: 'dns-domestic',
-      // strategy 仅控制 A/AAAA 偏好，与 FakeIP 无关：统一 prefer_ipv4（sing-box 官方默认行为，三平台一致）。
-      // 原 ipv4_only 分支会抑制 AAAA 查询，伤 CDN 优选域名 / IPv6-only 目标的解析（#57）；prefer_ipv4 在无 IPv6 时
-      // 仍优先用 A，安全无副作用。usesFakeIp 无平台分支，三平台 enableFakeIp 时一致走 FakeIP（旧注释已过时，实为恒 FakeIP）。
-      strategy: 'prefer_ipv4',
+      // §B strategy 随 enableIPv6 收敛:
+      //  - 开 IPv6 → prefer_ipv4(允许 AAAA,IPv6-only 目标/CDN v6 优选可达;有 v6 时 v6 可能被系统选用)。
+      //  - 关 IPv6 → ipv4_only(抑制 AAAA,客户端只拿 A)→ 杜绝"双栈站 + 节点无 v6"时浏览器试 v6 失败致
+      //    ERR_CONNECTION_CLOSED(#57:TUN 本地握手骗过 Happy Eyeballs、不回落 v4)。关 IPv6 即明示放弃 v6,
+      //    IPv6-only 目标不可达是该选择的预期代价(故不再有当初移除 ipv4_only 的顾虑——那是 v6 开着时的副作用)。
+      strategy: config.enableIPv6 ? 'prefer_ipv4' : 'ipv4_only',
       // 关 FakeIP：补 reverse_mapping，让无 SNI/ECH 的连接也能用 DNS 反查域名做路由匹配（不改节点收 IP 事实，见设计 T3）。
       // 开 FakeIP 时不加（FakeIP 本身已提供域名↔假 IP 的双向映射）。
       ...(enableFakeIp ? {} : { reverse_mapping: true }),
@@ -2297,21 +2454,41 @@ done
       server: 'dns-bootstrap-udp',
     } as SingBoxDnsRule);
 
-    // 解决 mDNS 和本地反向解析导致的 context deadline exceeded 超时问题
-    // 拦截 .arpa 等反向解析请求交由本地系统 DNS 快速返回，防止泄漏到公网 DNS 而引起解析超时
-    // 拦截国内常见网银 U盾 驱动的本地环回解析，防止 FakeIP 拦截产生 NXDOMAIN
-    dnsRules.push({
-      domain_suffix: ['.local', '.arpa', '.lan', '.home.arpa', ...DOMESTIC_BANK_AND_STOCK_DOMAINS],
-      server: 'dns-local',
-    } as SingBoxDnsRule);
+    // 解决 mDNS 和本地反向解析导致的 context deadline exceeded 超时问题。
+    // 方案B + Q1：内网/反查 → internalResolverTag、银行 → bankResolverTag、.local 恒 dns-local（组播安全）。
+    // 三者全为 dns-local（即非 dns-lan、非 Win+takeover）→ 合并回原单条规则，byte-diff 零变化（Linux baseline/系统代理/
+    // 关接管均走此路）。否则拆三条（mac/Win 有 LAN 解析器，或 Win+takeover 无 LAN 解析器）。
+    if (internalResolverTag === 'dns-local' && bankResolverTag === 'dns-local') {
+      dnsRules.push({
+        domain_suffix: [
+          '.local',
+          '.arpa',
+          '.lan',
+          '.home.arpa',
+          ...DOMESTIC_BANK_AND_STOCK_DOMAINS,
+        ],
+        server: 'dns-local',
+      } as SingBoxDnsRule);
+    } else {
+      dnsRules.push({ domain_suffix: ['.local'], server: 'dns-local' } as SingBoxDnsRule);
+      dnsRules.push({
+        domain_suffix: [...DOMESTIC_BANK_AND_STOCK_DOMAINS],
+        server: bankResolverTag,
+      } as SingBoxDnsRule);
+      dnsRules.push({
+        domain_suffix: ['.arpa', '.lan', '.home.arpa'],
+        server: internalResolverTag,
+      } as SingBoxDnsRule);
+    }
 
     // fake-ip-filter 默认清单（仅 FakeIP 开启时有意义；config.fakeIpFilter === false 可关）：NTP/STUN/Captive 等
     // 在 FakeIP 下会坏的域名 → 在 fakeip catch-all 之前命中、改走真实解析器，绕过 FakeIP。内联硬编码、无下载依赖。
     if (enableFakeIp && config.fakeIpFilter !== false) {
-      // 连通性探测 / Captive Portal → dns-local（系统解析，反映真实本地网络，否则系统误判断网 / 锁屏登录卡死）
+      // 连通性探测 / Captive Portal → internalResolverTag（需接入网/LAN 解析器反映真实本地网络，否则系统误判断网 /
+      // 锁屏登录卡死）：有 LAN 解析器→dns-lan；Win+takeover 无 LAN→dns-domestic(避死环,captive 检测降级但不挂);否则 dns-local。
       dnsRules.push({
         domain: FAKEIP_FILTER_CAPTIVE_DOMAINS,
-        server: 'dns-local',
+        server: internalResolverTag,
       } as SingBoxDnsRule);
       // NTP / STUN / TURN → dns-domestic（真实 DoH；校时与 P2P 需真实 IP）。同规则内 domain_suffix/domain_keyword 为 OR。
       dnsRules.push({
@@ -2445,27 +2622,19 @@ done
     //            （详见 generateRouteConfig A. 嗅探规则段注释）。
     const useLegacySniff = !coreVersionAtLeast(this.coreVersion, 1, 13);
 
-    const httpInbound: SingBoxInbound = {
-      type: 'http',
-      tag: 'http-in',
+    // mixed-only：单个 mixed inbound 同口服务 HTTP + SOCKS（取代原 http-in + socks-in + 可选 mixed-in）。
+    // 要 SOCKS 的 app 指同一端口即可。端口取单一真值 localProxyPort（mixedPort，旧配置回退 httpPort）。
+    const mixedInbound: SingBoxInbound = {
+      type: 'mixed',
+      tag: 'mixed-in',
       listen: listenAddr,
-      listen_port: config.httpPort || 2080,
+      listen_port: localProxyPort(config),
     };
-    const socksInbound: SingBoxInbound = {
-      type: 'socks',
-      tag: 'socks-in',
-      listen: listenAddr,
-      listen_port: config.socksPort || 2081,
-    };
-
     if (useLegacySniff) {
-      httpInbound.sniff = true;
-      httpInbound.sniff_override_destination = true;
-      socksInbound.sniff = true;
-      socksInbound.sniff_override_destination = true;
+      mixedInbound.sniff = true;
+      mixedInbound.sniff_override_destination = true;
     }
-
-    inbounds.push(httpInbound, socksInbound);
+    inbounds.push(mixedInbound);
 
     // 出口 IP 探针 inbound（仅本地回环，端口动态分配）：经 probe-direct-in 的请求由 route.rules 头部
     // 钉死走 direct 出站、经 probe-proxy-in 钉死走 proxy-selector，从而无论接管/分流模式都能测出真实出口
@@ -2487,21 +2656,6 @@ done
       );
     }
 
-    // Mixed 端口（可选）：同时接受 HTTP 和 SOCKS5 请求
-    if (config.mixedPort && config.mixedPort > 0) {
-      const mixedInbound: SingBoxInbound = {
-        type: 'mixed',
-        tag: 'mixed-in',
-        listen: listenAddr,
-        listen_port: config.mixedPort,
-      };
-      if (useLegacySniff) {
-        mixedInbound.sniff = true;
-        mixedInbound.sniff_override_destination = true;
-      }
-      inbounds.push(mixedInbound);
-    }
-
     // TUN 模式额外添加 TUN inbound
     if (modeType === 'tun') {
       const shouldBypassLAN = config.bypassLAN !== false; // 默认为 true
@@ -2512,6 +2666,12 @@ done
         process.platform === 'win32' && shouldBypassLAN
           ? [...PRIVATE_IP_CIDRS]
           : ['127.0.0.0/8', '::1/128'];
+      // 【已知限制 / Windows 真机待验】Windows+bypassLAN 下这里用宽私网段(10/8、192.168/16 等)整体排除出 TUN，
+      // 会顺带把落在私网段内的 endpoint(WG/Tailscale) force-route 段(如 mesh 192.168.50.0/24)也排除 → 该段到不了
+      // 组网节点（走物理 LAN/直连）。mac/Linux 不排除私网（gvisor/系统栈走路由规则），force-route 正常生效。
+      // 旧版曾用 route_address 把 mesh 段以更具体前缀抢回 TUN，但该机制本身从未在 Windows 真机验证（且 sing-box
+      // route_address 非空即替换默认 0/0，处置不当会反而破坏 Windows 全局代理）→ 故此处不再投机重加，留待 Windows
+      // 真机抓包定论后于专项分支处理（tailnet 100.64.0.0/10 不在私网排除表，Windows 下本就可达，不受此限制影响）。
 
       // Windows 下额外排除核心 DNS IP，防止 WFP 进程匹配失效时产生回流死循环
       if (process.platform === 'win32') {
@@ -2607,7 +2767,7 @@ done
           http_proxy: {
             enabled: true,
             server: '127.0.0.1',
-            server_port: config.httpPort || 2080,
+            server_port: localProxyPort(config), // mixed-only：指向本地 mixed 端口
           },
         };
       }
@@ -2649,6 +2809,10 @@ done
     idToTagMap: Map<string, string>
   ): SingBoxOutbound[] {
     const outbounds: SingBoxOutbound[] = [];
+    // endpoint（WireGuard 等）单独收进 pendingEndpoints（顶层 endpoints[]），但其 tag 仍与节点出站 tag 一同
+    // 进入 nodeTags → proxy-selector / rule-sel / route，与普通节点一视同仁（clash_api 热切换已实测兼容）。
+    this.pendingEndpoints = [];
+    const nodeTags: string[] = [];
 
     if (config) {
       // 生成【全部】节点的 Outbound：selector 需要列出所有可切换节点；detour 前置节点亦在 config.servers
@@ -2656,7 +2820,7 @@ done
       // （app/custom 分流规则指向的固定节点 tag 不变，仍直接命中其节点出站，不经 selector。）
       for (const server of config.servers) {
         const tag = idToTagMap.get(server.id) || `proxy-${server.id}`;
-        if (outbounds.some((o) => o.tag === tag)) continue; // 去重
+        if (nodeTags.includes(tag)) continue; // 去重（含 endpoint）
         // 不可用节点跳过：naive 缺 libcronet 时，sing-box 启动会预初始化全部出站、缺库的 naive 会让
         // 整个代理启动 FATAL（连非 naive 节点也用不了）。跳过后，路由层对该节点 tag 的死引用会在
         // generateSingBoxConfig 末尾被统一修正为 selector（见 H2 修复）。
@@ -2670,6 +2834,56 @@ done
         // 启动前配置校验 gate 已标记为非法的节点：跳过、不进 outbounds/selector（防 onRetry 重生成复活）。
         // 路由层对其 tag 的死引用由 generateSingBoxConfig 末尾 fixRouteDeadReferences 统一修正为 selector。
         if (this.gateInvalidNodes.has(server.id)) {
+          continue;
+        }
+        // WireGuard：endpoint（非 outbound）。建进 pendingEndpoints，tag 仍入 nodeTags 参与选择器/路由。
+        if (server.protocol.toLowerCase() === 'wireguard') {
+          try {
+            this.pendingEndpoints.push(this.buildWireGuardEndpoint(server, tag));
+            nodeTags.push(tag);
+          } catch (e: any) {
+            this.logToManager(
+              'warn',
+              `生成 WireGuard endpoint 失败，已跳过: ${server.name} (${e?.message ?? e})`
+            );
+          }
+          continue;
+        }
+        // Tailscale：endpoint（账号制 mesh）。就绪门控——非选中且未就绪（无 authKey、无持久 state）不发射，
+        // 避免拖慢启动 + 多个未登录节点登录 URL 刷屏；选中节点即便未就绪也发射（触发交互登录 URL 流）。
+        if (server.protocol.toLowerCase() === 'tailscale') {
+          const ts = server.tailscaleSettings;
+          const ready = !!ts?.authKey?.trim() || this.tailscaleStateExists(server.id);
+          if (server.id !== selectedServer.id && !ready) {
+            this.logToManager(
+              'info',
+              `Tailscale 节点「${server.name}」未就绪(需登录)且非选中，已跳过`
+            );
+            continue;
+          }
+          try {
+            this.pendingEndpoints.push(this.buildTailscaleEndpoint(server, tag));
+            nodeTags.push(tag);
+          } catch (e: any) {
+            this.logToManager(
+              'warn',
+              `生成 Tailscale endpoint 失败，已跳过: ${server.name} (${e?.message ?? e})`
+            );
+          }
+          continue;
+        }
+        // 自定义协议标记为 endpoint 类型（第三方类 wireguard/tailscale 实现）→ 进 endpoints[]；
+        // 否则走下方普通 outbound 路径。tag 由 generateProxyOutbound/此处统一注入。
+        if (server.protocol.toLowerCase() === 'custom' && server.customSettings?.isEndpoint) {
+          const { detour: _d, ...epOutbound } = (server.customSettings.outbound || {}) as Record<
+            string,
+            unknown
+          >;
+          this.pendingEndpoints.push({
+            ...(epOutbound as unknown as SingBoxEndpoint),
+            tag,
+          });
+          nodeTags.push(tag);
           continue;
         }
         try {
@@ -2695,10 +2909,22 @@ done
             if (looped) {
               this.logToManager('warn', `检测到代理链成环，已跳过 detour: ${server.name}`);
             } else {
-              ob.detour = idToTagMap.get(server.detour);
+              const detourSrv = config.servers.find((s) => s.id === server.detour);
+              if (detourSrv && isEndpointProtocol(detourSrv.protocol)) {
+                // endpoint（WireGuard/Tailscale）不作为 outbound 的前置代理(detour)目标（dialer detour→endpoint 语义
+                // 未定，且本节点会被下方 detour 死引用预校验误剔）。丢弃 detour（本节点仍直连可用）+ 警告。UI 亦不列
+                // endpoint 为 detour 候选（route 规则指向 endpoint 仍合法，仅 detour 不合法——两者语义不同）。
+                this.logToManager(
+                  'warn',
+                  `endpoint 节点（WireGuard/Tailscale）不支持作为前置代理(detour)目标，已忽略「${server.name}」的代理链`
+                );
+              } else {
+                ob.detour = idToTagMap.get(server.detour);
+              }
             }
           }
           outbounds.push(ob);
+          nodeTags.push(tag);
         } catch (e: any) {
           this.logToManager(
             'warn',
@@ -2724,8 +2950,7 @@ done
       // selector：列出已生成的全部节点 tag，default 指向当前选中节点；interrupt_exist_connections 由用户
       // 开关决定（默认 false=优雅切换，现有连接保留至自然关闭）。clash_api `PUT /proxies/proxy-selector`
       // 据此热切换、无需重启 sing-box（详见 switchMode）。路由的 final 与「→代理」规则统一指向本 selector。
-      const nodeTags = outbounds.map((o) => o.tag).filter((t): t is string => !!t);
-      // 所有节点生成失败 → 空 selector 会让 sing-box 启动报含糊错误；这里提前给出清晰原因
+      // nodeTags 已在节点循环中按序累积（含 endpoint tag）；空=所有节点生成失败/不可用。
       if (nodeTags.length === 0) {
         throw new Error('没有可用的代理节点出站（所有节点配置生成失败）');
       }
@@ -2980,9 +3205,22 @@ done
    *   - 清空 detour：测速每节点独立、不接前置代理链（前置链不可达会污染单节点延迟判定）。
    *   - 解析器用 'dns-direct'（与 SpeedTestService 临时配置的 dns server tag 对齐）。
    */
-  buildSpeedTestOutbound(server: ServerConfig, tag: string): SingBoxOutbound | null {
+  buildSpeedTestOutbound(
+    server: ServerConfig,
+    tag: string
+  ): SingBoxOutbound | SingBoxEndpoint | null {
     try {
       if (!this.isNodeUsable(server)) return null;
+      // Tailscale：账号制/带认证状态的入网，非即起即测的临时隧道 → 排除测速。
+      if (server.protocol.toLowerCase() === 'tailscale') return null;
+      // 自定义 endpoint 类型：测速临时配置按 isEndpointProtocol(type) 分流 outbounds/endpoints[]，
+      // 自定义 type 不被识别会错放 → 排除测速（自定义 outbound 类型仍走下方 generateProxyOutbound 正常测）。
+      if (server.protocol.toLowerCase() === 'custom' && server.customSettings?.isEndpoint)
+        return null;
+      // WireGuard：endpoint（非 outbound）。SpeedTestService 据 type 放入测速临时配置的 endpoints[]。
+      if (server.protocol.toLowerCase() === 'wireguard') {
+        return this.buildWireGuardEndpoint(server, tag);
+      }
       const map = new Map<string, string>([[server.id, tag]]);
       const ob = this.generateProxyOutbound(server, map, 'dns-direct');
       ob.tag = tag;
@@ -2991,6 +3229,86 @@ done
     } catch {
       return null;
     }
+  }
+
+  /**
+   * 构造 WireGuard endpoint（sing-box 1.11+ 顶层 endpoints[]）。单 peer：peer endpoint 用 server.address/port，
+   * 默认 gVisor 用户态栈（system=false，零提权）。base64/CIDR 字段在 UI 表单/.conf 解析已校验，此处直拼。
+   */
+  private buildWireGuardEndpoint(server: ServerConfig, tag: string): SingBoxEndpoint {
+    const s = server.wireguardSettings;
+    if (!s || !s.privateKey || !s.peerPublicKey || !s.localAddress?.length) {
+      throw new Error('WireGuard 配置缺少 privateKey/peerPublicKey/localAddress');
+    }
+    return {
+      type: 'wireguard',
+      tag,
+      system: false,
+      mtu: s.mtu && s.mtu > 0 ? s.mtu : 1408,
+      address: s.localAddress,
+      private_key: s.privateKey,
+      peers: [
+        {
+          address: server.address,
+          port: server.port,
+          public_key: s.peerPublicKey,
+          allowed_ips: s.allowedIPs?.length ? s.allowedIPs : ['0.0.0.0/0', '::/0'],
+          ...(s.preSharedKey ? { pre_shared_key: s.preSharedKey } : {}),
+          // keepalive 缺省强制 25s：WireGuard 是无连接 UDP，client 多在 NAT 后，无 keepalive 则 NAT 映射超时
+          // → 入向不可达、隧道静默断连。故未显式设置时兜 25s 维持映射，避免断连（用户可在表单调大）。
+          persistent_keepalive_interval:
+            s.persistentKeepalive && s.persistentKeepalive > 0 ? s.persistentKeepalive : 25,
+          ...(s.reserved?.length === 3 ? { reserved: s.reserved } : {}),
+        },
+      ],
+    };
+  }
+
+  /** Tailscale state 目录：`<userData>/tailscale/<serverId>`，跨重启免重认证、删节点时清理。 */
+  private tailscaleStateDir(serverId: string): string {
+    return path.join(getUserDataPath(), 'tailscale', serverId);
+  }
+
+  /** state 目录是否已有持久节点状态（免 authKey 重登录的判据）：目录存在且非空。 */
+  private tailscaleStateExists(serverId: string): boolean {
+    try {
+      // readdirSync 在目录缺失时抛 ENOENT → catch 返 false，无需先 existsSync（省一次 stat）。
+      return require('fs').readdirSync(this.tailscaleStateDir(serverId)).length > 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 构造 Tailscale endpoint（sing-box 1.12+ 顶层 endpoints[]）。账号制 mesh，无 server address/port。
+   * 默认 tsnet 用户态（system_interface 省略=false，零提权）；auth_key 可选（无则核日志出登录 URL）。
+   */
+  private buildTailscaleEndpoint(server: ServerConfig, tag: string): SingBoxEndpoint {
+    const ts = server.tailscaleSettings || {};
+    const stateDir = this.tailscaleStateDir(server.id);
+    try {
+      require('fs').mkdirSync(stateDir, { recursive: true });
+    } catch {
+      /* best-effort；目录建失败时 sing-box 自身会报错 */
+    }
+    const ep: SingBoxEndpoint = { type: 'tailscale', tag, state_directory: stateDir };
+    const authKey = ts.authKey?.trim();
+    if (authKey) ep.auth_key = authKey;
+    const controlUrl = ts.controlUrl?.trim();
+    if (controlUrl) ep.control_url = controlUrl;
+    const hostname = ts.hostname?.trim();
+    if (hostname) ep.hostname = hostname;
+    const exitNode = ts.exitNode?.trim();
+    if (exitNode) {
+      ep.exit_node = exitNode;
+      if (ts.exitNodeAllowLanAccess) ep.exit_node_allow_lan_access = true;
+    }
+    if (ts.acceptRoutes) ep.accept_routes = true;
+    if (ts.ephemeral) ep.ephemeral = true;
+    const adv = (ts.advertiseRoutes || []).map((c) => c.trim()).filter(Boolean);
+    if (adv.length) ep.advertise_routes = adv;
+    // Phase 2：ts.reverseMesh → ep.system_interface=true（+ 选中节点门控 + 强制 helper）。Phase 1 用户态、省略。
+    return ep;
   }
 
   /**
@@ -3007,6 +3325,21 @@ done
     const protocol = server.protocol.toLowerCase();
     const protocolLower = protocol;
     const tlsProtocols = ['trojan', 'anytls', 'hysteria2', 'tuic'];
+
+    // 自定义协议（raw-JSON 透传）：原样下发用户的 outbound 对象，仅【强制覆盖 tag】（防撞/防注入），
+    // 语义与能否启用由 sing-box check（启动 gate / 表单 probe）判定，FlowZ 不解析 type。
+    if (protocol === 'custom') {
+      // 强制覆盖 tag、剥离 detour：内层 detour 会绕过 FlowZ 的代理链环检测（仅走 server.detour）且 sing-box check
+      // 测不出 detour 环 → 运行时拨号死循环。FlowZ 经 detour 字段统一管理链路，自定义透传不携带内层 detour。
+      const { detour: _drop, ...userOutbound } = (server.customSettings?.outbound || {}) as Record<
+        string,
+        unknown
+      >;
+      return {
+        ...userOutbound,
+        tag: idToTagMap.get(server.id) || `proxy-${server.id}`,
+      } as unknown as SingBoxOutbound;
+    }
 
     const outbound: SingBoxOutbound = {
       type: protocol,
@@ -3294,7 +3627,18 @@ done
 
     // ECH（隐藏 SNI）+ 每节点 TLS 分片（抗 SNI-DPI）：需已有 tls 块
     if (outbound.tls) {
-      if (server.tlsSettings?.ech) outbound.tls.ech = { enabled: true };
+      if (server.tlsSettings?.ech) {
+        // 可选 ECHConfigList：填了下发 tls.ech.config（PEM 按行拆数组）；留空则 sing-box 从 DNS(HTTPS RR) 自取。
+        const echCfg = server.tlsSettings.echConfig?.trim();
+        const echLines = echCfg
+          ? echCfg
+              .split(/\r?\n/)
+              .map((l) => l.trim())
+              .filter(Boolean)
+          : [];
+        outbound.tls.ech =
+          echLines.length > 0 ? { enabled: true, config: echLines } : { enabled: true };
+      }
       if (server.tlsSettings?.fragment && !fragmentUnsupported) outbound.tls.fragment = true;
     }
 
@@ -3474,16 +3818,16 @@ done
     const customDomesticDns = this.getCustomDomesticDnsEndpoint(config);
     rules.push({
       ip_cidr: [
-        '223.5.5.5/32',
-        '223.6.6.6/32',
-        '1.12.12.12/32', // #57 DNSPod IP-DoH（节点域名解析器 DNSPod 档）：与 223.5.5.5 同列，hijack-dns 前直连放行（443 端口已含）
-        '119.29.29.29/32',
-        '119.28.28.28/32',
-        '114.114.114.114/32',
+        // bootstrap-direct 国内 DNS（含 1.12.12.12 DNSPod IP-DoH）：单一真值 shared/dns#BOOTSTRAP_DIRECT_DNS_IPS，
+        // 与 SystemDnsManager 的受控 DNS IP 选择守卫共用（受控 IP 绝不能落此列表，否则逃逸 hijack）。
+        ...BOOTSTRAP_DIRECT_DNS_IPS.map((ip) => `${ip}/32`),
         // 用户自定义的国内 DNS（IP 型）也须在 hijack-dns 之前直连放行，否则其 53 端口查询会被劫持成 FakeIP
         ...(customDomesticDns
           ? [`${customDomesticDns.ip}/${isIpv6Host(customDomesticDns.ip) ? 128 : 32}`]
           : []),
+        // 方案B：DNS 接管的内网 LAN 解析器（dns-lan 指向它）必须在 hijack-dns 之前直连放行，否则其 :53 查询会被
+        // hijack-dns 抢走 → 内网域名解析成环。私网 IPv4 /32（getLanResolverForDns 已保证私网，亦经下方私网直连可达）。
+        ...(this.lanResolverForDns ? [`${this.lanResolverForDns}/32`] : []),
       ],
       port: Array.from(new Set([53, 443, ...(customDomesticDns ? [customDomesticDns.port] : [])])),
       action: 'route',
@@ -3637,8 +3981,46 @@ done
       });
     }
 
-    // 1. 私有 IP 段直连（内网地址不应该经过代理，优先级最高）
-    // 仅当用户未关闭"绕过局域网"时添加
+    // 0c. endpoint 节点（WireGuard/Tailscale）的「配置路由段」强制路由到**该节点自身 tag**——优先于下方私网直连、
+    //     **独立于 bypass-LAN 开关、独立于全局选中**。单一真值：节点路由由其 allowedIPs(WG) / routes+tailnet(TS)
+    //     决定（endpointForcedRouteCidrs），不再有独立「绕过局域网排除段」。指向节点自身 tag（非 selector）→ 该段
+    //     恒走其 mesh 节点、与全局选中无关，实现「某段走 WG/TS、上网走全局节点」。仅 userspace（system 由内核接口
+    //     路由——Phase 2）；仅非 direct。按 config.servers 顺序=隐式优先级；被跳过节点的死引用由
+    //     fixRouteDeadReferences 兜底改写 selector。
+    if (proxyMode !== 'direct') {
+      // 仅对【本轮实际发射】的 endpoint 节点强制路由：未就绪/被跳过的 Tailscale 节点不进 pendingEndpoints，
+      // 其 tag 若仍 force-route 会被末尾 fixRouteDeadReferences 改写成 selector → 该段误流向全局选中节点。
+      // emitted 集合天然只含 endpoint 协议（仅 WG/TS 进 pendingEndpoints），故无需再按协议预判。
+      const emittedEndpointTags = new Set(this.pendingEndpoints.map((e) => e.tag));
+      // 跨 endpoint 去重：同一 CIDR 被多个 endpoint 声明（如两个 Tailscale 节点都含 tailnet 100.64.0.0/10，
+      // 或两个 WG 节点 allowedIPs 重叠），sing-box 路由首条命中 → 后者静默失效。按 config.servers 顺序，
+      // 先声明者占有该段（隐式优先级），后者重复段跳过 + 累计告警，杜绝「无声误路由到另一节点」。
+      const claimedCidrs = new Set<string>();
+      let forceRouteConflicts = 0;
+      for (const s of config.servers) {
+        const tag = idToTagMap.get(s.id);
+        if (!tag || !emittedEndpointTags.has(tag)) continue;
+        const cidrs = endpointForcedRouteCidrs(s).filter((c) => {
+          if (claimedCidrs.has(c)) {
+            forceRouteConflicts++;
+            return false;
+          }
+          claimedCidrs.add(c);
+          return true;
+        });
+        if (cidrs.length > 0) {
+          rules.push({ ip_cidr: cidrs, action: 'route', outbound: tag });
+        }
+      }
+      if (forceRouteConflicts > 0) {
+        this.logToManager(
+          'warn',
+          `${forceRouteConflicts} 个 endpoint 路由段被多个节点重复声明，已按节点顺序去重（先声明者生效）`
+        );
+      }
+    }
+
+    // 1. 私有 IP 段直连（内网地址不应该经过代理）。仅当用户未关闭"绕过局域网"时添加。
     if (config.bypassLAN !== false) {
       rules.push({
         ip_cidr: PRIVATE_IP_CIDRS,
@@ -4364,6 +4746,79 @@ done
     }
   }
 
+  /** 自定义协议兼容性 probe 的结果缓存：键 = 内核身份(版本) + outbound 规范化哈希；换核（版本变）键变、天然失效。 */
+  private probeCache = new Map<string, { ok: boolean; error?: string }>();
+
+  /**
+   * 用当前内核 probe 一个 outbound/endpoint 是否被支持（自定义协议门控的单一真值 = 内核本身）：
+   * 写一份最小 config（仅该出站 + direct）跑 `sing-box check`，`unknown outbound type` 等即不支持。
+   * 主进程子进程、结果缓存 → 渲染端异步调用不阻塞 UI。失败（spawn/超时）按「无法判定」返回 ok:false 带原因。
+   */
+  async probeOutbound(
+    outbound: unknown,
+    isEndpoint = false
+  ): Promise<{ ok: boolean; indeterminate?: boolean; error?: string }> {
+    if (
+      !outbound ||
+      typeof outbound !== 'object' ||
+      Array.isArray(outbound) ||
+      typeof (outbound as any).type !== 'string'
+    ) {
+      return { ok: false, error: 'invalid outbound: must be an object with a string "type"' };
+    }
+    const crypto = require('crypto');
+    const version = await this.getCoreVersion().catch(() => 'unknown');
+    // 内核身份含二进制 size+mtime：fork 版本号撞官方（同 version）但换了二进制时，键变、缓存自动失效。
+    let binId = 'na';
+    try {
+      const st = require('fs').statSync(this.singboxPath);
+      binId = `${st.size}-${Math.round(st.mtimeMs)}`;
+    } catch {
+      /* 核缺失：用 version 兜底键 */
+    }
+    const norm = JSON.stringify(outbound);
+    const key = `${version}|${binId}|${isEndpoint ? 'ep' : 'ob'}|${crypto.createHash('sha1').update(norm).digest('hex')}`;
+    const cached = this.probeCache.get(key);
+    if (cached) return cached;
+
+    const probe = { ...(outbound as Record<string, unknown>), tag: 'probe' };
+    const minimal = isEndpoint
+      ? {
+          log: { level: 'fatal' },
+          endpoints: [probe],
+          outbounds: [{ type: 'direct', tag: 'direct' }],
+          route: { final: 'direct' },
+        }
+      : {
+          log: { level: 'fatal' },
+          outbounds: [probe, { type: 'direct', tag: 'direct' }],
+          route: { final: 'direct' },
+        };
+
+    const fs = require('fs');
+    const tmp = path.join(getUserDataPath(), `probe-${crypto.randomBytes(6).toString('hex')}.json`);
+    let result: { ok: boolean; indeterminate?: boolean; error?: string };
+    try {
+      fs.writeFileSync(tmp, JSON.stringify(minimal));
+      const r = await this.runSingBoxCheck(tmp);
+      if (r.ok) result = { ok: true };
+      // failOpen（核缺失/超时/慢盘）≠ 不兼容 → indeterminate，渲染端给中性「无法判定」而非红色「不支持」。
+      else if (r.failOpen)
+        result = { ok: false, indeterminate: true, error: '内核不可用或超时，无法判定兼容性' };
+      else result = { ok: false, error: (r.stderr || 'check failed').slice(0, 300) };
+    } catch (e: any) {
+      result = { ok: false, error: String(e?.message ?? e) };
+    } finally {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {
+        /* 已不存在/无权限：忽略 */
+      }
+    }
+    this.probeCache.set(key, result);
+    return result;
+  }
+
   /**
    * 启动前配置校验 gate：对已写盘配置跑 `sing-box check`，把会致整体启动 FATAL 的坏节点（未知 cipher /
    * ss2022 坏 key / 未知 plugin / naive alpn 等字段级问题）迭代剔除后重写盘，直到 check 通过或触上限。
@@ -4400,11 +4855,19 @@ done
         throw new Error(`配置校验失败：已剔除 ${prunes} 个非法节点仍无法通过校验（${firstLine}）`);
       }
 
-      const idx = parseCheckOutboundIndex(stderr);
-      if (idx === null || idx < 0 || idx >= singboxConfig.outbounds.length) {
+      // 先按 outbounds[N] 反查；未命中再按 endpoints[N]（自定义 endpoint 用不兼容 type → endpoints[N] 报错，
+      // 否则整体启动失败而非剪单点）。两者命中域互斥（'endpoints' 不含 'outbound'）。
+      const obIdx = parseCheckOutboundIndex(stderr);
+      const epIdx = obIdx === null ? parseCheckEndpointIndex(stderr) : null;
+      let flagged: { type: string; tag: string } | undefined;
+      if (obIdx !== null && obIdx >= 0 && obIdx < singboxConfig.outbounds.length) {
+        flagged = singboxConfig.outbounds[obIdx];
+      } else if (epIdx !== null && epIdx >= 0 && epIdx < (singboxConfig.endpoints?.length ?? 0)) {
+        flagged = singboxConfig.endpoints![epIdx];
+      }
+      if (!flagged) {
         throw new Error(`配置校验失败：${firstLine}`);
       }
-      const flagged = singboxConfig.outbounds[idx];
       // 命中非节点出站（内置出站/探针）→ 不是坏节点问题，降级不启动（避免误剔内置出站致更大故障）。
       const NON_NODE_TYPES = new Set(['selector', 'urltest', 'direct', 'block']);
       const isProbeOrBuiltin =
@@ -4514,8 +4977,11 @@ done
       throw new Error(`选中节点「${selectedTag}」配置无效或其代理链依赖无效节点，请更换节点后重试`);
     }
 
-    // ② 删 outbound。
+    // ② 删 outbound（含 endpoint）。
     singboxConfig.outbounds = singboxConfig.outbounds.filter((o) => !toRemove.has(o.tag));
+    if (singboxConfig.endpoints) {
+      singboxConfig.endpoints = singboxConfig.endpoints.filter((e) => !toRemove.has(e.tag));
+    }
 
     // ③ group 成员删 tag + default 修正 + proxy-selector 剔空 throw。
     for (const ob of singboxConfig.outbounds) {
@@ -4569,7 +5035,10 @@ done
    */
   private fixRouteDeadReferences(singboxConfig: SingBoxConfig): void {
     const validTags = new Set(
-      singboxConfig.outbounds.map((o) => o.tag).filter((t): t is string => !!t)
+      [
+        ...singboxConfig.outbounds.map((o) => o.tag),
+        ...(singboxConfig.endpoints ?? []).map((e) => e.tag),
+      ].filter((t): t is string => !!t)
     );
     for (const rule of singboxConfig.route?.rules ?? []) {
       const r = rule as { action?: string; outbound?: string };
@@ -6105,6 +6574,11 @@ exit 0
     this.systemProxyManager = systemProxyManager;
   }
 
+  /** 注入系统 DNS 管理器（index.ts 启动时调用，须为同一 singleton）。仅 TUN 模式接管，收口于 ProxyManager。 */
+  setSystemDnsManager(systemDnsManager: ISystemDnsManager): void {
+    this.systemDnsManager = systemDnsManager;
+  }
+
   /** 注入「杀核前静默 clash_api 客户端」回调（停 StatsService + 关其 9090 连接）。防 9090 TIME_WAIT（P0-2）。 */
   setQuiesceClashClients(cb: () => void): void {
     this.quiesceClashClients = cb;
@@ -6572,7 +7046,7 @@ exit 0
       m.includes('root_orphan_blocked') ||
       m.includes('root 残留') ||
       m.includes('clash_api_port_busy') ||
-      m.includes('clash_api 端口 9090')
+      m.includes('clash_api 端口')
     );
   }
 
@@ -6586,6 +7060,10 @@ exit 0
    */
   async ensureSystemProxyCleared(): Promise<void> {
     if (this.stopping) return; // 主动停止/重启中 → 跳过，避免清了又被 start() reconcile 设回的竞态
+    // 系统 DNS 还原与系统代理清理同终态点收口（各自 marker + 单飞门控，互不影响）：让每条「核已死」路径
+    // （giveUp/健康检查/信号死·崩溃/重启 catch/外部死亡/用户停止前置）都顺带还原可能残留的受控 DNS，
+    // 无需在 7 处终态点各加一行。stopping 守卫共用（重启 stop 腿跳过，由 start reconcile 重设/还原）。
+    await this.ensureSystemDnsRestored();
     if (this.clearingSystemProxy) return; // 单飞：多路终态并发只清一次
     const mgr = this.systemProxyManager;
     if (!mgr) return;
@@ -6623,6 +7101,77 @@ exit 0
       );
     } finally {
       this.clearingSystemProxy = false;
+    }
+  }
+
+  /**
+   * TUN 进入后的残留系统代理提示：ensureSystemProxyCleared 已清掉 FlowZ 自己的(marker)；若系统代理仍开着，
+   * 即为**无 marker 残留**——可能是别的代理软件(Clash/Stash 等共用 7890)或外部/企业代理，也可能是我们丢了 marker。
+   * 因 7890 等是业内共用端口、无法据地址证明归属，**绝不自动清**(会误伤别的软件)→ 发一次性 advisory 交用户一键关。
+   * best-effort：读状态失败/无残留则静默。
+   */
+  private async adviseIfResidualSystemProxy(): Promise<void> {
+    const mgr = this.systemProxyManager;
+    if (!mgr) return;
+    try {
+      const status = await mgr.getProxyStatus().catch(() => null);
+      if (!status?.enabled) return;
+      const proxy = status.httpProxy || status.httpsProxy || status.socksProxy || '';
+      // 防自指：若残留指向 FlowZ 自己的本地端口(127.0.0.1:mixedPort)=我们自己的代理清理半失败(非外部)，不报「外部残留」
+      //（会误导）。仅 ensureSystemProxyCleared 的清理偶发部分失败时出现；下个终态点会重试清。修 round-2 MED:mac/linux 误报。
+      const ownHostPort = `127.0.0.1:${localProxyPort(this.currentConfig ?? {})}`;
+      if ([status.httpProxy, status.httpsProxy, status.socksProxy].some((p) => p === ownHostPort)) {
+        this.logToManager(
+          'warn',
+          `系统代理仍指向 FlowZ 自身(${proxy})但清理未净——非外部残留，跳过提示，下个终态点重试清理`
+        );
+        return;
+      }
+      this.logToManager(
+        'warn',
+        `TUN 模式下检测到非 FlowZ 设置的系统代理仍开启(${proxy || '未知地址'})，已提示用户（不自动清，避免误伤其它代理软件）`
+      );
+      this.sendEventToRenderer(IPC_CHANNELS.EVENT_SYSTEM_PROXY_RESIDUAL, { proxy });
+    } catch {
+      /* best-effort：提示失败不影响 TUN 启动 */
+    }
+  }
+
+  /**
+   * 用户主动关闭系统代理（TUN 残留提示的「关闭系统代理」一键动作）。用户显式意图 → 直接 disable
+   * (ProxyEnable=0 / restore 原始)，不 marker 门控(残留本就无我们的 marker)。供 IPC SYSTEM_PROXY_DISABLE 调。
+   */
+  async clearSystemProxyManually(): Promise<void> {
+    await this.systemProxyManager?.disableProxy();
+    this.logToManager('info', '已按用户请求关闭系统代理（TUN 残留提示）');
+  }
+
+  /**
+   * 系统 DNS 统一还原收口（public）：仅当 DNS 确由 FlowZ 接管（marker 在）才还原，杜绝误改用户自配 DNS。
+   * 调用方：① ensureSystemProxyCleared 内（覆盖全部「核已死」终态点，免逐点加行）；② start() reconcile 的
+   * 非 TUN 分支（systemProxy/manual 切换后还原残留）。门控镜像 ensureSystemProxyCleared：
+   * stopping（重启 stop 腿跳过，由 start reconcile 重设/还原负责）+ 单飞 + marker。
+   * 注意：本方法不重复 stopping 守卫——它已由唯一外部入口在调用前判定（ensureSystemProxyCleared 顶部 /
+   * start reconcile 仅在非重启路径调用）；此处仅做 单飞 + marker 门控，避免与 ensureSystemProxyCleared 的
+   * stopping 早返回语义打架。
+   */
+  async ensureSystemDnsRestored(): Promise<void> {
+    if (this.clearingSystemDns) return; // 单飞：多路终态并发只还原一次
+    const mgr = this.systemDnsManager;
+    if (!mgr) return;
+    // 仅当 DNS 确由 FlowZ 接管（marker 在）才动手 → 不误改用户自配/系统默认 DNS
+    if (!mgr.hasMarker()) return;
+
+    this.clearingSystemDns = true;
+    try {
+      await mgr.restoreDns();
+    } catch (e) {
+      this.logToManager(
+        'warn',
+        `终态还原系统 DNS 失败: ${e instanceof Error ? e.message : String(e)}`
+      );
+    } finally {
+      this.clearingSystemDns = false;
     }
   }
 
@@ -6860,6 +7409,10 @@ exit 0
    * 解析并记录日志行
    */
   private parseAndLogLine(line: string): void {
+    // Tailscale 交互登录：核打印 `endpoint/tailscale[<tag>]: Waiting for authentication: <url>`，
+    // 须在 dedup/低价值过滤之前抓出 → 推 renderer 弹「打开登录页」，保证必达。
+    this.detectTailscaleAuthUrl(line);
+
     // 过滤重复日志
     if (this.isDuplicateLog(line)) {
       return;
@@ -6889,6 +7442,23 @@ exit 0
       const resolvedLine = this.resolveTagsToNames(line);
       this.logToManager('info', resolvedLine, 'sing-box');
     }
+  }
+
+  /** 已推送过的 Tailscale 登录 URL（核会重复打印同一行，按 url 去重防刷屏）。urls 为一次性 token、量小，不清理。 */
+  private tailscaleAuthSeen = new Set<string>();
+
+  /**
+   * 抓 Tailscale 交互登录 URL（无 auth_key 时核日志出 `endpoint/tailscale[<tag>]: Waiting for authentication: <url>`）
+   * → 推 renderer 弹「打开登录页」。tag 即节点显示名（idToTagMap 用 server.name）。
+   */
+  private detectTailscaleAuthUrl(line: string): void {
+    const hit = parseTailscaleAuthLine(line);
+    if (!hit) return;
+    const { nodeName, url } = hit;
+    if (this.tailscaleAuthSeen.has(url)) return;
+    this.tailscaleAuthSeen.add(url);
+    this.sendEventToRenderer(IPC_CHANNELS.EVENT_TAILSCALE_AUTH_URL, { nodeName, url });
+    this.logToManager('info', `Tailscale 节点「${nodeName}」需要登录授权`, 'sing-box');
   }
 
   /**
@@ -6961,8 +7531,7 @@ exit 0
       'resolved', // DNS 解析完成
       'udp packet', // UDP 包
       'inbound/tun[tun-in]', // TUN 入站细节
-      'inbound/http[http-in]', // HTTP 入站细节
-      'inbound/socks[socks-in]', // SOCKS 入站细节
+      'inbound/mixed[mixed-in]', // mixed(HTTP+SOCKS) 入站细节（mixed-only）
     ];
 
     for (const pattern of filterPatterns) {
