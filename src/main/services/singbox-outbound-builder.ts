@@ -10,6 +10,7 @@ import type { SingBoxOutbound, SingBoxEndpoint } from './singbox-config-types';
 import { resourceManager } from './ResourceManager';
 import { coreVersionAtLeast } from '../../shared/version';
 import { isEndpointProtocol } from '../../shared/endpoint-routes';
+import { parseWsEarlyData } from '../../shared/ws-early-data';
 import { getUserDataPath } from '../utils/paths';
 import {
   effectiveCustomRules,
@@ -367,13 +368,17 @@ export function buildProxyOutbound(
  */
 function generateTransportConfig(server: ServerConfig): SingBoxOutbound['transport'] {
   if (server.network === 'ws' && server.wsSettings) {
-    // 0-RTT early-data：订阅/分享链解析时已存入 wsSettings，此前未落运行时配置导致静默失效
+    // 0-RTT early-data：分享链/订阅常把约定写进 path（`?ed=<bytes>`[&eh=<header>]）；sing-box 不自动解析它
+    // ——会把 `?` 编码成 %3F、整段当字面路径，且默认走 path 模式 → 与 xray 服务端的 /path 分流 + header 早数据
+    // 约定错位、连不上（#57 L2 已实测 wire capture）。故在此把 ed/eh 拆成内核显式字段、path 去 ed/eh；
+    // path 内无 ed 时回退既有显式字段（如 Clash 订阅的 max-early-data / early-data-header-name）。
+    const ed = parseWsEarlyData(server.wsSettings.path || '/');
     return {
       type: 'ws',
-      path: server.wsSettings.path || '/',
+      path: ed.path,
       headers: server.wsSettings.headers,
-      max_early_data: server.wsSettings.maxEarlyData,
-      early_data_header_name: server.wsSettings.earlyDataHeaderName,
+      max_early_data: ed.maxEarlyData ?? server.wsSettings.maxEarlyData,
+      early_data_header_name: ed.earlyDataHeaderName ?? server.wsSettings.earlyDataHeaderName,
     };
   }
 
