@@ -20,12 +20,16 @@ import type { RuleResourceManager } from './RuleResourceManager';
 import type { UserConfig } from '../../shared/types';
 import { getRuleResourcesPath } from '../utils/paths';
 import { BUILTIN_GEO_RULESETS, getRuleSetRuntimeDir, builtinIdFor } from './builtin-geo-rulesets';
+import { BackoffTracker } from './backoff-tracker';
 
 export class RuleResourceScheduler {
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private started = false;
   private isRunning = false;
-  private backoff = new Map<string, { failures: number; nextEligibleAt: number }>();
+  private backoff = new BackoffTracker(
+    RuleResourceScheduler.BACKOFF_BASE_MS,
+    RuleResourceScheduler.BACKOFF_MAX_MS
+  );
   /** 目录刷新「上次尝试」时刻：catalog 未成功远程拉取时 fetchedAt 恒 null，仅靠它会每 tick 重拉；
    *  按本字段节流，失败也算一次尝试、间隔内不重试（避免离线/限流下每 30min 白打 GitHub）。 */
   private lastCatalogRefreshAttempt = 0;
@@ -106,8 +110,7 @@ export class RuleResourceScheduler {
         const last = res.downloadedAt ? Date.parse(res.downloadedAt) : 0;
         const missing = !fssync.existsSync(path.join(dir, res.fileName));
         if (!missing && last && now - last < intervalMs) continue;
-        const bo = this.backoff.get(res.id);
-        if (bo && now < bo.nextEligibleAt) continue;
+        if (!this.backoff.isEligible(res.id, now)) continue;
         staleIds.push(res.id);
       }
 
@@ -121,8 +124,7 @@ export class RuleResourceScheduler {
         const missing = !fssync.existsSync(path.join(runtimeDir, b.fileName));
         if (!missing && last && now - last < intervalMs) continue;
         const id = builtinIdFor(b.tag);
-        const bo = this.backoff.get(id);
-        if (bo && now < bo.nextEligibleAt) continue;
+        if (!this.backoff.isEligible(id, now)) continue;
         staleIds.push(id);
       }
 
@@ -134,17 +136,10 @@ export class RuleResourceScheduler {
       for (const r of results) {
         if (r.ok) {
           ok++;
-          if (r.id) this.backoff.delete(r.id);
+          if (r.id) this.backoff.recordSuccess(r.id);
         } else {
           failed++;
-          if (r.id) {
-            const failures = (this.backoff.get(r.id)?.failures ?? 0) + 1;
-            const delay = Math.min(
-              RuleResourceScheduler.BACKOFF_BASE_MS * 2 ** (failures - 1),
-              RuleResourceScheduler.BACKOFF_MAX_MS
-            );
-            this.backoff.set(r.id, { failures, nextEligibleAt: now + delay });
-          }
+          if (r.id) this.backoff.recordFailure(r.id, now);
         }
       }
       if (ok > 0 || failed > 0) {

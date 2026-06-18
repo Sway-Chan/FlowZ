@@ -12,7 +12,8 @@ import { APP_USER_AGENT } from '../../shared/constants';
 import { getUserDataPath } from '../utils/paths';
 import { system32 } from '../utils/win-system32';
 import { compareSemver } from '../../shared/version';
-import { GH_PROXY_PRESETS } from '../../shared/gh-proxy';
+import { ghMirrorUrl } from '../../shared/gh-proxy';
+import { createIdleTimeout, parseExpectedBytes } from './download-hardening';
 
 // 下载停滞超时：连接/下载 30s 无数据即视为卡死 → abort + 失败兜底（github 链接自动换镜像重试一次）。
 // 防永久挂起致更新永不 resolve（进度窗/对话框永久转圈）。正常下载持续有 data、不断重置、不会误触发。
@@ -564,10 +565,30 @@ open "${installerPath}"
 
   private async fetchReleases(): Promise<any[]> {
     return new Promise((resolve, reject) => {
+      let settled = false;
       const request = net.request({
         method: 'GET',
         url: `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/releases`,
       });
+      // 单点收口：防 request/response 双错误源重复 settle；clear timeout；之后任何回调都 no-op。
+      const finish = (err: Error | null, val?: any[]) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (err) reject(err);
+        else resolve(val as any[]);
+      };
+      // 兜底超时：net.request 在连接被中间设备静默吞掉时可能长时间不触发 error → 检查更新 Promise 永不 settle
+      // → 前端永久转圈（与 CoreUpdateService.fetchReleases 对齐）。15s 后主动 abort+reject。
+      const timer = setTimeout(() => {
+        try {
+          request.abort();
+        } catch {
+          /* ignore */
+        }
+        finish(new Error('检查更新超时（GitHub 不可达或被网络拦截）'));
+      }, 15000);
+
       request.setHeader('User-Agent', APP_USER_AGENT);
       request.setHeader('Accept', 'application/vnd.github.v3+json');
 
@@ -575,21 +596,24 @@ open "${installerPath}"
         let data = '';
         res.on('data', (chunk) => (data += chunk.toString()));
         res.on('end', () => {
-          try {
-            if (res.statusCode === 200) {
-              resolve(JSON.parse(data));
-            } else if (res.statusCode === 403) {
-              reject(new Error('GitHub API 访问频率限制 (403)，请稍后再试或使用代理'));
-            } else {
-              reject(new Error(`GitHub API 返回错误: ${res.statusCode}`));
+          if (res.statusCode === 200) {
+            try {
+              finish(null, JSON.parse(data));
+            } catch {
+              finish(new Error('解析 GitHub API 响应失败'));
             }
-          } catch {
-            reject(new Error('解析 GitHub API 响应失败'));
+          } else if (res.statusCode === 403) {
+            finish(new Error('GitHub API 访问频率限制 (403)，请稍后再试或使用代理'));
+          } else {
+            finish(new Error(`GitHub API 返回错误: ${res.statusCode}`));
           }
         });
+        // response 阶段断连（ERR_CONNECTION_CLOSED 等）从 res emit 'error'，缺此 handler 会逃逸成主进程
+        // uncaughtException 且 Promise 永不 settle → checkForUpdate await 永挂 → 前端检查更新永久转圈。
+        res.on('error', (err: Error) => finish(err));
       });
 
-      request.on('error', reject);
+      request.on('error', (err: Error) => finish(err));
       request.end();
     });
   }
@@ -691,33 +715,23 @@ open "${installerPath}"
       const file = fs.createWriteStream(destPath);
       let downloadedBytes = 0;
       let settled = false;
-      let idleTimer: ReturnType<typeof setTimeout> | null = null;
       // 完整性校验用：优先响应头 content-length，缺失回落调用方传入的 totalSize（GitHub asset size）。
       let expectedBytes = NaN;
 
-      const clearIdle = () => {
-        if (idleTimer) {
-          clearTimeout(idleTimer);
-          idleTimer = null;
+      // ① 停滞看门狗：每收到 data / 连接阶段 arm；30s 无进展 → abort + handleError。收口 download-hardening。
+      const idle = createIdleTimeout(() => {
+        try {
+          request.abort();
+        } catch {
+          /* ignore */
         }
-      };
-      // ① 停滞超时：每收到 data / 连接阶段重置；30s 无进展 → abort + handleError。
-      const armIdle = () => {
-        clearIdle();
-        idleTimer = setTimeout(() => {
-          try {
-            request.abort();
-          } catch {
-            /* ignore */
-          }
-          handleError(new Error('下载停滞超时（30s 无数据，网络中断或被拦截）'));
-        }, DOWNLOAD_IDLE_TIMEOUT_MS);
-      };
+        handleError(new Error('下载停滞超时（30s 无数据，网络中断或被拦截）'));
+      }, DOWNLOAD_IDLE_TIMEOUT_MS);
 
       const handleError = (err: any) => {
         if (settled) return;
         settled = true;
-        clearIdle();
+        idle.clear();
         file.close();
         if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
 
@@ -728,8 +742,7 @@ open "${installerPath}"
             'UpdateService'
           );
           cb.onMirror();
-          // preset[0] 末尾已带 '/'，直接拼完整原 URL（同 gh-proxy 用法）。
-          const mirrorUrl = GH_PROXY_PRESETS[0] + url;
+          const mirrorUrl = ghMirrorUrl(url);
           this.downloadWithHardening(mirrorUrl, destPath, totalSize, true, cb)
             .then(resolve)
             .catch(reject);
@@ -750,7 +763,7 @@ open "${installerPath}"
           if (redirectUrl) {
             if (settled) return;
             settled = true;
-            clearIdle();
+            idle.clear();
             file.close();
             if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
             // 重定向沿用 isRetry（不消耗镜像名额），但重置 settled 由新一轮 Promise 接管
@@ -770,7 +783,7 @@ open "${installerPath}"
         if (response.statusCode !== 200) {
           if (settled) return;
           settled = true;
-          clearIdle();
+          idle.clear();
           file.close();
           if (fs.existsSync(destPath)) fs.unlinkSync(destPath);
           reject(new Error(`下载失败: HTTP ${response.statusCode}`));
@@ -778,15 +791,10 @@ open "${installerPath}"
         }
 
         // ② 完整性校验基准：响应头 content-length 优先，缺失回落调用方 totalSize。
-        const lenHeader = response.headers['content-length'];
-        const headerBytes = parseInt(
-          (Array.isArray(lenHeader) ? lenHeader[0] : lenHeader) as string,
-          10
-        );
-        expectedBytes = !isNaN(headerBytes) ? headerBytes : totalSize > 0 ? totalSize : NaN;
+        expectedBytes = parseExpectedBytes(response.headers['content-length'], totalSize);
 
         response.on('data', (chunk) => {
-          armIdle(); // 每收到数据重置停滞计时
+          idle.arm(); // 每收到数据重置停滞计时
           downloadedBytes += chunk.length;
           cb.onProgress(downloadedBytes, totalSize);
           // ③ 背压：写盘返回 false（缓冲已满）时暂停接收，drain 后恢复，防大文件下内存堆积。
@@ -802,7 +810,7 @@ open "${installerPath}"
         });
 
         response.on('end', () => {
-          clearIdle();
+          idle.clear();
           file.end(() => {
             if (settled) return;
             // ② 截断校验：实收字节与期望不符 → reject（github 链接经 handleError 自动换镜像重试一次）。
@@ -824,7 +832,7 @@ open "${installerPath}"
 
       request.on('error', handleError);
 
-      armIdle(); // 连接阶段也启动停滞计时（连接挂起 30s 超时）
+      idle.arm(); // 连接阶段也启动停滞计时（连接挂起 30s 超时）
       request.end();
     });
   }

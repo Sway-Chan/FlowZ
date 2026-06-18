@@ -8,7 +8,6 @@ export * from './log-handlers';
 export * from './proxy-handlers';
 export { setTrayStateCallback } from './proxy-handlers';
 export * from './version-handlers';
-export * from './admin-handlers';
 export * from './update-handlers';
 export * from './rules-handlers';
 export * from './autostart-handlers';

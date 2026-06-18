@@ -109,9 +109,6 @@ export const IPC_CHANNELS = {
   // 更新事件 (主进程 -> 渲染进程)
   EVENT_UPDATE_PROGRESS: 'update:progress',
 
-  // 管理员权限
-  ADMIN_CHECK: 'admin:check',
-
   // macOS 提权 helper（免提权启停 sing-box）
   HELPER_GET_STATUS: 'helper:getStatus',
   HELPER_INSTALL: 'helper:install',

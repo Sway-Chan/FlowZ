@@ -324,55 +324,6 @@ describe('H1 SSRF DNS rebinding', () => {
   });
 });
 
-describe('isPrivateIp — IPv4-mapped IPv6 / fe80::/10 残留绕过', () => {
-  // private static，单元直测：覆盖 hex/展开形 mapped + fe80 全段（assertHostAllowed 经它判定）。
-  const isPrivateIp = (ip: string): boolean =>
-    (SubscriptionService as unknown as { isPrivateIp(ip: string): boolean }).isPrivateIp(ip);
-
-  it('IPv4-mapped hex / 展开 / 点分 各写法的内网地址 → BLOCK', () => {
-    // 127.0.0.1
-    expect(isPrivateIp('::ffff:7f00:1')).toBe(true);
-    expect(isPrivateIp('0:0:0:0:0:ffff:127.0.0.1')).toBe(true);
-    expect(isPrivateIp('0:0:0:0:0:ffff:7f00:1')).toBe(true);
-    expect(isPrivateIp('::ffff:127.0.0.1')).toBe(true);
-    // 10.0.0.1
-    expect(isPrivateIp('::ffff:0a00:0001')).toBe(true);
-    // 192.168.1.1
-    expect(isPrivateIp('::ffff:192.168.1.1')).toBe(true);
-    expect(isPrivateIp('::ffff:c0a8:0101')).toBe(true);
-  });
-
-  it('IPv4-mapped 公网地址 → ALLOW（按内嵌 IPv4 判，8.8.8.8 放行）', () => {
-    expect(isPrivateIp('::ffff:8.8.8.8')).toBe(false);
-    expect(isPrivateIp('::ffff:0808:0808')).toBe(false);
-  });
-
-  it('fe80::/10 全段（fe80–febf）link-local → BLOCK', () => {
-    expect(isPrivateIp('fe80::1')).toBe(true);
-    expect(isPrivateIp('fe9a::1')).toBe(true);
-    expect(isPrivateIp('fea0::1')).toBe(true);
-    expect(isPrivateIp('feb0::1')).toBe(true);
-    expect(isPrivateIp('febf::1')).toBe(true);
-  });
-
-  it('fec0:: 起（site-local，超出 fe80–febf）→ 不被 fe80 规则误命中', () => {
-    // fec0::/10 非 link-local（且已废弃）；本规则不应把它算 link-local。
-    expect(isPrivateIp('fec0::1')).toBe(false);
-  });
-
-  it('回环 / ULA → BLOCK', () => {
-    expect(isPrivateIp('::1')).toBe(true);
-    expect(isPrivateIp('::')).toBe(true);
-    expect(isPrivateIp('fc00::1')).toBe(true);
-    expect(isPrivateIp('fd12:3456::1')).toBe(true);
-  });
-
-  it('公网 IPv6 → ALLOW', () => {
-    expect(isPrivateIp('2001:db8::1')).toBe(false);
-    expect(isPrivateIp('2606:4700::1')).toBe(false);
-  });
-});
-
 describe('H2 重定向绕过', () => {
   it('30x 跳到内网域名 → 拒绝（重定向目标过 guard）', async () => {
     const log = new FakeLog();

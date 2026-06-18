@@ -128,19 +128,3 @@ export async function retry<T>(
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
-
-/**
- * 创建带重试的函数包装器
- *
- * @param fn 要包装的函数
- * @param options 重试选项
- * @returns 包装后的函数
- */
-export function withRetry<T extends (...args: any[]) => Promise<any>>(
-  fn: T,
-  options: Partial<RetryOptions> = {}
-): T {
-  return (async (...args: any[]) => {
-    return retry(() => fn(...args), options);
-  }) as T;
-}

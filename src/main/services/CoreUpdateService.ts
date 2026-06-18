@@ -3,7 +3,7 @@
  * 负责检查 Sing-box 核心更新、下载并替换
  */
 
-import { app, net, dialog, session, Session } from 'electron';
+import { app, dialog } from 'electron';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -14,9 +14,10 @@ import { PlatformPrivilegeService } from './PlatformPrivilegeService';
 import { resourceManager } from './ResourceManager';
 
 import type { UserConfig } from '../../shared/types';
-import { APP_USER_AGENT } from '../../shared/constants';
 import { encodeMajorMinor, sameMajorMinor, compareSemver } from '../../shared/version';
-import { applyGhProxy, GH_PROXY_PRESETS, normalizeGhProxyPrefix } from '../../shared/gh-proxy';
+import { CoreUpdateStateStore } from './core-update-state-store';
+import type { StagedCoreInfo, CoreAutoUpdateState } from './core-update-state-store';
+import { CoreDownloader } from './core-downloader';
 import coreManifest from '../../shared/core-manifest.json';
 import { IPC_CHANNELS } from '../../shared/ipc-channels';
 import { system32, powershellPath } from '../utils/win-system32';
@@ -38,21 +39,8 @@ export interface CoreVersionInfo {
   lastKnownVersion: string | null;
 }
 
-/** 已下载预检通过、待落位的内核（代理运行中暂存，延到安全窗口落位）。 */
-export interface StagedCoreInfo {
-  version: string;
-  dir: string; // userData/core-staged，含解压后的 sing-box + 配套文件
-  stagedAt: string; // ISO
-}
-
-/** 内核自动更新持久状态（userData/core-update-state.json，不进 config，避免每次 check 触发配置原子写）。 */
-export interface CoreAutoUpdateState {
-  lastCheckAt?: number;
-  staged?: StagedCoreInfo;
-  crossBandNotifiedVersion?: string; // 已就此跨带版本提示过，避免每轮重复弹
-  // B0：已成功稳定运行、实证兼容过的最高版本带（编码）。棘轮：成功运行抬高、回滚重置到回滚后带。参与有效兼容上限。
-  verifiedCeiling?: number;
-}
+// StagedCoreInfo / CoreAutoUpdateState 迁至 core-update-state-store（与 CoreUpdateStateStore 同处）；re-export 保对外兼容。
+export type { StagedCoreInfo, CoreAutoUpdateState };
 
 /**
  * tryApplyStaged 落位结果枚举（供 applyStagedNow / UI 区分反馈）：
@@ -96,18 +84,22 @@ export class CoreUpdateService {
   private configProvider: (() => Promise<UserConfig>) | null = null;
   // 推渲染端的自动更新状态事件发送器（注入，仿 configProvider；不直接 import electron ipc 便于隔离）
   private eventSender: ((channel: string, payload: unknown) => void) | null = null;
-  // 检查更新/下载用的专用会话：强制 direct——default session 在 mainSessionViaProxy(默认 on) 下被 pin 到 sing-box
-  // http 入站（实测 net.request × http 入站挂死 50s），direct session 让 net.request 直连、由 TUN 透明捕获进 naive
-  // （同 curl 与订阅 getDirectSession，实测可达）；系统代理模式下直连 GitHub 也通。
-  private updateDirectSession: Session | null = null;
   // 新核心首启成功后需"稳定运行"此时长（无 error）才删旧备份——防 'started'(仅1s存活) 假成功删掉回滚网。
   // 不变量：必须 > ProxyManager 健康检查间隔(10s)，否则 TUN 模式下崩溃在轮询检测到之前就被判稳定、误删备份。
   private static readonly STABILITY_DWELL_MS = 30000;
   // "待验证"最长有效期：超过则后续 error 视为与本次更新无关，不再触发回滚（防陈旧 pending 误回滚）
   private static readonly PENDING_MAX_AGE_MS = 5 * 60 * 1000;
 
+  private readonly stateStore: CoreUpdateStateStore;
+  private readonly coreDownloader: CoreDownloader;
+
   constructor(logManager: LogManager) {
     this.logManager = logManager;
+    this.stateStore = new CoreUpdateStateStore(logManager, app.getPath('userData'));
+    // configProvider 在构造后才注入，故传惰性 thunk：调用时读当前 this.configProvider（未配置→null）。
+    this.coreDownloader = new CoreDownloader(logManager, () =>
+      this.configProvider ? this.configProvider() : Promise.resolve(null)
+    );
   }
 
   setProxyManager(proxyManager: ProxyManager): void {
@@ -142,7 +134,7 @@ export class CoreUpdateService {
       this.logManager.addLog('info', '正在检查 Sing-box 核心更新...', 'CoreUpdateService');
 
       const currentVersion = await this.getCurrentVersion();
-      const releases = await this.fetchReleases();
+      const releases = await this.coreDownloader.fetchReleases();
 
       if (!releases || releases.length === 0) {
         return { hasUpdate: false, currentVersion, error: '未找到发布版本' };
@@ -205,7 +197,7 @@ export class CoreUpdateService {
         }
 
         // 找到适合当前平台的资源
-        const asset = this.findSuitableAsset(latestRelease.assets);
+        const asset = this.coreDownloader.findSuitableAsset(latestRelease.assets);
         if (asset) {
           const result = {
             hasUpdate: true,
@@ -251,12 +243,13 @@ export class CoreUpdateService {
     try {
       // 1. 下载文件
       this.logManager.addLog('info', '开始下载核心文件...', 'CoreUpdateService');
-      const tempPath = await this.downloadFile(downloadUrl);
+      const tempPath = await this.coreDownloader.downloadFile(downloadUrl);
 
       // 2. 解压文件 (如果需要)
       // Sing-box release 通常是 .tar.gz 或 .zip
       this.logManager.addLog('info', '正在解压核心文件...', 'CoreUpdateService');
-      const { corePath, extractDir: tempExtractDir } = await this.extractCore(tempPath);
+      const { corePath, extractDir: tempExtractDir } =
+        await this.coreDownloader.extractCore(tempPath);
 
       // 2.5 预检：新核心可执行 + 可解析当前配置。不通过则不动现役核心（代理继续运行，永不 brick）。
       const preflight = await this.preflightValidate(corePath);
@@ -528,36 +521,14 @@ export class CoreUpdateService {
 
   // === 内核自动更新（仅兼容版本带内）：持久状态 / staged 落位 / 周期检查 ===
 
-  private getAutoStatePath(): string {
-    return path.join(app.getPath('userData'), 'core-update-state.json');
-  }
-
-  /** 读自动更新持久状态（损坏/缺失→空对象，失败安全）。 */
+  /** 读自动更新持久状态（委托 CoreUpdateStateStore；损坏/缺失→空对象，失败安全）。 */
   private loadAutoState(): CoreAutoUpdateState {
-    try {
-      const p = this.getAutoStatePath();
-      if (!fs.existsSync(p)) return {};
-      const d = JSON.parse(fs.readFileSync(p, 'utf-8'));
-      return d && typeof d === 'object' ? (d as CoreAutoUpdateState) : {};
-    } catch {
-      return {};
-    }
+    return this.stateStore.loadAutoState();
   }
 
-  /** 合并写入自动更新持久状态（仅覆盖传入字段）。 */
+  /** 合并写入自动更新持久状态（委托 CoreUpdateStateStore；原子写 tmp+rename，崩溃一致性）。 */
   private saveAutoState(patch: Partial<CoreAutoUpdateState>): void {
-    try {
-      const next = { ...this.loadAutoState(), ...patch };
-      // M4：原子写——先写临时文件再 rename 就位，避免进程在 writeFileSync 中途崩溃留半截 JSON（下次 loadAutoState
-      // 读到坏档→catch 返回 {} 丢全部 staged 状态）。注：单次 saveAutoState 的 load+write 是同步块（无 await、JS
-      // 单线程不被打断），不存在并发 lost-update；此处仅解决「写盘被打断」的崩溃一致性。
-      const p = this.getAutoStatePath();
-      const tmp = `${p}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(next, null, 2), 'utf-8');
-      fs.renameSync(tmp, p);
-    } catch (e) {
-      this.logManager.addLog('warn', `写入内核自动更新状态失败: ${e}`, 'CoreUpdateService');
-    }
+    this.stateStore.saveAutoState(patch);
   }
 
   /** 清除 staged 暂存（落位成功/作废后调用）：删元数据 + 删暂存目录。 */
@@ -721,8 +692,8 @@ export class CoreUpdateService {
       let tempPath: string | null = null;
       let extractDir: string | null = null;
       try {
-        tempPath = await this.downloadFile(check.downloadUrl);
-        const extracted = await this.extractCore(tempPath);
+        tempPath = await this.coreDownloader.downloadFile(check.downloadUrl);
+        const extracted = await this.coreDownloader.extractCore(tempPath);
         extractDir = extracted.extractDir;
         const preflight = await this.preflightValidate(extracted.corePath);
         if (!preflight.ok) {
@@ -1358,59 +1329,18 @@ export class CoreUpdateService {
     }
   }
 
-  private getKnownBadPath(): string {
-    return path.join(app.getPath('userData'), 'core-known-bad.json');
-  }
-
-  private loadKnownBad(): string[] {
-    try {
-      const p = this.getKnownBadPath();
-      if (!fs.existsSync(p)) return [];
-      const d = JSON.parse(fs.readFileSync(p, 'utf-8'));
-      return Array.isArray(d?.versions) ? d.versions : [];
-    } catch {
-      return [];
-    }
-  }
-
-  /** 标记某版本为"问题版本"（预检/启动失败），自动更新将跳过；手动更新仍可强制安装。 */
+  /** 标记问题版本（委托 CoreUpdateStateStore）：预检/启动失败的版本自动更新跳过，手动仍可强装。 */
   private markKnownBad(version: string): void {
-    try {
-      const list = this.loadKnownBad();
-      if (!list.includes(version)) list.push(version);
-      fs.writeFileSync(
-        this.getKnownBadPath(),
-        JSON.stringify({ versions: list }, null, 2),
-        'utf-8'
-      );
-      this.logManager.addLog(
-        'warn',
-        `已标记问题版本 ${version}，自动更新将跳过`,
-        'CoreUpdateService'
-      );
-    } catch {
-      /* ignore */
-    }
+    this.stateStore.markKnownBad(version);
   }
 
   isKnownBad(version: string): boolean {
-    return this.loadKnownBad().includes(version);
+    return this.stateStore.isKnownBad(version);
   }
 
-  /** 从问题版本名单移除某版本（该版本成功运行后调用，使误标记可恢复）。 */
+  /** 从问题版本名单移除某版本（委托 CoreUpdateStateStore；该版本成功运行后调用，使误标记可恢复）。 */
   private clearKnownBad(version: string): void {
-    try {
-      const list = this.loadKnownBad();
-      if (!list.includes(version)) return;
-      const next = list.filter((v) => v !== version);
-      fs.writeFileSync(
-        this.getKnownBadPath(),
-        JSON.stringify({ versions: next }, null, 2),
-        'utf-8'
-      );
-    } catch {
-      /* ignore */
-    }
+    this.stateStore.clearKnownBad(version);
   }
 
   private async isRestrictToCompatibleMinor(): Promise<boolean> {
@@ -1557,340 +1487,10 @@ export class CoreUpdateService {
 
   // --- 私有辅助方法 ---
 
-  /** 检查更新/下载的专用会话：强制 direct（复用 SubscriptionService 直连拉订阅的成熟模式）。
-   *  default session 在 mainSessionViaProxy(默认 on) 下会被 pin 到 sing-box http 入站——实测 net.request × http 入站
-   *  挂死 50s；改用 direct session 让 net.request 直连，TUN 模式由 OS 层透明捕获进 naive（同 curl，实测可达），
-   *  系统代理模式则直连 GitHub（你实测直连也通）。下载 asset 的 302 redirect 由 net.request 自动跟随。 */
-  private async getUpdateSession(): Promise<Session> {
-    if (this.updateDirectSession) return this.updateDirectSession;
-    const s = session.fromPartition('flowz-core-update-direct');
-    await s.setProxy({ mode: 'direct' });
-    this.updateDirectSession = s;
-    return s;
-  }
-
-  private async fetchReleases(): Promise<any[]> {
-    const sess = await this.getUpdateSession();
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      const request = net.request({
-        method: 'GET',
-        url: 'https://api.github.com/repos/SagerNet/sing-box/releases',
-        session: sess,
-      });
-      // 单点收口：防 request/response 双错误源重复 settle；clear timeout；之后任何回调都 no-op。
-      const finish = (err: Error | null, val?: any[]) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        if (err) reject(err);
-        else resolve(val as any[]);
-      };
-      // 兜底超时：net.request 在连接被中间设备静默吞掉时可能长时间不触发 error → 前端永久转圈。15s 后主动 abort+reject。
-      const timer = setTimeout(() => {
-        try {
-          request.abort();
-        } catch {
-          /* ignore */
-        }
-        finish(new Error('检查更新超时（GitHub 不可达或被网络拦截）'));
-      }, 15000);
-
-      request.setHeader('User-Agent', APP_USER_AGENT);
-      request.setHeader('Accept', 'application/vnd.github.v3+json');
-
-      request.on('response', (res) => {
-        let data = '';
-        res.on('data', (chunk) => (data += chunk.toString()));
-        res.on('end', () => {
-          if (res.statusCode === 200) {
-            try {
-              finish(null, JSON.parse(data));
-            } catch {
-              finish(new Error('解析 GitHub 响应失败'));
-            }
-          } else if (res.statusCode === 403) {
-            finish(new Error('GitHub API 访问频率限制 (403)，请稍后再试或使用代理'));
-          } else {
-            finish(new Error(`GitHub API 错误: ${res.statusCode}`));
-          }
-        });
-        // 关键：response 阶段断连（ERR_CONNECTION_CLOSED 等）从 res emit 'error'，缺此 handler 会逃逸成
-        // 主进程 uncaughtException，且 Promise 永不 settle → checkUpdate await 永挂 → 前端检查更新永久转圈。
-        res.on('error', (err: Error) => finish(err));
-      });
-
-      request.on('error', (err: Error) => finish(err));
-      request.end();
-    });
-  }
-
   // 版本比较收口到 shared/version.compareSemver（与 UpdateService.isNewerVersion 共用单一权威）。
   // 保留薄包装：内部 3 处调用 this.compareVersions 签名不变，行为等价（容忍前导 v 与 -/+ 后缀）。
   private compareVersions(v1: string, v2: string): number {
     return compareSemver(v1, v2);
-  }
-
-  private findSuitableAsset(assets: any[]): any {
-    const platform = process.platform;
-    const arch = process.arch;
-
-    // 映射 Node.js 平台/架构到 Sing-box 命名规则
-    // darwin, win32, linux
-    // x64, arm64
-
-    let keyword = '';
-    let ext = '';
-
-    if (platform === 'win32') {
-      keyword = 'windows';
-      ext = '.zip';
-    } else if (platform === 'darwin') {
-      keyword = 'darwin';
-      ext = '.tar.gz'; // 通常是 tar.gz 或者 zip
-    } else if (platform === 'linux') {
-      keyword = 'linux';
-      ext = '.tar.gz';
-    }
-
-    let archKeyword = '';
-    if (arch === 'x64') {
-      archKeyword = 'amd64';
-    } else if (arch === 'arm64') {
-      archKeyword = 'arm64';
-    }
-
-    // 优先查找包含特定架构的
-    const filteredAssets = assets.filter(
-      (a: any) =>
-        a.name.toLowerCase().includes(keyword) &&
-        a.name.toLowerCase().includes(archKeyword) &&
-        (a.name.endsWith(ext) || a.name.endsWith('.zip'))
-    );
-
-    if (filteredAssets.length === 0) return undefined;
-
-    // 优先顺序：
-    // 1. 包含 with-naive 或 full 的版本 (针对 Windows)
-    // 2. 不含 legacy 的版本
-    // 3. 其他匹配项
-
-    const preferred = filteredAssets.find(
-      (a: any) =>
-        a.name.toLowerCase().includes('with-naive') || a.name.toLowerCase().includes('full')
-    );
-    if (preferred) return preferred;
-
-    const nonLegacy = filteredAssets.find((a: any) => !a.name.toLowerCase().includes('legacy'));
-    if (nonLegacy) return nonLegacy;
-
-    return filteredAssets[0];
-  }
-
-  private async downloadFile(url: string, isRetry = false): Promise<string> {
-    // 根据系统平台设置合理的默认扩展名
-    let ext = process.platform === 'win32' ? '.zip' : '.tar.gz';
-    try {
-      const urlObj = new URL(url);
-      const pathname = urlObj.pathname;
-      // path.extname 对于 .tar.gz 只会返回 .gz
-      const urlExt = path.extname(pathname);
-      if (urlExt) {
-        if (pathname.endsWith('.tar.gz')) {
-          ext = '.tar.gz';
-        } else {
-          ext = urlExt;
-        }
-      }
-    } catch (e) {
-      this.logManager.addLog('warn', `解析下载 URL 后缀失败: ${e}`, 'CoreUpdateService');
-    }
-
-    // 如果是 Windows，且后缀不是 .zip，强制使用 .zip (因为 Sing-box Windows 构建通常是 zip)
-    // 这是一个保险措施
-    if (process.platform === 'win32' && ext !== '.zip') {
-      ext = '.zip';
-    }
-
-    const tempPath = path.join(app.getPath('temp'), `sing-box-core-update-${Date.now()}${ext}`);
-    const file = fs.createWriteStream(tempPath);
-    const sess = await this.getUpdateSession();
-    // 下载失败兜底镜像前缀：优先用户配置的 ghProxyPrefix，否则用内置 preset[0]（gh-proxy.org）。
-    // 旧硬编码 mirror.ghproxy.com 已停服，复用 shared/gh-proxy 单一权威（同 RuleResourceManager 重试链）。
-    let ghPrefix: string | undefined;
-    try {
-      const cfg = this.configProvider ? await this.configProvider() : null;
-      const raw = cfg?.ghProxyPrefix;
-      ghPrefix = raw ? (normalizeGhProxyPrefix(raw) ?? undefined) : undefined;
-    } catch {
-      ghPrefix = undefined;
-    }
-
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      let idleTimer: ReturnType<typeof setTimeout> | null = null;
-      const clearIdle = () => {
-        if (idleTimer) {
-          clearTimeout(idleTimer);
-          idleTimer = null;
-        }
-      };
-      // 停滞超时：连接/下载 30s 无进展（无 data）即视为卡死 → abort + handleError（github 链接会自动换镜像重试一次）。
-      // 防下载挂起致 updateCore 永不 resolve → 前端「更新」按钮永久转圈。正常下载持续有 data、不断重置、不会误触发。
-      const armIdle = () => {
-        clearIdle();
-        idleTimer = setTimeout(() => {
-          try {
-            request.abort();
-          } catch {
-            /* ignore */
-          }
-          handleError(new Error('下载停滞超时（30s 无数据，网络中断或被拦截）'));
-        }, 30000);
-      };
-
-      const handleError = (err: any) => {
-        if (settled) return;
-        settled = true;
-        clearIdle();
-        file.close();
-        fs.unlink(tempPath, () => {});
-
-        // 遇到网络错误，且是第一次尝试，并且是 github 链接，尝试使用加速镜像
-        if (!isRetry && url.includes('github.com')) {
-          // 优先配置前缀（applyGhProxy 只对 GitHub 域生效），否则回落内置 preset[0]。GH_PROXY_PRESETS 末尾带 '/'。
-          const proxied = ghPrefix ? applyGhProxy(ghPrefix, url) : url;
-          const mirrorUrl = proxied !== url ? proxied : GH_PROXY_PRESETS[0] + url;
-          this.logManager.addLog(
-            'warn',
-            `下载出错，尝试使用加速镜像: ${err.message}`,
-            'CoreUpdateService'
-          );
-          this.downloadFile(mirrorUrl, true).then(resolve).catch(reject);
-          return;
-        }
-
-        reject(err);
-      };
-
-      const request = net.request({ url, session: sess });
-      request.setHeader('User-Agent', APP_USER_AGENT);
-
-      request.on('response', (response) => {
-        if (response.statusCode >= 400) {
-          if (settled) return;
-          settled = true;
-          clearIdle();
-          file.close();
-          fs.unlink(tempPath, () => {});
-          reject(new Error(`Download failed: ${response.statusCode}`));
-          return;
-        }
-
-        // 完整性校验：累计字节与 Content-Length 比对，拦截被截断/中断的下载流入解压
-        const lenHeader = response.headers['content-length'];
-        const expectedBytes = parseInt(
-          (Array.isArray(lenHeader) ? lenHeader[0] : lenHeader) as string,
-          10
-        );
-        let receivedBytes = 0;
-
-        response.on('data', (chunk) => {
-          armIdle(); // 每收到数据重置停滞计时
-          receivedBytes += chunk.length;
-          file.write(chunk);
-        });
-
-        response.on('end', () => {
-          clearIdle();
-          file.close(() => {
-            if (!isNaN(expectedBytes) && receivedBytes !== expectedBytes) {
-              // 截断的 GitHub 下载会经 handleError 自动换镜像重试一次
-              handleError(
-                new Error(
-                  `下载不完整：收到 ${receivedBytes} 字节，期望 ${expectedBytes}（可能被截断）`
-                )
-              );
-              return;
-            }
-            if (settled) return;
-            settled = true;
-            resolve(tempPath);
-          });
-        });
-
-        response.on('error', handleError);
-      });
-
-      request.on('error', handleError);
-
-      armIdle(); // 连接阶段也启动停滞计时（连接挂起 30s 超时）
-      request.end();
-    });
-  }
-
-  private async extractCore(filePath: string): Promise<{ corePath: string; extractDir: string }> {
-    // 这是一个简化实现，处理 zip 和 tar.gz 需要引入 adm-zip 或 tar 库
-    // 假设项目中可能有这些依赖，或者使用系统命令
-    // 为了稳健性，这里使用系统命令 (tar / powershell Expand-Archive)
-
-    const extractDir = path.join(app.getPath('temp'), `sing-box-extracted-${Date.now()}`);
-    fs.mkdirSync(extractDir);
-
-    try {
-      if (process.platform === 'win32') {
-        // Windows: 使用 PowerShell 解压 zip
-        const { execSync } = require('child_process');
-        execSync(
-          `"${powershellPath()}" -command "Expand-Archive -Path '${filePath}' -DestinationPath '${extractDir}' -Force"`
-        );
-      } else {
-        // macOS/Linux: 使用 tar
-        const { execSync } = require('child_process');
-        // 检测是 zip 还是 tar.gz
-        if (filePath.endsWith('.zip')) {
-          execSync(`unzip -o "${filePath}" -d "${extractDir}"`);
-        } else {
-          execSync(`tar -xzf "${filePath}" -C "${extractDir}"`);
-        }
-      }
-
-      // 查找解压后的可执行文件
-      const exeName = process.platform === 'win32' ? 'sing-box.exe' : 'sing-box';
-
-      // 递归查找
-      const findFile = (dir: string): string | null => {
-        const files = fs.readdirSync(dir);
-        for (const file of files) {
-          const fullPath = path.join(dir, file);
-          const stat = fs.statSync(fullPath);
-          if (stat.isDirectory()) {
-            const found = findFile(fullPath);
-            if (found) return found;
-          } else if (file === exeName) {
-            return fullPath;
-          }
-        }
-        return null;
-      };
-
-      const corePath = findFile(extractDir);
-      if (!corePath) {
-        throw new Error('无法在压缩包中找到 sing-box 可执行文件');
-      }
-
-      return { corePath, extractDir };
-    } catch (error) {
-      // 报错时也尝试清理临时目录
-      try {
-        if (fs.existsSync(extractDir)) {
-          fs.rmSync(extractDir, { recursive: true, force: true });
-        }
-      } catch {
-        // Ignore cleanup errors during recovery
-      }
-      throw new Error(`解压失败: ${(error as any).message}`);
-    }
   }
 
   private getBackupPath(): string {
