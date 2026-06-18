@@ -20,7 +20,7 @@ const PLACEHOLDER = `{
   "server": "1.2.3.4",
   "server_port": 8388,
   "psk": "your-psk",
-  "version": "4"
+  "version": 4
 }`;
 
 type ProbeState = { state: 'idle' | 'checking' | 'ok' | 'fail' | 'unknown'; error?: string };
