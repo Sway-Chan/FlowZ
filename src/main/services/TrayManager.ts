@@ -578,12 +578,9 @@ export class TrayManager implements ITrayManager {
    */
   private handleEnterPrivacyMode(): void {
     this.logManager.addLog('info', 'Enter privacy mode clicked from tray', 'TrayManager');
-    if (this.onEnterPrivacyMode) {
-      this.onEnterPrivacyMode();
-    } else {
-      const { setPrivacyMode } = require('../index');
-      setPrivacyMode(true);
-    }
+    // onEnterPrivacyMode 由 index.ts 构造 TrayManager 时恒注入（置主进程隐私 flag 并广播）。
+    // 此处仅经回调，不再 require('../index') 兜底——那是死分支且会形成 TrayManager→index 循环依赖。
+    this.onEnterPrivacyMode?.();
   }
 
   private handleShowWindow(): void {

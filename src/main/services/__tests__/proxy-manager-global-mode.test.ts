@@ -20,7 +20,20 @@ jest.mock('electron', () => ({ app: { getPath: () => TMP }, net: {} }));
 
 import { ProxyManager } from '../ProxyManager';
 import { buildCustomRuleFiles } from '../custom-rule-files';
+import { effectiveCustomRules, effectiveAppRules } from '../singbox-config-helpers';
+import { buildRouteConfig, type RouteConfigDeps } from '../singbox-route-builder';
 import type { UserConfig } from '../../../shared/types';
+
+/** generateRouteConfig 已抽到 singbox-route-builder（buildRouteConfig）；注入 deps（端到端断言不依赖 probe/lan/version 细节）。 */
+const routeDeps = (): RouteConfigDeps => ({
+  coreVersion: '1.13.0',
+  probeDirectPort: null,
+  probeProxyPort: null,
+  lanResolverForDns: null,
+  pendingEndpoints: [],
+  log: () => {},
+  onDegraded: () => {},
+});
 
 function makeSvc(): any {
   return new ProxyManager(
@@ -45,35 +58,32 @@ function makeConfig(proxyMode: 'smart' | 'global' | 'direct'): UserConfig {
 }
 
 describe('用户路由 gate（effectiveCustomRules / effectiveAppRules 仅 smart）', () => {
-  const svc = makeSvc();
-
   it('smart：返回用户的自定义规则与应用分流', () => {
     const cfg = makeConfig('smart');
-    expect(svc.effectiveCustomRules(cfg)).toHaveLength(1);
-    expect(svc.effectiveAppRules(cfg)).toHaveLength(1);
+    expect(effectiveCustomRules(cfg)).toHaveLength(1);
+    expect(effectiveAppRules(cfg)).toHaveLength(1);
   });
 
   it('global：自定义规则与应用分流均为空（真·全局忽略用户分流）', () => {
     const cfg = makeConfig('global');
-    expect(svc.effectiveCustomRules(cfg)).toEqual([]);
-    expect(svc.effectiveAppRules(cfg)).toEqual([]);
+    expect(effectiveCustomRules(cfg)).toEqual([]);
+    expect(effectiveAppRules(cfg)).toEqual([]);
   });
 
   it('direct：自定义规则与应用分流均为空', () => {
     const cfg = makeConfig('direct');
-    expect(svc.effectiveCustomRules(cfg)).toEqual([]);
-    expect(svc.effectiveAppRules(cfg)).toEqual([]);
+    expect(effectiveCustomRules(cfg)).toEqual([]);
+    expect(effectiveAppRules(cfg)).toEqual([]);
   });
 
   it('应用分流总开关关闭：smart 下 appRules 仍为空（开关优先）', () => {
     const cfg = { ...makeConfig('smart'), appRoutingEnabled: false } as UserConfig;
-    expect(svc.effectiveAppRules(cfg)).toEqual([]);
-    expect(svc.effectiveCustomRules(cfg)).toHaveLength(1); // 自定义规则不受应用分流开关影响
+    expect(effectiveAppRules(cfg)).toEqual([]);
+    expect(effectiveCustomRules(cfg)).toHaveLength(1); // 自定义规则不受应用分流开关影响
   });
 });
 
 describe('generateRouteConfig：global 不 emit 用户分流（端到端）', () => {
-  const svc = makeSvc();
   const idMap = new Map([['s1', 'proxy-s1']]);
   const hasRuleSelOutbound = (route: any): boolean =>
     (route.rules || []).some(
@@ -81,25 +91,25 @@ describe('generateRouteConfig：global 不 emit 用户分流（端到端）', ()
     );
 
   it('smart：存在 rule-sel-* 出站（自定义/应用分流 selector），final=proxy-selector', () => {
-    const route = svc.generateRouteConfig(makeConfig('smart'), idMap);
+    const route = buildRouteConfig(makeConfig('smart'), idMap, routeDeps());
     expect(hasRuleSelOutbound(route)).toBe(true);
     expect(route.final).toBe('proxy-selector');
   });
 
   it('global：无 rule-sel-* 出站（用户分流被忽略），final 仍=proxy-selector（一律走选中节点）', () => {
-    const route = svc.generateRouteConfig(makeConfig('global'), idMap);
+    const route = buildRouteConfig(makeConfig('global'), idMap, routeDeps());
     expect(hasRuleSelOutbound(route)).toBe(false);
     expect(route.final).toBe('proxy-selector');
   });
 
   it('direct：无 rule-sel-* 出站，final=direct', () => {
-    const route = svc.generateRouteConfig(makeConfig('direct'), idMap);
+    const route = buildRouteConfig(makeConfig('direct'), idMap, routeDeps());
     expect(hasRuleSelOutbound(route)).toBe(false);
     expect(route.final).toBe('direct');
   });
 
   it('global：功能性强制直连仍保留（LAN 私网 + 节点 IP 排除）', () => {
-    const route = svc.generateRouteConfig(makeConfig('global'), idMap);
+    const route = buildRouteConfig(makeConfig('global'), idMap, routeDeps());
     const directIpRules = (route.rules || []).filter(
       (r: any) => r.outbound === 'direct' && Array.isArray(r.ip_cidr)
     );

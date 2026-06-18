@@ -4,18 +4,9 @@
  * 背景：sing-box 对任一 remote rule_set 取回 404 会**整体 FATAL**（崩整个代理，非跳过）。预检发现确定缺失的
  * rule_set 后，applyRuleSetPrune 把它从定义与路由引用中剔除，rule_set 清空的规则整条丢弃（"资源不存在则该规则停止"）。
  *
- * 私有方法经 `(svc as any).applyRuleSetPrune()` 直调（跟随既有 proxy-manager 测试风格），不触网、不启动 sing-box。
+ * applyRuleSetPrune 已抽到 singbox-config-helpers（纯函数）；直接 import 调用，不触网、不启动 sing-box。
  */
-import { ProxyManager } from '../ProxyManager';
-
-function makeSvc(): any {
-  return new ProxyManager(
-    undefined as any,
-    undefined as any,
-    '/tmp/flowz-test-cfg.json',
-    '/fake/sing-box'
-  );
-}
+import { applyRuleSetPrune } from '../singbox-config-helpers';
 
 /** 构造一份含「应用分流 Telegram」典型路由的最小 singbox 配置。 */
 function makeConfig(): any {
@@ -61,12 +52,10 @@ function makeConfig(): any {
   };
 }
 
-describe('ProxyManager.applyRuleSetPrune（远程 rule_set 404 剪枝）', () => {
-  const svc = makeSvc();
-
+describe('applyRuleSetPrune（远程 rule_set 404 剪枝）', () => {
   it('部分缺失（geoip 404、geosite 存在）：剔 geoip-telegram，规则保留 geosite-telegram', () => {
     const cfg = makeConfig();
-    const dropped = svc.applyRuleSetPrune(cfg, new Set(['geoip-telegram']));
+    const dropped = applyRuleSetPrune(cfg, new Set(['geoip-telegram']));
     expect(dropped).toEqual(['geoip-telegram']);
     // 定义只剩 geosite-telegram + geoip-cn
     expect(cfg.route.rule_set.map((r: any) => r.tag)).toEqual(['geosite-telegram', 'geoip-cn']);
@@ -86,7 +75,7 @@ describe('ProxyManager.applyRuleSetPrune（远程 rule_set 404 剪枝）', () =>
 
   it('全部缺失（geosite+geoip 均 404）：rule_set 规则整条丢弃，进程名规则仍在', () => {
     const cfg = makeConfig();
-    const dropped = svc.applyRuleSetPrune(cfg, new Set(['geosite-telegram', 'geoip-telegram']));
+    const dropped = applyRuleSetPrune(cfg, new Set(['geosite-telegram', 'geoip-telegram']));
     expect(dropped.sort()).toEqual(['geoip-telegram', 'geosite-telegram']);
     // 两个远程定义都删，只剩本地 geoip-cn
     expect(cfg.route.rule_set.map((r: any) => r.tag)).toEqual(['geoip-cn']);
@@ -99,7 +88,7 @@ describe('ProxyManager.applyRuleSetPrune（远程 rule_set 404 剪枝）', () =>
   it('空 unreachable：配置零改动', () => {
     const cfg = makeConfig();
     const before = JSON.stringify(cfg);
-    const dropped = svc.applyRuleSetPrune(cfg, new Set<string>());
+    const dropped = applyRuleSetPrune(cfg, new Set<string>());
     expect(dropped).toEqual([]);
     expect(JSON.stringify(cfg)).toBe(before);
   });
@@ -118,7 +107,7 @@ describe('ProxyManager.applyRuleSetPrune（远程 rule_set 404 剪枝）', () =>
         ],
       },
     };
-    const dropped = svc.applyRuleSetPrune(cfg, new Set(['geosite-amazon']));
+    const dropped = applyRuleSetPrune(cfg, new Set(['geosite-amazon']));
     expect(dropped).toEqual([]); // 无定义可删 → dropped 空（关键：剪规则不以 dropped 为闸）
     expect(cfg.route.rules.some((r: any) => Array.isArray(r.rule_set))).toBe(false); // 悬空引用规则被剪
     expect(cfg.route.rules.find((r: any) => r.process_name)).toBeTruthy(); // 进程名规则保留
@@ -144,7 +133,7 @@ describe('ProxyManager.applyRuleSetPrune（远程 rule_set 404 剪枝）', () =>
         ],
       },
     };
-    const dropped = svc.applyRuleSetPrune(cfg, new Set(['geosite-foo']));
+    const dropped = applyRuleSetPrune(cfg, new Set(['geosite-foo']));
     expect(dropped).toEqual(['geosite-foo']);
     expect(cfg.route.rules).toEqual([]); // logical 子条件清空 → 整条丢
   });
@@ -169,7 +158,7 @@ describe('ProxyManager.applyRuleSetPrune（远程 rule_set 404 剪枝）', () =>
         ],
       },
     };
-    svc.applyRuleSetPrune(cfg, new Set(['geosite-amazon']));
+    applyRuleSetPrune(cfg, new Set(['geosite-amazon']));
     // 整条 AND 被丢，绝不残留 {action:'reject', rules:[{network:['udp'],port:[443]}]}
     expect(cfg.route.rules).toEqual([]);
   });
