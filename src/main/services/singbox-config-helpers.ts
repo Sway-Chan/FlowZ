@@ -176,9 +176,18 @@ export function getRequiredGeoCategories(
     if (!appRule.enabled) continue;
     const preset = getAppPreset(appRule.appId, customAppPresets);
     if (preset) {
-      preset.geositeTags.forEach((tag) => geositeCategories.add(tag));
+      // 与 customRules 分支同口径：trim + 小写。必须与发射端（singbox-route-builder app 规则
+      // `geosite-/geoip-`）+ 本地 .srs 文件名/资源 id（均小写）一致，否则 customAppPresets 含大写 tag 时
+      // 所需类别集（决定注入哪些 rule_set）与实际引用的 rule_set tag 错位 → fail-closed 剪枝静默丢规则。
+      preset.geositeTags.forEach((tag) => {
+        const t = tag.trim().toLowerCase();
+        if (t) geositeCategories.add(t);
+      });
       if (preset.geoipTags) {
-        preset.geoipTags.forEach((tag) => geoipCategories.add(tag));
+        preset.geoipTags.forEach((tag) => {
+          const t = tag.trim().toLowerCase();
+          if (t) geoipCategories.add(t);
+        });
       }
     }
   }

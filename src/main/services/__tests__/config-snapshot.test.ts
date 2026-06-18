@@ -168,7 +168,9 @@ describe('generateSingBoxConfig — characterization 快照（抽取前锁基线
               id: 'custom-app1',
               name: 'MyApp',
               emoji: '🌐',
-              geositeTags: ['youtube'],
+              // 混合大小写：端到端锁 geosite tag 小写归一（getRequiredGeoCategories 收集 + route 发射端引用
+              // 同步 toLowerCase）。snapshot 不变即证两端一致输出 geosite-youtube；回退任一端则 snapshot 漂移报警。
+              geositeTags: ['YouTube'],
               geoipTags: [],
             },
           ],

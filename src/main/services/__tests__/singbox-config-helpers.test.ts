@@ -180,6 +180,25 @@ describe('getRequiredGeoCategories — 扫 customRules + appRules 收集 geo 类
     expect([...geoip]).toEqual(['us']);
   });
 
+  it('appRules preset tag 大写/含空白 → trim + 小写归一（对齐 customRules + route 发射端 + 本地 .srs 口径）', () => {
+    const appRules: AppRule[] = [
+      { appId: 'cap', action: 'proxy', enabled: true },
+    ] as unknown as AppRule[];
+    const presets = [
+      {
+        id: 'cap',
+        name: 'Cap',
+        emoji: '🧢',
+        geositeTags: ['YouTube', ' Netflix '],
+        geoipTags: ['US'],
+      },
+    ] as any;
+    const { geosite, geoip } = getRequiredGeoCategories([], appRules, presets);
+    // 不小写 → 'YouTube' 与本地 geosite-youtube.srs 错位被 fail-closed 剪掉，应规整为小写裸标签。
+    expect([...geosite].sort()).toEqual(['netflix', 'youtube']);
+    expect([...geoip]).toEqual(['us']);
+  });
+
   it('空输入 → 两空集', () => {
     const { geosite, geoip } = getRequiredGeoCategories([], [], []);
     expect(geosite.size).toBe(0);

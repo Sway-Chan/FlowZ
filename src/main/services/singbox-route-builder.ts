@@ -477,9 +477,11 @@ export function buildRouteConfig(
       }
 
       // b. 基于原有 rule_set 的规则（兜底，基于域名/IP 识别）
+      // tag 小写对齐 getRequiredGeoCategories（注入哪些 rule_set）+ 本地 .srs 文件名/资源 id，
+      // 否则 customAppPresets 大写 tag → 引用 geosite-<Cap> 但本地仅 geosite-<cap>.srs → fail-closed 剪掉。
       const ruleSets = [
-        ...preset.geositeTags.map((tag) => `geosite-${tag}`),
-        ...(preset.geoipTags || []).map((tag) => `geoip-${tag}`),
+        ...preset.geositeTags.map((tag) => `geosite-${tag.toLowerCase()}`),
+        ...(preset.geoipTags || []).map((tag) => `geoip-${tag.toLowerCase()}`),
       ];
 
       if (ruleSets.length > 0) {

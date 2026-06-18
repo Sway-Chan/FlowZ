@@ -97,4 +97,9 @@ describe('prunedSelectorDefault', () => {
     expect(prunedSelectorDefault('rule-sel-x', ['a', 'proxy-selector'])).toBe('proxy-selector');
     expect(prunedSelectorDefault('proxy-selector', ['a', 'b'])).toBe('a');
   });
+  it('proxy-selector 成员剔光（空数组）→ undefined（不伪造默认，退化态由 buildOutbounds 空守卫 throw 拦截）', () => {
+    expect(prunedSelectorDefault('proxy-selector', [])).toBeUndefined();
+    // rule-sel 恒嵌套回 proxy-selector，与成员是否剔空无关。
+    expect(prunedSelectorDefault('rule-sel-y', [])).toBe('proxy-selector');
+  });
 });

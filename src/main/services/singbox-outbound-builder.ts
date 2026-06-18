@@ -26,11 +26,16 @@ export function isNodeUsable(server: ServerConfig): boolean {
   return true;
 }
 
-/** selector default 被剔除后的兜底：rule-sel 回 proxy-selector（嵌套），proxy-selector 落剩余首节点（MED-1）。 */
+/**
+ * selector default 被剔除后的兜底：rule-sel 回 proxy-selector（嵌套），proxy-selector 落剩余首节点（MED-1）。
+ * proxy-selector 成员被剔光（remainingOutbounds 空）时无有效成员可选 → 返 undefined（不伪造默认掩盖「无节点」）；
+ * 该退化态由调用方 buildOutbounds「proxy-selector 空 → throw 没有可用的代理节点出站」守卫拦截，不会下发非法
+ * config。返回类型如实标 `string | undefined`，避免签名谎称恒返 string。
+ */
 export function prunedSelectorDefault(
   tag: string | undefined,
   remainingOutbounds: string[]
-): string {
+): string | undefined {
   return tag?.startsWith('rule-sel-') ? 'proxy-selector' : remainingOutbounds[0];
 }
 
