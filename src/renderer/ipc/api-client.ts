@@ -455,6 +455,10 @@ export const systemApi = {
   async listProcesses(): Promise<SystemProcessInfo[]> {
     return ipcClient.invoke(IPC_CHANNELS.SYSTEM_LIST_PROCESSES);
   },
+  /** 用系统默认浏览器打开外部链接（收口 shell:openExternal；api-client 单一入口，渐替 bridge/api-wrapper.openExternal）。 */
+  async openExternal(url: string): Promise<void> {
+    return ipcClient.invoke(IPC_CHANNELS.SHELL_OPEN_EXTERNAL, url);
+  },
 };
 
 /**
@@ -532,27 +536,6 @@ export const versionApi = {
    */
   async getInfo(): Promise<VersionInfo> {
     return ipcClient.invoke(IPC_CHANNELS.VERSION_GET_INFO);
-  },
-};
-
-/**
- * 管理员权限检查结果
- */
-export interface AdminCheckResult {
-  isAdmin: boolean;
-  platform: NodeJS.Platform;
-  needsElevationForTun: boolean;
-}
-
-/**
- * 管理员权限 API
- */
-export const adminApi = {
-  /**
-   * 检查管理员权限状态
-   */
-  async check(): Promise<AdminCheckResult> {
-    return ipcClient.invoke(IPC_CHANNELS.ADMIN_CHECK);
   },
 };
 
@@ -902,7 +885,6 @@ export const api = {
   ruleResources: ruleResourcesApi,
   ipInfo: ipInfoApi,
   version: versionApi,
-  admin: adminApi,
   update: updateApi,
   coreUpdate: coreUpdateApi,
   subscription: subscriptionApi,

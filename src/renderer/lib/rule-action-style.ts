@@ -7,6 +7,8 @@
  * block  → destructive（红）
  */
 
+import type { TFunction } from 'i18next';
+
 export type RuleAction = 'proxy' | 'direct' | 'block' | string;
 
 export interface RuleActionStyle {
@@ -45,4 +47,17 @@ export function getRuleActionStyle(action: RuleAction): RuleActionStyle {
     badgeBg: 'bg-primary',
     badgeBgHover: 'hover:bg-primary/90',
   };
+}
+
+/**
+ * 规则 action → i18n 中文 label。
+ * 仅映射 proxy/direct/block 三个语义值（未知值容错回落 proxy label）。
+ * key 使用 'rules.proxy' / 'rules.direct' / 'rules.block'，与 sortable-rule-row 保持一致。
+ */
+export function ruleActionLabel(action: RuleAction, t: TFunction): string {
+  const a = (action || '').toLowerCase();
+  if (a === 'direct') return t('rules.direct');
+  if (a === 'block' || a === 'reject' || a === 'reject-drop' || a === 'drop')
+    return t('rules.block');
+  return t('rules.proxy');
 }

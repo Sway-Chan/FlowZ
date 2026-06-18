@@ -243,10 +243,6 @@
     "fetchingStatus": "Fetching status...",
     "systemProxyMode": "System Proxy Mode",
     "manualModeTip": "Local proxy is ready! Please configure your apps to use SOCKS5/HTTP port 127.0.0.1.",
-    "tunNeedsAdmin": "TUN mode requires admin privileges, please run the app as administrator",
-    "tunDriverFail": "TUN driver failed to load, please check if wintun.dll exists",
-    "tunInterfaceFail": "TUN interface creation failed, please check network settings",
-    "singboxMissing": "sing-box core file is missing or cannot start",
     "uptime": "Uptime: {{min}} min",
     "startingTun": "Starting TUN mode...",
     "tunNotEnabled": "TUN mode is not enabled",
@@ -1010,8 +1006,8 @@
       },
       "ruleSet": {
         "name": "Rule Set",
-        "desc": "Remote rule-set URL or a downloaded local resource",
-        "placeholder": "https://example.com/rule.srs"
+        "desc": "A downloaded local rule resource",
+        "placeholder": ""
       }
     },
     "processPicker": {

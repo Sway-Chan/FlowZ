@@ -2,8 +2,6 @@ import { useEffect } from 'react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import * as z from 'zod';
-import { Loader2 } from 'lucide-react';
-import { Button } from '@/components/ui/button';
 import {
   Form,
   FormControl,
@@ -15,6 +13,7 @@ import {
 } from '@/components/ui/form';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
+import { FormButtons } from './shared/form-buttons';
 import { FormSection, FieldGrid, FieldSpan } from './shared/form-layout';
 import { splitTextList } from './shared/parse-list';
 import type { ServerConfig } from '@/bridge/types';
@@ -271,20 +270,7 @@ export function TailscaleForm({ serverConfig, onSubmit }: TailscaleFormProps) {
           </FieldGrid>
         </FormSection>
 
-        <div className="flex gap-4">
-          <Button type="submit" disabled={form.formState.isSubmitting}>
-            {form.formState.isSubmitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            {t('common.save')}
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => form.reset()}
-            disabled={form.formState.isSubmitting}
-          >
-            {t('common.reset')}
-          </Button>
-        </div>
+        <FormButtons isSubmitting={form.formState.isSubmitting} onReset={() => form.reset()} />
       </form>
     </Form>
   );

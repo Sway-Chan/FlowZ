@@ -53,7 +53,7 @@ import { api } from '@/ipc/api-client';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 import { useAppStore } from '@/store/app-store';
-import { PROTOCOL_OPTIONS } from './shared/protocol-options';
+import { getSortedProtocolOptions } from './shared/protocol-options';
 import { isAccountBasedProtocol } from '../../../shared/endpoint-routes';
 
 type ServerConfigWithId = ServerConfig;
@@ -152,7 +152,7 @@ export function ServerList({
     total: number;
   } | null>(null);
   const [testingServerIds, setTestingServerIds] = useState<Set<string>>(new Set());
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
 
   // 记住用户的视图偏好
   const [viewMode, setViewMode] = useState<ViewMode>(() => {
@@ -351,12 +351,12 @@ export function ServerList({
   };
 
   // 过滤 + 排序
-  // 协议筛选项按【当前分组实际存在的协议】动态生成（保持 PROTOCOL_OPTIONS 顺序）：订阅组不再列 WG/WARP/Tailscale
-  // 等不可能出现的协议，自建/组网组也各只列自己有的——降低无意义选项的理解成本。
+  // 协议筛选项按【当前分组实际存在的协议】动态生成：订阅组不再列 WG/WARP/Tailscale 等不可能出现的协议，
+  // 自建/组网组也各只列自己有的——降低无意义选项的理解成本。顺序经 getSortedProtocolOptions 按显示名 locale 排序、custom 置末。
   const availableProtocols = useMemo(() => {
     const present = new Set(servers.map((s) => s.protocol?.toLowerCase()));
-    return PROTOCOL_OPTIONS.filter((p) => present.has(p.value));
-  }, [servers]);
+    return getSortedProtocolOptions(t, i18n.language, (v) => present.has(v));
+  }, [servers, t, i18n.language]);
 
   // 当前筛选的协议在本组已不存在（切组/订阅更新后）→ 回落 all，避免筛出空列表。
   useEffect(() => {
@@ -638,7 +638,7 @@ export function ServerList({
             <SelectItem value="all">{t('servers.allProtocols')}</SelectItem>
             {availableProtocols.map((p) => (
               <SelectItem key={p.value} value={p.value}>
-                {p.value === 'custom' ? t('servers.protocolCustom', p.label) : p.label}
+                {p.label}
               </SelectItem>
             ))}
           </SelectContent>

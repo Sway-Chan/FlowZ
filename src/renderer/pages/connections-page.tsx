@@ -3,6 +3,7 @@ import { useAppStore } from '@/store/app-store';
 import { EyeOff } from 'lucide-react';
 import { ConnectionsTable } from '@/components/connections/connections-table';
 import { shouldHideForPrivacy } from '@/components/connections/connection-utils';
+import { PageHeader } from '@/components/page-header';
 
 /**
  * 连接信息页：复用 main 单一 poller 的连接快照（connectionsApi），逐条展示活动连接 + per-conn 速率差分。
@@ -16,10 +17,7 @@ export function ConnectionsPage() {
 
   return (
     <div className="space-y-6">
-      <div>
-        <h2 className="text-2xl font-bold">{t('connections.pageTitle')}</h2>
-        <p className="text-muted-foreground mt-1">{t('connections.pageDesc')}</p>
-      </div>
+      <PageHeader title={t('connections.pageTitle')} description={t('connections.pageDesc')} />
 
       {hidden ? (
         <div className="flex flex-col items-center justify-center gap-3 rounded-lg border bg-muted/40 py-20 text-muted-foreground">

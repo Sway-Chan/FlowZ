@@ -21,7 +21,7 @@ import {
 import type { Rule } from '@/bridge/types';
 import { ruleConditions } from '../../../shared/rules';
 import { TYPE_TO_CATEGORY, CATEGORY_BADGE_CLASS, RULE_TYPE_NAME } from './rule-type-meta';
-import { getRuleActionStyle } from '@/lib/rule-action-style';
+import { getRuleActionStyle, ruleActionLabel } from '@/lib/rule-action-style';
 
 interface SortableRuleRowProps {
   rule: Rule;
@@ -83,11 +83,7 @@ function RuleDetailContent({
           variant="default"
           className={`whitespace-nowrap border-transparent text-white ${getRuleActionStyle(rule.action).badgeBg} ${getRuleActionStyle(rule.action).badgeBgHover}`}
         >
-          {rule.action === 'proxy'
-            ? t('rules.proxy')
-            : rule.action === 'direct'
-              ? t('rules.direct')
-              : t('rules.block')}
+          {ruleActionLabel(rule.action, t)}
         </Badge>
         {rule.action === 'proxy' && renderExitNode(rule)}
       </div>
@@ -222,11 +218,7 @@ export function SortableRuleRow({
             variant="default"
             className={`whitespace-nowrap border-transparent text-white ${getRuleActionStyle(rule.action).badgeBg} ${getRuleActionStyle(rule.action).badgeBgHover}`}
           >
-            {rule.action === 'proxy'
-              ? t('rules.proxy')
-              : rule.action === 'direct'
-                ? t('rules.direct')
-                : t('rules.block')}
+            {ruleActionLabel(rule.action, t)}
           </Badge>
           {(rule.action === 'proxy' || rule.bypassFakeIP) && (
             <div className="flex min-w-0 items-center gap-1.5">

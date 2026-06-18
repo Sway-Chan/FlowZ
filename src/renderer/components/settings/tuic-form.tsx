@@ -1,9 +1,7 @@
 import { useEffect } from 'react';
-import { Loader2 } from 'lucide-react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import * as z from 'zod';
-import { Button } from '@/components/ui/button';
 import {
   Form,
   FormControl,
@@ -24,6 +22,7 @@ import {
 import { EchField } from './shared/anti-censor-fields';
 import { AddressField, PortField } from './shared/basic-fields';
 import { TlsServerNameField, AllowInsecureField, AlpnField } from './shared/tls-fields';
+import { FormButtons } from './shared/form-buttons';
 import { echSchemaShape, echDefaults, readEchDefault } from './shared/field-schemas';
 import { FormSection, FieldGrid, FieldSpan } from './shared/form-layout';
 import type { ServerConfig } from '@/bridge/types';
@@ -214,20 +213,7 @@ export function TuicForm({ serverConfig, onSubmit }: TuicFormProps) {
           </FieldGrid>
         </FormSection>
 
-        <div className="flex gap-4">
-          <Button type="submit" disabled={form.formState.isSubmitting}>
-            {form.formState.isSubmitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            {t('common.save')}
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => form.reset()}
-            disabled={form.formState.isSubmitting}
-          >
-            {t('common.reset')}
-          </Button>
-        </div>
+        <FormButtons isSubmitting={form.formState.isSubmitting} onReset={() => form.reset()} />
       </form>
     </Form>
   );

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import type { TFunction } from 'i18next';
 import { useAppStore } from '@/store/app-store';
 import { api } from '@/ipc/api-client';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
@@ -52,6 +53,14 @@ import { ResourceUrlDialog } from '@/components/rules/resource-url-dialog';
 
 const DIRECT = '__direct__';
 const CUSTOM = '__custom__';
+
+function reportDownloadResult(results: Array<{ ok: boolean }>, t: TFunction): void {
+  const ok = results.filter((r) => r.ok).length;
+  const fail = results.length - ok;
+  if (fail === 0) toast.success(t('ruleResources.downloadSuccess', '已下载 {{n}} 项', { n: ok }));
+  else if (ok === 0) toast.error(t('ruleResources.downloadAllFailed', '下载失败'));
+  else toast.warning(t('ruleResources.partialFailed', '{{ok}} 成功，{{fail}} 失败', { ok, fail }));
+}
 
 export function RuleResourcesPage() {
   const { t } = useTranslation();
@@ -110,13 +119,7 @@ export function RuleResourcesPage() {
     try {
       const results = await api.ruleResources.download(downloadItems);
       refresh();
-      const ok = results.filter((r) => r.ok).length;
-      const fail = results.length - ok;
-      if (fail === 0)
-        toast.success(t('ruleResources.downloadSuccess', '已下载 {{n}} 项', { n: ok }));
-      else if (ok === 0) toast.error(t('ruleResources.downloadAllFailed', '下载失败'));
-      else
-        toast.warning(t('ruleResources.partialFailed', '{{ok}} 成功，{{fail}} 失败', { ok, fail }));
+      reportDownloadResult(results, t);
     } catch {
       refresh();
       toast.error(t('ruleResources.downloadAllFailed', '下载失败'));
@@ -206,14 +209,8 @@ export function RuleResourcesPage() {
     try {
       const results = await api.ruleResources.updateAll();
       refresh();
-      const ok = results.filter((r) => r.ok).length;
-      const fail = results.length - ok;
       if (results.length === 0) return;
-      if (fail === 0)
-        toast.success(t('ruleResources.downloadSuccess', '已下载 {{n}} 项', { n: ok }));
-      else if (ok === 0) toast.error(t('ruleResources.downloadAllFailed', '下载失败'));
-      else
-        toast.warning(t('ruleResources.partialFailed', '{{ok}} 成功，{{fail}} 失败', { ok, fail }));
+      reportDownloadResult(results, t);
     } catch {
       refresh();
       toast.error(t('ruleResources.downloadAllFailed', '下载失败'));
