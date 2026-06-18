@@ -9,6 +9,8 @@
  * 未在表单声明 secretKeys，则不会被打码——故 custom 节点务必声明 secretKeys（snell psk 等常见键已黑名单兜底）。
  */
 
+import { isIpv4 } from './ip';
+
 /** 打码占位符（定长，不泄露原值长度信息）。 */
 export const REDACTED = '<redacted>';
 
@@ -115,7 +117,9 @@ export interface NodeIdentifier {
 }
 
 const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-const looksLikeIp = (s: string): boolean => /^\d{1,3}(\.\d{1,3}){3}$/.test(s) || s.includes(':');
+// IPv4 判定收敛到 shared/ip.isIpv4（严格每段 0-255，杜绝 999.x 被旧宽松正则误判为 IP）；
+// IPv6 仅作脱敏形态粗判（含 ':' 即归 IP），无需精确。
+const looksLikeIp = (s: string): boolean => isIpv4(s) || s.includes(':');
 
 type ServerLike = {
   address?: unknown;
@@ -124,7 +128,7 @@ type ServerLike = {
   wsSettings?: { headers?: Record<string, unknown> | null } | null;
   shadowTlsSettings?: { sni?: unknown } | null;
   tailscaleSettings?: { hostname?: unknown; exitNode?: unknown } | null;
-  httpSettings?: { host?: unknown } | null;
+  httpSettings?: { host?: unknown; headers?: Record<string, unknown> | null } | null;
   customSettings?: { outbound?: Record<string, unknown> | null } | null;
 };
 
@@ -157,8 +161,21 @@ function collectHostsDeep(obj: unknown, add: (v: unknown) => void): void {
 }
 
 /**
+ * 收集 transport headers 里的 Host 值（节点伪装域名）。大小写不敏感匹配 `host` 键；值兼容
+ * string（WebSocketSettings.headers）与 string[]（HttpSettings.headers）。ws/http 共用，避免两处各写一份。
+ */
+function addHostHeaders(headers: unknown, add: (v: unknown) => void): void {
+  if (!headers || typeof headers !== 'object') return;
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() !== 'host') continue;
+    if (Array.isArray(v)) for (const x of v) add(x);
+    else add(v);
+  }
+}
+
+/**
  * 从 config.servers 收集本用户节点标识符 + 稳定占位符。涵盖一切会进生成 config / 日志的节点身份字段：
- * 地址/SNI/WS-Host/ShadowTLS-sni/Tailscale-hostname·exitNode/HTTP-host[]/custom outbound 的 server·sni·host。
+ * 地址/SNI/WS-Host/ShadowTLS-sni/Tailscale-hostname·exitNode/HTTP-host[]·headers.Host/custom outbound 的 server·sni·host。
  * 地址类：域名→`<domain-N>`、IP→`<ip-N>`（保留"域名 vs IP"诊断信号）；节点名→`<node-N>`。去重（同值一占位）。
  * 节点名 <4 字符跳过（防误伤日志普通词）；地址类不设长度阈值（靠 redactIdentifiers 的主机边界锚定防误替）。
  */
@@ -191,11 +208,12 @@ export function collectNodeIdentifiers(
   for (const s of config?.servers || []) {
     add(s?.address, 'addr');
     add(s?.tlsSettings?.serverName, 'addr');
-    // WS Host 头大小写不敏感取（JSON 导入路径可能透传小写 host 等非规范键）
-    const wsHeaders = s?.wsSettings?.headers;
-    if (wsHeaders && typeof wsHeaders === 'object')
-      for (const [hk, hv] of Object.entries(wsHeaders))
-        if (hk.toLowerCase() === 'host') add(hv, 'addr');
+    // ws/http transport 的 Host 头（伪装域名）：大小写不敏感、值兼容 string(ws)|string[](http)，共用 addHostHeaders。
+    // 仅匹配精确 `host` 键（刻意不走 collectHostsDeep 的 HOST_KEY_SET）：transport headers 只有 Host 头承载身份，
+    // 用全集会把恰好叫 server/sni 的自定义 HTTP 头误收为节点身份；collectHostsDeep 仅用于 custom raw-JSON
+    // outbound（键名不可控、需广撒网）。
+    addHostHeaders(s?.wsSettings?.headers, (v) => add(v, 'addr'));
+    addHostHeaders(s?.httpSettings?.headers, (v) => add(v, 'addr'));
     add(s?.shadowTlsSettings?.sni, 'addr');
     add(s?.tailscaleSettings?.hostname, 'addr');
     add(s?.tailscaleSettings?.exitNode, 'addr');

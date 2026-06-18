@@ -265,6 +265,19 @@ describe('collectNodeIdentifiers — 节点标识符提取 + 类型化占位（P
     });
     expect(ids.map((i) => i.value)).toContain('lower.host.io');
   });
+
+  it('HTTP transport headers.Host（值为 string[]，与 ws 分支对称）也被收集', () => {
+    const ids = collectNodeIdentifiers({
+      servers: [{ httpSettings: { headers: { Host: ['masq.http.io'] } } }],
+    });
+    expect(ids.map((i) => i.value)).toContain('masq.http.io');
+  });
+
+  it('looksLikeIp 收敛 isIpv4：超界段 999.1.1.1 归域名而非 IP（不再被宽松正则误判）', () => {
+    const ids = collectNodeIdentifiers({ servers: [{ address: '999.1.1.1' }] });
+    expect(ids).toHaveLength(1);
+    expect(ids[0].placeholder).toBe('<domain-1>');
+  });
 });
 
 describe('redactIdentifiers — 文本统一打码 + 主机边界锚定（P0.6 / H1）', () => {
