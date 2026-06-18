@@ -259,6 +259,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private static readonly RESTART_COOLDOWN = 60000; // 重启冷却时间（1分钟内最多重启3次）
   private isRestarting: boolean = false;
   private coreVersion: string = 'unknown';
+  // `sing-box version` 原始第一行（含 fork 后缀，不截 X.Y.Z）；供内核来源判定（classifyCoreBuild）。
+  // 由 getCoreVersion 的同一次 spawn 顺带写入，避免「关于/内核」页二次 spawn（Windows 45MB 核加载慢）。
+  private coreVersionLine: string | null = null;
 
   constructor(
     logManager?: ILogManager,
@@ -1280,15 +1283,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       return this.coreVersion;
     }
     try {
-      const { exec } = require('child_process');
-      const util = require('util');
-      const execAsync = util.promisify(exec);
-
-      const { stdout } = await execAsync(`"${this.singboxPath}" version`);
-      // 输出示例: sing-box version 1.13.0 ... 或 v1.13.0 ...
-      const match = stdout.match(/(?:version\s+|v)(\d+\.\d+(\.\d+)?)/i);
-      // 备选方案：尝试直接取第一组连续的数字版本号
-      const secondMatch = stdout.match(/(\d+\.\d+\.\d+)/);
+      // 版本号恒在第一行（`sing-box version X.Y.Z ...`）；用第一行解析既复用 coreVersionLine 的同一次 spawn，
+      // 又避免在全量 stdout 上误匹配后续行（如 Environment 的 `go1.25.10` 含 `1.25.10`）。
+      const line = await this.spawnCoreVersionFirstLine();
+      this.coreVersionLine = line; // 顺带缓存原始行（含 fork 后缀）供内核来源判定
+      const match = line.match(/(?:version\s+|v)(\d+\.\d+(\.\d+)?)/i);
+      const secondMatch = line.match(/(\d+\.\d+\.\d+)/);
       const detected = match
         ? match[1]
         : secondMatch
@@ -1299,6 +1299,30 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     } catch (error) {
       this.logToManager('error', `获取核心版本失败: ${(error as any).message}`);
       return coreManifest.bundledCoreVersion; // 不写 'unknown' 缓存，下次仍可重试
+    }
+  }
+
+  /** spawn `sing-box version` 取原始第一行（含 fork 后缀，不截 X.Y.Z）。失败抛出，由调用方按各自缓存策略处理。 */
+  private async spawnCoreVersionFirstLine(): Promise<string> {
+    const execAsync = require('util').promisify(require('child_process').exec);
+    const { stdout } = await execAsync(`"${this.singboxPath}" version`);
+    return String(stdout).split('\n')[0]?.trim() || '';
+  }
+
+  /**
+   * 获取 `sing-box version` 原始第一行（含 fork 后缀），供内核来源判定（classifyCoreBuild）。
+   * 通常已由 getCoreVersion 顺带写入 coreVersionLine（换核后 getCoreVersion(force) 会刷新）；未捕获过则单独 spawn。
+   * 失败置 null 不缓存（与 getCoreVersion 同策略，下次重试），返回 ''（→ classifyCoreBuild 视为 unknown）。
+   */
+  async getCoreVersionLine(force = false): Promise<string> {
+    if (!force && this.coreVersionLine !== null) return this.coreVersionLine;
+    try {
+      this.coreVersionLine = await this.spawnCoreVersionFirstLine();
+      return this.coreVersionLine;
+    } catch (error) {
+      this.logToManager('warn', `获取核心版本行失败: ${(error as any).message}`);
+      this.coreVersionLine = null;
+      return '';
     }
   }
 

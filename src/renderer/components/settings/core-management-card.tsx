@@ -58,6 +58,8 @@ export function CoreManagementCard() {
   const [backupVersion, setBackupVersion] = useState<string | null>(null);
   const [hasBackup, setHasBackup] = useState(false);
   const [autoStatus, setAutoStatus] = useState<AutoStatus | null>(null);
+  // 内核来源：official / fork（第三方→禁在线·自动更新+置灰）/ unknown（仅提示）。
+  const [coreBuild, setCoreBuild] = useState<'official' | 'fork' | 'unknown'>('official');
 
   const [checkingCoreUpdate, setCheckingCoreUpdate] = useState(false);
   const [updatingCore, setUpdatingCore] = useState(false);
@@ -86,6 +88,10 @@ export function CoreManagementCard() {
       setCurrentVersion(info.currentVersion || 'Unknown');
       setBackupVersion(info.backupVersion);
       setHasBackup(info.hasBackup);
+      const build = info.build ?? 'official';
+      setCoreBuild(build);
+      // 换到第三方内核后清掉此前官方核检查残留的「发现新内核」常驻入口（其更新按钮已置灰，留着是误导性死 UI）。
+      if (build === 'fork') setAvailableCoreUpdate(null);
     } catch (error) {
       console.error('Failed to load core version info:', error);
     }
@@ -359,6 +365,11 @@ export function CoreManagementCard() {
     resettingFactory ||
     uninstalling;
 
+  // 第三方（非官方）内核：置灰在线/自动更新相关控件（检查更新 / 更新 / 自动更新开关 / 跨带限制 / 立即应用）。
+  // 本地管理控件（手动替换 / 回滚 / 重置出厂 / 卸载）保留可用——它们是装/换内核与回到官方的逃生通道。
+  const isForkCore = coreBuild === 'fork';
+  const isUnknownCore = coreBuild === 'unknown';
+
   return (
     <Card>
       <CardContent className="pt-6">
@@ -380,6 +391,36 @@ export function CoreManagementCard() {
             </div>
           )}
         </div>
+
+        {/* 第三方（非官方）内核：警告卡 + 已禁用在线/自动更新的说明 + 恢复官方的指引。 */}
+        {isForkCore && (
+          <div className="mt-3 flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 p-3 text-xs">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-warning" />
+            <div className="space-y-0.5">
+              <p className="font-medium text-warning">
+                {t('settings.coreManagement.nonOfficialTitle', '检测到第三方（非官方）内核')}
+              </p>
+              <p className="text-muted-foreground">
+                {t(
+                  'settings.coreManagement.nonOfficialDesc',
+                  '已禁用在线更新与自动更新，以避免覆盖你手动安装的内核。如需恢复官方更新，请使用下方「回滚」或「重置到出厂内核」。'
+                )}
+              </p>
+            </div>
+          </div>
+        )}
+        {/* 无法确认来源（源码自建/go install）：中性提示，不禁更新。 */}
+        {isUnknownCore && (
+          <div className="mt-3 flex items-start gap-2 rounded-md border bg-muted/40 p-3 text-xs text-muted-foreground">
+            <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>
+              {t(
+                'settings.coreManagement.unknownBuildNote',
+                '无法确认当前内核来源（可能为源码自建）。'
+              )}
+            </span>
+          </div>
+        )}
 
         {/* 常驻「发现新内核」入口（数据源 = store.availableCoreUpdate）。crossBand 时警告色 + 风险文案。 */}
         {availableCoreUpdate && (
@@ -424,7 +465,7 @@ export function CoreManagementCard() {
                         availableCoreUpdate.latestVersion
                       )
                     }
-                    disabled={busy}
+                    disabled={busy || isForkCore}
                     className="w-full sm:w-auto"
                   >
                     {updatingCore && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
@@ -437,7 +478,11 @@ export function CoreManagementCard() {
         )}
 
         <div className="mt-3 flex flex-col sm:flex-row flex-wrap gap-3">
-          <Button onClick={handleCheckCoreUpdate} disabled={busy} className="w-full sm:w-auto">
+          <Button
+            onClick={handleCheckCoreUpdate}
+            disabled={busy || isForkCore}
+            className="w-full sm:w-auto"
+          >
             {checkingCoreUpdate && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
             {t('settings.coreManagement.checkUpdate')}
           </Button>
@@ -478,8 +523,9 @@ export function CoreManagementCard() {
           description={t('settings.coreManagement.autoUpdateDesc')}
         >
           <Switch
-            checked={config?.autoUpdateCore === true}
+            checked={config?.autoUpdateCore === true && !isForkCore}
             onCheckedChange={handleToggleAutoUpdate}
+            disabled={isForkCore}
           />
         </SettingsRow>
 
@@ -491,6 +537,7 @@ export function CoreManagementCard() {
           <Switch
             checked={config?.restrictCoreUpdateToCompatibleMinor !== false}
             onCheckedChange={handleToggleRestrictCoreUpdate}
+            disabled={isForkCore}
           />
         </SettingsRow>
 
@@ -505,7 +552,7 @@ export function CoreManagementCard() {
             <Button
               size="sm"
               onClick={handleApplyStaged}
-              disabled={busy}
+              disabled={busy || isForkCore}
               title={t('settings.coreManagement.applyNowWarn')}
             >
               {applyingStaged && <Loader2 className="mr-2 h-3.5 w-3.5 animate-spin" />}
