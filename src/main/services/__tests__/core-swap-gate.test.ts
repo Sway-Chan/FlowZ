@@ -206,9 +206,9 @@ describe('T2：CoreUpdateService 4 写核路径 setCoreSwapInProgress try/finall
   it('updateCore：install 成功 → setCoreSwapInProgress(true) → install → finally false', async () => {
     const { proxy, calls } = makeProxyWithSpy();
     const svc = makeSvc(proxy);
-    jest.spyOn(svc as any, 'downloadFile').mockResolvedValue('/tmp/fake.tar.gz');
+    jest.spyOn((svc as any).coreDownloader, 'downloadFile').mockResolvedValue('/tmp/fake.tar.gz');
     jest
-      .spyOn(svc as any, 'extractCore')
+      .spyOn((svc as any).coreDownloader, 'extractCore')
       .mockResolvedValue({ corePath: '/tmp/x/sing-box', extractDir: '/tmp/x' });
     jest.spyOn(svc as any, 'preflightValidate').mockResolvedValue({ ok: true, version: '1.13.14' });
     const installSpy = jest.spyOn(svc as any, 'installCoreFromDir').mockResolvedValue(undefined);
@@ -224,9 +224,9 @@ describe('T2：CoreUpdateService 4 写核路径 setCoreSwapInProgress try/finall
   it('updateCore：install 抛错 → finally 仍清位（[true, false]，不挂死闩）', async () => {
     const { proxy, calls } = makeProxyWithSpy();
     const svc = makeSvc(proxy);
-    jest.spyOn(svc as any, 'downloadFile').mockResolvedValue('/tmp/fake.tar.gz');
+    jest.spyOn((svc as any).coreDownloader, 'downloadFile').mockResolvedValue('/tmp/fake.tar.gz');
     jest
-      .spyOn(svc as any, 'extractCore')
+      .spyOn((svc as any).coreDownloader, 'extractCore')
       .mockResolvedValue({ corePath: '/tmp/x/sing-box', extractDir: '/tmp/x' });
     jest.spyOn(svc as any, 'preflightValidate').mockResolvedValue({ ok: true, version: '1.13.14' });
     jest.spyOn(svc as any, 'installCoreFromDir').mockRejectedValue(new Error('disk full'));

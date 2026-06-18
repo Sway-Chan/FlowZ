@@ -9,6 +9,8 @@
  * 未在表单声明 secretKeys，则不会被打码——故 custom 节点务必声明 secretKeys（snell psk 等常见键已黑名单兜底）。
  */
 
+import { isIpv4 } from './ip';
+
 /** 打码占位符（定长，不泄露原值长度信息）。 */
 export const REDACTED = '<redacted>';
 
@@ -102,6 +104,148 @@ export function redactDeep(value: unknown, extraSecretKeys?: ReadonlySet<string>
   return value;
 }
 
+/**
+ * P0.6 节点标识符脱敏：键名黑名单（redactDeep）只打码"密钥键"，但节点的 server/SNI/Host/节点名 是**值**、
+ * 刻意保留以判形态——它们泄漏"用哪个机场/后端域名/优选 IP"；且日志 tail 原文（redactDeep 管不到）含这些 +
+ * 访问活动。本组：把节点标识符在 配置块 + 日志 统一替换为稳定占位（保留"域名/IP"形态与跨段相关性，
+ * 例如 `lookup <domain-1> SERVFAIL` 仍可对上配置里的 `<domain-1>`），但不暴露具体值。
+ * 访问活动（非节点的目标域名/IP）暂不打码（#57 诊断需要，报告头声明可自删）。
+ */
+export interface NodeIdentifier {
+  value: string;
+  placeholder: string;
+}
+
+const escapeRegExp = (s: string): string => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+// IPv4 判定收敛到 shared/ip.isIpv4（严格每段 0-255，杜绝 999.x 被旧宽松正则误判为 IP）；
+// IPv6 仅作脱敏形态粗判（含 ':' 即归 IP），无需精确。
+const looksLikeIp = (s: string): boolean => isIpv4(s) || s.includes(':');
+
+type ServerLike = {
+  address?: unknown;
+  name?: unknown;
+  tlsSettings?: { serverName?: unknown } | null;
+  wsSettings?: { headers?: Record<string, unknown> | null } | null;
+  shadowTlsSettings?: { sni?: unknown } | null;
+  tailscaleSettings?: { hostname?: unknown; exitNode?: unknown } | null;
+  httpSettings?: { host?: unknown; headers?: Record<string, unknown> | null } | null;
+  customSettings?: { outbound?: Record<string, unknown> | null } | null;
+};
+
+/** 主机类键名（归一：小写去 _）：custom 透传 outbound 里这些键的字符串值是节点身份。 */
+const HOST_KEY_SET: ReadonlySet<string> = new Set([
+  'server',
+  'servername',
+  'sni',
+  'host',
+  'hostname',
+]);
+
+/**
+ * 递归收集对象里主机类键的字符串值。custom 协议（raw-JSON 透传）的 outbound 原样下发到生成 config，
+ * 身份字段可能嵌套（如 `tls.server_name` 伪装 SNI、`transport.headers.Host`），只扫顶层会漏 → 全深度遍历。
+ */
+function collectHostsDeep(obj: unknown, add: (v: unknown) => void): void {
+  if (Array.isArray(obj)) {
+    for (const x of obj) collectHostsDeep(x, add);
+    return;
+  }
+  if (!obj || typeof obj !== 'object') return;
+  for (const [k, v] of Object.entries(obj)) {
+    if (typeof v === 'string') {
+      if (HOST_KEY_SET.has(k.toLowerCase().replace(/_/g, ''))) add(v);
+    } else if (v && typeof v === 'object') {
+      collectHostsDeep(v, add);
+    }
+  }
+}
+
+/**
+ * 收集 transport headers 里的 Host 值（节点伪装域名）。大小写不敏感匹配 `host` 键；值兼容
+ * string（WebSocketSettings.headers）与 string[]（HttpSettings.headers）。ws/http 共用，避免两处各写一份。
+ */
+function addHostHeaders(headers: unknown, add: (v: unknown) => void): void {
+  if (!headers || typeof headers !== 'object') return;
+  for (const [k, v] of Object.entries(headers)) {
+    if (k.toLowerCase() !== 'host') continue;
+    if (Array.isArray(v)) for (const x of v) add(x);
+    else add(v);
+  }
+}
+
+/**
+ * 从 config.servers 收集本用户节点标识符 + 稳定占位符。涵盖一切会进生成 config / 日志的节点身份字段：
+ * 地址/SNI/WS-Host/ShadowTLS-sni/Tailscale-hostname·exitNode/HTTP-host[]·headers.Host/custom outbound 的 server·sni·host。
+ * 地址类：域名→`<domain-N>`、IP→`<ip-N>`（保留"域名 vs IP"诊断信号）；节点名→`<node-N>`。去重（同值一占位）。
+ * 节点名 <4 字符跳过（防误伤日志普通词）；地址类不设长度阈值（靠 redactIdentifiers 的主机边界锚定防误替）。
+ */
+export function collectNodeIdentifiers(
+  config: { servers?: ReadonlyArray<ServerLike> } | null | undefined
+): NodeIdentifier[] {
+  const out: NodeIdentifier[] = [];
+  const seen = new Set<string>();
+  let domainN = 0;
+  let ipN = 0;
+  let nameN = 0;
+  const add = (raw: unknown, kind: 'addr' | 'name'): void => {
+    if (typeof raw !== 'string') return;
+    const v = raw.trim();
+    if (!v) return;
+    if (kind === 'name' && v.length < 4) return;
+    const key = v.toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    let placeholder: string;
+    if (kind === 'name') {
+      placeholder = `<node-${++nameN}>`;
+    } else if (looksLikeIp(v)) {
+      placeholder = `<ip-${++ipN}>`;
+    } else {
+      placeholder = `<domain-${++domainN}>`;
+    }
+    out.push({ value: v, placeholder });
+  };
+  for (const s of config?.servers || []) {
+    add(s?.address, 'addr');
+    add(s?.tlsSettings?.serverName, 'addr');
+    // ws/http transport 的 Host 头（伪装域名）：大小写不敏感、值兼容 string(ws)|string[](http)，共用 addHostHeaders。
+    // 仅匹配精确 `host` 键（刻意不走 collectHostsDeep 的 HOST_KEY_SET）：transport headers 只有 Host 头承载身份，
+    // 用全集会把恰好叫 server/sni 的自定义 HTTP 头误收为节点身份；collectHostsDeep 仅用于 custom raw-JSON
+    // outbound（键名不可控、需广撒网）。
+    addHostHeaders(s?.wsSettings?.headers, (v) => add(v, 'addr'));
+    addHostHeaders(s?.httpSettings?.headers, (v) => add(v, 'addr'));
+    add(s?.shadowTlsSettings?.sni, 'addr');
+    add(s?.tailscaleSettings?.hostname, 'addr');
+    add(s?.tailscaleSettings?.exitNode, 'addr');
+    const httpHost = s?.httpSettings?.host;
+    if (Array.isArray(httpHost)) for (const h of httpHost) add(h, 'addr');
+    // custom 透传 outbound 原样下发 → 递归收主机类键（含嵌套 tls.server_name / transport.headers.Host）
+    collectHostsDeep(s?.customSettings?.outbound, (v) => add(v, 'addr'));
+    add(s?.name, 'name');
+  }
+  return out;
+}
+
+/**
+ * 在任意文本（日志 tail / 序列化后的配置）里把节点标识符替换为占位符。
+ * 长值优先（防短值先替坏长值）、大小写不敏感（日志域名常小写）、正则转义。
+ * **主机边界锚定**（前后非 `[字母数字._-]`）：防节点标识符作为子串误替无关串
+ * （节点 `a.com` 不碰 `cdn.a.com`；节点 IP `104.18.8.8` 不把 `104.18.8.83` 切成 `<ip-1>3`）。
+ * 占位符为 `<...>` 不含原值，不会自我再匹配。
+ */
+export function redactIdentifiers(text: string, ids: readonly NodeIdentifier[]): string {
+  if (!text || ids.length === 0) return text;
+  const sorted = [...ids].sort((a, b) => b.value.length - a.value.length);
+  let out = text;
+  for (const { value, placeholder } of sorted) {
+    out = out.replace(
+      new RegExp(`(?<![\\w.-])${escapeRegExp(value)}(?![\\w.-])`, 'gi'),
+      placeholder
+    );
+  }
+  return out;
+}
+
 /** 诊断报告输入（全部已脱敏 / 已 tail；构建器只拼装，不做任何 IO 或脱敏）。 */
 export interface DiagnosticReportInput {
   generatedAt: string; // ISO
@@ -127,6 +271,8 @@ export interface DiagnosticReportInput {
   redactedSingboxConfig: unknown;
   appLogTail: string;
   singboxLogTail: string;
+  /** 节点标识符 → 占位符（P0.6）：构建末尾在全报告统一替换，打码节点身份（域名/IP/SNI/节点名），保留形态与跨段相关性。 */
+  nodeIdentifiers?: readonly NodeIdentifier[];
   /** 当前级别不含连接明细（>info）且日志疑似有连接/DNS 错误 → 提示开启诊断采集复现。 */
   hint?: string;
 }
@@ -159,8 +305,8 @@ export function buildDiagnosticReport(input: DiagnosticReportInput): string {
   lines.push('# FlowZ 诊断报告');
   lines.push('');
   lines.push(
-    '> 本报告用于排障，可附到 GitHub issue。**密钥已脱敏**（uuid/密码/私钥/订阅 token 等已打码），' +
-      '但仍可能含访问过的域名/IP/SNI（日志明细）——介意可自行删减后再上传。'
+    '> 本报告用于排障，可附到 GitHub issue。**密钥与节点身份已脱敏**（uuid/密码/私钥/订阅 token 已打码；' +
+      '节点域名/IP/SNI/节点名已替换为 `<domain-N>`/`<ip-N>`/`<node-N>` 占位符）。日志明细可能仍含访问过的**其它**域名/IP——介意可自行删减后再上传。'
   );
   lines.push('');
   if (input.hint) {
@@ -211,5 +357,6 @@ export function buildDiagnosticReport(input: DiagnosticReportInput): string {
   lines.push(fence('text', input.singboxLogTail));
   lines.push('');
 
-  return lines.join('\n');
+  // P0.6：末尾在全报告（配置块 + 日志 + 运行态）统一打码节点标识符，跨段占位一致便于关联诊断。
+  return redactIdentifiers(lines.join('\n'), input.nodeIdentifiers ?? []);
 }

@@ -7,7 +7,7 @@ import * as fs from 'fs/promises';
 import * as fssync from 'fs';
 import * as path from 'path';
 import { getRuleResourcesPath } from '../utils/paths';
-import { applyGhProxy, GH_PROXY_PRESETS, normalizeGhProxyPrefix } from '../../shared/gh-proxy';
+import { applyGhProxy, ghMirrorUrl, normalizeGhProxyPrefix } from '../../shared/gh-proxy';
 import {
   mrdRawUrl,
   RULE_RESOURCE_CATALOG,
@@ -392,7 +392,7 @@ export class RuleResourceManager {
     let r = await this.fetchBuffer(finalUrl, onChunk);
     if (!r.ok && prefix) r = await this.fetchBuffer(sourceUrl, onChunk);
     if (!r.ok && this.isGithub(sourceUrl)) {
-      r = await this.fetchBuffer(GH_PROXY_PRESETS[0] + sourceUrl, onChunk);
+      r = await this.fetchBuffer(ghMirrorUrl(sourceUrl), onChunk);
     }
     if (!r.ok) return { ok: false, errorCode: r.errorCode };
     // 内容校验：.srs 魔数 'SRS'（拦加速代理返回的 HTML 错误页）

@@ -6,7 +6,6 @@ import { useTranslation } from 'react-i18next';
 import { useAppStore } from '@/store/app-store';
 import { encodeMajorMinor } from '@shared/version';
 import { Button } from '@/components/ui/button';
-import { Loader2 } from 'lucide-react';
 import {
   Form,
   FormControl,
@@ -18,14 +17,10 @@ import {
 } from '@/components/ui/form';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from '@/components/ui/select';
+import { AddressField, PortField } from './shared/basic-fields';
+import { FingerprintField } from './shared/tls-fields';
 import { FormSection, FieldGrid, FieldSpan } from './shared/form-layout';
+import { FormButtons } from './shared/form-buttons';
 import type { ServerConfig } from '@/bridge/types';
 import { api } from '@/ipc';
 
@@ -136,37 +131,8 @@ export function NaiveForm({ serverConfig, onSubmit }: NaiveFormProps) {
 
         <FormSection title={t('servers.basic', 'Basic')}>
           <FieldGrid cols={2}>
-            <FormField
-              control={form.control}
-              name="address"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>{t('servers.serverAddress')}</FormLabel>
-                  <FormControl>
-                    <Input placeholder="example.com" {...field} />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
-            <FormField
-              control={form.control}
-              name="port"
-              render={({ field }) => (
-                <FormItem>
-                  <FormLabel>{t('servers.port')}</FormLabel>
-                  <FormControl>
-                    <Input
-                      type="number"
-                      placeholder="443"
-                      {...field}
-                      onChange={(e) => field.onChange(parseInt(e.target.value, 10))}
-                    />
-                  </FormControl>
-                  <FormMessage />
-                </FormItem>
-              )}
-            />
+            <AddressField control={form.control} t={t} />
+            <PortField control={form.control} t={t} placeholder="443" />
             <FormField
               control={form.control}
               name="username"
@@ -215,36 +181,7 @@ export function NaiveForm({ serverConfig, onSubmit }: NaiveFormProps) {
               />
             </FieldSpan>
             <FieldSpan>
-              <FormField
-                control={form.control}
-                name="tlsFingerprint"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>{t('servers.fingerprint')}</FormLabel>
-                    <Select onValueChange={field.onChange} value={field.value}>
-                      <FormControl>
-                        <SelectTrigger>
-                          <SelectValue
-                            placeholder={t('servers.selectFingerprint', 'Select TLS Fingerprint')}
-                          />
-                        </SelectTrigger>
-                      </FormControl>
-                      <SelectContent>
-                        <SelectItem value="none">{t('servers.none', 'None')}</SelectItem>
-                        <SelectItem value="chrome">Chrome</SelectItem>
-                        <SelectItem value="firefox">Firefox</SelectItem>
-                        <SelectItem value="safari">Safari</SelectItem>
-                        <SelectItem value="edge">Edge</SelectItem>
-                        <SelectItem value="ios">iOS</SelectItem>
-                        <SelectItem value="android">Android</SelectItem>
-                        <SelectItem value="random">{t('servers.random')}</SelectItem>
-                      </SelectContent>
-                    </Select>
-                    <FormDescription>{t('servers.fingerprintDesc')}</FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
+              <FingerprintField control={form.control} t={t} />
             </FieldSpan>
             <FieldSpan>
               <FormField
@@ -266,20 +203,7 @@ export function NaiveForm({ serverConfig, onSubmit }: NaiveFormProps) {
           </FieldGrid>
         </FormSection>
 
-        <div className="flex gap-4">
-          <Button type="submit" disabled={form.formState.isSubmitting}>
-            {form.formState.isSubmitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            {t('common.save')}
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => form.reset()}
-            disabled={form.formState.isSubmitting}
-          >
-            {t('common.reset')}
-          </Button>
-        </div>
+        <FormButtons isSubmitting={form.formState.isSubmitting} onReset={() => form.reset()} />
       </form>
     </Form>
   );

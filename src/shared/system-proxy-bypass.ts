@@ -90,11 +90,16 @@ export function ipv4CidrToWindowsPatterns(cidr: string): string[] {
   return [];
 }
 
+/** 对条目数组做 trim + 去重，纯函数（mac/linux 共用）。 */
+function dedupeTrim(list: string[]): string[] {
+  return Array.from(new Set(list.map((s) => s.trim()).filter(Boolean)));
+}
+
 /**
  * macOS networksetup -setproxybypassdomains 参数（接受 CIDR(v4/v6) + 域名 + *.通配，原样下发）。
  */
 export function formatBypassForMac(list: string[]): string[] {
-  return Array.from(new Set(list.map((s) => s.trim()).filter(Boolean)));
+  return dedupeTrim(list);
 }
 
 /**
@@ -120,5 +125,5 @@ export function formatBypassForWindows(list: string[]): string {
 
 /** Linux gsettings ignore-hosts 数组（接受 CIDR + 域名，原样去重）。 */
 export function formatBypassForLinux(list: string[]): string[] {
-  return Array.from(new Set(list.map((s) => s.trim()).filter(Boolean)));
+  return dedupeTrim(list);
 }

@@ -16,13 +16,17 @@ import type { LogManager } from './LogManager';
 import { SubscriptionService } from './SubscriptionService';
 import type { UserConfig } from '../../shared/types';
 import { localProxyPort } from '../../shared/proxy-ports';
+import { BackoffTracker } from './backoff-tracker';
 
 export class SubscriptionScheduler {
   private tickTimer: ReturnType<typeof setInterval> | null = null;
   private started = false;
   private isRunning = false; // 防重入（巡检与启动补更不并发）
   // 每订阅退避状态：累计失败次数 + 下次可尝试时刻
-  private backoff = new Map<string, { failures: number; nextEligibleAt: number }>();
+  private backoff = new BackoffTracker(
+    SubscriptionScheduler.BACKOFF_BASE_MS,
+    SubscriptionScheduler.BACKOFF_MAX_MS
+  );
   private pendingProxyCatchup = false; // viaProxy 但代理未起时跳过的「启动补更」挂起标记，待代理就绪补跑
   private startupTimer: ReturnType<typeof setTimeout> | null = null; // 启动补更句柄（stop 时清，防 8s 内 stop→start 武装双补更）
 
@@ -98,7 +102,7 @@ export class SubscriptionScheduler {
       const subs = config.subscriptions || [];
       // 清理已删除订阅的退避条目（仅内存，防无界增长）
       const subIds = new Set(subs.map((s) => s.id));
-      for (const id of this.backoff.keys()) if (!subIds.has(id)) this.backoff.delete(id);
+      this.backoff.prune(subIds);
       if (subs.length === 0) return;
 
       const viaProxy = config.subscriptionUpdateViaProxy === true;
@@ -139,8 +143,7 @@ export class SubscriptionScheduler {
         if (!stale) continue;
 
         // 退避判断：失败源未到下次可尝试时刻则跳过
-        const bo = this.backoff.get(sub.id);
-        if (bo && now < bo.nextEligibleAt) continue;
+        if (!this.backoff.isEligible(sub.id, now)) continue;
 
         try {
           const result = await this.subscriptionService.fetchSubscription(
@@ -158,18 +161,13 @@ export class SubscriptionScheduler {
             partial: result.partial,
             failedProviders: result.failedProviders,
           });
-          this.backoff.delete(sub.id);
+          this.backoff.recordSuccess(sub.id);
         } catch (e: any) {
           failed++;
-          const failures = (this.backoff.get(sub.id)?.failures ?? 0) + 1;
-          const delay = Math.min(
-            SubscriptionScheduler.BACKOFF_BASE_MS * 2 ** (failures - 1),
-            SubscriptionScheduler.BACKOFF_MAX_MS
-          );
-          this.backoff.set(sub.id, { failures, nextEligibleAt: now + delay });
+          const { failures, delayMs } = this.backoff.recordFailure(sub.id, now);
           this.logManager.addLog(
             'warn',
-            `[${reason}] 订阅 [${sub.name}] 更新失败(第 ${failures} 次)，${Math.round(delay / 60_000)} 分钟后重试: ${e?.message ?? e}`,
+            `[${reason}] 订阅 [${sub.name}] 更新失败(第 ${failures} 次)，${Math.round(delayMs / 60_000)} 分钟后重试: ${e?.message ?? e}`,
             'SubScheduler'
           );
         }

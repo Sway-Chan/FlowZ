@@ -1,0 +1,155 @@
+/**
+ * 协议设置类型定义
+ * 各协议专用的 *Settings interface，ServerConfig 按需引用
+ */
+
+// Hysteria2 网络类型（仅 Hysteria2Settings 使用，随协议设置一起放置）
+export type Hysteria2Network = 'tcp' | 'udp';
+
+export interface TlsSettings {
+  serverName?: string;
+  allowInsecure?: boolean;
+  alpn?: string[];
+  fingerprint?: string;
+  ech?: boolean; // Encrypted Client Hello（隐藏 SNI）；sing-box tls.ech.enabled
+  echConfig?: string; // 可选 ECHConfigList(PEM)；空=sing-box 从 DNS(HTTPS RR type65) 自取，填=下发 tls.ech.config
+  fragment?: boolean; // TLS ClientHello 分片，抗 SNI-DPI；sing-box tls.fragment
+}
+
+export interface RealitySettings {
+  publicKey: string;
+  shortId?: string;
+}
+
+export interface WebSocketSettings {
+  path?: string;
+  headers?: Record<string, string>;
+  maxEarlyData?: number;
+  earlyDataHeaderName?: string;
+}
+
+export interface GrpcSettings {
+  serviceName?: string;
+  multiMode?: boolean;
+}
+
+export interface HttpSettings {
+  host?: string[];
+  path?: string;
+  method?: string;
+  headers?: Record<string, string[]>;
+}
+
+// Hysteria2 混淆设置
+export interface Hysteria2ObfsSettings {
+  type?: 'salamander';
+  password?: string;
+}
+
+// Hysteria2 协议设置
+export interface Hysteria2Settings {
+  upMbps?: number;
+  downMbps?: number;
+  obfs?: Hysteria2ObfsSettings;
+  network?: Hysteria2Network;
+  serverPorts?: string; // 端口跳跃范围，如 "20000:30000"；sing-box server_ports
+  hopInterval?: string; // 端口跳跃间隔，如 "30s"；sing-box hop_interval
+}
+
+// Multiplex 多路复用设置（vless/trojan/vmess/shadowsocks）；注意 reality+vision(xtls-rprx-vision) 不兼容
+export interface MultiplexSettings {
+  enabled?: boolean;
+  protocol?: 'smux' | 'yamux' | 'h2mux'; // 默认 h2mux
+  maxConnections?: number;
+  minStreams?: number;
+  padding?: boolean; // 流量填充，增强抗特征
+}
+
+// TUIC 协议设置
+export interface TuicSettings {
+  congestionControl?: 'bbr' | 'cubic' | 'new_reno';
+  udpRelayMode?: 'native' | 'quic';
+  zeroRttHandshake?: boolean;
+  heartbeat?: string;
+}
+
+// Naive 协议设置
+export interface NaiveSettings {
+  useHttp3?: boolean; // 使用 HTTP/3 (QUIC) 传输；sing-box naive outbound 的 quic 字段
+}
+
+// Shadowsocks 协议设置
+export interface ShadowsocksSettings {
+  method: string;
+  password: string;
+  plugin?: string;
+  pluginOptions?: string;
+}
+
+// AnyTLS 协议设置
+export interface AnyTlsSettings {
+  idleSessionCheckInterval?: string; // e.g. '30s'
+  idleSessionTimeout?: string; // e.g. '30s'
+  minIdleSession?: number; // default 0
+}
+
+// SSH 协议设置
+export interface SshSettings {
+  user?: string; // SSH 用户名，默认 root
+  password?: string; // 密码认证
+  privateKey?: string; // 内联私钥内容
+  privateKeyPath?: string; // 私钥文件路径，如 $HOME/.ssh/id_rsa
+  privateKeyPassphrase?: string; // 私钥密码
+  hostKey?: string[]; // 主机公钥（留空接受所有）
+  hostKeyAlgorithms?: string[]; // 主机密钥算法
+  clientVersion?: string; // 客户端版本字符串
+}
+
+// Shadow-TLS 插件设置（套在 SS/其他协议外层，版本固定 v3）
+export interface ShadowTlsSettings {
+  password: string; // Shadow-TLS v3 密码
+  sni: string; // 伪装的目标域名
+  fingerprint?: string; // uTLS 指纹，默认 chrome
+  port?: number; // Shadow-TLS 监听/转发的真实端口 (可选)
+}
+
+/**
+ * WireGuard endpoint 设置（sing-box 1.11+ endpoint；默认 gVisor 用户态栈、零额外提权）。
+ * 单 peer 模型：peer 的 endpoint 用 ServerConfig.address/port 承载（与其他协议一致），其余 peer 参数在此。
+ */
+export interface WireGuardSettings {
+  privateKey: string; // 本地私钥（base64）
+  localAddress: string[]; // 本地隧道地址（wg-quick [Interface].Address），如 ['10.0.0.2/32','fd00::2/128']
+  peerPublicKey: string; // 对端公钥（base64）
+  preSharedKey?: string; // 可选预共享密钥（base64）
+  allowedIPs?: string[]; // 缺省 ['0.0.0.0/0','::/0']
+  persistentKeepalive?: number; // 保活间隔（秒）
+  reserved?: number[]; // 3 字节 reserved（Cloudflare WARP 等需要）
+  mtu?: number; // 缺省 1408
+}
+
+// Tailscale（sing-box endpoint，账号制 mesh，无 server address/port——连控制面）。Phase 1 userspace。
+export interface TailscaleSettings {
+  authKey?: string; // pre-auth key（可选；无则核日志出 `Waiting for authentication: <url>` 交互登录）
+  exitNode?: string; // 出口节点 name/IP（选它当全局代理时填；空=仅通 tailnet 内网/accept_routes 段）
+  exitNodeAllowLanAccess?: boolean; // 用 exit node 时本地 LAN 仍直连
+  acceptRoutes?: boolean; // 接受其它节点广告的子网路由（访问 tailnet 内网段）
+  // 经此 Tailscale 节点路由的子网（CIDR）= WG allowedIPs 的等价物（FlowZ force-route 源）。
+  // 与 advertiseRoutes 不同：advertiseRoutes 是「本机对外广告」，routes 是「把这些段的流量送进此节点」。
+  // FlowZ userspace 下自动含 tailnet 段 100.64.0.0/10 + 这里填的 advertised 子网。需配 acceptRoutes 才真正接收。
+  routes?: string[];
+  controlUrl?: string; // 默认 controlplane.tailscale.com；Headscale 自建控制面填此
+  hostname?: string; // 节点名（默认系统主机名）
+  ephemeral?: boolean; // 临时节点（离线即注销）
+  advertiseRoutes?: string[]; // 本机作子网路由器对外广告的段
+  reverseMesh?: boolean; // Phase 2：反向 mesh（system_interface=真 TUN，被组网访问）；默认 false=userspace
+}
+
+// 自定义协议（raw-JSON 透传）：用户直接填一份 sing-box outbound/endpoint JSON，FlowZ 不解析语义、只注入 tag。
+// 供第三方内核协议（如 snell）使用——「内核即权威」：能否启用由 sing-box check probe / 启动 gate 判定，FlowZ 不维护
+// type 白名单。address/port 由 JSON 内部携带，不用 ServerConfig.address/port。
+export interface CustomSettings {
+  outbound: Record<string, unknown>; // 用户填的 outbound/endpoint 对象（须含字符串 type）；tag 由 FlowZ 生成期强制覆盖
+  isEndpoint?: boolean; // 该 type 属 sing-box endpoints[]（如类 wireguard/tailscale 的第三方实现）而非 outbounds[]
+  secretKeys?: string[]; // 该 JSON 里属密钥的键名（诊断报告脱敏用：redactDeep 据此叠加打码）。无值层启发式，未声明则仅靠通用密钥黑名单兜底（psk/password/uuid 等），建议填全自定义密钥键
+}

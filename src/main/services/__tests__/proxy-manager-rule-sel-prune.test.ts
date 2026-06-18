@@ -8,14 +8,20 @@
  * 修法：`prunedSelectorDefault` 单一真值——rule-sel-* 回 'proxy-selector'，proxy-selector/urltest 仍落首成员。
  * 两个剔除点（内联 detour 剔除循环 + pruneTagsClosure）共用此 helper。
  *
- * 私有方法经 `(svc as any).method()` 直调（跟随既有 proxy-manager 测试风格），构造仅注入 configPath/singboxPath，
- * 不启动 sing-box。
+ * prunedSelectorDefault 已抽到 singbox-outbound-builder（纯函数）；直接 import 调用。
+ * pruneTagsClosure 仍是 ProxyManager 方法（内部复用 prunedSelectorDefault），经 `(svc as any)` 直调、不启动 sing-box。
  */
+import { prunedSelectorDefault } from '../singbox-outbound-builder';
 import { ProxyManager } from '../ProxyManager';
 import type { UserConfig } from '../../../shared/types';
 
 function makeSvc(): any {
-  return new ProxyManager(undefined as any, undefined as any, '/tmp/flowz-test-cfg.json', '/fake/sing-box');
+  return new ProxyManager(
+    undefined as any,
+    undefined as any,
+    '/tmp/flowz-test-cfg.json',
+    '/fake/sing-box'
+  );
 }
 
 /** 最小 UserConfig（pruneTagsClosure 仅读 selectedServerId；其余字段不参与本路径）。 */
@@ -23,25 +29,23 @@ function makeConfig(): UserConfig {
   return { selectedServerId: null, servers: [], customRules: [] } as unknown as UserConfig;
 }
 
-describe('ProxyManager.prunedSelectorDefault（MED-1 回落语义）', () => {
-  const svc = makeSvc();
-
+describe('prunedSelectorDefault（MED-1 回落语义）', () => {
   it('rule-sel-* 回落 proxy-selector，而非剩余首节点', () => {
-    expect(svc.prunedSelectorDefault('rule-sel-r1', ['jp', 'sg', 'proxy-selector'])).toBe(
+    expect(prunedSelectorDefault('rule-sel-r1', ['jp', 'sg', 'proxy-selector'])).toBe(
       'proxy-selector'
     );
-    expect(svc.prunedSelectorDefault('rule-sel-app-com.foo', ['jp', 'proxy-selector'])).toBe(
+    expect(prunedSelectorDefault('rule-sel-app-com.foo', ['jp', 'proxy-selector'])).toBe(
       'proxy-selector'
     );
   });
 
   it('proxy-selector 自身仍落剩余首节点（首存活节点是正确兜底）', () => {
-    expect(svc.prunedSelectorDefault('proxy-selector', ['jp', 'sg'])).toBe('jp');
+    expect(prunedSelectorDefault('proxy-selector', ['jp', 'sg'])).toBe('jp');
   });
 
   it('非 rule-sel selector（如 urltest）仍落剩余首成员', () => {
-    expect(svc.prunedSelectorDefault('auto-urltest', ['jp', 'sg'])).toBe('jp');
-    expect(svc.prunedSelectorDefault(undefined, ['jp'])).toBe('jp');
+    expect(prunedSelectorDefault('auto-urltest', ['jp', 'sg'])).toBe('jp');
+    expect(prunedSelectorDefault(undefined, ['jp'])).toBe('jp');
   });
 });
 

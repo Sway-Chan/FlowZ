@@ -1,5 +1,4 @@
 import { useState, useRef, useEffect } from 'react';
-import { toast } from 'sonner';
 import { useAppStore } from '@/store/app-store';
 import { ServerList } from '@/components/settings/server-list';
 import { ServerConfigDialog } from '@/components/settings/server-config-dialog';
@@ -21,30 +20,34 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from '@/components/ui/alert-dialog';
-import {
-  addSubscription,
-  updateSubscription,
-  deleteSubscription,
-  updateSubscriptionServers,
-} from '@/bridge/api-wrapper';
 import type { ServerConfig, SubscriptionConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
+import { PageHeader } from '@/components/page-header';
+import { useServerActions } from './use-server-actions';
 
 type ServerConfigWithId = ServerConfig;
 
 export function ServerPage() {
   const { t, i18n } = useTranslation();
   const config = useAppStore((state) => state.config);
-  const saveConfig = useAppStore((state) => state.saveConfig);
-  const deleteServer = useAppStore((state) => state.deleteServer);
-  const loadConfig = useAppStore((state) => state.loadConfig);
+
+  const {
+    updatingSubId,
+    deleteServer: handleDeleteServer,
+    selectServer: handleSelectServer,
+    cloneServer: handleCloneServer,
+    importSuccess: handleImportSuccess,
+    deleteSubscription: handleDeleteSubscription,
+    updateSubscriptionServers: handleUpdateSubscriptionServers,
+    saveServer,
+    saveSubscription,
+  } = useServerActions();
 
   const [isDialogOpen, setIsDialogOpen] = useState(false);
   const [editingServer, setEditingServer] = useState<ServerConfigWithId | undefined>();
 
   const [isSubDialogOpen, setIsSubDialogOpen] = useState(false);
   const [editingSub, setEditingSub] = useState<SubscriptionConfig | undefined>();
-  const [updatingSubId, setUpdatingSubId] = useState<string | null>(null);
 
   const servers = config?.servers || [];
   const subscriptions = config?.subscriptions || [];
@@ -109,101 +112,9 @@ export function ServerPage() {
     setIsDialogOpen(true);
   };
 
-  const handleDeleteServer = async (serverId: string) => {
-    try {
-      await deleteServer(serverId);
-      toast.success(t('servers.deleteSuccess'));
-    } catch (error) {
-      toast.error(t('servers.deleteFail'), {
-        description: error instanceof Error ? error.message : t('servers.deleteFailDesc'),
-      });
-    }
-  };
-
-  const handleSelectServer = async (serverId: string) => {
-    if (!config) return;
-    try {
-      await saveConfig({ ...config, selectedServerId: serverId });
-      toast.success(t('servers.selectSuccess'));
-    } catch (error) {
-      toast.error(t('servers.selectFail'), {
-        description: error instanceof Error ? error.message : t('servers.selectFailDesc'),
-      });
-    }
-  };
-
-  const handleSaveServer = async (
+  const handleSaveServer = (
     serverData: Omit<ServerConfigWithId, 'id' | 'createdAt' | 'updatedAt'>
-  ) => {
-    try {
-      const now = new Date().toISOString();
-      let updatedServers: ServerConfigWithId[];
-
-      if (editingServer) {
-        updatedServers = servers.map((s) =>
-          s.id === editingServer.id
-            ? {
-                ...serverData,
-                id: editingServer.id,
-                // 保留归属订阅：订阅节点的编辑属临时改动，下次订阅更新会覆盖；
-                // 需长期自定义请用「克隆到自建」生成脱离订阅的副本。
-                subscriptionId: editingServer.subscriptionId,
-                createdAt: editingServer.createdAt,
-                updatedAt: now,
-              }
-            : s
-        );
-      } else {
-        const newServer: ServerConfigWithId = {
-          ...serverData,
-          id: crypto.randomUUID(),
-          createdAt: now,
-          updatedAt: now,
-        };
-        updatedServers = [...servers, newServer];
-      }
-
-      if (!config) throw new Error('配置未加载');
-      await saveConfig({ ...config, servers: updatedServers });
-
-      const action = editingServer ? t('servers.actionUpdate') : t('servers.actionAdd');
-      toast.success(t('servers.saveSuccess', { action }), {
-        description: t('servers.saveSuccessDesc', { name: serverData.name }),
-      });
-    } catch (error) {
-      toast.error(t('servers.saveFail'), {
-        description: error instanceof Error ? error.message : t('servers.saveFailDesc'),
-      });
-      throw error;
-    }
-  };
-
-  // 克隆节点到自建列表：生成脱离订阅的持久副本（订阅节点的本地自定义需用此方式保留）
-  const handleCloneServer = async (server: ServerConfigWithId) => {
-    if (!config) return;
-    try {
-      const now = new Date().toISOString();
-      const cloned: ServerConfigWithId = {
-        ...server,
-        id: crypto.randomUUID(),
-        subscriptionId: undefined,
-        name: t('servers.cloneNameSuffix', { name: server.name }),
-        createdAt: now,
-        updatedAt: now,
-      };
-      await saveConfig({ ...config, servers: [...servers, cloned] });
-      toast.success(t('servers.cloneSuccess'), { description: cloned.name });
-    } catch (error) {
-      toast.error(t('servers.cloneFail'), {
-        description: error instanceof Error ? error.message : String(error),
-      });
-    }
-  };
-
-  const handleImportSuccess = async () => {
-    await loadConfig();
-    toast.success(t('servers.importSuccess'));
-  };
+  ) => saveServer(serverData, editingServer);
 
   // ================= 订阅操作 =================
 
@@ -217,45 +128,12 @@ export function ServerPage() {
     setIsSubDialogOpen(true);
   };
 
-  const handleDeleteSubscription = async (subId: string) => {
-    const res = await deleteSubscription(subId);
-    if (res.success) await loadConfig();
-  };
-
-  const handleUpdateSubscriptionServers = async (subId: string) => {
-    setUpdatingSubId(subId);
-    try {
-      const res = await updateSubscriptionServers(subId);
-      if (res.success) await loadConfig();
-    } finally {
-      setUpdatingSubId(null);
-    }
-  };
-
-  const handleSaveSubscription = async (subData: Omit<SubscriptionConfig, 'id' | 'createdAt'>) => {
-    if (editingSub) {
-      const updatedSub: SubscriptionConfig = {
-        ...subData,
-        id: editingSub.id,
-        createdAt: editingSub.createdAt,
-        lastUpdated: editingSub.lastUpdated,
-      };
-      const res = await updateSubscription(updatedSub);
-      if (res.success) await loadConfig();
-    } else {
-      const res = await addSubscription(subData);
-      if (res.success && res.data) {
-        await handleUpdateSubscriptionServers(res.data.id);
-      }
-    }
-  };
+  const handleSaveSubscription = (subData: Omit<SubscriptionConfig, 'id' | 'createdAt'>) =>
+    saveSubscription(subData, editingSub);
 
   return (
     <div className="space-y-6">
-      <div>
-        <h2 className="text-2xl font-bold">{t('servers.pageTitle')}</h2>
-        <p className="text-muted-foreground mt-1">{t('servers.pageDesc')}</p>
-      </div>
+      <PageHeader title={t('servers.pageTitle')} description={t('servers.pageDesc')} />
 
       <Tabs value={activeTab} onValueChange={setTabOverride}>
         {/* Tab 栏：自建节点 + 组网 + 每个订阅（右侧固定「添加订阅」按钮，不在 TabsList 内） */}

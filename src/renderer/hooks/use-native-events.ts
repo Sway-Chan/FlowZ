@@ -96,7 +96,7 @@ export function useNativeEvent<K extends keyof NativeEventData>(
 
 // ── 模块级事件处理器 ───────────────────────────────────────────────
 // 提到模块层 → 引用稳定，useNativeEvent 的 [eventName, callback] 依赖不再随每次渲染变化，
-// 7 个 IPC 监听仅在挂载时订阅一次，避免 App 每次重渲染都退订/重订（抖动 + 潜在监听泄漏）。
+// 10 个 IPC 监听仅在挂载时订阅一次，避免 App 每次重渲染都退订/重订（抖动 + 潜在监听泄漏）。
 // 处理器直接引用静态导入的 useAppStore（无循环依赖），去掉原先逐次 import('../store/app-store')。
 
 function handleProcessStarted(_data: NativeEventData['processStarted']) {

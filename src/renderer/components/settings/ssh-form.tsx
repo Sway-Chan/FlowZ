@@ -1,8 +1,7 @@
-import { useEffect, useState } from 'react';
+import { useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import * as z from 'zod';
-import { Button } from '@/components/ui/button';
 import {
   Form,
   FormControl,
@@ -15,9 +14,9 @@ import {
 import { Input } from '@/components/ui/input';
 import { Textarea } from '@/components/ui/textarea';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
-import { Loader2 } from 'lucide-react';
 import { AddressField, PortField } from './shared/basic-fields';
 import { FormSection, FieldGrid, FieldSpan } from './shared/form-layout';
+import { FormButtons } from './shared/form-buttons';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation, Trans } from 'react-i18next';
 
@@ -46,15 +45,19 @@ interface SshFormProps {
 export function SshForm({ serverConfig, onSubmit }: SshFormProps) {
   const { t } = useTranslation();
   const sshSchema = createSshSchema(t);
-  const [authMode, setAuthMode] = useState<'password' | 'privatekey'>('password');
+  // 认证方式初值从已保存配置派生（lazy init；父组件 key 重挂载会在切换节点时重算）。
+  // 不在 getDefaultValues 内 setState——那是 render 期副作用反模式。
+  const [authMode, setAuthMode] = useState<'password' | 'privatekey'>(() => {
+    const ssh = serverConfig?.sshSettings;
+    return serverConfig?.protocol?.toLowerCase() === 'ssh' &&
+      (ssh?.privateKey || ssh?.privateKeyPath)
+      ? 'privatekey'
+      : 'password';
+  });
 
   const getDefaultValues = (): SshFormValues => {
     const ssh = serverConfig?.sshSettings;
     if (serverConfig && serverConfig.protocol?.toLowerCase() === 'ssh') {
-      // 根据已保存的认证方式决定默认 tab
-      if (ssh?.privateKey || ssh?.privateKeyPath) {
-        setAuthMode('privatekey');
-      }
       return {
         address: serverConfig.address || '',
         port: serverConfig.port || 22,
@@ -82,12 +85,6 @@ export function SshForm({ serverConfig, onSubmit }: SshFormProps) {
     resolver: zodResolver(sshSchema),
     defaultValues: getDefaultValues(),
   });
-
-  useEffect(() => {
-    if (serverConfig && serverConfig.protocol?.toLowerCase() === 'ssh') {
-      form.reset(getDefaultValues());
-    }
-  }, [serverConfig]);
 
   const handleSubmit = async (values: SshFormValues) => {
     const sshSettings: any = {
@@ -270,20 +267,7 @@ export function SshForm({ serverConfig, onSubmit }: SshFormProps) {
           />
         </FormSection>
 
-        <div className="flex gap-4">
-          <Button type="submit" disabled={form.formState.isSubmitting}>
-            {form.formState.isSubmitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            {t('common.save')}
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => form.reset()}
-            disabled={form.formState.isSubmitting}
-          >
-            {t('common.reset')}
-          </Button>
-        </div>
+        <FormButtons isSubmitting={form.formState.isSubmitting} onReset={() => form.reset()} />
       </form>
     </Form>
   );

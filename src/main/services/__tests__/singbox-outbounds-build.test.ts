@@ -1,0 +1,166 @@
+/**
+ * buildOutbounds 单测 —— 原 ProxyManager.generateOutbounds 无单测（仅 config-snapshot 集成锁字节）。
+ * 锁：节点出站 + proxy-selector + rule-sel（含 anti-drift default）+ direct/block + 两载体返回
+ * （pendingEndpoints / pendingRuleSelectors）+ WG endpoint 收集 + naive 缺库跳过。
+ */
+jest.mock('electron', () => ({
+  app: { getPath: () => '/fake/userData', getAppPath: () => '/fake/app', isPackaged: false },
+  net: {},
+}));
+
+import { buildOutbounds, type OutboundsDeps } from '../singbox-outbound-builder';
+import type { ServerConfig, UserConfig, InvalidNodeInfo } from '../../../shared/types';
+
+const deps = (over: Partial<OutboundsDeps> = {}): OutboundsDeps => ({
+  coreVersion: '1.13.0',
+  gateInvalidNodes: new Map<string, InvalidNodeInfo>(),
+  log: () => {},
+  ...over,
+});
+
+const vless = (id: string, name: string): ServerConfig =>
+  ({
+    id,
+    name,
+    protocol: 'vless',
+    address: `${id}.example.com`,
+    port: 443,
+    uuid: 'u',
+  }) as unknown as ServerConfig;
+
+const cfg = (servers: ServerConfig[], over: Partial<UserConfig> = {}): UserConfig =>
+  ({
+    proxyMode: 'smart',
+    servers,
+    selectedServerId: servers[0]?.id,
+    customRules: [],
+    appRules: [],
+    ...over,
+  }) as unknown as UserConfig;
+
+const idMap = (servers: ServerConfig[]): Map<string, string> =>
+  new Map(servers.map((s) => [s.id, s.name]));
+
+describe('buildOutbounds — 基础装配 + 载体', () => {
+  it('单节点：节点出站 + proxy-selector(default=节点) + direct + block；载体空', () => {
+    const servers = [vless('s1', '香港')];
+    const r = buildOutbounds(servers[0], cfg(servers), idMap(servers), deps());
+    const tags = r.outbounds.map((o) => o.tag);
+    expect(tags).toContain('香港');
+    expect(tags).toContain('proxy-selector');
+    expect(tags).toContain('direct');
+    expect(tags).toContain('block');
+    const sel = r.outbounds.find((o) => o.tag === 'proxy-selector')!;
+    expect(sel.type).toBe('selector');
+    expect(sel.outbounds).toEqual(['香港']);
+    expect(sel.default).toBe('香港');
+    expect(r.pendingEndpoints).toEqual([]);
+    expect(r.pendingRuleSelectors).toEqual([]);
+  });
+
+  it('多节点 + 选中第二个 → proxy-selector.default=第二节点，members 含全部', () => {
+    const servers = [vless('s1', '香港'), vless('s2', '日本')];
+    const r = buildOutbounds(
+      servers[1],
+      cfg(servers, { selectedServerId: 's2' }),
+      idMap(servers),
+      deps()
+    );
+    const sel = r.outbounds.find((o) => o.tag === 'proxy-selector')!;
+    expect(sel.outbounds).toEqual(['香港', '日本']);
+    expect(sel.default).toBe('日本');
+  });
+
+  it('1.12 → 增 direct-loopback；1.13 → 无', () => {
+    const servers = [vless('s1', 'HK')];
+    const r12 = buildOutbounds(
+      servers[0],
+      cfg(servers),
+      idMap(servers),
+      deps({ coreVersion: '1.12.8' })
+    );
+    expect(r12.outbounds.map((o) => o.tag)).toContain('direct-loopback');
+    const r13 = buildOutbounds(servers[0], cfg(servers), idMap(servers), deps());
+    expect(r13.outbounds.map((o) => o.tag)).not.toContain('direct-loopback');
+  });
+});
+
+describe('buildOutbounds — rule-sel 载体（smart）', () => {
+  it('proxy 自定义规则(指定目标) → rule-sel-<id> default=目标；pendingRuleSelectors 收集', () => {
+    const servers = [vless('s1', '香港'), vless('s2', '日本')];
+    const c = cfg(servers, {
+      customRules: [
+        {
+          id: 'r1',
+          type: 'domain',
+          values: ['x.com'],
+          action: 'proxy',
+          enabled: true,
+          targetServerId: 's2',
+        },
+      ] as any,
+    });
+    const r = buildOutbounds(servers[0], c, idMap(servers), deps());
+    const ruleSel = r.outbounds.find((o) => o.tag === 'rule-sel-r1')!;
+    expect(ruleSel.type).toBe('selector');
+    expect(ruleSel.default).toBe('日本'); // anti-drift：指定目标
+    expect(ruleSel.outbounds).toContain('proxy-selector'); // 嵌套全局
+    expect(r.pendingRuleSelectors).toEqual([
+      { ruleKey: 'custom:r1', selectorTag: 'rule-sel-r1', memberTag: '日本', targetServerId: 's2' },
+    ]);
+  });
+
+  it('global 模式 → 不生成 rule-sel（用户分流被忽略）', () => {
+    const servers = [vless('s1', 'HK')];
+    const c = cfg(servers, {
+      proxyMode: 'global',
+      customRules: [
+        { id: 'r1', type: 'domain', values: ['x'], action: 'proxy', enabled: true },
+      ] as any,
+    });
+    const r = buildOutbounds(servers[0], c, idMap(servers), deps());
+    expect(r.outbounds.some((o) => o.tag?.startsWith('rule-sel'))).toBe(false);
+    expect(r.pendingRuleSelectors).toEqual([]);
+  });
+});
+
+describe('buildOutbounds — endpoint + 门控', () => {
+  it('WireGuard → 进 pendingEndpoints（非 outbounds），tag 入 selector', () => {
+    const wg = {
+      id: 'w1',
+      name: 'WG',
+      protocol: 'wireguard',
+      address: 'wg.example.com',
+      port: 51820,
+      wireguardSettings: { privateKey: 'pk', peerPublicKey: 'pub', localAddress: ['10.0.0.2/32'] },
+    } as unknown as ServerConfig;
+    const r = buildOutbounds(wg, cfg([wg]), idMap([wg]), deps());
+    expect(r.pendingEndpoints.map((e) => e.tag)).toEqual(['WG']);
+    expect(r.outbounds.find((o) => o.tag === 'proxy-selector')!.outbounds).toContain('WG');
+  });
+
+  it('gateInvalidNodes 命中 → 跳过该节点出站', () => {
+    const servers = [vless('s1', '香港'), vless('s2', '日本')];
+    const gate = new Map<string, InvalidNodeInfo>([
+      ['s1', { id: 's1', tag: '香港', reason: 'x' } as InvalidNodeInfo],
+    ]);
+    const r = buildOutbounds(
+      servers[1],
+      cfg(servers, { selectedServerId: 's2' }),
+      idMap(servers),
+      deps({ gateInvalidNodes: gate })
+    );
+    expect(r.outbounds.map((o) => o.tag)).not.toContain('香港');
+    expect(r.outbounds.find((o) => o.tag === 'proxy-selector')!.outbounds).toEqual(['日本']);
+  });
+
+  it('所有节点不可用 → 抛错', () => {
+    const servers = [vless('s1', 'HK')];
+    const gate = new Map<string, InvalidNodeInfo>([
+      ['s1', { id: 's1', tag: 'HK', reason: 'x' } as InvalidNodeInfo],
+    ]);
+    expect(() =>
+      buildOutbounds(servers[0], cfg(servers), idMap(servers), deps({ gateInvalidNodes: gate }))
+    ).toThrow();
+  });
+});

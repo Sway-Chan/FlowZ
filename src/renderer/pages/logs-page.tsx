@@ -5,6 +5,7 @@ import { SettingsCollapsible } from '@/components/settings/settings-collapsible'
 import { DiagnosticSection } from '@/components/settings/diagnostic-section';
 import { useAppStore } from '@/store/app-store';
 import { useTranslation } from 'react-i18next';
+import { PageHeader } from '@/components/page-header';
 
 export function LogsPage() {
   const { t } = useTranslation();
@@ -13,10 +14,7 @@ export function LogsPage() {
 
   return (
     <div className="space-y-4">
-      <div>
-        <h2 className="text-2xl font-bold">{t('logs.pageTitle')}</h2>
-        <p className="text-muted-foreground mt-1">{t('logs.pageDesc')}</p>
-      </div>
+      <PageHeader title={t('logs.pageTitle')} description={t('logs.pageDesc')} />
 
       {/* 日志与诊断（排障归一 C1/H2/M4）：默认折叠，触发标题常显当前级别，保持日志查看器为主。 */}
       <Card>

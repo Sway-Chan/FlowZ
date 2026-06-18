@@ -7,6 +7,7 @@ import {
 } from '@/components/settings';
 import { ErrorBoundary } from '@/components/error-boundary';
 import { useTranslation } from 'react-i18next';
+import { PageHeader } from '@/components/page-header';
 
 interface SettingsPageProps {
   activeSection: string;
@@ -56,10 +57,10 @@ export function SettingsPage({ activeSection }: SettingsPageProps) {
     // 流式满宽：内容随窗口拖动自适应充满内容区（仅受全局 main 容器 max-w-[1400px] 约束），与规则/节点等其它页一致；
     // 不再限 max-w-2xl(672)——固定窄列会在宽窗右侧留白（用户反馈：自适应充满比留白更美观）。
     <div className="space-y-6">
-      <div>
-        <h2 className="text-2xl font-bold">{t(meta.titleKey, meta.defaultTitle)}</h2>
-        <p className="text-muted-foreground mt-1">{t(meta.descKey, meta.defaultDesc)}</p>
-      </div>
+      <PageHeader
+        title={t(meta.titleKey, meta.defaultTitle)}
+        description={t(meta.descKey, meta.defaultDesc)}
+      />
 
       <div>
         <ErrorBoundary>

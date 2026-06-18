@@ -1,0 +1,248 @@
+/**
+ * config-gen 共享纯 helper —— 从 ProxyManager 抽出（SingBoxConfigBuilder 抽取 Phase 2）。
+ * 全部纯函数、零实例状态：只读 config / host 字符串。ProxyManager 与各 generator 模块
+ * （dns / route / ruleselectors / outbound）共用，避免跨模块依赖私有方法。
+ */
+
+import { isIpv4 } from '../../shared/ip';
+import type { UserConfig, Rule, AppRule, CustomAppPreset } from '../../shared/types';
+import { parseDnsServerSpec } from '../../shared/dns';
+import { ruleConditions } from '../../shared/rules';
+import { getAppPreset } from '../../shared/app-rules-preset';
+import { BUILTIN_GEO_RULESETS } from './builtin-geo-rulesets';
+import type { SingBoxConfig, SingBoxRouteRule } from './singbox-config-types';
+
+/**
+ * 国内常见网银 U盾插件及本地证券/炒股软件的专属域名
+ * 用于绕过代理，防止被 FakeIP 劫持或因协议不兼容（如二进制协议通过 HTTP 代理）被阻断。
+ * DNS（generateDnsConfig 银行域名规则）与 route（generateRouteConfig 强制直连）共用，单一真值。
+ */
+export const DOMESTIC_BANK_AND_STOCK_DOMAINS = [
+  // U盾及网银相关（通常指向 127.0.0.1）
+  '.microdone.cn', // 微动（杭州银行、中信银行等地方和股份制网银插件常用）
+  '.icbc.com.cn', // 工商银行
+  '.boc.cn', // 中国银行
+  '.ccb.com', // 建设银行
+  '.abchina.com',
+  '.abchina.com.cn', // 农业银行
+  '.bankcomm.com', // 交通银行
+  '.cmbchina.com', // 招商银行
+  '.psbc.com', // 邮储银行
+  '.spdb.com.cn', // 浦发银行
+  '.cebbank.com', // 光大银行
+  '.citicbank.com', // 中信银行
+  '.pingan.com', // 平安银行
+  '.cib.com.cn', // 兴业银行
+  '.hxb.com.cn', // 华夏银行
+  '.cmbc.com.cn', // 民生银行
+  '.hzbank.com.cn', // 杭州银行
+
+  // 证券炒股软件相关（经常使用定制化的 TCP 二进制协议通信，在 SOCKS/HTTP 系统代理模式下会导致握手失败并被代理核心主动断开）
+  '.10jqka.com.cn',
+  '.thsi.cn', // 同花顺
+  '.eastmoney.com',
+  '.1234567.com.cn', // 东方财富
+  '.gw.com.cn', // 大智慧
+  '.tdx.com.cn', // 通达信
+];
+
+/** 私有/保留 IP 段（route 私网直连 + TUN 排除集共用，单一真值）。 */
+export const PRIVATE_IP_CIDRS = [
+  // IPv4 私有地址
+  '10.0.0.0/8',
+  '172.16.0.0/12',
+  '192.168.0.0/16',
+  '127.0.0.0/8',
+  '169.254.0.0/16',
+  '224.0.0.0/4',
+  '240.0.0.0/4',
+  // IPv6 私有地址
+  '::1/128', // loopback
+  'fc00::/7', // unique local address (ULA)
+  'fe80::/10', // link-local
+  'ff00::/8', // multicast
+];
+
+/** 主机字符串是否为 IPv4 字面量（收敛到 shared/ip.isIpv4 严格判定，与 DNS 分类同源，避免不一致）。 */
+export const isIpv4Host = (host: string): boolean => isIpv4(host);
+
+/** 主机字符串是否为 IPv6 字面量。 */
+export const isIpv6Host = (host: string): boolean =>
+  /^[0-9a-fA-F:]+$/.test(host) && host.includes(':');
+
+/**
+ * #57 节点域名解析器档位 → 实际使用的 DNS server tag。
+ * 同时供节点 outbound 的 domain_resolver（ctx='dial'）与节点域名 DNS rule1（ctx='rule'）取值，
+ * 保证 dial 与 rule1 用同一档（outbound 级统一 tag），不破坏 selector 热切换。
+ *
+ * 档位（缺省 / 'auto' = 零行为变化，dial 与 rule1 忠实保留各自基线解析器）：
+ *  - auto   → dial=dns-bootstrap（AliDNS IP-DoH 223.5.5.5，保 outbound.domain_resolver 现状）；
+ *             rule=dns-domestic（doh.pub DoH，保节点域名 DNS rule1 现状）。
+ *             两路径基线本就不同档，统一会把 rule1 从 doh.pub 悄改成 AliDNS，违反「默认零行为变化」。
+ *  - dnspod → dns-node（DNSPod IP-DoH 1.12.12.12）
+ *  - system → dns-local（系统 DNS）；但 INV-1：TUN 下 rule ctx 强制 dns-node（IP-DoH）防递归——
+ *             节点域名查询若落 dns-local，其上游可能再经 TUN 被 hijack-dns 劫持回 DNS rules 形成软死循环。
+ */
+export function getNodeResolverTag(
+  config: UserConfig | null | undefined,
+  ctx: 'dial' | 'rule'
+): string {
+  const mode = config?.dnsConfig?.nodeDomainResolver ?? 'auto';
+  if (mode === 'dnspod') return 'dns-node';
+  if (mode === 'system') {
+    if (ctx === 'rule' && config?.proxyModeType === 'tun') return 'dns-node'; // INV-1
+    return 'dns-local';
+  }
+  // auto（含缺省）：忠实保留两路径各自基线解析器，逐字节回现状。
+  return ctx === 'dial' ? 'dns-bootstrap' : 'dns-domestic';
+}
+
+/**
+ * 用户路由规则 gate（单一真值）：自定义路由规则**仅 smart 模式生效**。
+ * global = 真·全局（一律走选中节点，忽略用户分流，仅保留功能性强制直连：防环 / LAN·私网 / 网银 U盾 / 节点排除）；
+ * direct = 全部直连。对齐业内（Clash/Surge/sing-box GUI）——全局模式即忽略所有用户分流规则。
+ * 消费点统一经此（route emit / 规则选择器 / geo 收集 / DNS bypassFakeIP），与 effectiveAppRules 对称。
+ */
+export function effectiveCustomRules(config: UserConfig): Rule[] {
+  if ((config.proxyMode || 'smart').toLowerCase() !== 'smart') return [];
+  return config.customRules || [];
+}
+
+/**
+ * 应用分流总开关 gate：appRoutingEnabled !== true → 空（默认关）；非 smart 模式（global/direct）→ 空。
+ * 仅 smart + 显式启用才生效。单一真值点，4 个消费点（route 生成 / 规则选择器 / TUN 排除 / geo 收集）统一经此。
+ * global 忽略应用分流（真·全局走选中节点），与 effectiveCustomRules 对称。
+ */
+export function effectiveAppRules(config: UserConfig): AppRule[] {
+  if (config.appRoutingEnabled !== true) return [];
+  if ((config.proxyMode || 'smart').toLowerCase() !== 'smart') return [];
+  return config.appRules || [];
+}
+
+/** 用户自定义国内 DNS 若为 IP（非 DoH 域名），返回 {ip, port} 供 TUN 直连放行/排除集；否则 null。 */
+export function getCustomDomesticDnsEndpoint(
+  config: UserConfig
+): { ip: string; port: number } | null {
+  const p = parseDnsServerSpec(config.dnsConfig?.domesticDns);
+  return p && !p.isDomain ? { ip: p.server, port: p.port } : null;
+}
+
+/**
+ * 内置 geo 规则集的单一真值表：tag、运行时文件名、内置源路径。
+ * copyRuleSetsToUserData（写入）、generateRouteConfig（引用 path）、RuleResourceManager（页面展示/更新）
+ * 共用 builtin-geo-rulesets 模块的 BUILTIN_GEO_RULESETS，避免多处硬编码目录+文件名导致漂移——
+ * 改一处而另一处仍指旧路径会让 sing-box 加载本地 rule_set 失败。
+ */
+export function getLocalGeoRuleSets(): { tag: string; fileName: string; srcPath: string }[] {
+  return BUILTIN_GEO_RULESETS.map((b) => ({
+    tag: b.tag,
+    fileName: b.fileName,
+    srcPath: b.bundledPath(),
+  }));
+}
+
+/**
+ * 收集自定义规则中使用的 Geosite 和 GeoIP 类别（同时扫描 customRules 和 appRules）
+ */
+export function getRequiredGeoCategories(
+  customRules: Rule[],
+  appRules: AppRule[] = [],
+  customAppPresets: CustomAppPreset[] = []
+): { geosite: Set<string>; geoip: Set<string> } {
+  const geositeCategories = new Set<string>();
+  const geoipCategories = new Set<string>();
+
+  // 扫描 geosite / geoip 类型的自定义规则（values 即裸标签，如 'youtube'/'cn'）
+  for (const rule of customRules) {
+    if (!rule.enabled) continue;
+    // 扫所有条件（多条件规则的 logical 内可含 geosite/geoip → 否则其 remote rule_set 不被注入致引用缺失）
+    for (const cond of ruleConditions(rule)) {
+      if (cond.type === 'geosite') {
+        for (const t of cond.values) {
+          const tag = t.trim().toLowerCase();
+          if (tag) geositeCategories.add(tag);
+        }
+      } else if (cond.type === 'geoip') {
+        for (const t of cond.values) {
+          const tag = t.trim().toLowerCase();
+          if (tag) geoipCategories.add(tag);
+        }
+      }
+    }
+  }
+
+  // 扫描应用分流规则
+  for (const appRule of appRules) {
+    if (!appRule.enabled) continue;
+    const preset = getAppPreset(appRule.appId, customAppPresets);
+    if (preset) {
+      // 与 customRules 分支同口径：trim + 小写。必须与发射端（singbox-route-builder app 规则
+      // `geosite-/geoip-`）+ 本地 .srs 文件名/资源 id（均小写）一致，否则 customAppPresets 含大写 tag 时
+      // 所需类别集（决定注入哪些 rule_set）与实际引用的 rule_set tag 错位 → fail-closed 剪枝静默丢规则。
+      preset.geositeTags.forEach((tag) => {
+        const t = tag.trim().toLowerCase();
+        if (t) geositeCategories.add(t);
+      });
+      if (preset.geoipTags) {
+        preset.geoipTags.forEach((tag) => {
+          const t = tag.trim().toLowerCase();
+          if (t) geoipCategories.add(t);
+        });
+      }
+    }
+  }
+  return { geosite: geositeCategories, geoip: geoipCategories };
+}
+
+/**
+ * fail-closed 兜底：剪掉引用「未定义/不可达 rule_set tag」的路由规则及 rule_set 定义。复用三态递归剪枝
+ * （string/array/logical）：smart geo 缺失→该方向规则 skip；app 规则只掉 geo 半（进程名规则独立保留）；
+ * 自定义规则 AND/OR 合理坍缩。就地改 singboxConfig.route（mutate），无实例状态。返回被丢弃的 rule_set tag。
+ */
+export function applyRuleSetPrune(
+  singboxConfig: SingBoxConfig,
+  unreachable: Set<string>
+): string[] {
+  if (unreachable.size === 0 || !singboxConfig.route) return [];
+  const dropped: string[] = [];
+  if (singboxConfig.route.rule_set) {
+    singboxConfig.route.rule_set = singboxConfig.route.rule_set.filter((rs) => {
+      if (rs.tag && unreachable.has(rs.tag)) {
+        dropped.push(rs.tag);
+        return false;
+      }
+      return true;
+    });
+  }
+  const pruneRules = (rules: SingBoxRouteRule[]): SingBoxRouteRule[] =>
+    rules.filter((rule) => {
+      if (Array.isArray(rule.rules)) {
+        const before = rule.rules.length;
+        rule.rules = pruneRules(rule.rules);
+        // logical 规则子条件被剪空 → 整条丢（空 logical 无意义且 sing-box 不接受）
+        if (rule.type === 'logical' && rule.rules.length === 0) return false;
+        // AND logical 任一子条件被剪掉 → 整条丢（fail-closed：缺失条件无法满足，留剩余子集会以「超集」匹配）。
+        // 关键：修「派生的嵌套 AND udp443 reject」——内层 geo logical 被剪空丢弃后，外层 AND 仅剩 {network,port}
+        // 否则坍缩成无差别全局 udp443 reject（误伤 Hysteria2/TUIC 握手与全局 QUIC）；与 generateCustomRules
+        // 的 AND fail-closed 语义一致（任一子条件丢→整条 skip）。OR / 无 mode 不受影响（少一候选项无害）。
+        if (rule.type === 'logical' && rule.mode === 'and' && rule.rules.length < before) {
+          return false;
+        }
+      }
+      const rs = rule.rule_set;
+      if (typeof rs === 'string') {
+        if (unreachable.has(rs)) return false; // 唯一 rule_set 缺失 → 该规则停止生效
+      } else if (Array.isArray(rs)) {
+        const kept = rs.filter((t) => !unreachable.has(t));
+        if (kept.length === 0) return false; // rule_set 全缺失 → 该规则停止生效
+        if (kept.length !== rs.length) rule.rule_set = kept; // 部分保留（如 geosite 留、geoip 丢）
+      }
+      return true;
+    });
+  // 以 unreachable.size 为闸（已 early-return size===0），不以 dropped.length——fail-closed 下复用此函数剪
+  // 「本地缺失、无 rule_set 定义」的悬空 tag 时 dropped 恒为 0，但仍须剪掉引用它的规则（否则悬空引用 FATAL）。
+  if (unreachable.size > 0) {
+    singboxConfig.route.rules = pruneRules(singboxConfig.route.rules ?? []);
+  }
+  return dropped;
+}

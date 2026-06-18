@@ -313,6 +313,41 @@ describe('§B：enableIPv6 收敛 AAAA（IPv4-only 节点防 ERR_CONNECTION_CLOS
   });
 });
 
+describe('#57 L2 集成：generateSingBoxConfig 把 ws path ?ed= 拆成内核早数据字段', () => {
+  const baseCfg = buildFixtures().find((f) => f.name === 'tun-smart__auto')!.config as AnyCfg;
+  const genWsTransport = (wsPath: string): AnyCfg => {
+    const node: AnyCfg = {
+      id: 'ws-ed',
+      name: 'ws-ed',
+      protocol: 'vless',
+      address: '104.16.0.1',
+      port: 443,
+      uuid: '00000000-0000-0000-0000-0000000000ed',
+      network: 'ws',
+      wsSettings: { path: wsPath, headers: { Host: 'x.trycloudflare.com' } },
+      security: 'tls',
+      tlsSettings: { serverName: 'x.trycloudflare.com' },
+    };
+    const cfg = { ...baseCfg, servers: [node], selectedServerId: 'ws-ed' } as AnyCfg;
+    const sb = new ProxyManager().generateSingBoxConfig(cfg) as AnyCfg;
+    return nodeOutbounds(sb).find((o) => o.transport?.type === 'ws')?.transport;
+  };
+
+  it('?ed=2560 → path 去 ?ed + max_early_data + Sec-WebSocket-Protocol（杜绝 %3F 怪路径）', () => {
+    const t = genWsTransport('/vless-argo?ed=2560');
+    expect(t).toBeTruthy();
+    expect(t.path).toBe('/vless-argo');
+    expect(t.max_early_data).toBe(2560);
+    expect(t.early_data_header_name).toBe('Sec-WebSocket-Protocol');
+  });
+
+  it('无 ?ed → path 原样、不强加早数据字段', () => {
+    const t = genWsTransport('/plain');
+    expect(t.path).toBe('/plain');
+    expect(t.max_early_data).toBeUndefined();
+  });
+});
+
 describe('#57 错误归因：translateErrorMessage / classifyCoreError 同序镜像', () => {
   const pm = new ProxyManager();
   // 注入 currentConfig，使节点域名集 = NODE_A/B 域名

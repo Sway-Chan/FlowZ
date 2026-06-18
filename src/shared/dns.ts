@@ -1,3 +1,5 @@
+import { isIpv4 } from './ip';
+
 /**
  * sing-box route 在 hijack-dns 之前「直连放行」的国内 bootstrap DNS IP（:53/:443）。单一真值：
  *   - generateRouteConfig 的引导直连规则（C 段）引用，保证核心 DNS 自举不被 hijack 成 FakeIP；
@@ -44,14 +46,12 @@ export interface ParsedDnsServer {
 }
 
 // 严格 IPv4（每段 0-255），避免 999.1.1.1 等被误收
-const IPV4_RE = /^(?:(?:25[0-5]|2[0-4]\d|1?\d?\d)\.){3}(?:25[0-5]|2[0-4]\d|1?\d?\d)$/;
-
 function stripBrackets(host: string): string {
   return host.replace(/^\[/, '').replace(/\]$/, '');
 }
 
 function isIpv4Literal(host: string): boolean {
-  return IPV4_RE.test(host);
+  return isIpv4(host);
 }
 
 /** 粗判 IPv6 字面量：去方括号后仅含 hex 与冒号，且至少两个冒号（排除 "8.8.8.8:53" 这类带端口裸输入）。 */

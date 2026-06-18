@@ -2,6 +2,8 @@ import {
   redactDeep,
   redactUrlValue,
   buildDiagnosticReport,
+  collectNodeIdentifiers,
+  redactIdentifiers,
   REDACTED,
   type DiagnosticReportInput,
 } from '../diagnostic-redact';
@@ -192,5 +194,144 @@ describe('buildDiagnosticReport', () => {
       redactedUserConfig: { name: 'a```b' },
     });
     expect(md).toContain('````json');
+  });
+});
+
+describe('collectNodeIdentifiers — 节点标识符提取 + 类型化占位（P0.6）', () => {
+  it('地址/SNI/Host/ShadowTLS-sni/Tailscale/custom outbound/节点名 全覆盖，类型化占位、去重、节点名跳过<4', () => {
+    const ids = collectNodeIdentifiers({
+      servers: [
+        {
+          address: 'a.example-argo.com',
+          name: '香港机场A',
+          tlsSettings: { serverName: 'sni.real.net' },
+          wsSettings: { headers: { Host: 'host.argo.dev' } },
+        },
+        { address: '104.18.8.83', name: 'US' }, // name 'US' <4 跳过
+        { shadowTlsSettings: { sni: 'disguise.shadow.io' } }, // H2: ShadowTLS sni
+        { tailscaleSettings: { hostname: 'mybox.ts.net', exitNode: 'exit.ts.net' } }, // H2: tailscale
+        {
+          customSettings: {
+            outbound: { type: 'snell', server: 'custom.node.io', sni: 'cust.sni.io' },
+          },
+        }, // H2: custom 展平
+        { address: 'a.example-argo.com' }, // 重复 → 不再分配
+      ],
+    });
+    const map = Object.fromEntries(ids.map((i) => [i.value, i.placeholder]));
+    expect(map['a.example-argo.com']).toBe('<domain-1>');
+    expect(map['sni.real.net']).toBe('<domain-2>');
+    expect(map['host.argo.dev']).toBe('<domain-3>');
+    expect(map['104.18.8.83']).toBe('<ip-1>');
+    expect(map['disguise.shadow.io']).toBeDefined(); // H2 ShadowTLS sni 已采集
+    expect(map['mybox.ts.net']).toBeDefined(); // H2 tailscale hostname
+    expect(map['exit.ts.net']).toBeDefined(); // H2 tailscale exitNode
+    expect(map['custom.node.io']).toBeDefined(); // H2 custom outbound server
+    expect(map['cust.sni.io']).toBeDefined(); // H2 custom outbound sni
+    expect(map['香港机场A']).toBe('<node-1>');
+    expect(map['US']).toBeUndefined();
+    expect(ids.filter((i) => i.value === 'a.example-argo.com')).toHaveLength(1);
+  });
+
+  it('空 / 无 servers → 空', () => {
+    expect(collectNodeIdentifiers(null)).toEqual([]);
+    expect(collectNodeIdentifiers({})).toEqual([]);
+  });
+
+  it('MED-1：custom 透传 outbound 的嵌套主机字段(tls.server_name / transport.headers.Host)也被收集', () => {
+    const ids = collectNodeIdentifiers({
+      servers: [
+        {
+          customSettings: {
+            outbound: {
+              type: 'vless',
+              server: 'node.real.io',
+              tls: { server_name: 'hidden.sni.com' },
+              transport: { headers: { Host: 'ws.host.com' } },
+            },
+          },
+        },
+      ],
+    });
+    const vals = ids.map((i) => i.value);
+    expect(vals).toContain('node.real.io');
+    expect(vals).toContain('hidden.sni.com'); // 嵌套 tls.server_name
+    expect(vals).toContain('ws.host.com'); // 嵌套 transport.headers.Host
+  });
+
+  it('LOW-1：WS headers 小写 host 也被收集(JSON 导入非规范键)', () => {
+    const ids = collectNodeIdentifiers({
+      servers: [{ wsSettings: { headers: { host: 'lower.host.io' } } }],
+    });
+    expect(ids.map((i) => i.value)).toContain('lower.host.io');
+  });
+
+  it('HTTP transport headers.Host（值为 string[]，与 ws 分支对称）也被收集', () => {
+    const ids = collectNodeIdentifiers({
+      servers: [{ httpSettings: { headers: { Host: ['masq.http.io'] } } }],
+    });
+    expect(ids.map((i) => i.value)).toContain('masq.http.io');
+  });
+
+  it('looksLikeIp 收敛 isIpv4：超界段 999.1.1.1 归域名而非 IP（不再被宽松正则误判）', () => {
+    const ids = collectNodeIdentifiers({ servers: [{ address: '999.1.1.1' }] });
+    expect(ids).toHaveLength(1);
+    expect(ids[0].placeholder).toBe('<domain-1>');
+  });
+});
+
+describe('redactIdentifiers — 文本统一打码 + 主机边界锚定（P0.6 / H1）', () => {
+  const ids = [
+    { value: 'a.example-argo.com', placeholder: '<domain-1>' },
+    { value: '104.18.8.83', placeholder: '<ip-1>' },
+  ];
+  it('日志里节点域名/IP 被替换为占位（大小写不敏感）', () => {
+    const log = 'lookup A.Example-Argo.com: SERVFAIL\noutbound to 104.18.8.83:443';
+    expect(redactIdentifiers(log, ids)).toBe('lookup <domain-1>: SERVFAIL\noutbound to <ip-1>:443');
+  });
+  it('H1 边界：节点标识符作子串不误替无关串（cdn.a... 不动、104.18.8.831 不切）', () => {
+    const text = 'visit cdn.a.example-argo.com and 104.18.8.831';
+    expect(redactIdentifiers(text, ids)).toBe(text);
+  });
+  it('长值优先：避免子串先替坏长值', () => {
+    const out = redactIdentifiers('x.example-argo.com', [
+      { value: 'example-argo.com', placeholder: '<domain-2>' },
+      { value: 'x.example-argo.com', placeholder: '<domain-1>' },
+    ]);
+    expect(out).toBe('<domain-1>');
+  });
+  it('空文本 / 空 ids → 原样', () => {
+    expect(redactIdentifiers('', ids)).toBe('');
+    expect(redactIdentifiers('abc', [])).toBe('abc');
+  });
+});
+
+describe('buildDiagnosticReport × P0.6：末尾统一打码节点标识符（配置块 + 日志一致）', () => {
+  const input: DiagnosticReportInput = {
+    generatedAt: '2026-06-17T00:00:00.000Z',
+    app: { flowzVersion: '1', coreVersion: '1.13', os: 'win32' },
+    runtime: {
+      proxyMode: 'smart',
+      proxyModeType: 'tun',
+      proxyRunning: true,
+      nodeDomainResolver: 'auto',
+      logLevel: 'info',
+      captureActive: false,
+    },
+    redactedUserConfig: { servers: [{ address: 'a.example-argo.com' }] },
+    redactedSingboxConfig: { outbounds: [{ server: 'a.example-argo.com' }] },
+    appLogTail: 'lookup a.example-argo.com: SERVFAIL',
+    singboxLogTail: '',
+    nodeIdentifiers: [{ value: 'a.example-argo.com', placeholder: '<domain-1>' }],
+  };
+  it('配置块与日志中的节点域名均替换为同一占位（可关联、不泄漏值）', () => {
+    const md = buildDiagnosticReport(input);
+    expect(md).not.toContain('a.example-argo.com');
+    expect(md).toContain('<domain-1>');
+    expect(md).toContain('lookup <domain-1>: SERVFAIL');
+  });
+  it('无 nodeIdentifiers → 不改动（向后兼容）', () => {
+    const md = buildDiagnosticReport({ ...input, nodeIdentifiers: undefined });
+    expect(md).toContain('a.example-argo.com');
   });
 });

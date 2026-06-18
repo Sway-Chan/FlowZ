@@ -18,7 +18,6 @@ import {
   registerLogHandlers,
   registerProxyHandlers,
   registerVersionHandlers,
-  registerAdminHandlers,
   registerUpdateHandlers,
   registerRulesHandlers,
   registerAutoStartHandlers,
@@ -53,8 +52,11 @@ import { RuleResourceScheduler } from './services/RuleResourceScheduler';
 import { HelperManager } from './services/HelperManager';
 import { WindowsServiceHelper } from './services/WindowsServiceHelper';
 import type { IPrivilegedHelper } from './services/IPrivilegedHelper';
-import type { HelperStatus, UserConfig, LogLevel } from '../shared/types';
+import type { HelperStatus, UserConfig } from '../shared/types';
 import { ipcEventEmitter } from './ipc/ipc-events';
+import { buildTrayCallbacks } from './tray-actions';
+import { scheduleStartupTasks } from './startup-tasks';
+import { registerConfigChangeListener } from './config-change-handler';
 import { mainEventEmitter, MAIN_EVENTS } from './ipc/main-events';
 import { initUserDataPath } from './utils/paths';
 import { IPC_CHANNELS } from '../shared/ipc-channels';
@@ -1266,7 +1268,6 @@ if (gotTheLock) {
     registerSystemHandlers();
     registerRuleResourceHandlers(ruleResourceManager);
     registerVersionHandlers(coreUpdateService);
-    registerAdminHandlers();
 
     registerRulesHandlers(configManager);
 
@@ -1334,344 +1335,51 @@ if (gotTheLock) {
     });
 
     // 创建托盘图标
-    trayManager = new TrayManager(mainWindow, logManager, {
-      onStartProxy: async () => {
-        try {
-          const config = await configManager.loadConfig();
-          // helper 引导已收敛到 ProxyManager.start() 单点（promptHelperGate 注入），托盘启动自动覆盖。
-          if (proxyManager) {
-            // 系统代理 enable/clear 已收口于 start()（拆双轨），托盘不再重复设置。
-            await proxyManager.start(config);
-
-            logManager.addLog('info', 'Proxy started from tray', 'Main');
-            // 更新托盘菜单状态
-            updateTrayMenuState(true);
-          }
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          logManager.addLog('error', `Failed to start proxy: ${errorMessage}`, 'Main');
-        }
-      },
-      onStopProxy: async () => {
-        try {
-          // 用户主动停止：先清系统代理（stop() 前调，stopping 仍 false → 会真正清）。经 ensureSystemProxyCleared
-          // 的 marker + 指向门控，仅清 FlowZ 自己设置的，不 stomp 用户自配/TUN 模式（修 M4）。
-          if (proxyManager) {
-            await proxyManager.ensureSystemProxyCleared().catch(() => {});
-            await proxyManager.stop();
-            logManager.addLog('info', 'Proxy stopped from tray', 'Main');
-            // 更新托盘菜单状态
-            updateTrayMenuState(false);
-          }
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          logManager.addLog('error', `Failed to stop proxy: ${errorMessage}`, 'Main');
-        }
-      },
-      onShowWindow: () => {
-        showWindow();
-      },
-      onQuit: () => {
-        // 收敛到单一退出管线：app.quit() → before-quit(置 isQuitting) → close 放行 → will-quit → cleanupResources → exit
-        app.quit();
-      },
-      onSelectServer: async (serverId: string) => {
-        try {
-          const config = await configManager.loadConfig();
-          config.selectedServerId = serverId;
-          await configManager.saveConfig(config);
-          logManager.addLog('info', `Server selected from tray: ${serverId}`, 'Main');
-
-          // 如果代理正在运行，应用新服务器：切节点走 switchMode（clash_api 热切换、不断流），
-          // 失败自动退回重启——与渲染端切换路径行为一致，避免托盘切节点硬重启断流。
-          if (proxyManager && proxyManager.getStatus().running) {
-            await proxyManager.switchMode(config);
-            logManager.addLog('info', 'Applied server switch from tray', 'Main');
-          }
-
-          // 更新托盘菜单
-          updateTrayMenuState(proxyManager?.getStatus().running ?? false);
-
-          // 通知渲染进程配置已更新
-          ipcEventEmitter.sendToAll('event:configChanged', { newValue: config });
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          logManager.addLog('error', `Failed to select server: ${errorMessage}`, 'Main');
-        }
-      },
-      onChangeProxyMode: async (mode) => {
-        try {
-          const config = await configManager.loadConfig();
-          config.proxyMode = mode;
-          await configManager.saveConfig(config);
-          logManager.addLog('info', `Proxy mode changed from tray: ${mode}`, 'Main');
-
-          // 如果代理正在运行，重启以应用新模式（走 restart()：start 腿失败会清残留系统代理，防死端口断网）
-          if (proxyManager && proxyManager.getStatus().running) {
-            await proxyManager.restart(config);
-            logManager.addLog('info', 'Proxy restarted with new mode', 'Main');
-          }
-
-          // 更新托盘菜单
-          updateTrayMenuState(proxyManager?.getStatus().running ?? false);
-
-          // 通知渲染进程配置已更新
-          ipcEventEmitter.sendToAll('event:configChanged', { newValue: config });
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          logManager.addLog('error', `Failed to change proxy mode: ${errorMessage}`, 'Main');
-          // helper gate 取消等导致 start 中止 → 代理已停，刷新托盘态防显示陈旧「运行中」
-          updateTrayMenuState(proxyManager?.getStatus().running ?? false);
-        }
-      },
-      onChangeProxyModeType: async (modeType) => {
-        try {
-          const config = await configManager.loadConfig();
-          config.proxyModeType = modeType;
-          await configManager.saveConfig(config);
-          logManager.addLog('info', `Takeover mode changed from tray: ${modeType}`, 'Main');
-
-          // 运行中则重启以应用新接管方式（走 restart()：start 腿失败清残留系统代理；成功则 start reconcile
-          // 按新模式 enable/clear——覆盖 systemProxy↔TUN 双向切换的系统代理一致性）
-          if (proxyManager && proxyManager.getStatus().running) {
-            await proxyManager.restart(config);
-            logManager.addLog('info', 'Proxy restarted with new takeover mode', 'Main');
-          }
-
-          updateTrayMenuState(proxyManager?.getStatus().running ?? false);
-          ipcEventEmitter.sendToAll('event:configChanged', { newValue: config });
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          logManager.addLog('error', `Failed to change takeover mode: ${errorMessage}`, 'Main');
-          // helper gate 取消等导致 start 中止 → 代理已停，刷新托盘态防显示陈旧「运行中」
-          updateTrayMenuState(proxyManager?.getStatus().running ?? false);
-        }
-      },
-      onOpenSettings: () => {
-        showWindow();
-        // 发送导航事件到渲染进程
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('navigate', '/settings');
-        }
-      },
-      onCheckUpdate: async () => {
-        // 检查更新并显示对话框
-        const result = await updateService.checkForUpdate();
-        if (result.hasUpdate && result.updateInfo) {
-          const action = await updateService.showUpdateDialog(result.updateInfo);
-          if (action === 'update') {
-            // 使用带进度窗口的下载方法
-            const filePath = await updateService.downloadUpdateWithProgress(result.updateInfo);
-            if (filePath) {
-              await updateService.installUpdate(filePath);
-            }
-          } else if (action === 'skip') {
-            updateService.skipVersion(result.updateInfo.version);
-          }
-        } else if (!result.error) {
-          // 没有更新，显示提示
-          if (mainWindow && !mainWindow.isDestroyed()) {
-            const { dialog } = require('electron');
-            dialog.showMessageBox(mainWindow, {
-              type: 'info',
-              title: '检查更新',
-              message: '当前已是最新版本',
-              buttons: ['确定'],
-            });
-          }
-        }
-      },
-      onManageServers: () => {
-        showWindow();
-        // 发送导航事件到渲染进程
-        if (mainWindow && !mainWindow.isDestroyed()) {
-          mainWindow.webContents.send('navigate', '/server');
-        }
-      },
-      onSpeedTest: async () => {
-        try {
-          const config = await configManager.loadConfig();
-          if (config.servers.length === 0) {
-            logManager.addLog('warn', 'No servers configured for speed test', 'Main');
-            return;
-          }
-
-          logManager.addLog(
-            'info',
-            `Starting speed test for ${config.servers.length} servers`,
-            'Main'
-          );
-
-          // 复用 SpeedTestService（互斥：与 UI 入口并发时复用同一次测速，避免起两个临时 sing-box）。
-          // onResult/onProgress 流式推 renderer（与 UI 入口一致，latencyMap/进度实时更新）→ 托盘与 UI 测速结果互通。
-          const results = await speedTestService.testAllServers(
-            config.servers,
-            (serverId, latency) => {
-              if (mainWindow && !mainWindow.isDestroyed()) {
-                mainWindow.webContents.send(IPC_CHANNELS.EVENT_SPEED_TEST_RESULT, {
-                  serverId,
-                  latency: latency === null ? -1 : latency,
-                });
-              }
-            },
-            (tested, ok, total) => {
-              if (mainWindow && !mainWindow.isDestroyed()) {
-                mainWindow.webContents.send(IPC_CHANNELS.EVENT_SPEED_TEST_PROGRESS, {
-                  tested,
-                  ok,
-                  total,
-                });
-              }
-            },
-            config.speedTestUrl // 与 UI 入口一致用用户配置的测速端点（否则托盘测速仍走默认 generate_204）
-          );
-
-          logManager.addLog('info', 'Speed test completed for all servers', 'Main');
-
-          if (trayManager) {
-            trayManager.updateSpeedTestResults(results, config.servers);
-          }
-        } catch (error) {
-          const errorMessage = error instanceof Error ? error.message : String(error);
-          logManager.addLog('error', `Speed test failed: ${errorMessage}`, 'Main');
-
-          if (trayManager) {
-            trayManager.updateSpeedTestResults(new Map(), []);
-          }
-        }
-      },
-      onEnterPrivacyMode: () => {
-        setPrivacyMode(true); // 置主进程 flag（单一真值）并广播；避免渲染端异步回写竞态/窗口重建丢锁
-      },
-    });
+    trayManager = new TrayManager(
+      mainWindow,
+      logManager,
+      buildTrayCallbacks({
+        getMainWindow: () => mainWindow,
+        getTrayManager: () => trayManager,
+        getProxyManager: () => proxyManager,
+        logManager,
+        configManager,
+        updateService,
+        speedTestService,
+        showWindow,
+        updateTrayMenuState,
+        setPrivacyMode,
+      })
+    );
     trayManager.createTray();
 
     // 初始化托盘菜单状态
     updateTrayMenuState(false);
 
-    // 启动时自动连接（延迟 2 秒，等待窗口和服务初始化完成）
-    setTimeout(async () => {
-      try {
-        const config = await configManager.loadConfig();
-
-        // 内核自动更新：App 启动序列的安全窗口（代理尚未 autoConnect）→ 先尝试落位上轮暂存的 staged 内核，
-        // 再做版本变更检测+autoConnect。落位仅在代理未运行时发生（此刻必然未连），不断流硬不变量。
-        try {
-          await coreUpdateService.tryApplyStaged('startup');
-        } catch (stagedErr) {
-          logManager.addLog('warn', `启动期落位 staged 内核异常: ${stagedErr}`, 'Main');
-        }
-
-        // 启动期「内核版本变更」横幅已移除：基线对齐缺收口 → 每次启动重复弹扰民（基线 core-version.json 与实际核不一致
-        // 时反复触发）。更新当下已有一次性反馈（applyStagedNow 的 EVENT_CORE_VERSION_CHANGED），回滚入口常驻内核管理设置，
-        // 故启动期不再主动弹。
-
-        // 检查是否启用了启动时自动连接
-        if (config.autoConnect && config.selectedServerId) {
-          logManager.addLog('info', '启动时自动连接已启用，正在连接...', 'Main');
-
-          if (proxyManager) {
-            // 系统代理 enable/clear 已收口于 start()（拆双轨），自动连接不再重复设置。
-            await proxyManager.start(config);
-
-            logManager.addLog('info', '启动时自动连接成功', 'Main');
-            // 更新托盘菜单状态
-            updateTrayMenuState(true);
-          }
-        } else if (config.autoConnect && !config.selectedServerId) {
-          logManager.addLog('warn', '启动时自动连接已启用，但未选择服务器', 'Main');
-        }
-      } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        logManager.addLog('error', `启动时自动连接失败: ${errorMessage}`, 'Main');
-        // 连接失败时更新托盘状态
-        updateTrayMenuState(false, true);
-      }
-    }, 2000);
-
-    // 启动后自动检查更新（延迟 5 秒，避免影响启动体验）
-    setTimeout(async () => {
-      try {
-        const config = await configManager.loadConfig();
-        // 检查是否启用了自动检查更新
-        if (config.autoCheckUpdate !== false) {
-          logManager.addLog('info', '正在自动检查更新...', 'Main');
-          const result = await updateService.checkForUpdate();
-          if (result.hasUpdate && result.updateInfo) {
-            logManager.addLog('info', `发现新版本: ${result.updateInfo.version}`, 'Main');
-            // 显示更新对话框
-            const action = await updateService.showUpdateDialog(result.updateInfo);
-            if (action === 'update') {
-              // 使用带进度窗口的下载方法
-              const filePath = await updateService.downloadUpdateWithProgress(result.updateInfo);
-              if (filePath) {
-                await updateService.installUpdate(filePath);
-              }
-            } else if (action === 'skip') {
-              updateService.skipVersion(result.updateInfo.version);
-            }
-          } else if (result.error) {
-            logManager.addLog('warn', `自动检查更新失败: ${result.error}`, 'Main');
-          } else {
-            logManager.addLog('info', '当前已经是最新版本', 'Main');
-          }
-        }
-      } catch (error) {
-        logManager.addLog('error', `自动检查更新异常: ${error}`, 'Main');
-      }
-    }, 5000);
+    // 启动期延迟任务（自动连接 + 自动检查更新）已抽到 startup-tasks.scheduleStartupTasks。
+    scheduleStartupTasks({
+      configManager,
+      coreUpdateService,
+      updateService,
+      logManager,
+      getProxyManager: () => proxyManager,
+      updateTrayMenuState,
+    });
 
     // 订阅自动更新由 SubscriptionScheduler 接管（启动补更 + 周期巡检 + 退避 + 不打断连接），
     // 取代旧的「启动后一次性 setTimeout 拉取」。详见 subscriptionScheduler.start() 调用处。
 
-    // 监听配置变更事件，更新托盘菜单并自动重启代理
-    mainEventEmitter.on(
-      MAIN_EVENTS.CONFIG_CHANGED,
-      async (changedConfig?: { logLevel?: LogLevel }) => {
-        // 0. logLevel 热同步到 LogManager（设置页改日志级别即时生效，无需重启 app；与启动期 setLogLevel 对齐）
-        const lvl =
-          changedConfig?.logLevel ?? (await configManager.loadConfig().catch(() => null))?.logLevel;
-        logManager.setLogLevel(effectiveLogLevel(lvl || 'info', getPrivacyMode()));
-
-        // 1. 更新托盘菜单
-        const isRunning = proxyManager?.getStatus().running ?? false;
-        updateTrayMenuState(isRunning);
-
-        // 2. 如果代理正在运行，应用新配置：仅切节点走 clash_api 热切换（不断流），其余重启（见 switchMode）
-        if (isRunning && proxyManager) {
-          try {
-            // 重新加载配置以确保使用最新值
-            const latestConfig = await configManager.loadConfig();
-            await proxyManager.switchMode(latestConfig);
-            logManager.addLog('info', 'Applied configuration change', 'Main');
-
-            // 应用后再次更新托盘（以防状态有变）
-            updateTrayMenuState(proxyManager.getStatus().running);
-          } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : String(error);
-            logManager.addLog('error', `Failed to apply config change: ${errorMessage}`, 'Main');
-            // 应用失败，更新托盘状态为停止
-            updateTrayMenuState(false, true);
-          }
-        }
-
-        // 3. 同步自动换节点服务状态
-        if (autoSwitchService) {
-          const latestCfg = await configManager.loadConfig().catch(() => null);
-          if (latestCfg?.autoSwitchNode) {
-            autoSwitchService.enable();
-          } else {
-            autoSwitchService.disable();
-          }
-        }
-
-        // 4. 应用「更新检查走代理」总开关（mainSessionViaProxy 切换时热生效；幂等）
-        await applyMainSessionProxy();
-
-        // 5. 内核自动更新开关刚开 → kick 一次即时检查（无需等 6h tick）；未开/未 due 自然跳过，幂等
-        coreUpdateScheduler?.kick();
-      }
-    );
+    // CONFIG_CHANGED 监听器已抽到 config-change-handler.registerConfigChangeListener。
+    registerConfigChangeListener({
+      configManager,
+      logManager,
+      getProxyManager: () => proxyManager,
+      getAutoSwitchService: () => autoSwitchService,
+      getCoreUpdateScheduler: () => coreUpdateScheduler,
+      updateTrayMenuState,
+      applyMainSessionProxy,
+      getPrivacyMode,
+    });
 
     // macOS/Linux 关机/重启早期钩子：powerMonitor 'shutdown'（win32 不发此事件，注销/关机走窗口级
     // 'session-end'，见 createWindow）。同步兜底：停代理 + marker 门控关系统代理（syncCleanupOnExit 内），

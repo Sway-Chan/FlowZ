@@ -216,10 +216,10 @@ describe('CoreUpdateService.runAutoUpdateCycle', () => {
     // 边界打桩：checkUpdate（网络）/ download / extract / preflight / stage / save-state
     jest.spyOn(svc as any, 'checkUpdate').mockResolvedValue(opts.checkResult);
     const downloadSpy = jest
-      .spyOn(svc as any, 'downloadFile')
+      .spyOn((svc as any).coreDownloader, 'downloadFile')
       .mockResolvedValue('/tmp/fake.tar.gz');
     jest
-      .spyOn(svc as any, 'extractCore')
+      .spyOn((svc as any).coreDownloader, 'extractCore')
       .mockResolvedValue({ corePath: '/tmp/x/sing-box', extractDir: '/tmp/x' });
     jest
       .spyOn(svc as any, 'preflightValidate')
@@ -558,12 +558,12 @@ describe('B0：兼容版本带去硬编码 + verifiedCeiling', () => {
     jest.spyOn(svc as any, 'loadAutoState').mockReturnValue(opts.autoState);
     jest.spyOn(svc as any, 'isKnownBad').mockReturnValue(false);
     jest
-      .spyOn(svc as any, 'fetchReleases')
+      .spyOn((svc as any).coreDownloader, 'fetchReleases')
       .mockResolvedValue([
         { tag_name: `v${opts.latest}`, prerelease: false, assets: [{ name: 'x' }] },
       ]);
     jest
-      .spyOn(svc as any, 'findSuitableAsset')
+      .spyOn((svc as any).coreDownloader, 'findSuitableAsset')
       .mockReturnValue({ browser_download_url: `http://x/sing-box-${opts.latest}.tar.gz` });
     return svc;
   }

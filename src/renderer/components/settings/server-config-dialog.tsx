@@ -33,7 +33,7 @@ import { CustomForm } from './custom-form';
 import { WarpPanel } from './warp-panel';
 import { ServerSelectGroups } from './server-select-groups';
 import { FormSection } from './shared/form-layout';
-import { PROTOCOL_OPTIONS } from './shared/protocol-options';
+import { getSortedProtocolOptions } from './shared/protocol-options';
 import { ENDPOINT_PROTOCOLS } from '../../../shared/endpoint-routes';
 import type { ServerConfig, ProtocolType } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
@@ -57,7 +57,7 @@ export function ServerConfigDialog({
   servers = [],
   onSave,
 }: ServerConfigDialogProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [serverName, setServerName] = useState('');
   // 'warp' 是 UI 伪协议（仅新增流的一键 WARP 入口，不进 PROTOCOL_OPTIONS/协议枚举）；选它渲染 WarpPanel，
   // 实际保存的是普通 wireguard 节点。
@@ -200,9 +200,9 @@ export function ServerConfigDialog({
                       {t('servers.warpOption', 'Cloudflare WARP (one-click)')}
                     </SelectItem>
                   )}
-                  {PROTOCOL_OPTIONS.map((p) => (
+                  {getSortedProtocolOptions(t, i18n.language).map((p) => (
                     <SelectItem key={p.value} value={p.value}>
-                      {p.value === 'custom' ? t('servers.protocolCustom', p.label) : p.label}
+                      {p.label}
                     </SelectItem>
                   ))}
                 </SelectContent>

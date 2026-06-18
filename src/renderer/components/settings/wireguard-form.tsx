@@ -1,9 +1,9 @@
 import { useEffect, useState } from 'react';
-import { Loader2 } from 'lucide-react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import * as z from 'zod';
 import { Button } from '@/components/ui/button';
+import { FormButtons } from './shared/form-buttons';
 import {
   Form,
   FormControl,
@@ -317,20 +317,7 @@ export function WireGuardForm({ serverConfig, onSubmit }: WireGuardFormProps) {
           </FieldGrid>
         </FormSection>
 
-        <div className="flex gap-4">
-          <Button type="submit" disabled={form.formState.isSubmitting}>
-            {form.formState.isSubmitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            {t('common.save')}
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => form.reset()}
-            disabled={form.formState.isSubmitting}
-          >
-            {t('common.reset')}
-          </Button>
-        </div>
+        <FormButtons isSubmitting={form.formState.isSubmitting} onReset={() => form.reset()} />
       </form>
     </Form>
   );

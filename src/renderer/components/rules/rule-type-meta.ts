@@ -75,7 +75,7 @@ export const RULE_TYPE_DESC: Record<RuleType, string> = {
   processPath: '进程可执行文件完整路径（区分同名程序）',
   geosite: 'sing-geosite 域名分类库标签（如 youtube）',
   geoip: 'sing-geoip 国家/地区 IP 库标签（如 cn）',
-  ruleSet: '远程规则集 URL 或已下载的本地资源',
+  ruleSet: '已下载的本地规则资源',
 };
 
 /** 每行一条输入的占位示例（i18n key: rules.types.<type>.placeholder）。 */
@@ -92,7 +92,7 @@ export const RULE_TYPE_PLACEHOLDER: Record<RuleType, string> = {
   processPath: '/Applications/Telegram.app/Contents/MacOS/Telegram',
   geosite: 'youtube',
   geoip: 'cn',
-  ruleSet: 'https://example.com/rule.srs',
+  ruleSet: '',
 };
 
 export const PROCESS_TYPES: RuleType[] = ['processName', 'processPath'];

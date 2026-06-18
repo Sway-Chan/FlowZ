@@ -1,8 +1,6 @@
-import { useEffect } from 'react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import * as z from 'zod';
-import { Button } from '@/components/ui/button';
 import {
   Form,
   FormControl,
@@ -20,7 +18,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { Loader2 } from 'lucide-react';
+import { FormButtons } from './shared/form-buttons';
 import { EchField } from './shared/anti-censor-fields';
 import { AddressField, PortField } from './shared/basic-fields';
 import { TlsServerNameField, FingerprintField, AllowInsecureField } from './shared/tls-fields';
@@ -94,12 +92,6 @@ export function AnyTlsForm({ serverConfig, onSubmit }: AnyTlsFormProps) {
     resolver: zodResolver(anyTlsFormSchema),
     defaultValues: getDefaultValues(),
   });
-
-  useEffect(() => {
-    if (serverConfig && serverConfig.protocol?.toLowerCase() === 'anytls') {
-      form.reset(getDefaultValues());
-    }
-  }, [serverConfig]);
 
   const handleSubmit = async (values: AnyTlsFormValues) => {
     const config: any = {
@@ -224,20 +216,7 @@ export function AnyTlsForm({ serverConfig, onSubmit }: AnyTlsFormProps) {
           </FormSection>
         )}
 
-        <div className="flex gap-4">
-          <Button type="submit" disabled={form.formState.isSubmitting}>
-            {form.formState.isSubmitting && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
-            {t('common.save')}
-          </Button>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={() => form.reset()}
-            disabled={form.formState.isSubmitting}
-          >
-            {t('common.reset')}
-          </Button>
-        </div>
+        <FormButtons isSubmitting={form.formState.isSubmitting} onReset={() => form.reset()} />
       </form>
     </Form>
   );

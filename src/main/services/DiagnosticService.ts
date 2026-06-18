@@ -17,6 +17,7 @@ import {
   buildDiagnosticReport,
   redactDeep,
   normalizeKey,
+  collectNodeIdentifiers,
   type DiagnosticReportInput,
 } from '../../shared/diagnostic-redact';
 import { effectiveLogLevel } from '../../shared/log-level';
@@ -141,6 +142,7 @@ export class DiagnosticService {
       redactedSingboxConfig: redactedSingbox,
       appLogTail,
       singboxLogTail,
+      nodeIdentifiers: collectNodeIdentifiers(config),
       hint: wantDeeper
         ? `当前日志级别为 ${effLevel}，未含 DNS 解析等连接详情，但日志中已出现连接/DNS 类错误。建议到 设置 → 高级 → 诊断 开启「诊断采集」，复现问题后再次导出可获得更完整的根因数据。`
         : undefined,
