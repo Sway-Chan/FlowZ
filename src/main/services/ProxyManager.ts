@@ -27,6 +27,7 @@ import { PlatformPrivilegeService } from './PlatformPrivilegeService';
 import { type ISystemProxyManager, SystemProxyBase } from './SystemProxyManager';
 import { type ISystemDnsManager } from './SystemDnsManager';
 import { localProxyPort, controlApiPort } from '../../shared/proxy-ports';
+import { effectiveBypassLan } from '../../shared/system-proxy-bypass';
 import {
   isIpv4Host,
   isIpv6Host,
@@ -558,7 +559,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           '127.0.0.1',
           localProxyPort(config), // mixed-only：HTTP 与 SOCKS 同口（mac 三代理同口、win 仅 http）
           localProxyPort(config),
-          config.systemProxyBypass // 缺省 undefined → SystemProxyManager 取业内默认 bypass 清单
+          // 系统代理「忽略列表」= 绕过局域网完整清单（CIDR+域名），受 bypassLAN 开关管理（单一真值 effectiveBypassLan）。
+          effectiveBypassLan(config)
         );
       } else {
         await this.ensureSystemProxyCleared();

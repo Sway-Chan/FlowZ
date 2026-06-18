@@ -12,7 +12,9 @@ import { RuleDialog } from '@/components/rules/rule-dialog';
 import { DeleteRuleDialog } from '@/components/rules/delete-rule-dialog';
 import { SortableRuleRow } from '@/components/rules/sortable-rule-row';
 import type { Rule } from '@/bridge/types';
-import { ruleConditions } from '../../shared/rules';
+import { ruleConditions, ruleIpCidrs } from '../../shared/rules';
+import { meshForcedRouteCidrs } from '../../shared/endpoint-routes';
+import { cidrOverlapsAny } from '../../shared/ip';
 import { useTranslation, Trans } from 'react-i18next';
 import { toast } from 'sonner';
 import { RULE_TYPE_NAME } from '@/components/rules/rule-type-meta';
@@ -103,6 +105,18 @@ export function RulesPage() {
 
   const servers = config?.servers || [];
   const selectedServer = servers.find((s) => s.id === config?.selectedServerId);
+
+  // 与组网(WG/Tailscale)force-route 段重叠的规则 id（仅 smart）：优先级重排后这些规则覆盖组网路由 → 列内 ⚠ 角标提醒。
+  // 依赖直接挂 config?.servers/customRules（store 引用稳定）而非本地 `|| []`（每 render 新数组会令 memo 失效空转）。
+  const meshOverlapRuleIds = useMemo(() => {
+    const meshCidrs = meshForcedRouteCidrs(config?.servers ?? []);
+    if (!isSmartMode || meshCidrs.length === 0) return new Set<string>();
+    const ids = new Set<string>();
+    for (const r of config?.customRules ?? []) {
+      if (r.enabled && ruleIpCidrs(r).some((c) => cidrOverlapsAny(c, meshCidrs))) ids.add(r.id);
+    }
+    return ids;
+  }, [isSmartMode, config?.servers, config?.customRules]);
 
   // ── 排序编辑态 ──────────────────────────────────────────────────────────
   const enterOrderEdit = () => {
@@ -243,7 +257,9 @@ export function RulesPage() {
           <div className="flex items-start justify-between gap-2">
             <div>
               <CardTitle>{t('rules.ruleList')}</CardTitle>
-              <CardDescription>{t('rules.ruleListDesc')}</CardDescription>
+              <CardDescription className="mt-1.5 leading-relaxed">
+                {t('rules.ruleListDesc')}
+              </CardDescription>
             </div>
             {/* 排序编辑工具栏（≥2 条才显示） */}
             {customRules.length >= 2 &&
@@ -347,6 +363,7 @@ export function RulesPage() {
                         onMoveToEdge={moveDraftToEdge}
                         renderExitNode={renderExitNode}
                         hasMissingResource={missingResRuleIds.has(rule.id)}
+                        hasMeshOverlap={meshOverlapRuleIds.has(rule.id)}
                       />
                     ))}
                   </SortableContext>
@@ -362,10 +379,15 @@ export function RulesPage() {
           <CardTitle>{t('rules.ruleInstructions')}</CardTitle>
         </CardHeader>
         <CardContent className="space-y-2 text-sm text-muted-foreground">
+          <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 font-medium text-amber-700 dark:text-amber-400">
+            {t(
+              'rules.priorityFlow',
+              '优先级（从高到低）：自定义规则 → 应用分流 → 组网(WG/Tailscale) → 绕过局域网 → 智能分流 → 默认出口。靠前先匹配，你的自定义规则最高。'
+            )}
+          </p>
           <p>{t('rules.instruction1')}</p>
           <p>{t('rules.instruction2')}</p>
           <p>{t('rules.instruction3')}</p>
-          <p>{t('rules.instruction4')}</p>
           <p>{t('rules.instruction5')}</p>
           <p>
             <Trans i18nKey="rules.instruction6" components={{ strong: <strong /> }} />

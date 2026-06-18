@@ -8,7 +8,7 @@
  * 默认 bypass 清单（业内聚合清单，含私网/保留段 + Apple 连通性 + 国内会被代理打断的 App/网银）。
  * 用户可在设置里编辑（逗号分隔）；缺省取此。注：非 ClashX 出厂 9 条原版，是社区聚合的「业内」广覆盖清单。
  */
-export const DEFAULT_SYSTEM_PROXY_BYPASS: readonly string[] = [
+export const DEFAULT_BYPASS_LAN: readonly string[] = [
   // 私网 / 保留 / 特殊用途网段
   '10.0.0.0/8',
   '100.64.0.0/10', // CGNAT / 运营商 NAT（亦 Tailscale tailnet 段）
@@ -42,29 +42,48 @@ export const DEFAULT_SYSTEM_PROXY_BYPASS: readonly string[] = [
   'mobile-bank.psbc.com',
 ];
 
-/** 解析用户输入（逗号/分号/换行分隔）→ 去空白去重的条目数组。 */
-export function parseBypassList(input: string): string[] {
-  return Array.from(
-    new Set(
-      input
-        .split(/[,;\n\r]+/)
-        .map((s) => s.trim())
-        .filter(Boolean)
-    )
-  );
-}
-
-/** 取生效 bypass 清单：用户已设则用其（解析/去重后），否则默认清单。 */
-export function effectiveBypassList(userList: string[] | undefined): string[] {
-  if (userList && userList.length) {
-    return Array.from(new Set(userList.map((s) => s.trim()).filter(Boolean)));
-  }
-  return [...DEFAULT_SYSTEM_PROXY_BYPASS];
+/**
+ * 「绕过局域网」生效清单（单一真值）：开关关 → []（不绕过，全走代理）；开 → 用户清单，缺省取 DEFAULT_BYPASS_LAN。
+ * 系统代理忽略列表 / TUN route 私网直连 / Windows TUN 排除三处共用，杜绝「开关语义 + 缺省」在多文件各写一遍。
+ */
+export function effectiveBypassLan(config: {
+  bypassLAN?: boolean;
+  bypassLANList?: string[];
+}): string[] {
+  if (config.bypassLAN === false) return [];
+  return config.bypassLANList ?? [...DEFAULT_BYPASS_LAN];
 }
 
 /** 是否 IPv4 CIDR 字面量（用于 Windows 通配转换；v6/域名不在此列）。 */
 export function isIpv4Cidr(s: string): boolean {
   return /^(?:\d{1,3}\.){3}\d{1,3}\/\d{1,2}$/.test(s.trim());
+}
+
+/**
+ * 是否 IPv6 CIDR 字面量（粗判形状：仅十六进制组+冒号的地址 + /0-128 前缀）。足够把 fc00::/7 / fe80::/10 / ::1/128
+ * 这类合法段与域名/URL(如 http://a:b/c)区分开，避免用裸 `includes(':')&&includes('/')` 误纳脏输入。
+ */
+export function isIpv6Cidr(s: string): boolean {
+  const t = s.trim();
+  const slash = t.indexOf('/');
+  if (slash < 0) return false;
+  const addr = t.slice(0, slash);
+  const prefix = t.slice(slash + 1);
+  if (!/^\d{1,3}$/.test(prefix) || Number(prefix) > 128) return false;
+  return addr.includes(':') && /^[0-9a-fA-F:]+$/.test(addr);
+}
+
+/** 是否 IP CIDR 字面量（v4 或 v6）。CIDR 形状判定的单一真值，供 bypassLanCidrs / Windows 格式化等共用。 */
+export function isIpCidr(s: string): boolean {
+  return isIpv4Cidr(s) || isIpv6Cidr(s);
+}
+
+/**
+ * 从「绕过局域网」完整清单中筛出 IP CIDR 条目（v4/v6），滤掉域名/通配/localhost。
+ * TUN 模式 route 私网直连 + Windows TUN route_exclude_address 只能用 IP 段（域名在系统代理模式由 OS 忽略列表处理）。
+ */
+export function bypassLanCidrs(list: readonly string[]): string[] {
+  return list.map((s) => s.trim()).filter(isIpCidr);
 }
 
 /**
@@ -113,7 +132,7 @@ export function formatBypassForWindows(list: string[]): string {
     if (!t) continue;
     if (isIpv4Cidr(t)) {
       out.push(...ipv4CidrToWindowsPatterns(t));
-    } else if (t.includes(':') && t.includes('/')) {
+    } else if (isIpv6Cidr(t)) {
       continue; // IPv6 CIDR：Windows 代理例外跳过
     } else {
       out.push(t); // 域名 / *.x / localhost / 纯 IP

@@ -124,6 +124,75 @@ describe('generateRouteConfig：global 不 emit 用户分流（端到端）', ()
   });
 });
 
+describe('优先级重排 + mesh 重叠提醒', () => {
+  const idMap = new Map([['s1', 'proxy-s1']]);
+  const wgServer = {
+    id: 'wg1',
+    name: 'WG',
+    protocol: 'wireguard',
+    address: 'wg.example.com',
+    port: 51820,
+    wireguardSettings: {
+      privateKey: 'a',
+      peerPublicKey: 'b',
+      localAddress: ['10.0.0.2/32'],
+      allowedIPs: ['192.168.50.0/24'],
+    },
+  };
+  const vlessServer = { id: 's1', name: 'N1', protocol: 'vless', address: '1.2.3.4', port: 443 };
+
+  it('reorder：自定义规则优先于 bypassLAN（custom ip_cidr 排在私网直连之前）', () => {
+    const cfg = {
+      ...makeConfig('smart'),
+      customRules: [
+        { id: 'c1', type: 'ipCidr', values: ['8.8.8.0/24'], action: 'proxy', enabled: true },
+      ],
+      bypassLAN: true,
+    } as unknown as UserConfig;
+    const rules = (buildRouteConfig(cfg, idMap, routeDeps()).rules || []) as any[];
+    const customIdx = rules.findIndex(
+      (r) => Array.isArray(r.ip_cidr) && r.ip_cidr.includes('8.8.8.0/24')
+    );
+    const bypassIdx = rules.findIndex(
+      (r) =>
+        r.outbound === 'direct' &&
+        Array.isArray(r.ip_cidr) &&
+        r.ip_cidr.some((c: string) => c.startsWith('192.168.'))
+    );
+    expect(customIdx).toBeGreaterThanOrEqual(0);
+    expect(bypassIdx).toBeGreaterThanOrEqual(0);
+    expect(customIdx).toBeLessThan(bypassIdx); // 用户规则优先级高于 bypassLAN（reorder）
+  });
+
+  it('mesh 重叠：自定义 ip_cidr 与组网(WG)段重叠 → 记 warn（非阻断）', () => {
+    const logs: Array<[string, string]> = [];
+    const deps = { ...routeDeps(), log: (lvl: any, msg: string) => logs.push([lvl, msg]) };
+    const cfg = {
+      ...makeConfig('smart'),
+      servers: [vlessServer, wgServer],
+      customRules: [
+        { id: 'c1', type: 'ipCidr', values: ['192.168.50.128/25'], action: 'proxy', enabled: true },
+      ],
+    } as unknown as UserConfig;
+    buildRouteConfig(cfg, idMap, deps);
+    expect(logs.some(([lvl, msg]) => lvl === 'warn' && msg.includes('组网'))).toBe(true);
+  });
+
+  it('mesh 不重叠（172.16 vs 组网 192.168.50）→ 不 warn', () => {
+    const logs: Array<[string, string]> = [];
+    const deps = { ...routeDeps(), log: (lvl: any, msg: string) => logs.push([lvl, msg]) };
+    const cfg = {
+      ...makeConfig('smart'),
+      servers: [vlessServer, wgServer],
+      customRules: [
+        { id: 'c1', type: 'ipCidr', values: ['172.16.0.0/24'], action: 'proxy', enabled: true },
+      ],
+    } as unknown as UserConfig;
+    buildRouteConfig(cfg, idMap, deps);
+    expect(logs.some(([lvl, msg]) => lvl === 'warn' && msg.includes('组网'))).toBe(false);
+  });
+});
+
 describe('configGenerationNorm：global 下用户路由变更不翻转 norm（免无谓重启）', () => {
   const svc = makeSvc();
   const addRule = (cfg: UserConfig): UserConfig =>

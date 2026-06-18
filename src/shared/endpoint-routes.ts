@@ -36,3 +36,11 @@ export function endpointForcedRouteCidrs(server: ServerConfig): string[] {
   }
   return Array.from(new Set(raw.map((c) => c.trim()).filter(Boolean)));
 }
+
+/**
+ * 全部节点的 mesh force-route 段并集（去重）。供「路由规则与组网段重叠」提醒共用：
+ * main 的 config-gen warn + renderer 的内联 hint/列表角标。用全量 servers（非仅 emitted）以覆盖潜在重叠。
+ */
+export function meshForcedRouteCidrs(servers: ServerConfig[]): string[] {
+  return Array.from(new Set(servers.flatMap((s) => endpointForcedRouteCidrs(s))));
+}

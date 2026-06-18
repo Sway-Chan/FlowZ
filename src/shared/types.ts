@@ -363,11 +363,12 @@ export interface UserConfig {
   // 任意进程占用时，FlowZ 据此改 external_controller 端口，避免 clash_api 无法 bind 的死局。统一经 shared/proxy-ports#controlApiPort 取用。
   controlPort?: number;
   allowLan?: boolean; // 局域网共享代理（允许其他设备连接）
-  bypassLAN?: boolean; // 绕过局域网（将内网 IP 设置为直连）
-  // 系统代理「忽略代理列表」(OS proxy 例外)。仅系统代理模式生效（TUN 直连走 sing-box route）。
-  // 缺省/空 → 取 shared/system-proxy-bypass#DEFAULT_SYSTEM_PROXY_BYPASS（业内聚合清单）；用户可在设置里逗号分隔编辑。
-  // mac networksetup 原样下发 CIDR+域名；win 转通配；linux gsettings ignore-hosts。详见 shared/system-proxy-bypass。
-  systemProxyBypass?: string[];
+  bypassLAN?: boolean; // 绕过局域网总开关（关 → 不绕过，内网/清单内目标也走代理）
+  // 绕过局域网完整清单（用户可编辑，含 CIDR + 域名）：undefined=用 DEFAULT_BYPASS_LAN（字节不变）；已编辑存全量。
+  // 受 bypassLAN 开关管理。双消费：① TUN 模式 route 私网直连 + Windows TUN 排除只取其 CIDR（bypassLanCidrs，
+  // mac/Linux 走 route 规则规避 NetworkExtension HANG）；② 系统代理模式整份（CIDR+域名）写入 OS 忽略列表。
+  // 原 systemProxyBypass 已并入此字段（单一清单，杜绝两处重复）。
+  bypassLANList?: string[];
   blockQuic?: boolean; // 阻止 QUIC（对代理向 UDP 443 执行 reject，逼浏览器回退 TCP）；默认关；节点无关，对所有协议一视同仁
   tlsFragment?: boolean; // 全局 TLS 分片：对所有 TLS 节点切分 ClientHello 抗 SNI-DPI；默认关
   // 节点测速端点 URL（经各节点代理 GET 量 TTFB）。默认 generate_204（见 shared/speed-test）；用户可自配，兼容 http/https。
@@ -375,6 +376,9 @@ export interface UserConfig {
   speedTestUrl?: string;
   // fake-ip-filter 默认清单（NTP/STUN/Captive 等在 FakeIP 下会坏的域名 → 真实解析）。默认开（undefined/true=开），仅 false=关。
   fakeIpFilter?: boolean;
+  // FakeIP 例外域名清单（用户可编辑）：undefined=用内置默认（DEFAULT_FAKEIP_FILTER_DOMAINS，与历史字节一致）；
+  // 已编辑则存全量。仅 fakeIpFilter 开时生效。内置 captive 域名仍走内网解析器，其余走 dns-domestic（见 singbox-dns-builder）。
+  fakeIpFilterList?: string[];
   // 核心更新：仅在配置生成器已验证的 sing-box minor 版本带内自动更新（默认 true）。关闭后允许自动
   // 更新跨越 minor（如 1.13→1.14），但跨 minor 的 schema 变更可能导致配置不兼容、需手动处理。
   restrictCoreUpdateToCompatibleMinor?: boolean;

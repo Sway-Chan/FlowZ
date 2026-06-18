@@ -13,10 +13,10 @@ import type { SingBoxInbound } from './singbox-config-types';
 import {
   isIpv4Host,
   isIpv6Host,
-  PRIVATE_IP_CIDRS,
   effectiveAppRules,
   getCustomDomesticDnsEndpoint,
 } from './singbox-config-helpers';
+import { bypassLanCidrs, effectiveBypassLan } from '../../shared/system-proxy-bypass';
 
 /** 注入依赖：generateInbounds 原读的实例态。 */
 export interface InboundsDeps {
@@ -94,7 +94,7 @@ export function buildInbounds(
     // 但是在 Windows 下，Wintun 如果不排除局域网物理网关，发往本地路由器的 DHCP/网关查询会被死循环拦截，导致全局断网。
     const excludeAddr =
       process.platform === 'win32' && shouldBypassLAN
-        ? [...PRIVATE_IP_CIDRS]
+        ? bypassLanCidrs(effectiveBypassLan(config))
         : ['127.0.0.0/8', '::1/128'];
     // 【已知限制 / Windows 真机待验】Windows+bypassLAN 下这里用宽私网段(10/8、192.168/16 等)整体排除出 TUN，
     // 会顺带把落在私网段内的 endpoint(WG/Tailscale) force-route 段(如 mesh 192.168.50.0/24)也排除 → 该段到不了

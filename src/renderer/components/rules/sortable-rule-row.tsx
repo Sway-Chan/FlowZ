@@ -37,6 +37,8 @@ interface SortableRuleRowProps {
   renderExitNode: (rule: Rule) => ReactNode;
   /** 该规则引用的规则资源本地缺失（已删除 / 文件丢失）→ 运行期被 fail-closed 跳过，列内标「资源缺失」角标。 */
   hasMissingResource?: boolean;
+  /** 该规则 ip_cidr 与组网(WG/Tailscale)force-route 段重叠 → 优先级更高会覆盖组网路由，列内标「覆盖组网」警示角标（非阻断）。 */
+  hasMeshOverlap?: boolean;
 }
 
 /** 规则详情悬浮卡内容：多条件头(AND/OR) + 逐条件(类型 badge + 值) + 策略。备注列与类型列共用。 */
@@ -109,6 +111,7 @@ export function SortableRuleRow({
   onMoveToEdge,
   renderExitNode,
   hasMissingResource,
+  hasMeshOverlap,
 }: SortableRuleRowProps) {
   const { t } = useTranslation();
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({
@@ -184,6 +187,20 @@ export function SortableRuleRow({
             >
               <AlertTriangle className="h-3 w-3" />
               {t('rules.resourceMissing', '资源缺失')}
+            </Badge>
+          )}
+          {/* 覆盖组网角标：本规则 ip_cidr 与组网(WG/Tailscale)路由段重叠，优先级更高会覆盖组网路由（非阻断，按需调整）。 */}
+          {hasMeshOverlap && (
+            <Badge
+              variant="outline"
+              className="shrink-0 gap-1 whitespace-nowrap border-transparent bg-amber-500/15 text-xs text-amber-600 dark:text-amber-400"
+              title={t(
+                'rules.meshOverlapTip',
+                '该规则网段与组网(WG/Tailscale)路由段重叠，优先级更高将覆盖组网路由，该段可能不走组网节点。如非有意请调整。'
+              )}
+            >
+              <AlertTriangle className="h-3 w-3" />
+              {t('rules.meshOverlap', '覆盖组网')}
             </Badge>
           )}
         </div>

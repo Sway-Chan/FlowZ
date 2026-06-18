@@ -1,7 +1,7 @@
 /**
  * buildInbounds 单测 —— 原 ProxyManager.generateInbounds 无单测（仅 config-snapshot 集成锁字节）。
  * 锁：mixed inbound（listenAddr/端口/legacy sniff）/ probe inbound 注入 / TUN inbound（平台排除段/MTU/stack/
- * IPv6/macOS http_proxy platform）/ allowLan。依赖（PRIVATE_IP_CIDRS 等）均为 config-helpers 纯函数。
+ * IPv6/macOS http_proxy platform）/ allowLan。Windows bypassLAN 排除段取 bypassLanCidrs(DEFAULT_BYPASS_LAN)。
  */
 jest.mock('electron', () => ({
   app: { getPath: () => '/fake/userData', getAppPath: () => '/fake/app', isPackaged: false },

@@ -20,20 +20,17 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
-import { Textarea } from '@/components/ui/textarea';
 import { useAppStore } from '@/store/app-store';
 import { parseDnsServerSpec } from '@shared/dns';
 import { controlApiPort } from '@shared/proxy-ports';
-import {
-  DEFAULT_SYSTEM_PROXY_BYPASS,
-  parseBypassList,
-  effectiveBypassList,
-} from '@shared/system-proxy-bypass';
+import { DEFAULT_BYPASS_LAN } from '@shared/system-proxy-bypass';
 import { parseSpeedTestUrl, DEFAULT_SPEED_TEST_URL } from '@shared/speed-test';
 import { toast } from 'sonner';
 import { useTranslation } from 'react-i18next';
 import { SettingsRow } from './settings-row';
 import { SettingsCollapsible } from './settings-collapsible';
+import { ExceptionList } from './exception-list';
+import { DEFAULT_FAKEIP_FILTER_DOMAINS } from '../../../shared/fakeip-filter';
 import { HelperManagementCard } from './helper-management-card';
 import { ExternalControlSection } from './external-control-section';
 import { TerminalProxySection } from './terminal-proxy-section';
@@ -64,7 +61,6 @@ export function NetworkSettings() {
   const [controlPort, setControlPort] = useState(controlApiPort(config ?? {}).toString());
   // TUN 模式下 FakeIP ON→OFF 一次性风险确认弹窗开关（机场拒纯 IP 不可预判、无法客户端缓解）。
   const [fakeIpOffConfirmOpen, setFakeIpOffConfirmOpen] = useState(false);
-  // 绕过局域网 · 排除段（每行一个 CIDR）：onBlur 提交（避免逐键触发代理重启），外部变更时 resync。
   const [subInterval, setSubInterval] = useState(
     config?.subscriptionUpdateIntervalHours?.toString() || '12'
   );
@@ -75,10 +71,6 @@ export function NetworkSettings() {
     config?.dnsConfig?.foreignDns || DNS_DEFAULTS.foreignDns
   );
   const [speedTestUrl, setSpeedTestUrl] = useState(config?.speedTestUrl || DEFAULT_SPEED_TEST_URL);
-  // 系统代理「跳过代理」清单（逗号分隔文本编辑；缺省取业内默认清单）。
-  const [bypassText, setBypassText] = useState(
-    effectiveBypassList(config?.systemProxyBypass).join(', ')
-  );
 
   // F26：config 异步到达 / 挂载期间被外部替换（托盘改配置、备份恢复、规则 CRUD 后 loadConfig）时，
   // 回填「未被用户改动」的字段；dirty 守卫（本地值 ≠ 上次种子）避免打断正在输入的用户。
@@ -89,7 +81,6 @@ export function NetworkSettings() {
     domesticDns: string;
     foreignDns: string;
     speedTestUrl: string;
-    bypassText: string;
   } | null>(null);
   useEffect(() => {
     if (!config) return;
@@ -100,7 +91,6 @@ export function NetworkSettings() {
       domesticDns: config.dnsConfig?.domesticDns || DNS_DEFAULTS.domesticDns,
       foreignDns: config.dnsConfig?.foreignDns || DNS_DEFAULTS.foreignDns,
       speedTestUrl: config.speedTestUrl || DEFAULT_SPEED_TEST_URL,
-      bypassText: effectiveBypassList(config.systemProxyBypass).join(', '),
     };
     const prev = seededRef.current;
     setLocalPort((cur) => (prev && cur !== prev.localPort ? cur : snap.localPort));
@@ -109,7 +99,6 @@ export function NetworkSettings() {
     setDomesticDns((cur) => (prev && cur !== prev.domesticDns ? cur : snap.domesticDns));
     setForeignDns((cur) => (prev && cur !== prev.foreignDns ? cur : snap.foreignDns));
     setSpeedTestUrl((cur) => (prev && cur !== prev.speedTestUrl ? cur : snap.speedTestUrl));
-    setBypassText((cur) => (prev && cur !== prev.bypassText ? cur : snap.bypassText));
     seededRef.current = snap;
   }, [
     config?.mixedPort,
@@ -119,7 +108,6 @@ export function NetworkSettings() {
     config?.dnsConfig?.domesticDns,
     config?.dnsConfig?.foreignDns,
     config?.speedTestUrl,
-    config?.systemProxyBypass,
   ]);
 
   if (!config) return null;
@@ -127,22 +115,6 @@ export function NetworkSettings() {
   // 切换布尔配置项（整体回写，保留其余字段）
   const setBool = (key: keyof typeof config, value: boolean) =>
     saveConfig({ ...config, [key]: value }).catch(() => toast.error(t('common.saveFailed')));
-
-  // 系统代理「跳过代理」清单：失焦提交（解析逗号分隔→去重→存 config.systemProxyBypass）。
-  const commitBypass = () => {
-    const parsed = parseBypassList(bypassText);
-    setBypassText(parsed.join(', '));
-    saveConfig({ ...config, systemProxyBypass: parsed }).catch(() =>
-      toast.error(t('common.saveFailed'))
-    );
-  };
-  const resetBypass = () => {
-    const def = [...DEFAULT_SYSTEM_PROXY_BYPASS];
-    setBypassText(def.join(', '));
-    saveConfig({ ...config, systemProxyBypass: def }).catch(() =>
-      toast.error(t('common.saveFailed'))
-    );
-  };
 
   const updateDns = (patch: Partial<NonNullable<typeof config.dnsConfig>>) => {
     const updated = { ...config };
@@ -330,18 +302,36 @@ export function NetworkSettings() {
             </AlertDialogContent>
           </AlertDialog>
           <SettingsCollapsible label={t('settings.network.advancedDns', '高级 DNS')} defaultOpen>
-            <SettingsRow
-              label={t('settings.advanced.fakeIpFilter', 'fake-ip-filter 默认清单')}
-              description={t(
-                'settings.advanced.fakeIpFilterDesc',
-                'NTP / STUN / 连通性探测等域名走真实 DNS 解析、绕过 FakeIP（避免校时失败、系统误判断网 / 锁屏登录卡死）。建议开启。'
+            <div>
+              <SettingsRow
+                label={t('settings.advanced.fakeIpFilter', 'FakeIP 例外域名')}
+                description={t(
+                  'settings.advanced.fakeIpFilterDesc',
+                  '这些域名走真实 DNS、不用假 IP（校时、连通性探测、锁屏登录用假 IP 会失败）。建议开启。'
+                )}
+              >
+                <Switch
+                  checked={config.fakeIpFilter !== false}
+                  onCheckedChange={(c) => setBool('fakeIpFilter', c)}
+                />
+              </SettingsRow>
+              {config.fakeIpFilter !== false && (
+                <ExceptionList
+                  value={config.fakeIpFilterList}
+                  defaults={DEFAULT_FAKEIP_FILTER_DOMAINS}
+                  onChange={(v) =>
+                    saveConfig({ ...config, fakeIpFilterList: v }).catch(() =>
+                      toast.error(t('common.saveFailed'))
+                    )
+                  }
+                  placeholder={'每行一个域名，例如：\ntime.example.com\nstun.example.com'}
+                  hint={t(
+                    'settings.advanced.fakeIpFilterEditHint',
+                    '每行一个域名；可增删，恢复默认回到内置清单。'
+                  )}
+                />
               )}
-            >
-              <Switch
-                checked={config.fakeIpFilter !== false}
-                onCheckedChange={(c) => setBool('fakeIpFilter', c)}
-              />
-            </SettingsRow>
+            </div>
             <SettingsRow
               label={t('settings.advanced.nodeDomainResolver')}
               description={t('settings.advanced.nodeDomainResolverDesc')}
@@ -411,51 +401,50 @@ export function NetworkSettings() {
           >
             {numInput(controlPort, setControlPort, 'w-[120px]', commitControlPort)}
           </SettingsRow>
-          <SettingsRow
-            label={t('settings.advanced.allowLan')}
-            description={t('settings.advanced.allowLanDesc')}
-          >
-            <Switch
-              checked={config.allowLan === true}
-              onCheckedChange={(c) => setBool('allowLan', c)}
-            />
-          </SettingsRow>
-          {config.allowLan && (
-            <p className="py-2 text-xs font-medium text-warning">
-              {t('settings.advanced.allowLanGatewayTip')}
-            </p>
-          )}
-          <SettingsRow
-            label={t('settings.advanced.bypassLAN')}
-            description={t('settings.advanced.bypassLANDesc')}
-          >
-            <Switch
-              checked={config.bypassLAN !== false}
-              onCheckedChange={(c) => setBool('bypassLAN', c)}
-            />
-          </SettingsRow>
-          <SettingsRow
-            stacked
-            label={t('settings.advanced.systemProxyBypass', '跳过代理（系统代理）')}
-            description={t(
-              'settings.advanced.systemProxyBypassDesc',
-              '仅系统代理模式生效：这些地址/域名直连、不走代理（逗号分隔，支持 CIDR 与域名）。TUN 模式直连由路由规则负责。'
+          <div>
+            <SettingsRow
+              label={t('settings.advanced.allowLan')}
+              description={t('settings.advanced.allowLanDesc')}
+            >
+              <Switch
+                checked={config.allowLan === true}
+                onCheckedChange={(c) => setBool('allowLan', c)}
+              />
+            </SettingsRow>
+            {config.allowLan && (
+              <p className="pb-2 text-xs font-medium text-warning">
+                {t('settings.advanced.allowLanGatewayTip')}
+              </p>
             )}
-          >
-            <Textarea
-              value={bypassText}
-              onChange={(e) => setBypassText(e.target.value)}
-              onBlur={commitBypass}
-              rows={6}
-              spellCheck={false}
-              className="w-full font-mono text-xs"
-            />
-            <div className="flex justify-end">
-              <Button size="sm" onClick={resetBypass}>
-                {t('settings.advanced.systemProxyBypassReset', '恢复默认')}
-              </Button>
-            </div>
-          </SettingsRow>
+          </div>
+          <div>
+            <SettingsRow
+              label={t('settings.advanced.bypassLAN')}
+              description={t('settings.advanced.bypassLANDesc')}
+            >
+              <Switch
+                checked={config.bypassLAN !== false}
+                onCheckedChange={(c) => setBool('bypassLAN', c)}
+              />
+            </SettingsRow>
+            {config.bypassLAN !== false && (
+              <ExceptionList
+                value={config.bypassLANList}
+                defaults={DEFAULT_BYPASS_LAN}
+                onChange={(v) =>
+                  saveConfig({ ...config, bypassLANList: v }).catch(() =>
+                    toast.error(t('common.saveFailed'))
+                  )
+                }
+                placeholder={'每行一个 IP 段，例如：\n192.168.0.0/16\n10.0.0.0/8'}
+                hint={t(
+                  'settings.advanced.bypassLANEditHint',
+                  '路由规则优先级高于此：需让某段走代理，可以从列表删除或者去「路由规则」加自定义规则即可覆盖。'
+                )}
+                hintTone="warning"
+              />
+            )}
+          </div>
         </CardContent>
       </Card>
 
