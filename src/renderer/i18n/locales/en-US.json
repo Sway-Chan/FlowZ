@@ -52,7 +52,8 @@
     "copyFail": "Copy failed",
     "loading": "Loading...",
     "saveFailed": "Save failed",
-    "configLoadFail": "Failed to load config"
+    "configLoadFail": "Failed to load config",
+    "restoreDefault": "Restore defaults"
   },
   "sidebar": {
     "home": "Home",
@@ -63,7 +64,10 @@
     "ruleResources": "Rule Resources",
     "rules": "Rules",
     "settings": "Settings",
-    "group": { "routing": "Routing", "diagnostics": "Diagnostics" }
+    "group": {
+      "routing": "Routing",
+      "diagnostics": "Diagnostics"
+    }
   },
   "logs": {
     "pageTitle": "Live Logs",
@@ -456,12 +460,12 @@
       "foreignDnsDesc": "Used to resolve foreign domains, prevents DNS poisoning (sent through proxy)",
       "dnsInvalid": "Unrecognized DNS address (supports https:// DoH, tls:// DoT, udp:// or IP); not saved, please correct",
       "enableFakeIp": "Enable FakeIP",
-      "fakeIpDesc": "On: nodes receive domains, faster first connection, recommended for TUN mode. Off: nodes receive real IPs; some airports with strict anti-abuse may refuse connections, and overseas first-connection latency increases",
+      "fakeIpDesc": "On: nodes receive domains, faster first connect, recommended for TUN. Off: nodes receive real IPs; some strict airports may refuse, overseas first connect is slower.",
       "fakeIpTunOffConfirmTitle": "Disable FakeIP?",
       "fakeIpTunOffConfirmDesc": "In TUN mode, after disabling, proxy nodes will receive real IPs instead of domains. Some airports with strict anti-abuse policies may refuse the connection (invalid certificate or block page), and this risk cannot be mitigated by the client. Overseas first-connection latency will also increase. Disable anyway?",
       "fakeIpTunOffConfirmOk": "Disable anyway",
-      "fakeIpFilter": "Default fake-ip-filter list",
-      "fakeIpFilterDesc": "NTP / STUN / connectivity-check domains use real DNS resolution and bypass FakeIP (prevents clock sync failure, false network-down detection, and lock-screen login hangs). Recommended on.",
+      "fakeIpFilter": "FakeIP exception domains",
+      "fakeIpFilterDesc": "These domains use real DNS instead of a fake IP (clock sync, connectivity checks and lock-screen login break with fake IPs). Recommended on.",
       "nodeDomainResolver": "Node domain resolver",
       "nodeDomainResolverDesc": "DNS used to resolve proxy node domains. Defaults to AliDNS; if node domains (e.g. Argo / trycloudflare) fail to resolve (SERVFAIL), switch to DNSPod or System DNS to recover",
       "nodeResolverAuto": "AliDNS (default)",
@@ -469,7 +473,7 @@
       "nodeResolverSystem": "System DNS",
       "nodeResolverExperimental": "experimental",
       "takeoverSystemDns": "Take over system DNS in TUN",
-      "takeoverSystemDnsDesc": "In TUN mode, temporarily set system DNS to 8.8.8.8 so proxied domains resolve correctly through the tunnel (auto-restored on stop/exit). When off, your original DNS is kept (friendlier for internal/LAN domains) but some proxied domains may resolve incorrectly. Recommended on.",
+      "takeoverSystemDnsDesc": "In TUN, temporarily set system DNS to 8.8.8.8 so proxied domains resolve through the tunnel (auto-restored on stop). Off is friendlier for internal domains but some proxied domains may resolve wrong. Recommended on.",
       "mainSessionViaProxy": "Update checks via proxy",
       "mainSessionViaProxyDesc": "When on, app/core update checks and rule-resource downloads go through the proxy while it runs (update sources are mostly on GitHub); when off, they go direct / via system proxy. Note: under TUN mode, OS-level capture means off cannot fully bypass the proxy.",
       "localProxyLan": "Local proxy & LAN",
@@ -481,13 +485,10 @@
       "portClashWithControl": "Local port can't equal the control port; change one of them",
       "default": "Default",
       "allowLan": "Allow LAN Traffic",
-      "allowLanDesc": "When enabled, the proxy port listens on 0.0.0.0, allowing other devices on the same local network to connect and access the internet.",
-      "allowLanGatewayTip": "When used as a gateway (other devices set this computer as Gateway/DNS), please ensure TUN mode is enabled. This will automatically enable system IP forwarding and listen on port 53 for DNS services.",
+      "allowLanDesc": "Proxy port listens on 0.0.0.0 so other devices on your LAN can connect through this machine.",
+      "allowLanGatewayTip": "Using this machine as a gateway (other devices set it as Gateway + DNS) requires TUN mode: it auto-enables IP forwarding and serves DNS on port 53.",
       "bypassLAN": "Bypass LAN",
-      "bypassLANDesc": "Force requests destined for the local network to bypass the proxy (disable to allow proxying for 192.168.x etc.)",
-      "systemProxyBypass": "Bypass list (system proxy)",
-      "systemProxyBypassDesc": "System-proxy mode only: these addresses/domains go direct, not through the proxy (comma-separated; CIDR and domains supported). Written to the OS ignore-list on enable, restored on disable. In TUN mode, direct routing is handled by route rules.",
-      "systemProxyBypassReset": "Reset to default",
+      "bypassLANDesc": "Ranges/domains in the list go direct, not through the proxy. Turn off to let them use the proxy.",
       "blockQuic": "Block QUIC (UDP/443, nudge browsers to TCP)",
       "blockQuicDesc": "Reject proxy-bound QUIC (UDP 443) so browsers fall back to TCP. Fixes pages stalling when a node's UDP relay is unreliable. Off by default; applies to all nodes.",
       "interruptOnSwitch": "Interrupt existing connections on switch",
@@ -573,7 +574,9 @@
       },
       "autoSwitchNode": "Auto-Switch Node on Failure",
       "autoSwitchNodeDesc": "Automatically switch to an available node if the current proxy connection fails",
-      "subIntervalRange": "Update interval must be 1–168 hours"
+      "subIntervalRange": "Update interval must be 1–168 hours",
+      "fakeIpFilterEditHint": "One domain per line; add or remove, restore defaults to reset.",
+      "bypassLANEditHint": "Route rules outrank this: to proxy a range, remove it from the list or add a custom rule on the Rules page to override."
     },
     "about": {
       "title": "About",
@@ -1037,6 +1040,10 @@
     "targetMissingTip": "The selected node was deleted; at runtime it falls back to following the global selected node.",
     "resourceMissing": "Resource missing",
     "resourceMissingTip": "This rule references a rule resource that is missing (deleted or file lost); it is currently inactive. Re-download it on the Rule Resources page to restore.",
+    "meshOverlap": "Overrides mesh",
+    "meshOverlapTip": "This rule's CIDR overlaps a mesh (WireGuard/Tailscale) route segment; with higher priority it overrides the mesh route, so that segment may not go through the mesh node. Adjust if unintended.",
+    "meshOverlapHint": "CIDR {{values}} overlaps a mesh (WireGuard/Tailscale) route segment: this rule has higher priority and will override the mesh route, so that segment may not go through the mesh node. Adjust if unintended.",
+    "priorityFlow": "Priority (high to low): custom rules → app routing → mesh (WireGuard/Tailscale) → bypass LAN → smart routing → default. Earlier matches first; your custom rules rank highest.",
     "appGeoMissingTip": "This app references a routing rule-set that is missing (deleted or file lost); only process-name matching is active. Re-download it on the Rule Resources page to restore.",
     "editOrder": "Edit order",
     "saveOrder": "Save order",
@@ -1067,7 +1074,7 @@
     "customRules": "Custom Rules",
     "customRulesDesc": "Manage domain, IP/port, process and rule-set routing rules",
     "ruleList": "Rule List",
-    "ruleListDesc": "Matched top-to-bottom, first match wins; custom rules take precedence over app policy and smart routing. Custom rules and app policy apply only in Smart mode (Global routes all traffic through the selected node; Direct connects all traffic directly).",
+    "ruleListDesc": "Custom rules and app routing apply only in Smart mode: Global routes everything through the selected node, Direct connects everything directly.",
     "noRules": "No rules yet",
     "addFirstRule": "Click the button above to add your first rule",
     "ruleInstructions": "Rule Guide",

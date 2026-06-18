@@ -19,41 +19,13 @@ import {
   effectiveCustomRules,
   DOMESTIC_BANK_AND_STOCK_DOMAINS,
 } from './singbox-config-helpers';
-
-/**
- * fake-ip-filter 默认清单：FakeIP 模式下被假 IP（198.18/15）弄坏的通用域名 → 强制走真实 DNS 解析（绕过 FakeIP）。
- * **刻意内联硬编码**——fake-ip-filter 是启动必经的 DNS 规则，绝不能依赖可能 404 的远程 rule_set（重蹈 geoip-telegram FATAL）。
- * 默认注入（config.fakeIpFilter !== false 时），按"应路由到哪个真实解析器"分组：
- *   - 连通性探测 / Captive Portal → dns-local（系统解析，反映真实本地网络，否则系统误判断网 / 锁屏登录态卡死）
- *   - NTP / STUN / TURN → dns-domestic（真实 DoH；校时握手与 WebRTC/P2P 需真实 IP）
- * 本地域（.local/.arpa/.lan/.home.arpa）已由上方 dns-local 规则覆盖，不重复。
- */
-const FAKEIP_FILTER_CAPTIVE_DOMAINS = [
-  'captive.apple.com', // Apple 连通性探测
-  'connectivitycheck.gstatic.com', // Android 连通性探测
-  'connectivitycheck.android.com',
-  'msftconnecttest.com', // Windows NCSI
-  'www.msftconnecttest.com',
-  'msftncsi.com',
-  'www.msftncsi.com',
-  'dns.msftncsi.com',
-  'detectportal.firefox.com', // Firefox captive 检测
-  'network-test.debian.org',
-  'connect.rom.miui.com', // 小米连通性
-];
-/** NTP 时间同步域名（FakeIP 下校时失败）。 */
-const FAKEIP_FILTER_NTP_SUFFIXES = [
-  'ntp.org', // pool.ntp.org 及各区域子域
-  'time.windows.com',
-  'time.apple.com',
-  'time.cloudflare.com',
-  'time.nist.gov',
-  'time.android.com',
-];
-// NTP/STUN 关键字：domain_keyword 是**裸子串**匹配，故只保留误伤面极小的 'ntp'/'stun'；刻意去掉 'turn'
-// （会误命中 saturn/return/nocturne/overturn 等正常域名 → 被强制走 dns-domestic 真实解析、绕过 FakeIP，海外域可能被污染）。
-// TURN 服务器通常同时是 STUN（stun.* 已覆盖）；NTP 域另由 FAKEIP_FILTER_NTP_SUFFIXES 的 domain_suffix 兜底。
-const FAKEIP_FILTER_NTP_STUN_KEYWORDS = ['ntp', 'stun'];
+// fake-ip-filter 默认清单（captive→真实本地解析、ntp→真实 DoH）。单一真值在 shared，renderer 设置页可编辑清单 seed 共用。
+// 启动必经规则、刻意硬编码不依赖远程 rule_set（防 404 FATAL）。用户编辑后存 config.fakeIpFilterList。
+import {
+  FAKEIP_FILTER_CAPTIVE_DOMAINS,
+  FAKEIP_FILTER_NTP_SUFFIXES,
+  FAKEIP_FILTER_NTP_STUN_KEYWORDS,
+} from '../../shared/fakeip-filter';
 
 /** 日志回调：注入 ProxyManager.logToManager（source 默认 'ProxyManager'）。 */
 type DnsLogFn = (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', message: string) => void;
@@ -278,18 +250,38 @@ export function buildDnsConfig(
   // fake-ip-filter 默认清单（仅 FakeIP 开启时有意义；config.fakeIpFilter === false 可关）：NTP/STUN/Captive 等
   // 在 FakeIP 下会坏的域名 → 在 fakeip catch-all 之前命中、改走真实解析器，绕过 FakeIP。内联硬编码、无下载依赖。
   if (enableFakeIp && config.fakeIpFilter !== false) {
-    // 连通性探测 / Captive Portal → internalResolverTag（需接入网/LAN 解析器反映真实本地网络，否则系统误判断网 /
-    // 锁屏登录卡死）：有 LAN 解析器→dns-lan；Win+takeover 无 LAN→dns-domestic(避死环,captive 检测降级但不挂);否则 dns-local。
-    dnsRules.push({
-      domain: FAKEIP_FILTER_CAPTIVE_DOMAINS,
-      server: internalResolverTag,
-    } as SingBoxDnsRule);
-    // NTP / STUN / TURN → dns-domestic（真实 DoH；校时与 P2P 需真实 IP）。同规则内 domain_suffix/domain_keyword 为 OR。
-    dnsRules.push({
-      domain_suffix: FAKEIP_FILTER_NTP_SUFFIXES.flatMap((d) => [d, `.${d}`]),
-      domain_keyword: FAKEIP_FILTER_NTP_STUN_KEYWORDS,
-      server: 'dns-domestic',
-    } as SingBoxDnsRule);
+    if (config.fakeIpFilterList === undefined) {
+      // 默认（未编辑）：与历史逐字节一致。captive→internalResolverTag（接入网/LAN 解析器反映真实本地网络，
+      // 否则系统误判断网/锁屏登录卡死）；ntp/stun→dns-domestic（真实 DoH，校时与 P2P 需真实 IP）。
+      dnsRules.push({
+        domain: FAKEIP_FILTER_CAPTIVE_DOMAINS,
+        server: internalResolverTag,
+      } as SingBoxDnsRule);
+      dnsRules.push({
+        domain_suffix: FAKEIP_FILTER_NTP_SUFFIXES.flatMap((d) => [d, `.${d}`]),
+        domain_keyword: FAKEIP_FILTER_NTP_STUN_KEYWORDS,
+        server: 'dns-domestic',
+      } as SingBoxDnsRule);
+    } else {
+      // 用户编辑过的清单：内置 captive 域名仍→internalResolverTag（保 captive 检测正确）；其余→dns-domestic 真实解析。
+      // ntp/stun 关键字（裸子串、非域名清单项）始终兜底保留。
+      const captiveSet = new Set<string>(FAKEIP_FILTER_CAPTIVE_DOMAINS);
+      const captive = config.fakeIpFilterList.filter((d) => captiveSet.has(d));
+      const others = config.fakeIpFilterList.filter((d) => !captiveSet.has(d));
+      if (captive.length > 0) {
+        dnsRules.push({ domain: captive, server: internalResolverTag } as SingBoxDnsRule);
+      }
+      if (others.length > 0) {
+        dnsRules.push({
+          domain_suffix: others.flatMap((d) => [d, `.${d}`]),
+          server: 'dns-domestic',
+        } as SingBoxDnsRule);
+      }
+      dnsRules.push({
+        domain_keyword: FAKEIP_FILTER_NTP_STUN_KEYWORDS,
+        server: 'dns-domestic',
+      } as SingBoxDnsRule);
+    }
   }
 
   // 处理自定义规则中的 bypassFakeIP（仅 domain / domainSuffix / domainKeyword 三类域名规则有效）。

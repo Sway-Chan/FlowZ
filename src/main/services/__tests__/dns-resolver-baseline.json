@@ -44,18 +44,29 @@
       ],
       "rules": [
         {
-          "domain": ["a.example-argo.com", "sni-a.example.net"],
+          "domain": [
+            "a.example-argo.com",
+            "sni-a.example.net"
+          ],
           "domain_suffix": [
             "a.example-argo.com",
             ".a.example-argo.com",
             "sni-a.example.net",
             ".sni-a.example.net"
           ],
-          "domain_keyword": ["a.example-argo.com", "sni-a.example.net"],
+          "domain_keyword": [
+            "a.example-argo.com",
+            "sni-a.example.net"
+          ],
           "server": "dns-domestic"
         },
         {
-          "domain": ["doh.pub", "dns.google", "cloudflare-dns.com", "one.one.one.one"],
+          "domain": [
+            "doh.pub",
+            "dns.google",
+            "cloudflare-dns.com",
+            "one.one.one.one"
+          ],
           "server": "dns-bootstrap-udp"
         },
         {
@@ -91,7 +102,10 @@
           "server": "dns-local"
         },
         {
-          "query_type": ["A", "AAAA"],
+          "query_type": [
+            "A",
+            "AAAA"
+          ],
           "server": "fakeip"
         }
       ],
@@ -103,7 +117,10 @@
         "action": "sniff"
       },
       {
-        "process_name": ["sing-box", "sing-box.exe"],
+        "process_name": [
+          "sing-box",
+          "sing-box.exe"
+        ],
         "action": "route",
         "outbound": "direct"
       },
@@ -115,12 +132,17 @@
           "119.28.28.28/32",
           "114.114.114.114/32"
         ],
-        "port": [53, 443],
+        "port": [
+          53,
+          443
+        ],
         "action": "route",
         "outbound": "direct"
       },
       {
-        "port": [53],
+        "port": [
+          53
+        ],
         "action": "hijack-dns"
       },
       {
@@ -163,22 +185,37 @@
           "dns.quad9.net",
           "one.one.one.one"
         ],
-        "port": [443, 853],
+        "port": [
+          443,
+          853
+        ],
         "action": "reject"
       },
       {
-        "domain": ["a.example-argo.com", "sni-a.example.net", "b.trycloudflare.com"],
-        "domain_suffix": [".a.example-argo.com", ".sni-a.example.net", ".b.trycloudflare.com"],
+        "domain": [
+          "a.example-argo.com",
+          "sni-a.example.net",
+          "b.trycloudflare.com"
+        ],
+        "domain_suffix": [
+          ".a.example-argo.com",
+          ".sni-a.example.net",
+          ".b.trycloudflare.com"
+        ],
         "action": "route",
         "outbound": "direct"
       },
       {
-        "ip_cidr": ["203.0.113.7/32"],
+        "ip_cidr": [
+          "203.0.113.7/32"
+        ],
         "action": "route",
         "outbound": "direct"
       },
       {
-        "domain_suffix": [".microdone.cn"],
+        "domain_suffix": [
+          ".microdone.cn"
+        ],
         "action": "route",
         "outbound": "direct",
         "override_address": "127.0.0.1"
@@ -214,16 +251,18 @@
       {
         "ip_cidr": [
           "10.0.0.0/8",
-          "172.16.0.0/12",
-          "192.168.0.0/16",
+          "100.64.0.0/10",
           "127.0.0.0/8",
           "169.254.0.0/16",
+          "172.16.0.0/12",
+          "192.0.0.0/24",
+          "192.88.99.0/24",
+          "192.168.0.0/16",
           "224.0.0.0/4",
+          "233.252.0.0/24",
           "240.0.0.0/4",
-          "::1/128",
           "fc00::/7",
-          "fe80::/10",
-          "ff00::/8"
+          "fe80::/10"
         ],
         "action": "route",
         "outbound": "direct"
@@ -236,8 +275,12 @@
           "dns.quad9.net",
           "one.one.one.one"
         ],
-        "network": ["udp"],
-        "port": [443],
+        "network": [
+          "udp"
+        ],
+        "port": [
+          443
+        ],
         "action": "reject"
       },
       {
@@ -246,13 +289,20 @@
         "outbound": "direct"
       },
       {
-        "ip_cidr": ["223.5.5.5/32"],
-        "port": [53, 443],
+        "ip_cidr": [
+          "223.5.5.5/32"
+        ],
+        "port": [
+          53,
+          443
+        ],
         "action": "route",
         "outbound": "direct"
       },
       {
-        "domain_suffix": ["doh.pub"],
+        "domain_suffix": [
+          "doh.pub"
+        ],
         "action": "route",
         "outbound": "direct"
       },
@@ -276,7 +326,14 @@
         "action": "reject"
       },
       {
-        "domain_keyword": ["google", "gmail", "youtube", "gstatic", "googleapis", "googlevideo"],
+        "domain_keyword": [
+          "google",
+          "gmail",
+          "youtube",
+          "gstatic",
+          "googleapis",
+          "googlevideo"
+        ],
         "action": "route",
         "outbound": "proxy-selector"
       },
@@ -305,7 +362,10 @@
       {
         "type": "tun",
         "tag": "tun-in",
-        "route_exclude_address": ["127.0.0.0/8", "::1/128"]
+        "route_exclude_address": [
+          "127.0.0.0/8",
+          "::1/128"
+        ]
       }
     ],
     "outboundResolvers": [
@@ -371,18 +431,29 @@
       ],
       "rules": [
         {
-          "domain": ["a.example-argo.com", "sni-a.example.net"],
+          "domain": [
+            "a.example-argo.com",
+            "sni-a.example.net"
+          ],
           "domain_suffix": [
             "a.example-argo.com",
             ".a.example-argo.com",
             "sni-a.example.net",
             ".sni-a.example.net"
           ],
-          "domain_keyword": ["a.example-argo.com", "sni-a.example.net"],
+          "domain_keyword": [
+            "a.example-argo.com",
+            "sni-a.example.net"
+          ],
           "server": "dns-domestic"
         },
         {
-          "domain": ["doh.pub", "dns.google", "cloudflare-dns.com", "one.one.one.one"],
+          "domain": [
+            "doh.pub",
+            "dns.google",
+            "cloudflare-dns.com",
+            "one.one.one.one"
+          ],
           "server": "dns-bootstrap-udp"
         },
         {
@@ -418,7 +489,10 @@
           "server": "dns-local"
         },
         {
-          "query_type": ["A", "AAAA"],
+          "query_type": [
+            "A",
+            "AAAA"
+          ],
           "server": "fakeip"
         }
       ],
@@ -430,7 +504,10 @@
         "action": "sniff"
       },
       {
-        "process_name": ["sing-box", "sing-box.exe"],
+        "process_name": [
+          "sing-box",
+          "sing-box.exe"
+        ],
         "action": "route",
         "outbound": "direct"
       },
@@ -442,12 +519,17 @@
           "119.28.28.28/32",
           "114.114.114.114/32"
         ],
-        "port": [53, 443],
+        "port": [
+          53,
+          443
+        ],
         "action": "route",
         "outbound": "direct"
       },
       {
-        "port": [53],
+        "port": [
+          53
+        ],
         "action": "hijack-dns"
       },
       {
@@ -490,22 +572,37 @@
           "dns.quad9.net",
           "one.one.one.one"
         ],
-        "port": [443, 853],
+        "port": [
+          443,
+          853
+        ],
         "action": "reject"
       },
       {
-        "domain": ["a.example-argo.com", "sni-a.example.net", "b.trycloudflare.com"],
-        "domain_suffix": [".a.example-argo.com", ".sni-a.example.net", ".b.trycloudflare.com"],
+        "domain": [
+          "a.example-argo.com",
+          "sni-a.example.net",
+          "b.trycloudflare.com"
+        ],
+        "domain_suffix": [
+          ".a.example-argo.com",
+          ".sni-a.example.net",
+          ".b.trycloudflare.com"
+        ],
         "action": "route",
         "outbound": "direct"
       },
       {
-        "ip_cidr": ["203.0.113.7/32"],
+        "ip_cidr": [
+          "203.0.113.7/32"
+        ],
         "action": "route",
         "outbound": "direct"
       },
       {
-        "domain_suffix": [".microdone.cn"],
+        "domain_suffix": [
+          ".microdone.cn"
+        ],
         "action": "route",
         "outbound": "direct",
         "override_address": "127.0.0.1"
@@ -541,16 +638,18 @@
       {
         "ip_cidr": [
           "10.0.0.0/8",
-          "172.16.0.0/12",
-          "192.168.0.0/16",
+          "100.64.0.0/10",
           "127.0.0.0/8",
           "169.254.0.0/16",
+          "172.16.0.0/12",
+          "192.0.0.0/24",
+          "192.88.99.0/24",
+          "192.168.0.0/16",
           "224.0.0.0/4",
+          "233.252.0.0/24",
           "240.0.0.0/4",
-          "::1/128",
           "fc00::/7",
-          "fe80::/10",
-          "ff00::/8"
+          "fe80::/10"
         ],
         "action": "route",
         "outbound": "direct"
@@ -563,8 +662,12 @@
           "dns.quad9.net",
           "one.one.one.one"
         ],
-        "network": ["udp"],
-        "port": [443],
+        "network": [
+          "udp"
+        ],
+        "port": [
+          443
+        ],
         "action": "reject"
       },
       {
@@ -573,13 +676,20 @@
         "outbound": "direct"
       },
       {
-        "ip_cidr": ["223.5.5.5/32"],
-        "port": [53, 443],
+        "ip_cidr": [
+          "223.5.5.5/32"
+        ],
+        "port": [
+          53,
+          443
+        ],
         "action": "route",
         "outbound": "direct"
       },
       {
-        "domain_suffix": ["doh.pub"],
+        "domain_suffix": [
+          "doh.pub"
+        ],
         "action": "route",
         "outbound": "direct"
       },
@@ -612,7 +722,10 @@
       {
         "type": "tun",
         "tag": "tun-in",
-        "route_exclude_address": ["127.0.0.0/8", "::1/128"]
+        "route_exclude_address": [
+          "127.0.0.0/8",
+          "::1/128"
+        ]
       }
     ],
     "outboundResolvers": [
@@ -673,18 +786,29 @@
       ],
       "rules": [
         {
-          "domain": ["a.example-argo.com", "sni-a.example.net"],
+          "domain": [
+            "a.example-argo.com",
+            "sni-a.example.net"
+          ],
           "domain_suffix": [
             "a.example-argo.com",
             ".a.example-argo.com",
             "sni-a.example.net",
             ".sni-a.example.net"
           ],
-          "domain_keyword": ["a.example-argo.com", "sni-a.example.net"],
+          "domain_keyword": [
+            "a.example-argo.com",
+            "sni-a.example.net"
+          ],
           "server": "dns-domestic"
         },
         {
-          "domain": ["doh.pub", "dns.google", "cloudflare-dns.com", "one.one.one.one"],
+          "domain": [
+            "doh.pub",
+            "dns.google",
+            "cloudflare-dns.com",
+            "one.one.one.one"
+          ],
           "server": "dns-bootstrap-udp"
         },
         {
@@ -735,7 +859,10 @@
         "action": "sniff"
       },
       {
-        "process_name": ["sing-box", "sing-box.exe"],
+        "process_name": [
+          "sing-box",
+          "sing-box.exe"
+        ],
         "action": "route",
         "outbound": "direct"
       },
@@ -747,12 +874,17 @@
           "119.28.28.28/32",
           "114.114.114.114/32"
         ],
-        "port": [53, 443],
+        "port": [
+          53,
+          443
+        ],
         "action": "route",
         "outbound": "direct"
       },
       {
-        "port": [53],
+        "port": [
+          53
+        ],
         "action": "hijack-dns"
       },
       {
@@ -795,22 +927,37 @@
           "dns.quad9.net",
           "one.one.one.one"
         ],
-        "port": [443, 853],
+        "port": [
+          443,
+          853
+        ],
         "action": "reject"
       },
       {
-        "domain": ["a.example-argo.com", "sni-a.example.net", "b.trycloudflare.com"],
-        "domain_suffix": [".a.example-argo.com", ".sni-a.example.net", ".b.trycloudflare.com"],
+        "domain": [
+          "a.example-argo.com",
+          "sni-a.example.net",
+          "b.trycloudflare.com"
+        ],
+        "domain_suffix": [
+          ".a.example-argo.com",
+          ".sni-a.example.net",
+          ".b.trycloudflare.com"
+        ],
         "action": "route",
         "outbound": "direct"
       },
       {
-        "ip_cidr": ["203.0.113.7/32"],
+        "ip_cidr": [
+          "203.0.113.7/32"
+        ],
         "action": "route",
         "outbound": "direct"
       },
       {
-        "domain_suffix": [".microdone.cn"],
+        "domain_suffix": [
+          ".microdone.cn"
+        ],
         "action": "route",
         "outbound": "direct",
         "override_address": "127.0.0.1"
@@ -846,16 +993,18 @@
       {
         "ip_cidr": [
           "10.0.0.0/8",
-          "172.16.0.0/12",
-          "192.168.0.0/16",
+          "100.64.0.0/10",
           "127.0.0.0/8",
           "169.254.0.0/16",
+          "172.16.0.0/12",
+          "192.0.0.0/24",
+          "192.88.99.0/24",
+          "192.168.0.0/16",
           "224.0.0.0/4",
+          "233.252.0.0/24",
           "240.0.0.0/4",
-          "::1/128",
           "fc00::/7",
-          "fe80::/10",
-          "ff00::/8"
+          "fe80::/10"
         ],
         "action": "route",
         "outbound": "direct"
@@ -868,8 +1017,12 @@
           "dns.quad9.net",
           "one.one.one.one"
         ],
-        "network": ["udp"],
-        "port": [443],
+        "network": [
+          "udp"
+        ],
+        "port": [
+          443
+        ],
         "action": "reject"
       },
       {
@@ -878,13 +1031,20 @@
         "outbound": "direct"
       },
       {
-        "ip_cidr": ["223.5.5.5/32"],
-        "port": [53, 443],
+        "ip_cidr": [
+          "223.5.5.5/32"
+        ],
+        "port": [
+          53,
+          443
+        ],
         "action": "route",
         "outbound": "direct"
       },
       {
-        "domain_suffix": ["doh.pub"],
+        "domain_suffix": [
+          "doh.pub"
+        ],
         "action": "route",
         "outbound": "direct"
       },
@@ -908,7 +1068,14 @@
         "action": "reject"
       },
       {
-        "domain_keyword": ["google", "gmail", "youtube", "gstatic", "googleapis", "googlevideo"],
+        "domain_keyword": [
+          "google",
+          "gmail",
+          "youtube",
+          "gstatic",
+          "googleapis",
+          "googlevideo"
+        ],
         "action": "route",
         "outbound": "proxy-selector"
       },

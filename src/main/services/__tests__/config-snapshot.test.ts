@@ -180,6 +180,18 @@ describe('generateSingBoxConfig — characterization 快照（抽取前锁基线
     ).toMatchSnapshot();
   });
 
+  it('FakeIP 例外域名 用户编辑清单 → 内置 captive 走内网解析、其余 dns-domestic + ntp/stun 关键字兜底', () => {
+    expect(
+      snap(
+        cfg({
+          servers: [server({})],
+          dnsConfig: { enableFakeIp: true },
+          fakeIpFilterList: ['captive.apple.com', 'my-ntp.example.com'],
+        } as unknown as Partial<UserConfig>)
+      )
+    ).toMatchSnapshot();
+  });
+
   it('多节点 + 选中第二个 → 锁 idToTagMap 唯一化 + selector 成员', () => {
     expect(
       snap(
@@ -549,7 +561,7 @@ describe('generateSingBoxConfig — characterization 快照（抽取前锁基线
     expect(snap(cfg({ servers: [server({})], blockQuic: true, customRules }))).toMatchSnapshot();
   });
 
-  it('bypassLAN=false → 锁跳过私网直连 route 规则（PRIVATE_IP_CIDRS / geosite-private 路由规则不注入；geosite-private 定义作为内置 geo 仍在）', () => {
+  it('bypassLAN=false → 锁跳过私网直连 route 规则（bypassLAN ip_cidr / geosite-private 路由规则不注入；geosite-private 定义作为内置 geo 仍在）', () => {
     expect(
       snap(cfg({ servers: [server({})], bypassLAN: false } as unknown as Partial<UserConfig>))
     ).toMatchSnapshot();

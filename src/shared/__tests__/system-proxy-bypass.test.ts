@@ -1,8 +1,9 @@
 import {
-  DEFAULT_SYSTEM_PROXY_BYPASS,
-  parseBypassList,
-  effectiveBypassList,
+  DEFAULT_BYPASS_LAN,
+  effectiveBypassLan,
+  bypassLanCidrs,
   isIpv4Cidr,
+  isIpv6Cidr,
   ipv4CidrToWindowsPatterns,
   formatBypassForMac,
   formatBypassForWindows,
@@ -26,34 +27,66 @@ describe('默认清单（业内聚合，对齐 Stash）', () => {
       'mobile-bank.psbc.com',
       'www.abchina.com.cn',
     ]) {
-      expect(DEFAULT_SYSTEM_PROXY_BYPASS).toContain(e);
+      expect(DEFAULT_BYPASS_LAN).toContain(e);
     }
   });
   it('无重复项', () => {
-    expect(new Set(DEFAULT_SYSTEM_PROXY_BYPASS).size).toBe(DEFAULT_SYSTEM_PROXY_BYPASS.length);
+    expect(new Set(DEFAULT_BYPASS_LAN).size).toBe(DEFAULT_BYPASS_LAN.length);
   });
 });
 
-describe('parseBypassList', () => {
-  it('逗号/分号/换行分隔 + trim + 去重 + 去空', () => {
-    expect(parseBypassList('10.0.0.0/8, *.local ;localhost\n10.0.0.0/8\n')).toEqual([
-      '10.0.0.0/8',
-      '*.local',
-      'localhost',
+describe('effectiveBypassLan（开关 + 缺省单一真值）', () => {
+  it('开关关 → []（不绕过）', () => {
+    expect(effectiveBypassLan({ bypassLAN: false, bypassLANList: ['10.0.0.0/8'] })).toEqual([]);
+  });
+  it('开关开（或未设）+ 无用户清单 → 默认清单副本', () => {
+    expect(effectiveBypassLan({})).toEqual([...DEFAULT_BYPASS_LAN]);
+    expect(effectiveBypassLan({ bypassLAN: true })).toEqual([...DEFAULT_BYPASS_LAN]);
+  });
+  it('开关开 + 用户清单 → 用户清单原样', () => {
+    expect(effectiveBypassLan({ bypassLAN: true, bypassLANList: ['1.2.3.0/24'] })).toEqual([
+      '1.2.3.0/24',
     ]);
   });
-  it('空串 → []', () => {
-    expect(parseBypassList('   ')).toEqual([]);
+});
+
+describe('isIpv6Cidr', () => {
+  it('合法 v6 CIDR 真', () => {
+    expect(isIpv6Cidr('fc00::/7')).toBe(true);
+    expect(isIpv6Cidr('fe80::/10')).toBe(true);
+    expect(isIpv6Cidr('::1/128')).toBe(true);
+  });
+  it('v4 CIDR / 域名 / URL / 越界前缀 假', () => {
+    expect(isIpv6Cidr('10.0.0.0/8')).toBe(false);
+    expect(isIpv6Cidr('*.local')).toBe(false);
+    expect(isIpv6Cidr('http://a:b/c')).toBe(false); // 含 : 和 / 但不是 CIDR
+    expect(isIpv6Cidr('fc00::/200')).toBe(false); // 前缀越界
+    expect(isIpv6Cidr('fc00::')).toBe(false); // 无前缀
   });
 });
 
-describe('effectiveBypassList', () => {
-  it('用户清单非空 → 用其（trim/去重）', () => {
-    expect(effectiveBypassList([' a ', 'b', 'a'])).toEqual(['a', 'b']);
+describe('bypassLanCidrs（TUN / Windows route_exclude 只取 IP 段）', () => {
+  it('保留 v4/v6 CIDR，滤掉域名/通配/localhost/纯 IP', () => {
+    expect(
+      bypassLanCidrs([
+        '10.0.0.0/8',
+        '100.64.0.0/10',
+        'fc00::/7',
+        'fe80::/10',
+        'localhost',
+        '*.local',
+        'captive.apple.com',
+        '127.0.0.1',
+      ])
+    ).toEqual(['10.0.0.0/8', '100.64.0.0/10', 'fc00::/7', 'fe80::/10']);
   });
-  it('undefined/空 → 默认清单', () => {
-    expect(effectiveBypassList(undefined)).toEqual([...DEFAULT_SYSTEM_PROXY_BYPASS]);
-    expect(effectiveBypassList([])).toEqual([...DEFAULT_SYSTEM_PROXY_BYPASS]);
+  it('从完整默认清单筛 CIDR：含全部 v4/v6 段、无域名项', () => {
+    const cidrs = bypassLanCidrs([...DEFAULT_BYPASS_LAN]);
+    expect(cidrs).toContain('10.0.0.0/8');
+    expect(cidrs).toContain('fc00::/7');
+    expect(cidrs).not.toContain('localhost');
+    expect(cidrs).not.toContain('captive.apple.com');
+    expect(cidrs.every((c) => c.includes('/'))).toBe(true);
   });
 });
 

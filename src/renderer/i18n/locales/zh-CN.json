@@ -52,7 +52,8 @@
     "copyFail": "复制失败",
     "loading": "加载中...",
     "saveFailed": "保存失败",
-    "configLoadFail": "配置加载失败"
+    "configLoadFail": "配置加载失败",
+    "restoreDefault": "恢复默认"
   },
   "sidebar": {
     "home": "首页",
@@ -63,7 +64,10 @@
     "ruleResources": "规则资源",
     "rules": "路由规则",
     "settings": "设置",
-    "group": { "routing": "分流", "diagnostics": "诊断" }
+    "group": {
+      "routing": "分流",
+      "diagnostics": "诊断"
+    }
   },
   "logs": {
     "pageTitle": "实时日志",
@@ -456,12 +460,12 @@
       "foreignDnsDesc": "用于解析海外域名，防止 DNS 污染 (将通过代理发送)",
       "dnsInvalid": "DNS 地址无法识别（支持 https:// DoH、tls:// DoT、udp:// 或 IP），未保存，请修正",
       "enableFakeIp": "启用 FakeIP",
-      "fakeIpDesc": "开启：节点收到域名，首次连接更快，TUN 模式推荐。关闭：节点收到真实 IP，部分防滥用严格的机场可能拒绝连接，海外首次连接延迟增加",
+      "fakeIpDesc": "开启：节点收到域名、首连更快，TUN 推荐。关闭：节点收到真实 IP，部分严格机场可能拒连、海外首连变慢。",
       "fakeIpTunOffConfirmTitle": "关闭 FakeIP？",
       "fakeIpTunOffConfirmDesc": "TUN 模式下关闭后，代理节点将收到真实 IP 而非域名。部分防滥用严格的机场可能因此拒绝连接（抛出无效证书或拦截页面），此风险无法由客户端缓解。海外域名首次连接延迟也会增加。确认关闭？",
       "fakeIpTunOffConfirmOk": "仍然关闭",
-      "fakeIpFilter": "fake-ip-filter 默认清单",
-      "fakeIpFilterDesc": "NTP / STUN / 连通性探测等域名走真实 DNS 解析、绕过 FakeIP（避免校时失败、系统误判断网 / 锁屏登录卡死）。建议开启。",
+      "fakeIpFilter": "FakeIP 例外域名",
+      "fakeIpFilterDesc": "这些域名走真实 DNS、不用假 IP（校时、连通性探测、锁屏登录用假 IP 会失败）。建议开启。",
       "nodeDomainResolver": "节点域名解析器",
       "nodeDomainResolverDesc": "解析代理节点域名所用的 DNS。默认 AliDNS；若节点域名（如 Argo / trycloudflare）解析失败（SERVFAIL），可切换为 DNSPod 或系统 DNS 自救",
       "nodeResolverAuto": "AliDNS (默认)",
@@ -469,7 +473,7 @@
       "nodeResolverSystem": "系统 DNS",
       "nodeResolverExperimental": "实验性",
       "takeoverSystemDns": "TUN 接管系统 DNS",
-      "takeoverSystemDnsDesc": "TUN 模式下把系统 DNS 临时改为 8.8.8.8，让需代理的域名经隧道正确解析（停止/退出自动还原）。关闭后改用你原本的 DNS，内网域名解析更友好，但部分需代理域名可能解析异常。建议保持开启。",
+      "takeoverSystemDnsDesc": "TUN 模式临时把系统 DNS 改为 8.8.8.8，让代理域名经隧道正确解析（停止自动还原）。关闭更利于内网域名，但部分代理域名可能解析异常。建议开启。",
       "mainSessionViaProxy": "更新检查走代理",
       "mainSessionViaProxyDesc": "开启后，应用/内核更新检查与规则资源下载在代理运行时经代理（更新源多在 GitHub）；关闭则直连/走系统代理。注：TUN 模式下因系统层捕获，关闭不能完全直连。",
       "localProxyLan": "本地代理 / 局域网",
@@ -481,13 +485,10 @@
       "portClashWithControl": "本地端口不能与控制端口相同，请改其中之一",
       "default": "默认",
       "allowLan": "局域网共享代理",
-      "allowLanDesc": "开启后，代理端口将监听 0.0.0.0，允许局域网内的其他设备连接本机的代理进而访问互联网",
-      "allowLanGatewayTip": "当作为网关使用（另一台设备设置此电脑为网关及 DNS）时，请务必开启 TUN 模式。该设置将自动开启系统 IP 转发并监听 53 端口提供 DNS 服务。",
+      "allowLanDesc": "代理端口监听 0.0.0.0，让同一局域网的其他设备连本机代理上网。",
+      "allowLanGatewayTip": "作为网关使用（别的设备把本机设为网关+DNS）时务必开 TUN：会自动开 IP 转发并在 53 端口提供 DNS。",
       "bypassLAN": "绕过局域网 (Bypass LAN)",
-      "bypassLANDesc": "默认将发往局域网的请求强制直连（关闭此选项后，192.168.x 等内网 IP 才可能走代理）",
-      "systemProxyBypass": "跳过代理（系统代理）",
-      "systemProxyBypassDesc": "仅系统代理模式生效：这些地址/域名直连、不走代理（逗号分隔，支持 CIDR 与域名）。开启系统代理时写入系统忽略列表、关闭还原。TUN 模式直连由路由规则负责。",
-      "systemProxyBypassReset": "恢复默认",
+      "bypassLANDesc": "列表内的网段/域名直连、不走代理。关闭后这些地址才会走代理。",
       "blockQuic": "阻断 QUIC（UDP/443，促浏览器回退 TCP）",
       "blockQuicDesc": "reject 代理向 QUIC（UDP 443），让浏览器回退 TCP，解决节点 UDP relay 不通导致的网页卡顿/断流。默认关；对所有节点生效。",
       "interruptOnSwitch": "切换节点时断开现有连接",
@@ -573,7 +574,9 @@
       },
       "autoSwitchNode": "节点故障自动切换",
       "autoSwitchNodeDesc": "当当前代理连接失败时，自动切换到可用节点",
-      "subIntervalRange": "更新间隔需为 1–168 小时"
+      "subIntervalRange": "更新间隔需为 1–168 小时",
+      "fakeIpFilterEditHint": "每行一个域名；可增删，恢复默认回到内置清单。",
+      "bypassLANEditHint": "路由规则优先级高于此：需让某段走代理，可以从列表删除或者去「路由规则」加自定义规则即可覆盖。"
     },
     "about": {
       "title": "关于",
@@ -1037,6 +1040,10 @@
     "targetMissingTip": "指定节点已删除，运行时回退为跟随全局选中节点",
     "resourceMissing": "资源缺失",
     "resourceMissingTip": "该规则引用的规则资源缺失（已删除或文件丢失），当前不生效；请到「规则资源」页下载恢复",
+    "meshOverlap": "覆盖组网",
+    "meshOverlapTip": "该规则网段与组网(WG/Tailscale)路由段重叠，优先级更高将覆盖组网路由，该段可能不走组网节点。如非有意请调整。",
+    "meshOverlapHint": "网段 {{values}} 与组网(WG/Tailscale)路由段重叠：本规则优先级更高、将覆盖组网路由，该段可能不走组网节点。如非有意请调整。",
+    "priorityFlow": "优先级（从高到低）：自定义规则 → 应用分流 → 组网(WG/Tailscale) → 绕过局域网 → 智能分流 → 默认出口。靠前先匹配，你的自定义规则最高。",
     "appGeoMissingTip": "该应用引用的分流规则集缺失（已删除或文件丢失），仅按进程名生效；请到「规则资源」页下载恢复",
     "editOrder": "编辑顺序",
     "saveOrder": "保存顺序",
@@ -1067,7 +1074,7 @@
     "customRules": "自定义规则",
     "customRulesDesc": "管理域名、IP/端口、进程与规则集分流规则",
     "ruleList": "规则列表",
-    "ruleListDesc": "按列表顺序自上而下匹配，先命中先生效；自定义规则优先于应用分流与智能分流。自定义规则与应用分流仅在「智能分流」模式生效（全局模式一律走选中节点，直连模式全部直连）。",
+    "ruleListDesc": "自定义规则与应用分流仅「智能分流」模式生效：全局模式走选中节点、直连模式全部直连。",
     "noRules": "暂无规则",
     "addFirstRule": "点击上方按钮添加您的第一条规则",
     "ruleInstructions": "规则说明",

@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { toast } from 'sonner';
 import {
   Dialog,
@@ -28,6 +28,9 @@ import { ServerSelectGroups } from '@/components/settings/server-select-groups';
 import { useAppStore } from '@/store/app-store';
 import type { Rule, RuleType, RuleAction, RuleCondition } from '../../../shared/types';
 import { validateRuleValue, RULE_TYPE_IDS } from '../../../shared/rules';
+import { meshForcedRouteCidrs } from '../../../shared/endpoint-routes';
+import { cidrOverlapsAny } from '../../../shared/ip';
+import { parseLines } from '../../../shared/parse-lines';
 import { useTranslation } from 'react-i18next';
 import {
   RULE_CATEGORIES,
@@ -59,6 +62,9 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
   const addCustomRule = useAppStore((state) => state.addCustomRule);
   const updateCustomRule = useAppStore((state) => state.updateCustomRule);
   const servers = useAppStore((state) => state.config?.servers || []);
+  // 组网(WG/Tailscale)force-route 段：供 ipCidr 值「与组网重叠」内联提醒（优先级重排后自定义规则会覆盖组网路由）。
+  // memo 化避免每次按键 render 都重算（servers 未变时引用稳定）。
+  const meshCidrs = useMemo(() => meshForcedRouteCidrs(servers), [servers]);
   // 全局 FakeIP 开关（usesFakeIp 已统一为纯看此开关，缺省 true）：关时本规则的「绕过 FakeIP」天然 no-op，UI 置灰提示。
   const globalFakeIpEnabled = useAppStore((state) => state.config?.dnsConfig?.enableFakeIp ?? true);
 
@@ -122,12 +128,6 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
   const usedTypes = new Set(conditionTypes);
   // bypassFakeIP 是规则级设置：只要任一条件是域名类即可用（生成期对域名类条件取真实 DNS）。
   const bypassApplicable = conditionTypes.some((ct) => BYPASS_FAKEIP_TYPES.includes(ct));
-
-  const parseLines = (input: string): string[] =>
-    input
-      .split('\n')
-      .map((l) => l.trim())
-      .filter((l) => l.length > 0);
 
   const valuesOf = (ct: RuleType) => valuesByType[ct] ?? '';
   const setValuesOf = (ct: RuleType, text: string) =>
@@ -279,6 +279,7 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
     const text = valuesOf(ct);
     const parsed = parseLines(text);
     const invalid = invalidValuesOf(ct);
+    const meshOverlap = ct === 'ipCidr' ? parsed.filter((c) => cidrOverlapsAny(c, meshCidrs)) : [];
     return (
       <>
         <Textarea
@@ -299,6 +300,15 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
           <p className="text-xs text-destructive">
             {t('rules.invalidInline', {
               values: `${invalid.slice(0, 3).join(', ')}${invalid.length > 3 ? ' …' : ''}`,
+            })}
+          </p>
+        )}
+        {meshOverlap.length > 0 && (
+          <p className="text-xs text-amber-600 dark:text-amber-400">
+            {t('rules.meshOverlapHint', {
+              values: `${meshOverlap.slice(0, 3).join(', ')}${meshOverlap.length > 3 ? ' …' : ''}`,
+              defaultValue:
+                '网段 {{values}} 与组网(WG/Tailscale)路由段重叠：本规则优先级更高、将覆盖组网路由，该段可能不走组网节点。如非有意请调整。',
             })}
           </p>
         )}

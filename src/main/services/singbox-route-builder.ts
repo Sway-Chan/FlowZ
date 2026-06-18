@@ -12,7 +12,9 @@ import * as path from 'path';
 import type { UserConfig } from '../../shared/types';
 import { coreVersionAtLeast } from '../../shared/version';
 import { BOOTSTRAP_DIRECT_DNS_IPS } from '../../shared/dns';
-import { endpointForcedRouteCidrs } from '../../shared/endpoint-routes';
+import { endpointForcedRouteCidrs, meshForcedRouteCidrs } from '../../shared/endpoint-routes';
+import { cidrOverlapsAny } from '../../shared/ip';
+import { ruleIpCidrs } from '../../shared/rules';
 import { getAppPreset } from '../../shared/app-rules-preset';
 import { getRuleResourcesPath } from '../utils/paths';
 import { usesFakeIp } from './custom-rule-files';
@@ -27,7 +29,6 @@ import {
   isIpv4Host,
   isIpv6Host,
   DOMESTIC_BANK_AND_STOCK_DOMAINS,
-  PRIVATE_IP_CIDRS,
   effectiveCustomRules,
   effectiveAppRules,
   getCustomDomesticDnsEndpoint,
@@ -36,6 +37,8 @@ import {
   applyRuleSetPrune,
 } from './singbox-config-helpers';
 import { buildCustomRules } from './singbox-custom-rules';
+// 绕过局域网：TUN route 私网直连取 bypassLAN 完整清单的 CIDR 部分（域名在系统代理模式由 OS 忽略列表处理）。
+import { bypassLanCidrs, effectiveBypassLan } from '../../shared/system-proxy-bypass';
 
 /**
  * 浏览器隐私 DoH 泄漏域名（DoH-over-HTTPS / DoH-over-QUIC）。route reject 与 DNS 拦截须用同一份清单，
@@ -78,6 +81,27 @@ export function buildRouteConfig(
 ): SingBoxRouteConfig {
   const rules: SingBoxRouteRule[] = [];
   const proxyMode = (config.proxyMode || 'smart').toLowerCase();
+
+  // mesh 重叠提醒（layer-2 兜底，非阻断）：优先级重排后用户自定义规则高于组网(WG/Tailscale) force-route，
+  // 自定义规则 ip_cidr 与组网段重叠 → 该段被规则改道、可能不走组网节点（静默断 mesh）。检出即 warn（进诊断报告），
+  // 覆盖订阅导入/旧配置迁移等非 UI 录入盲区（UI 录入另有内联 hint/角标提醒）。仅 smart 有自定义规则故天然限定。
+  const meshCidrsForWarn = meshForcedRouteCidrs(config.servers);
+  if (meshCidrsForWarn.length > 0) {
+    const overlapping = new Set<string>();
+    for (const rule of effectiveCustomRules(config)) {
+      if (!rule.enabled) continue;
+      for (const c of ruleIpCidrs(rule)) {
+        if (cidrOverlapsAny(c, meshCidrsForWarn)) overlapping.add(c);
+      }
+    }
+    if (overlapping.size > 0) {
+      const sample = Array.from(overlapping).slice(0, 5).join(', ');
+      deps.log(
+        'warn',
+        `${overlapping.size} 个自定义规则网段（${sample}${overlapping.size > 5 ? '…' : ''}）与组网(WG/Tailscale)路由段重叠：按优先级将覆盖组网路由，该段可能不走组网节点。如非有意请调整规则或组网配置。`
+      );
+    }
+  }
 
   // 主代理出站统一走 selector(proxy-selector)：clash_api 热切换即改 selector 指向、路由无需重生成。
   // 具体 targetServerId 的 app/custom 分流在各自逻辑里直指节点 tag，不经此变量。
@@ -300,59 +324,8 @@ export function buildRouteConfig(
     });
   }
 
-  // 0c. endpoint 节点（WireGuard/Tailscale）的「配置路由段」强制路由到**该节点自身 tag**——优先于下方私网直连、
-  //     **独立于 bypass-LAN 开关、独立于全局选中**。单一真值：节点路由由其 allowedIPs(WG) / routes+tailnet(TS)
-  //     决定（endpointForcedRouteCidrs），不再有独立「绕过局域网排除段」。指向节点自身 tag（非 selector）→ 该段
-  //     恒走其 mesh 节点、与全局选中无关，实现「某段走 WG/TS、上网走全局节点」。仅 userspace（system 由内核接口
-  //     路由——Phase 2）；仅非 direct。按 config.servers 顺序=隐式优先级；被跳过节点的死引用由
-  //     fixRouteDeadReferences 兜底改写 selector。
-  if (proxyMode !== 'direct') {
-    // 仅对【本轮实际发射】的 endpoint 节点强制路由：未就绪/被跳过的 Tailscale 节点不进 pendingEndpoints，
-    // 其 tag 若仍 force-route 会被末尾 fixRouteDeadReferences 改写成 selector → 该段误流向全局选中节点。
-    // emitted 集合天然只含 endpoint 协议（仅 WG/TS 进 pendingEndpoints），故无需再按协议预判。
-    const emittedEndpointTags = new Set(deps.pendingEndpoints.map((e) => e.tag));
-    // 跨 endpoint 去重：同一 CIDR 被多个 endpoint 声明（如两个 Tailscale 节点都含 tailnet 100.64.0.0/10，
-    // 或两个 WG 节点 allowedIPs 重叠），sing-box 路由首条命中 → 后者静默失效。按 config.servers 顺序，
-    // 先声明者占有该段（隐式优先级），后者重复段跳过 + 累计告警，杜绝「无声误路由到另一节点」。
-    const claimedCidrs = new Set<string>();
-    let forceRouteConflicts = 0;
-    for (const s of config.servers) {
-      const tag = idToTagMap.get(s.id);
-      if (!tag || !emittedEndpointTags.has(tag)) continue;
-      const cidrs = endpointForcedRouteCidrs(s).filter((c) => {
-        if (claimedCidrs.has(c)) {
-          forceRouteConflicts++;
-          return false;
-        }
-        claimedCidrs.add(c);
-        return true;
-      });
-      if (cidrs.length > 0) {
-        rules.push({ ip_cidr: cidrs, action: 'route', outbound: tag });
-      }
-    }
-    if (forceRouteConflicts > 0) {
-      deps.log(
-        'warn',
-        `${forceRouteConflicts} 个 endpoint 路由段被多个节点重复声明，已按节点顺序去重（先声明者生效）`
-      );
-    }
-  }
-
-  // 1. 私有 IP 段直连（内网地址不应该经过代理）。仅当用户未关闭"绕过局域网"时添加。
-  if (config.bypassLAN !== false) {
-    rules.push({
-      ip_cidr: PRIVATE_IP_CIDRS,
-      action: 'route',
-      outbound: 'direct',
-    });
-    // 私有/本地**域名**直连（geosite-private，补 ip_cidr 的域名盲区，如路由器后台域）。geosite-private 由
-    // BUILTIN_GEO_RULESETS 随包 bundle + 自动更新 fswatch 热加载；仅在本地 .srs 有效时加规则，缺失则跳过
-    // （不引用不存在的 rule_set，避免 FATAL）——与上面 getLocalGeoRuleSets 的缺失即跳过一致。
-    if (isValidSrsFile(path.join(getRuntimeRulesDir(), 'geosite-private.srs'))) {
-      rules.push({ rule_set: 'geosite-private', action: 'route', outbound: 'direct' });
-    }
-  }
+  // 优先级重排：0c(wg/tailscale force-route) + 1(bypassLAN 私网直连) 已下移到「自定义规则 + 应用分流」之后
+  //（用户自定义规则/应用分流最高优先，可覆盖 mesh force-route 与 LAN 直连，用户态选节点最灵活）。见下方同名块。
 
   // Bug 4 修复：删除此处重复的 QUIC 阻断规则
   // 第一条 QUIC reject 规则已在上方（生成 routeConfig 之前）添加，此处重复添加会造成规则冗余
@@ -495,6 +468,64 @@ export function buildRouteConfig(
           outbound,
         });
       }
+    }
+  }
+
+  // ===== 用户规则之后的功能性强制路由（reorder：原在用户规则之上，现下移，使用户自定义规则/应用分流可覆盖）=====
+  // 0c. endpoint 节点（WireGuard/Tailscale）的「配置路由段」强制路由到**该节点自身 tag**——优先于下方私网直连、
+  //     **独立于 bypass-LAN 开关、独立于全局选中**。单一真值：节点路由由其 allowedIPs(WG) / routes+tailnet(TS)
+  //     决定（endpointForcedRouteCidrs）；指向节点自身 tag（非 selector）→ 该段恒走其 mesh 节点、与全局选中无关。
+  //     **现位于用户自定义规则/应用分流之后**：用户可写规则覆盖 mesh 段（选节点更灵活），重叠时由调用方记 warn 提醒。
+  //     仅 userspace（system 由内核接口路由——Phase 2）；仅非 direct。按 config.servers 顺序=隐式优先级；
+  //     被跳过节点的死引用由 fixRouteDeadReferences 兜底改写 selector。
+  if (proxyMode !== 'direct') {
+    // 仅对【本轮实际发射】的 endpoint 节点强制路由：未就绪/被跳过的 Tailscale 节点不进 pendingEndpoints，
+    // 其 tag 若仍 force-route 会被末尾 fixRouteDeadReferences 改写成 selector → 该段误流向全局选中节点。
+    // emitted 集合天然只含 endpoint 协议（仅 WG/TS 进 pendingEndpoints），故无需再按协议预判。
+    const emittedEndpointTags = new Set(deps.pendingEndpoints.map((e) => e.tag));
+    // 跨 endpoint 去重：同一 CIDR 被多个 endpoint 声明（如两个 Tailscale 节点都含 tailnet 100.64.0.0/10，
+    // 或两个 WG 节点 allowedIPs 重叠），sing-box 路由首条命中 → 后者静默失效。按 config.servers 顺序，
+    // 先声明者占有该段（隐式优先级），后者重复段跳过 + 累计告警，杜绝「无声误路由到另一节点」。
+    const claimedCidrs = new Set<string>();
+    let forceRouteConflicts = 0;
+    for (const s of config.servers) {
+      const tag = idToTagMap.get(s.id);
+      if (!tag || !emittedEndpointTags.has(tag)) continue;
+      const cidrs = endpointForcedRouteCidrs(s).filter((c) => {
+        if (claimedCidrs.has(c)) {
+          forceRouteConflicts++;
+          return false;
+        }
+        claimedCidrs.add(c);
+        return true;
+      });
+      if (cidrs.length > 0) {
+        rules.push({ ip_cidr: cidrs, action: 'route', outbound: tag });
+      }
+    }
+    if (forceRouteConflicts > 0) {
+      deps.log(
+        'warn',
+        `${forceRouteConflicts} 个 endpoint 路由段被多个节点重复声明，已按节点顺序去重（先声明者生效）`
+      );
+    }
+  }
+
+  // 1. 私有 IP 段直连（内网地址不应该经过代理）。仅当用户未关闭"绕过局域网"时添加。
+  //    **现位于用户规则之后**：用户自定义规则（如「192.168.x.x → 代理」）优先级更高、可覆盖此 LAN 默认直连，
+  //    故 bypassLAN 无需独立的「可编辑排除清单」（用规则覆盖即可）。
+  if (config.bypassLAN !== false) {
+    // 与 mesh force-route 块一致：空数组不发射规则（用户把 bypassLANList 编辑成只剩域名时 cidrs 为空，
+    // 避免 `ip_cidr:[]` 空规则；域名直连仍由下方 geosite-private 兜底）。
+    const bypassCidrs = bypassLanCidrs(effectiveBypassLan(config));
+    if (bypassCidrs.length > 0) {
+      rules.push({ ip_cidr: bypassCidrs, action: 'route', outbound: 'direct' });
+    }
+    // 私有/本地**域名**直连（geosite-private，补 ip_cidr 的域名盲区，如路由器后台域）。geosite-private 由
+    // BUILTIN_GEO_RULESETS 随包 bundle + 自动更新 fswatch 热加载；仅在本地 .srs 有效时加规则，缺失则跳过
+    // （不引用不存在的 rule_set，避免 FATAL）——与上面 getLocalGeoRuleSets 的缺失即跳过一致。
+    if (isValidSrsFile(path.join(getRuntimeRulesDir(), 'geosite-private.srs'))) {
+      rules.push({ rule_set: 'geosite-private', action: 'route', outbound: 'direct' });
     }
   }
 

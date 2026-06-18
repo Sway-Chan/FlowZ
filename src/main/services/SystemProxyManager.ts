@@ -13,7 +13,6 @@ import { system32, powershellPath, isCommandNotFoundError } from '../utils/win-s
 import type { LogManager } from './LogManager';
 import type { LogLevel } from '../../shared/types';
 import {
-  effectiveBypassList,
   formatBypassForMac,
   formatBypassForWindows,
   formatBypassForLinux,
@@ -39,7 +38,7 @@ export interface SystemProxyStatus {
  */
 export interface ISystemProxyManager {
   /**
-   * 启用系统代理。bypassList = 用户配置的忽略代理列表（缺省取 DEFAULT_SYSTEM_PROXY_BYPASS）；按平台格式化下发。
+   * 启用系统代理。bypassList = 「绕过局域网」清单（ProxyManager 传入：bypassLAN 关→[]，否则 bypassLANList ?? DEFAULT_BYPASS_LAN）；按平台格式化下发。
    */
   enableProxy(
     address: string,
@@ -245,7 +244,7 @@ export class WindowsSystemProxy extends SystemProxyBase {
           // 代理覆盖（忽略代理列表）= 用户配置的 bypass 清单（缺省业内聚合清单，含私网/保留段 + Apple 连通性 +
           // 国内会被代理打断的 App/网银）。Windows ProxyOverride 不支持 CIDR → CIDR 转通配（v6 CIDR 跳过）、域名原样、补 <local>。
           // 对齐 Clash/Stash 系：保存原列表→开启写入→关闭还原（restoreProxySettings 负责还原）。
-          const proxyOverride = formatBypassForWindows(effectiveBypassList(bypassList));
+          const proxyOverride = formatBypassForWindows(bypassList ?? []);
           await execAsync(
             `"${this.regExe}" add "${this.regPath}" /v ProxyOverride /t REG_SZ /d "${proxyOverride}" /f`
           );
@@ -548,7 +547,7 @@ export class MacOSSystemProxy extends SystemProxyBase {
 
             // 代理绕过列表（忽略代理列表）= 用户配置的 bypass 清单（缺省业内聚合清单，对齐 Clash/Stash）。
             // networksetup 原样接受 CIDR(v4/v6) + 域名 + *.通配（空格分隔）。保存原列表→开启写入→关闭还原。
-            const bypassDomains = formatBypassForMac(effectiveBypassList(bypassList));
+            const bypassDomains = formatBypassForMac(bypassList ?? []);
             await execAsync(
               `networksetup -setproxybypassdomains "${service}" ${bypassDomains.join(' ')}`
             );
@@ -806,7 +805,7 @@ export class LinuxSystemProxy extends SystemProxyBase {
 
           // 设置忽略列表（用户配置的 bypass 清单，缺省业内聚合清单）。gsettings ignore-hosts 为 GVariant 字符串数组，
           // 接受 CIDR + 域名；单引号包裹、逗号分隔。条目本身无单引号（已 trim/去空），无注入风险。
-          const hosts = formatBypassForLinux(effectiveBypassList(bypassList));
+          const hosts = formatBypassForLinux(bypassList ?? []);
           const ignoreList = `[${hosts.map((h) => `'${h}'`).join(', ')}]`;
           await execAsync(`gsettings set org.gnome.system.proxy ignore-hosts "${ignoreList}"`);
         },

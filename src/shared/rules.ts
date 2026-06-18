@@ -161,6 +161,15 @@ export function ruleConditions(
     : [{ type: rule.type, values: rule.values }];
 }
 
+/** 一条规则里的全部 ipCidr 值（trim/去空，扫所有条件）。供「与组网 mesh 段重叠」提醒共用。 */
+export function ruleIpCidrs(rule: Pick<Rule, 'type' | 'values' | 'conditions'>): string[] {
+  return ruleConditions(rule)
+    .filter((c) => c.type === 'ipCidr')
+    .flatMap((c) => (Array.isArray(c.values) ? c.values : []))
+    .map((v) => (typeof v === 'string' ? v.trim() : ''))
+    .filter(Boolean);
+}
+
 /** 聚合校验一条规则：每个条件类型合法 + 至少一个合法值；combineMode 合法；镜像 type 合法（旁路写防御）。 */
 export function validateRule(
   rule: Pick<Rule, 'type' | 'values' | 'conditions' | 'combineMode'>

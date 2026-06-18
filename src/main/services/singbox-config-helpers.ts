@@ -46,23 +46,6 @@ export const DOMESTIC_BANK_AND_STOCK_DOMAINS = [
   '.tdx.com.cn', // 通达信
 ];
 
-/** 私有/保留 IP 段（route 私网直连 + TUN 排除集共用，单一真值）。 */
-export const PRIVATE_IP_CIDRS = [
-  // IPv4 私有地址
-  '10.0.0.0/8',
-  '172.16.0.0/12',
-  '192.168.0.0/16',
-  '127.0.0.0/8',
-  '169.254.0.0/16',
-  '224.0.0.0/4',
-  '240.0.0.0/4',
-  // IPv6 私有地址
-  '::1/128', // loopback
-  'fc00::/7', // unique local address (ULA)
-  'fe80::/10', // link-local
-  'ff00::/8', // multicast
-];
-
 /** 主机字符串是否为 IPv4 字面量（收敛到 shared/ip.isIpv4 严格判定，与 DNS 分类同源，避免不一致）。 */
 export const isIpv4Host = (host: string): boolean => isIpv4(host);
 
