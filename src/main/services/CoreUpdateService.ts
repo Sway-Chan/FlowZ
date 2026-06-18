@@ -15,6 +15,7 @@ import { resourceManager } from './ResourceManager';
 
 import type { UserConfig } from '../../shared/types';
 import { encodeMajorMinor, sameMajorMinor, compareSemver } from '../../shared/version';
+import { classifyCoreBuild, type CoreBuildKind } from '../../shared/core-build';
 import { CoreUpdateStateStore } from './core-update-state-store';
 import type { StagedCoreInfo, CoreAutoUpdateState } from './core-update-state-store';
 import { CoreDownloader } from './core-downloader';
@@ -37,6 +38,8 @@ export interface CoreVersionInfo {
   backupVersion: string | null;
   hasBackup: boolean;
   lastKnownVersion: string | null;
+  // 内核来源：official=官方 / fork=第三方（禁在线·自动更新）/ unknown=无法确认（仅提示）。
+  build: CoreBuildKind;
 }
 
 // StagedCoreInfo / CoreAutoUpdateState 迁至 core-update-state-store（与 CoreUpdateStateStore 同处）；re-export 保对外兼容。
@@ -134,6 +137,23 @@ export class CoreUpdateService {
       this.logManager.addLog('info', '正在检查 Sing-box 核心更新...', 'CoreUpdateService');
 
       const currentVersion = await this.getCurrentVersion();
+
+      // 第三方（非官方）内核：禁在线更新（不打 GitHub），避免覆盖用户刻意安装的 fork。
+      // 自动调度经 runAutoUpdateCycle→checkUpdate 同被此闸拦下（=自动更新对 fork 失效）。
+      if ((await this.getCoreBuild()) === 'fork') {
+        this.logManager.addLog(
+          'info',
+          '检测到第三方（非官方）内核，已禁用在线检查更新',
+          'CoreUpdateService'
+        );
+        return {
+          hasUpdate: false,
+          currentVersion,
+          error:
+            '当前为第三方（非官方）内核，已禁用在线更新；如需恢复官方更新，请先回滚或重置到出厂内核',
+        };
+      }
+
       const releases = await this.coreDownloader.fetchReleases();
 
       if (!releases || releases.length === 0) {
@@ -235,6 +255,13 @@ export class CoreUpdateService {
   async updateCore(downloadUrl: string): Promise<boolean> {
     if (this.isUpdating) {
       throw new Error('更新正在进行中');
+    }
+
+    // 第三方（非官方）内核：拒绝在线更新，避免覆盖用户刻意安装的 fork。force 刷新版本行（本方法守卫前无 getCurrentVersion）。
+    if ((await this.getCoreBuild(true)) === 'fork') {
+      throw new Error(
+        '当前为第三方（非官方）内核，已禁用在线更新；请先回滚或重置到出厂内核后再更新'
+      );
     }
 
     this.isUpdating = true;
@@ -746,6 +773,20 @@ export class CoreUpdateService {
     if (!lockHeld && this.isUpdating) return 'noop';
     if (!lockHeld) this.isUpdating = true;
     try {
+      // 第三方（非官方）内核：作废任何暂存的官方核（不落位覆盖用户刻意安装的 fork）。
+      // 覆盖「曾官方→自动 staged→用户手动换 fork」时序，杜绝 staged 静默回覆 fork。force 刷新版本行（守卫前无强制刷新）。
+      if ((await this.getCoreBuild(true)) === 'fork') {
+        if (!this.loadAutoState().staged) return 'noop'; // 无暂存可作废 → noop（保持返回契约：discarded=确有 staged 被清）
+        this.logManager.addLog(
+          'info',
+          '当前为第三方内核，作废暂存的官方内核（不覆盖用户内核）',
+          'CoreUpdateService'
+        );
+        this.clearStaged();
+        this.emitAutoStatus();
+        return 'discarded';
+      }
+
       const staged = this.loadAutoState().staged;
       if (!staged) return 'noop';
 
@@ -959,6 +1000,24 @@ export class CoreUpdateService {
   }
 
   /**
+   * 判定当前内核来源（official/fork/unknown）。fork=第三方内核 → 禁在线/自动更新（见 checkUpdate/updateCore/
+   * tryApplyStaged 闸门）。读 `sing-box version` 原始行 → classifyCoreBuild（单一真值 shared/core-build）。
+   * 不单独缓存 kind：版本行由 getCoreVersion 缓存/换核后 force 刷新，判定恒跟随当前实跑内核。
+   */
+  async getCoreBuild(force = false): Promise<CoreBuildKind> {
+    try {
+      if (!this.proxyManager) return 'unknown';
+      // force=true：自行刷新版本行（不依赖调用方先 getCurrentVersion(force)），使守卫恒跟随当前实跑内核——
+      // 否则会话内换核（官方→fork）后读到陈旧 official 行 → 守卫失效覆盖用户 fork。updateCore/tryApplyStaged
+      // 传 true（它们守卫前无强制刷新）；checkUpdate/getVersionInfo 已先 getCurrentVersion(force) 刷新，传 false 复用。
+      const line = await this.proxyManager.getCoreVersionLine(force);
+      return classifyCoreBuild(line);
+    } catch {
+      return 'unknown';
+    }
+  }
+
+  /**
    * 记录成功启动的版本（在代理成功启动后调用）
    */
   async recordSuccessfulVersion(): Promise<void> {
@@ -1040,7 +1099,9 @@ export class CoreUpdateService {
     const hasBackup = this.hasBackup();
     const backupVersion = hasBackup ? await this.getBackupVersion() : null;
     const lastKnownVersion = this.getLastKnownGoodVersion();
-    return { currentVersion, backupVersion, hasBackup, lastKnownVersion };
+    // getCurrentVersion(force) 已刷新版本行 → getCoreBuild 跟随当前实跑内核。
+    const build = await this.getCoreBuild();
+    return { currentVersion, backupVersion, hasBackup, lastKnownVersion, build };
   }
 
   /**

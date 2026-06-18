@@ -663,6 +663,8 @@ export const coreUpdateApi = {
     backupVersion: string | null;
     hasBackup: boolean;
     lastKnownVersion: string | null;
+    /** 内核来源：official=官方 / fork=第三方（禁在线·自动更新）/ unknown=无法确认（仅提示）。 */
+    build: 'official' | 'fork' | 'unknown';
   }> {
     return ipcClient.invoke(IPC_CHANNELS.CORE_GET_VERSION_INFO);
   },
