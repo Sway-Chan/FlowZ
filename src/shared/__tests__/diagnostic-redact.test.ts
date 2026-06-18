@@ -210,7 +210,11 @@ describe('collectNodeIdentifiers — 节点标识符提取 + 类型化占位（P
         { address: '104.18.8.83', name: 'US' }, // name 'US' <4 跳过
         { shadowTlsSettings: { sni: 'disguise.shadow.io' } }, // H2: ShadowTLS sni
         { tailscaleSettings: { hostname: 'mybox.ts.net', exitNode: 'exit.ts.net' } }, // H2: tailscale
-        { customSettings: { outbound: { type: 'snell', server: 'custom.node.io', sni: 'cust.sni.io' } } }, // H2: custom 展平
+        {
+          customSettings: {
+            outbound: { type: 'snell', server: 'custom.node.io', sni: 'cust.sni.io' },
+          },
+        }, // H2: custom 展平
         { address: 'a.example-argo.com' }, // 重复 → 不再分配
       ],
     });
