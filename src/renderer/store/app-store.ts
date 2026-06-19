@@ -78,6 +78,11 @@ interface AppState {
   // 仅会话内存，由 EVENT_PROXY_INVALID_NODES 事件覆盖（空数组=清空）。
   invalidNodes: Record<string, InvalidNodeInfo>;
 
+  // Tailscale 节点真实登录态（serverId → loggedIn = hasAuthKey || state 目录存在）。Phase 1：
+  // 「需登录」角标由此真实态驱动（替代静态 !authKey），故交互登录成功后角标会自动消失。
+  // 仅 Tailscale 节点入表；挂载 / 节点增删 / 登录成功事件时由 refreshTailscaleLoginStates 刷新。
+  tailscaleLoginStates: Record<string, boolean>;
+
   // Privacy Protection Mode
   isPrivacyMode: boolean;
 
@@ -113,6 +118,9 @@ interface AppState {
   // Status Actions
   refreshConnectionStatus: () => Promise<void>;
   refreshStatistics: () => Promise<void>;
+  // Tailscale 登录态：整体刷新（挂载/节点增删后）+ 单条覆盖（登录成功事件即时更新，免一次 IPC 往返）。
+  refreshTailscaleLoginStates: () => Promise<void>;
+  setTailscaleLoginState: (serverId: string, loggedIn: boolean) => void;
 
   // Server Management Actions
   deleteServer: (serverId: string) => Promise<void>;
@@ -143,6 +151,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   ipInfo: null,
   latencyMap: {},
   invalidNodes: {},
+  tailscaleLoginStates: {},
   isPrivacyMode: false,
   helperStatus: null,
   availableAppUpdate: null,
@@ -298,6 +307,10 @@ export const useAppStore = create<AppState>((set, get) => ({
 
         const isPrivacyMode = await api.config.getPrivacyMode();
         set({ config, isPrivacyMode });
+        // 节点增删/导入/订阅更新/编辑最终都回流到 loadConfig（单飞合一）→ 在此统一刷新 Tailscale 登录态，
+        // 使登录态表始终与最新节点集合对齐（含新增的带 authKey 节点不误显「需登录」）。fire-and-forget：
+        // 不阻塞 loadConfig 主流程/单飞窗口，刷新失败仅 console（角标退化为缺省 false=保守显需登录，不破功能）。
+        void get().refreshTailscaleLoginStates();
       } catch (error) {
         console.error('[Store] Exception loading config:', error);
         toast.error(i18n.t('common.configLoadFail'));
@@ -369,11 +382,26 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
+  // 整体刷新 Tailscale 登录态（主进程按 hasAuthKey || state 目录存在 判定，整表覆盖）。
+  refreshTailscaleLoginStates: async () => {
+    try {
+      const states = await api.server.getTailscaleLoginStates();
+      set({ tailscaleLoginStates: states });
+    } catch (error) {
+      console.error('Failed to refresh tailscale login states:', error);
+    }
+  },
+
+  // 单条覆盖（登录成功事件即时点亮，无需等整表 IPC；下次整体刷新会与磁盘真值对齐）。
+  setTailscaleLoginState: (serverId, loggedIn) =>
+    set((s) => ({ tailscaleLoginStates: { ...s.tailscaleLoginStates, [serverId]: loggedIn } })),
+
   // Server Management Actions
   deleteServer: async (serverId) => {
     try {
       await api.server.delete(serverId);
-      // Reload config to get updated server list
+      // Reload config to get updated server list（loadConfig 内已统一刷新 Tailscale 登录态，覆盖增删/导入，
+      // 故此处不再单独调 refreshTailscaleLoginStates，避免双刷）。
       await get().loadConfig();
     } catch (error) {
       console.error('[Store] Exception deleting server:', error);

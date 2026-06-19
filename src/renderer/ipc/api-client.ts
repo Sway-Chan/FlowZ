@@ -132,9 +132,20 @@ export const proxyApi = {
 
   /**
    * 监听 Tailscale 交互登录 URL（无 auth_key 的节点启动时核日志出登录 URL）。
+   * transient=true 表示来自 Phase 2 按需登录核（已自动开浏览器）→ 渲染端降级为可关闭普通 toast。
    */
-  onTailscaleAuth(listener: (data: { nodeName: string; url: string }) => void): () => void {
+  onTailscaleAuth(
+    listener: (data: { nodeName: string; url: string; transient?: boolean }) => void
+  ): () => void {
     return ipcClient.on(IPC_CHANNELS.EVENT_TAILSCALE_AUTH_URL, listener);
+  },
+
+  /**
+   * 监听 Tailscale 交互登录成功（主进程轮询 state 目录检出，log-level 无关）。
+   * 渲染端据此 dismiss 那条 Infinity 登录 toast + 刷新登录态角标。
+   */
+  onTailscaleAuthOk(listener: (data: { serverId: string; nodeName: string }) => void): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_TAILSCALE_AUTH_OK, listener);
   },
 
   /**
@@ -254,6 +265,31 @@ export const serverApi = {
    */
   async delete(serverId: string): Promise<void> {
     return ipcClient.invoke(IPC_CHANNELS.SERVER_DELETE, { serverId });
+  },
+
+  /**
+   * Tailscale 节点真实登录态（Phase 1）：serverId → loggedIn（hasAuthKey || state 目录存在）。
+   * 仅含 Tailscale 节点；渲染端据此驱动「需登录」角标，与日志等级无关。
+   */
+  async getTailscaleLoginStates(): Promise<Record<string, boolean>> {
+    return ipcClient.invoke(IPC_CHANNELS.TAILSCALE_GET_LOGIN_STATES);
+  },
+
+  /**
+   * Phase 2 按需登录：拉起瞬态登录核取交互登录 URL（主进程自动开浏览器 + 系统通知）。
+   * started=false 时 reason 说明（alreadyLoggedIn / inMainCore / alreadyRunning），渲染端据此提示。
+   */
+  async tailscaleLogin(
+    server: ServerConfig
+  ): Promise<{ started: boolean; reason?: 'alreadyLoggedIn' | 'inMainCore' | 'alreadyRunning' }> {
+    return ipcClient.invoke(IPC_CHANNELS.TAILSCALE_LOGIN, { server });
+  },
+
+  /**
+   * 取消某节点在飞的瞬态登录核（用户手动取消）。
+   */
+  async tailscaleLoginCancel(serverId: string): Promise<void> {
+    return ipcClient.invoke(IPC_CHANNELS.TAILSCALE_LOGIN_CANCEL, { serverId });
   },
 
   /**

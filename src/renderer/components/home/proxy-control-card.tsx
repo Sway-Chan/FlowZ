@@ -116,6 +116,8 @@ export function ProxyControlCard() {
   };
 
   // 启停：helper 引导（macOS TUN 未就绪）由主进程 start() 的 native gate 统一承接，此处直接启停。
+  // Phase 2 起，Tailscale 登录改由节点列表/表单的「登录」按钮按需触发瞬态核（强制 info 级，捕获不再受
+  // 日志等级摆布）→ 原「日志级别无法捕获登录链接」兜底提示（§1.4）已无意义，删除。
   const handleToggleProxy = async () => {
     if (isConnected) {
       await stopProxy();
