@@ -157,7 +157,7 @@ export function computeTopologyLayout(
     x: PADDING_LEFT + SHIFT_RIGHT,
     y: PADDING_Y,
     height: Math.max(2, totalConnections * scale),
-    color: '#6366f1', // Indigo-500
+    color: 'fill-primary', // Conduit token(双主题自适配,见 connection-topology rect className)
   };
   sourceNode.y = (FIXED_HEIGHT - sourceNode.height) / 2;
   nodeList.push(sourceNode);
@@ -182,7 +182,7 @@ export function computeTopologyLayout(
       x: middleX,
       y: currentY,
       height: h,
-      color: name === t('home.others') ? '#94a3b8' : '#10b981', // Slate-400 or Emerald-500
+      color: name === t('home.others') ? 'fill-muted-foreground' : 'fill-success', // token: Others slate / 域名 live 绿
     };
     nodeList.push(node);
     midNodeParams.set(name, node);
@@ -208,7 +208,7 @@ export function computeTopologyLayout(
       x: outboundX,
       y: currentY,
       height: h,
-      color: '#f59e0b', // Amber-500
+      color: 'fill-warning', // token: 出口 warn 琥珀
     };
     nodeList.push(node);
     outNodeParams.set(name, node);
