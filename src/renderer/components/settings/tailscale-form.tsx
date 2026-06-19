@@ -24,6 +24,7 @@ const createTailscaleSchema = () =>
   z.object({
     authKey: z.string().optional(),
     allowInternet: z.boolean(),
+    reverseMesh: z.boolean(),
     exitNode: z.string().optional(),
     exitNodeAllowLanAccess: z.boolean(),
     acceptRoutes: z.boolean(),
@@ -49,6 +50,7 @@ export function TailscaleForm({ serverConfig, onSubmit }: TailscaleFormProps) {
     defaultValues: {
       authKey: '',
       allowInternet: true, // 新建默认开
+      reverseMesh: false, // Phase 2：反向 mesh（system_interface），默认关=userspace
       exitNode: '',
       exitNodeAllowLanAccess: false,
       acceptRoutes: false,
@@ -66,6 +68,7 @@ export function TailscaleForm({ serverConfig, onSubmit }: TailscaleFormProps) {
       form.reset({
         authKey: ts?.authKey || '',
         allowInternet: ts?.allowInternet !== false, // 缺省 true（向后兼容）
+        reverseMesh: ts?.reverseMesh === true, // 缺省 false
         exitNode: ts?.exitNode || '',
         exitNodeAllowLanAccess: ts?.exitNodeAllowLanAccess ?? false,
         acceptRoutes: ts?.acceptRoutes ?? false,
@@ -85,6 +88,7 @@ export function TailscaleForm({ serverConfig, onSubmit }: TailscaleFormProps) {
       tailscaleSettings: {
         authKey: values.authKey?.trim() || undefined,
         allowInternet: values.allowInternet,
+        reverseMesh: values.reverseMesh,
         exitNode: values.exitNode?.trim() || undefined,
         exitNodeAllowLanAccess: values.exitNodeAllowLanAccess || undefined,
         // 填了 routes 自动开 acceptRoutes（否则 tsnet 不接收这些 advertised 子网，路由白配）
@@ -100,6 +104,7 @@ export function TailscaleForm({ serverConfig, onSubmit }: TailscaleFormProps) {
   };
 
   const allowInternet = form.watch('allowInternet');
+  const reverseMesh = form.watch('reverseMesh');
 
   return (
     <Form {...form}>
@@ -142,9 +147,42 @@ export function TailscaleForm({ serverConfig, onSubmit }: TailscaleFormProps) {
                     <div className="space-y-0.5 pr-3">
                       <FormLabel>{t('servers.allowInternet', 'Allow internet access')}</FormLabel>
                       <FormDescription>
+                        {reverseMesh
+                          ? t(
+                              'servers.allowInternetSystemDisabled',
+                              'Disabled in reverse-mesh mode: a kernel-interface node only carries the listed subnets and never acts as the full-tunnel exit. Turn off reverse mesh to use this node as an exit.'
+                            )
+                          : t(
+                              'servers.tsAllowInternetDesc',
+                              'When off, this node never acts as a full-tunnel exit (the exit node below is ignored); it only reaches the tailnet and routed subnets.'
+                            )}
+                      </FormDescription>
+                    </div>
+                    <FormControl>
+                      <Switch
+                        checked={reverseMesh ? false : field.value}
+                        disabled={reverseMesh}
+                        onCheckedChange={field.onChange}
+                      />
+                    </FormControl>
+                  </FormItem>
+                )}
+              />
+            </FieldSpan>
+            <FieldSpan>
+              <FormField
+                control={form.control}
+                name="reverseMesh"
+                render={({ field }) => (
+                  <FormItem className="flex items-center justify-between rounded-md border p-3">
+                    <div className="space-y-0.5 pr-3">
+                      <FormLabel>
+                        {t('servers.reverseMesh', 'Reverse mesh (be reachable)')}
+                      </FormLabel>
+                      <FormDescription>
                         {t(
-                          'servers.tsAllowInternetDesc',
-                          'When off, this node never acts as a full-tunnel exit (the exit node below is ignored); it only reaches the tailnet and routed subnets.'
+                          'servers.reverseMeshDesc',
+                          'Create a real kernel interface so peers can reach this device or use it as a subnet router. Requires the privileged helper and TUN mode; this node then only carries the listed subnets (never the full tunnel).'
                         )}
                       </FormDescription>
                     </div>
@@ -166,7 +204,7 @@ export function TailscaleForm({ serverConfig, onSubmit }: TailscaleFormProps) {
                       <Input
                         placeholder="100.x.y.z / hostname"
                         {...field}
-                        disabled={!allowInternet}
+                        disabled={!allowInternet || reverseMesh}
                       />
                     </FormControl>
                     <FormDescription>
@@ -175,12 +213,17 @@ export function TailscaleForm({ serverConfig, onSubmit }: TailscaleFormProps) {
                         'Route all traffic through this tailnet node (full-tunnel). Empty = only reach tailnet / accepted routes.'
                       )}
                     </FormDescription>
-                    {!allowInternet && (
+                    {(reverseMesh || !allowInternet) && (
                       <p className="text-sm text-amber-600 dark:text-amber-500">
-                        {t(
-                          'servers.tsAllowInternetOffHint',
-                          'Internet access off: exit node ignored; this node only reaches the tailnet / routed subnets.'
-                        )}
+                        {reverseMesh
+                          ? t(
+                              'servers.tsReverseMeshHint',
+                              'Reverse-mesh (system) mode: exit node ignored; this node only reaches the tailnet / routed subnets and is reachable from peers (subnet router).'
+                            )
+                          : t(
+                              'servers.tsAllowInternetOffHint',
+                              'Internet access off: exit node ignored; this node only reaches the tailnet / routed subnets.'
+                            )}
                       </p>
                     )}
                     <FormMessage />
