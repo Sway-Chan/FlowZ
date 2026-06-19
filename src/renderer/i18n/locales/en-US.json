@@ -777,6 +777,8 @@
     "wsPathDesc": "WebSocket connection path",
     "wsHost": "WebSocket Host",
     "wsHostDesc": "WebSocket Host header",
+    "grpcServiceName": "gRPC Service Name",
+    "grpcServiceNameDesc": "gRPC service_name; must match the server.",
     "none": "None",
     "optional": "Optional",
     "random": "Random",
