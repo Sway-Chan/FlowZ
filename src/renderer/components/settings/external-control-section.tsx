@@ -39,6 +39,7 @@ export function ExternalControlSection() {
       <SettingsRow
         label={t('settings.advanced.clashApiAddress')}
         description={t('settings.advanced.externalControlDesc')}
+        tooltip={t('settings.advanced.externalControlDescFull')}
         stacked
       >
         <div className="flex items-center gap-2">
@@ -58,6 +59,7 @@ export function ExternalControlSection() {
       <SettingsRow
         label={t('settings.advanced.clashApiSecret')}
         description={t('settings.advanced.clashApiSecretDesc')}
+        tooltip={t('settings.advanced.clashApiSecretDescFull')}
         stacked
       >
         <div className="flex flex-wrap items-center gap-2">

@@ -12,7 +12,6 @@ import {
   FormMessage,
 } from '@/components/ui/form';
 import { Input } from '@/components/ui/input';
-import { Switch } from '@/components/ui/switch';
 import {
   Select,
   SelectContent,
@@ -26,6 +25,7 @@ import { TlsServerNameField, AllowInsecureField, AlpnField } from './shared/tls-
 import { FormButtons } from './shared/form-buttons';
 import { echSchemaShape, echDefaults, readEchDefault } from './shared/field-schemas';
 import { FormSection, FieldGrid, FieldSpan } from './shared/form-layout';
+import { SwitchField } from './shared/switch-field';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -133,9 +133,9 @@ export function TuicForm({ serverConfig, onSubmit }: TuicFormProps) {
                 name="uuid"
                 render={({ field }) => (
                   <FormItem>
-                    <FormLabel>UUID</FormLabel>
+                    <FormLabel>{t('servers.uuid', 'UUID')}</FormLabel>
                     <FormControl>
-                      <Input placeholder="Enter UUID" {...field} />
+                      <Input placeholder={t('servers.uuidPlaceholder')} {...field} />
                     </FormControl>
                     <FormDescription>{t('servers.tuicUuidDesc')}</FormDescription>
                     <FormMessage />
@@ -234,20 +234,11 @@ export function TuicForm({ serverConfig, onSubmit }: TuicFormProps) {
               <EchField control={form.control} t={t} />
             </FieldSpan>
             <FieldSpan>
-              <FormField
+              <SwitchField
                 control={form.control}
                 name="zeroRttHandshake"
-                render={({ field }) => (
-                  <FormItem className="flex items-center justify-between rounded-md border p-3">
-                    <div className="space-y-0.5 pe-3">
-                      <FormLabel>{t('servers.tuicZeroRtt')}</FormLabel>
-                      <FormDescription>{t('servers.tuicZeroRttDesc')}</FormDescription>
-                    </div>
-                    <FormControl>
-                      <Switch checked={field.value} onCheckedChange={field.onChange} />
-                    </FormControl>
-                  </FormItem>
-                )}
+                label={t('servers.tuicZeroRtt')}
+                tooltip={t('servers.tuicZeroRttDesc')}
               />
             </FieldSpan>
           </FieldGrid>

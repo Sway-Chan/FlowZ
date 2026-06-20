@@ -44,16 +44,13 @@ export function AppPolicyPage() {
           <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
             {t(
               'rules.appRoutingDisabledHint',
-              '应用分流已关闭：所有应用按当前分流策略走，下方规则不生效。提示：智能分流模式下自定义路由规则优先于应用分流。'
+              '应用分流已关闭：所有应用按当前分流策略走，下方规则不生效。'
             )}
           </p>
         ) : (
           !isSmartMode && (
             <p className="mt-1 text-xs text-amber-600 dark:text-amber-400">
-              {t(
-                'rules.appRoutingInactiveModeHint',
-                '当前分流模式下应用分流不生效，仅「智能分流」模式生效。'
-              )}
+              {t('rules.smartOnlyHint', '当前模式下不生效，仅「智能分流」模式生效。')}
             </p>
           )
         )}

@@ -33,7 +33,7 @@ export function RegionRoutingCard() {
             <CardDescription className="mt-1.5 leading-relaxed">
               {t(
                 'rules.regionRoutingDesc',
-                'Built-in scenario: auto-route by region — local direct, overseas via proxy. Only in Smart mode; your custom rules always take priority.'
+                'Auto-route by region: local direct, overseas via proxy. Only in Smart mode.'
               )}
             </CardDescription>
           </div>
@@ -85,8 +85,8 @@ export function RegionRoutingCard() {
           {!isSmart && (
             <p className="text-xs text-amber-600 dark:text-amber-400">
               {t(
-                'rules.regionRoutingInactive',
-                'Not active in the current mode; only Smart mode applies.'
+                'rules.smartOnlyHint',
+                'Not active in the current mode — only Smart mode applies.'
               )}
             </p>
           )}

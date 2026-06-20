@@ -30,6 +30,7 @@ export function LogSettingsSection() {
             ? t('settings.advanced.logLevelCaptureLocked')
             : t('settings.advanced.logLevelDesc')
         }
+        tooltip={t('settings.advanced.logLevelDescFull')}
       >
         {/* 诊断采集中级别锁定为 debug：禁用以免手动改被采集结束的快照还原静默覆盖（见诊断区）。 */}
         <Select
@@ -56,6 +57,7 @@ export function LogSettingsSection() {
       <SettingsRow
         label={t('settings.advanced.disableLogFile')}
         description={t('settings.advanced.disableLogFileDesc')}
+        tooltip={t('settings.advanced.disableLogFileDescFull')}
       >
         <Switch
           checked={config.disableLogFile === true}
