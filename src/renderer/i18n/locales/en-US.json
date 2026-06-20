@@ -703,7 +703,6 @@
     "searchPlaceholder": "Search node name, address...",
     "allProtocols": "All Protocols",
     "sort": "Sort",
-    "addServer": "Add Server",
     "manualAdd": "Add Manually",
     "importFromUrl": "Import from URL",
     "speedTest": "Latency",
@@ -845,7 +844,7 @@
     "editServer": "Edit Server Config",
     "addServerConfig": "Add Server Config",
     "editServerDesc": "Modify server configuration. Proxy will not restart automatically after saving.",
-    "addServerDesc": "Add a new proxy server. Supports VLESS, Trojan, Hysteria2, Shadowsocks, AnyTLS, TUIC, and Naive.",
+    "addServerDesc": "Add a proxy or mesh server. Choose the type under Protocol below.",
     "selectProtocol": "Select your proxy server protocol",
     "detour": "Proxy Chain (Detour)",
     "directConnection": "Direct (No Chain)",
@@ -1014,7 +1013,10 @@
     "tsLogoutRestartHint": "Node is running; restart the proxy to take effect",
     "tsLoggedInNoKeyHint": "Logged in — no auth key needed",
     "wgReverseMeshDesc": "Create a real WireGuard kernel interface (the OS holds the tunnel IP) so peers can reach services on this device. Requires the privileged helper and TUN mode.",
-    "tsReverseMeshDesc": "Reverse mesh (be reachable): create a real kernel interface so other tailnet devices can reach services on this device. Requires the privileged helper and TUN mode."
+    "tsReverseMeshDesc": "Reverse mesh (be reachable): create a real kernel interface so other tailnet devices can reach services on this device. Requires the privileged helper and TUN mode.",
+    "speedTestAll": "Test all",
+    "speedTestGroup": "Test this group",
+    "add": "Add"
   },
   "rules": {
     "ruleColumn": "Rule",
