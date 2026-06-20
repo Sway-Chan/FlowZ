@@ -23,6 +23,14 @@ const STATUS_DOT_PNG: Record<'connected' | 'disconnected' | 'error', string> = {
     'iVBORw0KGgoAAAANSUhEUgAAABIAAAASCAYAAABWzo5XAAABQklEQVR4nK2UTUoDQRCFv+qZNmMUF+YCLgRF4tLgAfQIvfEsggRc5BxZuMkR9ACSLAWJ4MILxIX4OxPmuZAJOhmFxHnL+nlV1a+qoSbYX06BEYIDYDDIDbQQu8AUQjRnDyHSL8XnjAIrKutwb5N4ZR+AaXpj17eP5ZhKoiJAne0NGuvnyE4wa305NcF0wcfzqQ3vn8pk9p2EM4zLnTVs9QrvO0wzyMkBcDhiD1k2RG9HHN+90EUFmZu1E4KzLjmW9PC+Q5qlCGE4DIcQaZbifQdLetYlnwlRdDQb6WC3hU8eMGuCrOINBSakV7L3LRuNJ0WuK7oBoJG0iVwTqVIIwJAgck0aSft7rqsIXgr1jmYghRDZaDzB1MfHDpHxc1eEyPCxw9S30XiiEKJCtdrkr38hy2Sw2IlUolajLRP+6xtZBp8CmLpNChT41AAAAABJRU5ErkJggg==',
 };
 
+/** 托盘菜单协议简写（菜单宽度受限，长协议名缩短以保留延迟显示；其余协议已短，原样大写）。 */
+const PROTOCOL_SHORT: Record<string, string> = {
+  wireguard: 'WG',
+  tailscale: 'TS',
+  shadowsocks: 'SS',
+  hysteria2: 'Hy2',
+};
+
 /**
  * 托盘图标状态
  */
@@ -311,7 +319,9 @@ export class TrayManager implements ITrayManager {
 
     const buildServerItem = (server: ServerConfig): MenuItemConstructorOptions => {
       const name = server.name || server.address;
-      const protocol = (server.protocol || '').toUpperCase();
+      const proto =
+        PROTOCOL_SHORT[(server.protocol || '').toLowerCase()] ??
+        (server.protocol || '').toUpperCase();
       const latency = this.speedTestResults.get(server.id);
       const latencyStr =
         latency !== undefined
@@ -319,10 +329,11 @@ export class TrayManager implements ITrayManager {
             ? ` [${latency}ms]`
             : ` [${this.t('超时', 'Timeout')}]`
           : '';
-      let label = `${name}（${protocol}）${latencyStr}`;
-      if (label.length > maxLabelLength) {
-        label = label.substring(0, maxLabelLength - 3) + '...';
-      }
+      // 超长只截「名字」，保「（协议）[延迟]」完整——延迟是选节点的关键信息，不应被尾部截断吃掉。
+      const suffix = `（${proto}）${latencyStr}`;
+      const maxName = Math.max(6, maxLabelLength - suffix.length);
+      const shownName = name.length > maxName ? `${name.slice(0, maxName - 1)}…` : name;
+      const label = `${shownName}${suffix}`;
       return {
         label,
         type: 'radio' as const,
@@ -727,7 +738,10 @@ export class TrayManager implements ITrayManager {
     this.isSpeedTesting = false;
     this.updateTrayMenu(this.isProxyRunning);
 
+    // 仅列实际测速的节点：不可测节点（Tailscale/reverseMesh/custom-endpoint）经 isSpeedTestable 已不在 results，
+    // 与 buildServerItem 的 undefined→无徽标 同口径，避免 toast 把「不适用」误报成「超时」。
     const resultList = servers
+      .filter((s) => results.has(s.id))
       .map((s) => ({
         name: s.name || s.address,
         protocol: (s.protocol || '').toUpperCase(),
@@ -739,8 +753,8 @@ export class TrayManager implements ITrayManager {
         return a.latency - b.latency;
       });
 
-    // 发送到渲染进程显示 toast
-    if (this.mainWindow && !this.mainWindow.isDestroyed()) {
+    // 发送到渲染进程显示 toast（全不可测/无结果时不弹空 toast；用独立 LIST 通道，与逐节点流式分开）
+    if (resultList.length > 0 && this.mainWindow && !this.mainWindow.isDestroyed()) {
       this.mainWindow.webContents.send(IPC_CHANNELS.EVENT_SPEED_TEST_RESULT_LIST, resultList);
     }
   }
