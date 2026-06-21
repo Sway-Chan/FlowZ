@@ -11,6 +11,16 @@ export function isAccountBasedProtocol(protocol: string | undefined): boolean {
   return protocol?.toLowerCase() === 'tailscale';
 }
 
+/**
+ * Tailscale 单节点硬限：已存在一个 Tailscale 节点时该「槽位」即被占用。
+ * 同一设备的所有 Tailscale 账号共用同一段网络地址（100.64.0.0/10 tailnet），多个会互相顶掉，故全局只许一个。
+ * editingId 排除自身——编辑现有 TS 节点不算「再加一个」，必须放行。
+ * 纯函数（仅看协议字段）：UI 主拦截点（use-server-actions）+ ConfigManager 兜底归一共用，可离线单测。
+ */
+export function tailscaleSlotTaken(servers: ServerConfig[], editingId?: string): boolean {
+  return servers.some((s) => s.protocol?.toLowerCase() === 'tailscale' && s.id !== editingId);
+}
+
 /** 全网段（catch-all / 全隧道）：IPv4 0.0.0.0/0 + IPv6 ::/0。单一真值——force-route 剥离、allowInternet=on
  * 注入 peer.allowed_ips、表单显示/录入剥离 均复用此清单，杜绝多处字面量漂移。 */
 export const FULL_TUNNEL_CIDRS = ['0.0.0.0/0', '::/0'] as const;
@@ -215,23 +225,6 @@ export function meshSelectedExitFallsBackToDirect(config: UserConfig): boolean {
   return (
     !!selected && isEndpointProtocol(selected.protocol) && !meshNodeCarriesFullTunnel(selected)
   );
-}
-
-/**
- * ICMP 兜底 outbound 是否走「选中节点的代理出口」(proxy-selector)，而非 direct（route-builder ICMP 规则单一真值）。
- *
- * route 侧 ICMP 兜底 = `proxyMode!=='direct' && isEndpointProtocol(selected) ? userExitTag : 'direct'`，其中
- * userExitTag 已经过 D4/D7 兜底（exitFallback ⟺ isEndpoint && !carriesFullTunnel → direct）。展开等价于：
- * 「非 direct 模式 ∧ 选中 endpoint 协议 ∧ 该节点承载全隧道」时 ICMP 经 proxy-selector，否则 direct。
- * 即只有 WG/Tailscale 全隧道节点能转 ICMP（防 ping 泄露真实 IP）；普通代理转不了 ICMP / off-mesh 兜底 → 直连。
- *
- * 单一真值供 route-builder 发射 + ProxyManager 热切换跨边界判定共用：热切换（clash_api PUT，不重生成 config）
- * 跨「ICMP 走 proxy ↔ 走 direct」边界时 ICMP 规则会错配 → planHotSwitch 据此退回重启（重生成 config 重算 ICMP）。
- */
-export function selectedExitRoutesIcmpViaProxy(config: UserConfig): boolean {
-  if ((config.proxyMode || 'smart').toLowerCase() === 'direct') return false;
-  const selected = config.servers?.find((s) => s.id === config.selectedServerId);
-  return !!selected && isEndpointProtocol(selected.protocol) && meshNodeCarriesFullTunnel(selected);
 }
 
 /**

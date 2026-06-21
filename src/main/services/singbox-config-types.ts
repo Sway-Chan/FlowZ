@@ -243,6 +243,10 @@ export interface SingBoxWireGuardPeer {
 export interface SingBoxEndpoint {
   type: string;
   tag: string;
+  // Dial Fields（endpoint 顶层继承）：sing-box 1.14 起，server 用域名的 endpoint 需 dial 级 domain_resolver
+  // （或 route.default_domain_resolver），否则域名解析无确定上游。WG peer.address 为域名时显式下发，
+  // 与 buildProxyOutbound 的 outbound.domain_resolver 同口径（IP server 不需 DNS 解析，故不下发）。
+  domain_resolver?: string;
   // WireGuard
   system?: boolean;
   mtu?: number;
@@ -349,9 +353,12 @@ export interface SingBoxApiService {
   listen: string;
   listen_port: number;
   secret?: string;
-  // sing-box 1.14 官方面板（opt-in）：enabled 时核首次联网拉 sing-box-dashboard 资源、于 listen_port 的 /dashboard/ serve。
+  // sing-box 1.14 官方面板（opt-in）：enabled 时于 listen_port 的 /dashboard/ serve。
   // 仅 config.singboxDashboard 开时注入 → 关闭时核绝不出网拉资源（默认不出网）。
-  dashboard?: { enabled: boolean };
+  // path（dashboard #55）：指向**随包内置/运行时下载覆盖**目录 → 核「serving user-provided files，auto-update disabled」，
+  //   零联网下载、打开即时、离线可用（实证 1.14-alpha.32：dashboard:{enabled,path} → /dashboard/ HTTP 200 本地 serve）。
+  //   省略 path 时核回落联网下载（异常打包/无内置时的兜底）。external_ui 等字段属 experimental.clash_api，非本 service。
+  dashboard?: { enabled: boolean; path?: string };
 }
 
 export interface SingBoxConfig {

@@ -29,7 +29,6 @@ import {
 } from '../../shared/server-completeness';
 import { isAccountBasedProtocol } from '../../shared/endpoint-routes';
 import { isDirectSelection } from '../../shared/direct-selection';
-import { leaksBearerOverPlaintext } from '../../shared/remote-instance-security';
 
 export interface IConfigManager {
   loadConfig(): Promise<UserConfig>;
@@ -311,6 +310,13 @@ export class ConfigManager implements IConfigManager {
     delete config.httpPort;
     delete config.socksPort;
 
+    // 远程实例 feature 已移除（UserConfig 类型已删 remoteInstances/activeInstanceId）→ 彻底清除旧版升级用户
+    // config.json 里的死字段残留。删除而非脱敏：feature 不存在，留着只会让明文 Bearer secret（remoteInstances[].secret）
+    // 既继续写盘、又随 CONFIG_GET 内联回退（`{...cfg}`）下发渲染端，破坏「远程 secret 明文永不出主进程」不变量。
+    // 经 saveConfig→validateConfig（loadConfig 与持久化两路径都过此）一次性清，下次落盘即不再写回。类型已无故 cast。
+    delete (config as unknown as Record<string, unknown>).remoteInstances;
+    delete (config as unknown as Record<string, unknown>).activeInstanceId;
+
     // 控制端口（clash_api external_controller）：未设(>0) → 默认 9090（DEFAULT_CONTROL_PORT）。可改以解端口冲突死局。
     // 防自撞：与本地端口同口则回退（9090，仍同则取 9091），杜绝 clash_api 与 mixed inbound 撞口致 sing-box FATAL。
     // 作用域：此 guard 护持久化/loadConfig 路径（saveConfig 亦经 validateConfig）。运行时 start() 收到的是渲染端
@@ -458,6 +464,28 @@ export class ConfigManager implements IConfigManager {
       this.log(
         'warn',
         `[ConfigManager] 丢弃 ${droppedCidrs} 处非法 CIDR（endpoint allowedIPs/routes）`
+      );
+    }
+
+    // Tailscale 单节点硬限兜底归一：同设备所有 TS 账号共用同一段 tailnet 地址，多个会互相顶掉，全局只许一个。
+    // UI 主拦截点（use-server-actions）已从源头挡住，正常配置不触发；此处仅对「已是非法多 TS 状态」（旁路
+    // config:save / 损坏备份导入 / 手改配置）归一：保留第一个、丢弃其余。沿用 sanitize 不 throw 惯例——绝不连累
+    // 整份配置回落默认（loadConfig catch 会用默认覆盖落盘致节点/订阅/规则全丢，与上方 CIDR/规则容错同标准）。
+    let firstTailscaleSeen = false;
+    let droppedTailscale = 0;
+    config.servers = config.servers.filter((s) => {
+      if (s.protocol?.toLowerCase() !== 'tailscale') return true;
+      if (!firstTailscaleSeen) {
+        firstTailscaleSeen = true;
+        return true;
+      }
+      droppedTailscale++;
+      return false;
+    });
+    if (droppedTailscale > 0) {
+      this.log(
+        'warn',
+        `[ConfigManager] Tailscale 单节点硬限：丢弃 ${droppedTailscale} 个多余 Tailscale 节点（保留第一个）`
       );
     }
 
@@ -637,68 +665,15 @@ export class ConfigManager implements IConfigManager {
       this.log('warn', 'singboxDashboard must be a boolean; resetting to default (disabled)');
       delete config.singboxDashboard;
     }
-    // remoteInstances（P5 Phase2 远程实例）：非法/缺必填字段的实例整条丢弃（sanitize 而非 throw——
-    // 同 appRoutingEnabled 标准，throw 在 loadConfig 路径会触发默认配置覆盖落盘致用户节点/订阅/规则全丢）。
-    // 必填：id/name 非空字符串、host 非空字符串、port 为 1..65535 整数。tls/secret/dashboardUrl 容错（按类型剔除非法子字段）。
-    if (config.remoteInstances !== undefined) {
-      if (!Array.isArray(config.remoteInstances)) {
-        this.log('warn', 'remoteInstances must be an array; resetting to empty');
-        config.remoteInstances = [];
-      } else {
-        const seenIds = new Set<string>();
-        config.remoteInstances = config.remoteInstances.filter((inst) => {
-          if (!inst || typeof inst !== 'object' || Array.isArray(inst)) return false;
-          const r = inst as unknown as Record<string, unknown>;
-          if (typeof r.id !== 'string' || r.id.trim() === '') return false;
-          if (typeof r.name !== 'string' || r.name.trim() === '') return false;
-          if (typeof r.host !== 'string' || r.host.trim() === '') return false;
-          if (
-            typeof r.port !== 'number' ||
-            !Number.isInteger(r.port) ||
-            r.port < 1 ||
-            r.port > 65535
-          )
-            return false;
-          if (seenIds.has(r.id)) return false; // 去重 id（防 React key 冲突 + 更新/删除只命中首条）
-          seenIds.add(r.id);
-          // 子字段容错剔除（非法不丢整条，只清掉该字段）
-          if (r.secret !== undefined && typeof r.secret !== 'string') delete r.secret;
-          if (r.dashboardUrl !== undefined && typeof r.dashboardUrl !== 'string')
-            delete r.dashboardUrl;
-          if (r.tls !== undefined) {
-            if (typeof r.tls !== 'object' || r.tls === null || Array.isArray(r.tls)) {
-              delete r.tls;
-            } else {
-              const t = r.tls as Record<string, unknown>;
-              if (t.ca !== undefined && typeof t.ca !== 'string') delete t.ca;
-              if (t.skipVerify !== undefined && typeof t.skipVerify !== 'boolean')
-                delete t.skipVerify;
-            }
-          }
-          // E-2/F3：非环回主机 + 无 tls（h2c 明文）+ 有 secret 时剥离 secret——否则 Bearer secret 经
-          // createInsecure() h2c 明文上物理链路泄漏（SingBoxApiClient.channelCredentials 无 tls → createInsecure）。
-          // 环回（localhost/127/::1，SSH 隧道 / 本机）h2c 合法、放行。判定收敛到 shared 的 leaksBearerOverPlaintext
-          // 单一真值（与诊断脱敏同源；上文子字段容错已把非法 tls 删成 undefined，故 r 传入即等价）。剥 secret 而非
-          // 丢整条实例：保留用户已配的 host/name/dashboardUrl 供编辑修正，且无 secret 后 probe 会 UNAUTHENTICATED 失败提示。
-          if (leaksBearerOverPlaintext(r as { host: string; tls?: unknown; secret?: string })) {
-            this.log(
-              'warn',
-              `remoteInstance ${r.id}: 非环回主机未启用 TLS，已剥离 secret 防 Bearer 明文泄漏（请配置 TLS）`
-            );
-            delete r.secret;
-          }
-          return true;
-        });
-      }
-    }
-    // activeInstanceId 收敛：'local' 或必须命中某条 remoteInstances.id，否则回落 undefined（=本地）。
-    if (config.activeInstanceId !== undefined) {
-      const ids = (config.remoteInstances || []).map((i) => i.id);
+    // singboxDashboardUrl：可选 download_url 覆盖。非字符串或空白一律删除（回落内置默认 URL）；sanitize 而非 throw。
+    if (config.singboxDashboardUrl !== undefined) {
       if (
-        typeof config.activeInstanceId !== 'string' ||
-        (config.activeInstanceId !== 'local' && !ids.includes(config.activeInstanceId))
+        typeof config.singboxDashboardUrl !== 'string' ||
+        config.singboxDashboardUrl.trim() === ''
       ) {
-        delete config.activeInstanceId;
+        delete config.singboxDashboardUrl;
+      } else {
+        config.singboxDashboardUrl = config.singboxDashboardUrl.trim();
       }
     }
 

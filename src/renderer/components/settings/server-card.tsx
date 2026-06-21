@@ -7,14 +7,17 @@ import { Badge } from '@/components/ui/badge';
 import { Checkbox } from '@/components/ui/checkbox';
 import { useTranslation } from 'react-i18next';
 import type { InvalidNodeInfo } from '../../../shared/types';
-import { runTailscaleLogin } from '../../lib/tailscale-login';
+import { openTailscaleLogin } from '../../lib/tailscale-login';
 import { ServerActions } from './server-actions';
+import { SpeedBadge } from './speed-badge';
+import { MeshInfoPopover } from './mesh-info-popover';
 import {
   getCountryCode,
   getTransportLabel,
   getProtocolBadgeVariant,
   isWarpNode,
   tailscaleNeedsLogin,
+  tailscaleStatusChecking,
   meshInternetOff,
   endpointLabel,
   type ServerConfigWithId,
@@ -28,6 +31,10 @@ interface ServerCardProps {
   selectedIds: Set<string>;
   invalidNodes: Record<string, InvalidNodeInfo>;
   tailscaleLoginStates: Record<string, boolean>;
+  tailscaleAuthUrls: Record<string, string>;
+  // 代理关 + status-only 探针在飞 + 该节点 loggedIn 尚未知 → 显「检测中」中性态（不误报需登录）。
+  tailscaleStatusProbing: boolean;
+  proxyRunning: boolean;
   shadowedCidrs: Map<string, string[]>;
   onSelectServer: (serverId: string) => void;
   onToggleSelect: (id: string, e: React.MouseEvent) => void;
@@ -41,6 +48,9 @@ export function ServerCard({
   selectedIds,
   invalidNodes,
   tailscaleLoginStates,
+  tailscaleAuthUrls,
+  tailscaleStatusProbing,
+  proxyRunning,
   shadowedCidrs,
   onSelectServer,
   onToggleSelect,
@@ -48,6 +58,13 @@ export function ServerCard({
 }: ServerCardProps) {
   const { t } = useTranslation();
   const countryCode = getCountryCode(server.name);
+  // 同参只算一次：「检测中」角标显隐 + 与「登录」角标的互斥取反共用（避免同帧重复求值）。
+  const isChecking = tailscaleStatusChecking(
+    server,
+    tailscaleLoginStates[server.id] !== undefined,
+    proxyRunning,
+    tailscaleStatusProbing
+  );
   return (
     <Card
       className={`cursor-pointer transition-colors relative overflow-hidden ${
@@ -111,21 +128,30 @@ export function ServerCard({
               WARP
             </Badge>
           )}
-          {tailscaleNeedsLogin(server, tailscaleLoginStates[server.id]) && (
+          {/* 代理关 + 探针在飞 + 该节点 loggedIn 未知 → 中性「检测中」（不误报需登录）；与下方「登录」角标互斥。 */}
+          {isChecking && (
+            <Badge
+              variant="outline"
+              className="text-xs h-4 px-1 bg-muted text-muted-foreground border-border"
+            >
+              {t('servers.tsLoginChecking', 'Checking')}
+            </Badge>
+          )}
+          {!isChecking && tailscaleNeedsLogin(server, tailscaleLoginStates[server.id]) && (
             <Badge
               variant="outline"
               role="button"
               tabIndex={0}
-              title={t('servers.tsLoginAction', 'Log in')}
+              title={t('servers.tsLoginClickHint', 'Click to log in')}
               onClick={(e) => {
                 e.stopPropagation();
-                void runTailscaleLogin(server);
+                openTailscaleLogin(server, tailscaleAuthUrls[server.id]);
               }}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault();
                   e.stopPropagation();
-                  void runTailscaleLogin(server);
+                  openTailscaleLogin(server, tailscaleAuthUrls[server.id]);
                 }
               }}
               className="text-xs h-4 px-1 cursor-pointer bg-badge-amber/15 text-badge-amber border-badge-amber/30 hover:bg-badge-amber/25"
@@ -170,21 +196,26 @@ export function ServerCard({
         </div>
       </CardHeader>
       <CardContent className="pt-0 pb-3">
-        <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
-          {server.protocol?.toLowerCase() === 'shadowsocks' ? (
-            <span>
-              {t('servers.encryption')}: {server.shadowsocksSettings?.method || 'N/A'}
-            </span>
-          ) : (
-            <>
+        {/* 传输/加密信息行（左）+ 测速结果（右下角，#59）。组网节点在「传输:」前加 ⓘ 弹内网IP/路由（#61）。 */}
+        <div className="flex items-end justify-between gap-2">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
+            {server.protocol?.toLowerCase() === 'shadowsocks' ? (
               <span>
-                {t('servers.transport')}: {getTransportLabel(server)}
+                {t('servers.encryption')}: {server.shadowsocksSettings?.method || 'N/A'}
               </span>
-              <span>
-                {t('servers.encryption')}: {server.security || 'none'}
-              </span>
-            </>
-          )}
+            ) : (
+              <>
+                <span className="inline-flex items-center gap-1">
+                  <MeshInfoPopover server={server} />
+                  {t('servers.transport')}: {getTransportLabel(server)}
+                </span>
+                <span>
+                  {t('servers.encryption')}: {server.security || 'none'}
+                </span>
+              </>
+            )}
+          </div>
+          <SpeedBadge server={server} latencyMap={actions.latencyMap} />
         </div>
       </CardContent>
     </Card>

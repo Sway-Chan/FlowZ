@@ -83,6 +83,19 @@ interface AppState {
   // 仅 Tailscale 节点入表；EVENT_TAILSCALE_STATUS 到达时由 setTailscaleLoginState 更新。
   tailscaleLoginStates: Record<string, boolean>;
 
+  // Tailscale 节点最新交互登录 URL（serverId → AUTH_URL）。1.14 always-emit：未登录节点（含非出口）会持续 emit
+  // EVENT_TAILSCALE_AUTH_URL，全量入此表。「需登录」角标据此可点直开该节点的登录页（无 URL 才回落触发重发）。
+  // 登录成功（setTailscaleLoginState(id,true)）时清该 serverId 的 URL，避免点角标开已失效的旧 URL。
+  tailscaleAuthUrls: Record<string, string>;
+
+  // 多节点 status-only 探针在飞中（代理关时读真实登录态）：探针起置 true、STATUS 到达/超时置 false。
+  // 「需登录」角标据此：代理关 + 探测中 + loggedIn 尚未知 → 显「检测中」中性态（不误报需登录），探针回来再收敛真值。
+  tailscaleStatusProbing: boolean;
+
+  // Tailscale 节点内网 IP（serverId → tailnet IP 列表，100.x/fd7a:…）。1.14 api STATUS 流（self.tailscaleIPs）
+  // 实时携带，由 setTailscaleIps 写入；供节点卡片「组网信息」popover 展示内网 IP，消「要登录控制台才看得到」黑盒。
+  tailscaleIps: Record<string, string[]>;
+
   // Privacy Protection Mode
   isPrivacyMode: boolean;
 
@@ -120,6 +133,12 @@ interface AppState {
   refreshStatistics: () => Promise<void>;
   // Tailscale 登录态单条覆盖（loggedIn=Running||Starting），由 EVENT_TAILSCALE_STATUS 驱动。
   setTailscaleLoginState: (serverId: string, loggedIn: boolean) => void;
+  // Tailscale 交互登录 URL 单条覆盖（serverId → 最新 AUTH_URL），由 EVENT_TAILSCALE_AUTH_URL 驱动。
+  setTailscaleAuthUrl: (serverId: string, url: string) => void;
+  // 多节点 status-only 探针在飞标记（触发探针置 true；首条探针 STATUS 到达 / 超时置 false）。
+  setTailscaleStatusProbing: (probing: boolean) => void;
+  // Tailscale 内网 IP 单条覆盖（self.tailscaleIPs），由 EVENT_TAILSCALE_STATUS 驱动。
+  setTailscaleIps: (serverId: string, ips: string[]) => void;
 
   // Server Management Actions
   deleteServer: (serverId: string) => Promise<void>;
@@ -151,6 +170,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   latencyMap: {},
   invalidNodes: {},
   tailscaleLoginStates: {},
+  tailscaleAuthUrls: {},
+  tailscaleStatusProbing: false,
+  tailscaleIps: {},
   isPrivacyMode: false,
   helperStatus: null,
   availableAppUpdate: null,
@@ -382,7 +404,41 @@ export const useAppStore = create<AppState>((set, get) => ({
   // 单条覆盖：EVENT_TAILSCALE_STATUS 即时点亮/熄灭该节点登录态（loggedIn=Running||Starting）。
   // 1.14 api STATUS 是单一真值（无整表刷新 / 无乐观代际防覆盖：无并发整表覆盖竞态，纯单点写）。
   setTailscaleLoginState: (serverId, loggedIn) => {
-    set((s) => ({ tailscaleLoginStates: { ...s.tailscaleLoginStates, [serverId]: loggedIn } }));
+    set((s) => {
+      const tailscaleLoginStates = { ...s.tailscaleLoginStates, [serverId]: loggedIn };
+      // 登录成功后旧 AUTH_URL 失效：清掉该 serverId 的缓存 URL，避免点角标开过期登录页（无则原样返回引用）。
+      if (loggedIn && s.tailscaleAuthUrls[serverId] !== undefined) {
+        const tailscaleAuthUrls = { ...s.tailscaleAuthUrls };
+        delete tailscaleAuthUrls[serverId];
+        return { tailscaleLoginStates, tailscaleAuthUrls };
+      }
+      return { tailscaleLoginStates };
+    });
+  },
+  // always-emit AUTH_URL：全量入表（无条件覆盖最新 URL），登录成功由 setTailscaleLoginState 反向清理。
+  setTailscaleAuthUrl: (serverId, url) => {
+    // URL 未变则不重建表（always-emit 同一 URL 反复 emit 时省整表浅拷贝 + 无谓订阅者重渲染）。
+    set((s) =>
+      s.tailscaleAuthUrls[serverId] === url
+        ? {}
+        : { tailscaleAuthUrls: { ...s.tailscaleAuthUrls, [serverId]: url } }
+    );
+  },
+  setTailscaleStatusProbing: (probing) => {
+    // 值未变则不触发订阅者重渲染（探针多帧 STATUS 反复置 false 时省无谓渲染）。
+    set((s) => (s.tailscaleStatusProbing === probing ? {} : { tailscaleStatusProbing: probing }));
+  },
+
+  // 单条覆盖：EVENT_TAILSCALE_STATUS 即时更新该节点内网 IP（self.tailscaleIPs，纯单点写无并发竞态）。
+  setTailscaleIps: (serverId, ips) => {
+    // IP 列表未变则不重建表（STATUS 多帧同 IP 反复 emit 时省整表浅拷贝 + 无谓订阅者重渲染）。
+    // 用 length + 逐元素比较而非 join(' ')：IP 场景（无空格/分隔符歧义）二者等价，但逐位比较更稳，
+    // 不依赖分隔符在元素值中不出现这一隐含前提。
+    set((s) => {
+      const prev = s.tailscaleIps[serverId];
+      const unchanged = prev?.length === ips.length && prev.every((ip, i) => ip === ips[i]);
+      return unchanged ? {} : { tailscaleIps: { ...s.tailscaleIps, [serverId]: ips } };
+    });
   },
 
   // Server Management Actions

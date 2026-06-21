@@ -8,14 +8,17 @@ import { Checkbox } from '@/components/ui/checkbox';
 import { useTranslation } from 'react-i18next';
 import { isAccountBasedProtocol } from '../../../shared/endpoint-routes';
 import type { InvalidNodeInfo } from '../../../shared/types';
-import { runTailscaleLogin } from '../../lib/tailscale-login';
+import { openTailscaleLogin } from '../../lib/tailscale-login';
 import { ServerActions } from './server-actions';
+import { SpeedBadge } from './speed-badge';
+import { MeshInfoPopover } from './mesh-info-popover';
 import {
   getCountryCode,
   getTransportLabel,
   getProtocolBadgeVariant,
   isWarpNode,
   tailscaleNeedsLogin,
+  tailscaleStatusChecking,
   meshInternetOff,
   endpointLabel,
   type ServerConfigWithId,
@@ -29,6 +32,10 @@ interface ServerRowProps {
   selectedIds: Set<string>;
   invalidNodes: Record<string, InvalidNodeInfo>;
   tailscaleLoginStates: Record<string, boolean>;
+  tailscaleAuthUrls: Record<string, string>;
+  // 代理关 + status-only 探针在飞 + 该节点 loggedIn 尚未知 → 显「检测中」中性态（不误报需登录）。
+  tailscaleStatusProbing: boolean;
+  proxyRunning: boolean;
   shadowedCidrs: Map<string, string[]>;
   onSelectServer: (serverId: string) => void;
   onToggleSelectId: (serverId: string) => void;
@@ -42,6 +49,9 @@ export function ServerRow({
   selectedIds,
   invalidNodes,
   tailscaleLoginStates,
+  tailscaleAuthUrls,
+  tailscaleStatusProbing,
+  proxyRunning,
   shadowedCidrs,
   onSelectServer,
   onToggleSelectId,
@@ -49,6 +59,13 @@ export function ServerRow({
 }: ServerRowProps) {
   const { t } = useTranslation();
   const countryCode = getCountryCode(server.name);
+  // 同参只算一次：「检测中」角标显隐 + 与「登录」角标的互斥取反共用（避免同帧重复求值）。
+  const isChecking = tailscaleStatusChecking(
+    server,
+    tailscaleLoginStates[server.id] !== undefined,
+    proxyRunning,
+    tailscaleStatusProbing
+  );
   return (
     <div
       className={`relative overflow-hidden flex items-center gap-3 px-4 py-2.5 cursor-pointer transition-colors ${
@@ -120,21 +137,30 @@ export function ServerRow({
               WARP
             </Badge>
           )}
-          {tailscaleNeedsLogin(server, tailscaleLoginStates[server.id]) && (
+          {/* 代理关 + 探针在飞 + 该节点 loggedIn 未知 → 中性「检测中」（不误报需登录）；与下方「登录」角标互斥。 */}
+          {isChecking && (
+            <Badge
+              variant="outline"
+              className="text-[10px] h-4 px-1 flex-shrink-0 bg-muted text-muted-foreground border-border"
+            >
+              {t('servers.tsLoginChecking', 'Checking')}
+            </Badge>
+          )}
+          {!isChecking && tailscaleNeedsLogin(server, tailscaleLoginStates[server.id]) && (
             <Badge
               variant="outline"
               role="button"
               tabIndex={0}
-              title={t('servers.tsLoginAction', 'Log in')}
+              title={t('servers.tsLoginClickHint', 'Click to log in')}
               onClick={(e) => {
                 e.stopPropagation();
-                void runTailscaleLogin(server);
+                openTailscaleLogin(server, tailscaleAuthUrls[server.id]);
               }}
               onKeyDown={(e) => {
                 if (e.key === 'Enter' || e.key === ' ') {
                   e.preventDefault();
                   e.stopPropagation();
-                  void runTailscaleLogin(server);
+                  openTailscaleLogin(server, tailscaleAuthUrls[server.id]);
                 }
               }}
               className="text-[10px] h-4 px-1 flex-shrink-0 cursor-pointer bg-badge-amber/15 text-badge-amber border-badge-amber/30 hover:bg-badge-amber/25"
@@ -177,14 +203,24 @@ export function ServerRow({
             </Badge>
           )}
         </div>
-        <p className="text-xs text-muted-foreground mt-0.5">
-          {endpointLabel(server)}
-          {!isAccountBasedProtocol(server.protocol) &&
-            server.protocol?.toLowerCase() !== 'custom' &&
-            getTransportLabel(server) !== 'tcp' && (
-              <span className="ms-2">{getTransportLabel(server)}</span>
-            )}
-        </p>
+        {/* 底部信息行（端点/传输）+ 测速结果（右，#59）。组网节点前缀 ⓘ 弹内网IP/路由（#61）。
+            用 div 而非 p：内含 HoverCard 触发器 <button>，p 内嵌 button 是非法嵌套。 */}
+        <div className="flex items-center justify-between gap-2 text-xs text-muted-foreground mt-0.5">
+          <span className="inline-flex items-center gap-1 min-w-0 truncate">
+            <MeshInfoPopover server={server} />
+            <span className="truncate">
+              {endpointLabel(server)}
+              {!isAccountBasedProtocol(server.protocol) &&
+                server.protocol?.toLowerCase() !== 'custom' &&
+                getTransportLabel(server) !== 'tcp' && (
+                  <span className="ms-2">{getTransportLabel(server)}</span>
+                )}
+            </span>
+          </span>
+          <span className="relative z-10 shrink-0">
+            <SpeedBadge server={server} latencyMap={actions.latencyMap} />
+          </span>
+        </div>
       </div>
 
       {/* 延迟 + 操作 */}

@@ -7,13 +7,13 @@ import {
   wireguardPeerAllowedIps,
   isMeshNodeUnroutable,
   meshSelectedExitFallsBackToDirect,
-  selectedExitRoutesIcmpViaProxy,
   meshShadowedCidrs,
   meshAlwaysRoutesSubnets,
   shouldForceRouteSubnets,
   collectRuleTargetedServerIds,
   meshForceRoutedServers,
   isSpeedTestable,
+  tailscaleSlotTaken,
 } from '../endpoint-routes';
 import type { ServerConfig, UserConfig } from '../types';
 
@@ -171,50 +171,6 @@ describe('meshSelectedExitFallsBackToDirect（D4/D7：global+smart 同兜底）'
 });
 
 // #9：ICMP 兜底 outbound 类型的单一真值（route-builder 发射 + ProxyManager 热切换跨边界判定共用）。
-// ICMP→proxy ⟺ 非 direct 模式 ∧ 选中 endpoint 全隧道节点（与 meshSelectedExitFallsBackToDirect 互补但非全反——
-//   普通代理两者皆 false）。热切换跨「proxy↔direct」边界即据此退回重启重生成 config。
-describe('selectedExitRoutesIcmpViaProxy（#9：ICMP 兜底单一真值）', () => {
-  const cfg = (server: ServerConfig, proxyMode: string): UserConfig =>
-    ({ proxyMode, servers: [server], selectedServerId: server.id }) as any;
-  it('smart + 选中 on WG（全隧道 endpoint）→ true（ICMP 经代理出口防 ping 泄露）', () => {
-    expect(selectedExitRoutesIcmpViaProxy(cfg(wg([], true), 'smart'))).toBe(true);
-  });
-  it('global + 选中 on TS（全隧道 endpoint）→ true', () => {
-    expect(selectedExitRoutesIcmpViaProxy(cfg(ts([], true), 'global'))).toBe(true);
-  });
-  it('smart + 选中 off WG（off-mesh，D4/D7 兜底）→ false（ICMP 直连）', () => {
-    expect(selectedExitRoutesIcmpViaProxy(cfg(wg([], false), 'smart'))).toBe(false);
-  });
-  it('smart + 选中 system 内核接口 WG（恒 specific-only）→ false', () => {
-    expect(selectedExitRoutesIcmpViaProxy(cfg(wg(['10.8.0.0/24'], true, true), 'smart'))).toBe(
-      false
-    );
-  });
-  it('smart + 选中普通代理（vless）→ false（普通代理转不了 ICMP）', () => {
-    expect(
-      selectedExitRoutesIcmpViaProxy(cfg({ id: 'v', protocol: 'vless' } as any, 'smart'))
-    ).toBe(false);
-  });
-  it('direct 模式 → false（恒直连，不适用）', () => {
-    expect(selectedExitRoutesIcmpViaProxy(cfg(wg([], true), 'direct'))).toBe(false);
-  });
-  it('跨边界判定：全隧道 endpoint ↔ 普通代理 不同侧（热切换须重启）', () => {
-    const endpoint = selectedExitRoutesIcmpViaProxy(cfg(wg([], true), 'smart'));
-    const plain = selectedExitRoutesIcmpViaProxy(
-      cfg({ id: 'v', protocol: 'vless' } as any, 'smart')
-    );
-    expect(endpoint).not.toBe(plain);
-  });
-  it('同侧判定：普通代理 ↔ off-mesh endpoint 同为 false（热切换无需重启）', () => {
-    const plain = selectedExitRoutesIcmpViaProxy(
-      cfg({ id: 'v', protocol: 'vless' } as any, 'smart')
-    );
-    const offMesh = selectedExitRoutesIcmpViaProxy(cfg(wg([], false), 'smart'));
-    expect(plain).toBe(offMesh);
-    expect(plain).toBe(false);
-  });
-});
-
 describe('meshShadowedCidrs（同网段首声明者占有）', () => {
   const wgNode = (id: string, allowedIPs: string[]): ServerConfig =>
     ({
@@ -440,5 +396,48 @@ describe('isSpeedTestable（不可测节点单一真值：tailscale / 自定义 
   });
   it('vless → true（普通代理节点正常测速）', () => {
     expect(isSpeedTestable({ id: 'v', protocol: 'vless' } as any)).toBe(true);
+  });
+});
+
+describe('tailscaleSlotTaken（Tailscale 单节点硬限：纯函数，UI 拦截 + ConfigManager 兜底共用）', () => {
+  // 带任意 id/protocol 的最小节点（绕过 ts/wg 工厂的固定 id，便于测 editingId 排除自身）
+  const node = (id: string, protocol: string): ServerConfig => ({ id, name: id, protocol }) as any;
+
+  it('无 TS 节点时加 TS → 放行（slot 空）', () => {
+    const servers = [node('a', 'vless'), node('b', 'wireguard')];
+    expect(tailscaleSlotTaken(servers)).toBe(false);
+  });
+
+  it('已有 1 个 TS 节点再加第二个 TS → 拦下（slot 被占）', () => {
+    const servers = [node('t1', 'tailscale')];
+    expect(tailscaleSlotTaken(servers)).toBe(true);
+  });
+
+  it('已有 1 个 TS 节点，编辑该 TS（传 editingId=自身）→ 放行（排除自身）', () => {
+    const servers = [node('t1', 'tailscale')];
+    expect(tailscaleSlotTaken(servers, 't1')).toBe(false);
+  });
+
+  it('已有 1 个 TS 节点，editingId 指向另一个节点 → 仍拦下（编辑的不是那个 TS）', () => {
+    const servers = [node('t1', 'tailscale'), node('v', 'vless')];
+    expect(tailscaleSlotTaken(servers, 'v')).toBe(true);
+  });
+
+  it('已有 1 个 TS 节点，加 WARP/WG/其它协议 → 不受限（仅限 tailscale）', () => {
+    // tailscaleSlotTaken 只看「是否已有 TS」；新增的 WG/WARP/vless 不是 TS，调用方据 serverData.protocol 不进闸门。
+    // 此处直接验：传 editingId=undefined（新增），已有 1 TS → slot 确占用，但调用侧仅对 protocol==='tailscale' 才查此函数。
+    const servers = [node('t1', 'tailscale')];
+    // 加 WG：调用方不会调用本函数（protocol!==tailscale）；函数本身对「已有 TS」恒返回 true，故由调用侧分流保证放行。
+    expect(tailscaleSlotTaken(servers)).toBe(true); // slot 占用为真，但仅 TS 新增才会被拦
+  });
+
+  it('协议大小写不敏感（Tailscale / TAILSCALE 均识别）', () => {
+    expect(tailscaleSlotTaken([node('t1', 'Tailscale')])).toBe(true);
+    expect(tailscaleSlotTaken([node('t1', 'TAILSCALE')], 't1')).toBe(false);
+  });
+
+  it('已有 2 个 WARP/WG 再加 WARP/WG → 不受限（WG 多节点合法，非 TS）', () => {
+    const servers = [node('w1', 'wireguard'), node('w2', 'wireguard')];
+    expect(tailscaleSlotTaken(servers)).toBe(false);
   });
 });

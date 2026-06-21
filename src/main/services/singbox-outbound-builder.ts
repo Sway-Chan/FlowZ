@@ -61,8 +61,20 @@ export function prunedSelectorDefault(
   return tag?.startsWith('rule-sel-') ? 'proxy-selector' : remainingOutbounds[0];
 }
 
-/** WireGuard endpoint 构造（sing-box 1.11+ 顶层 endpoints[]）。config-gen 与测速共用。 */
-export function buildWireGuardEndpoint(server: ServerConfig, tag: string): SingBoxEndpoint {
+/**
+ * WireGuard endpoint 构造（sing-box 1.11+ 顶层 endpoints[]）。config-gen 与测速共用。
+ *
+ * #58：peer.address 为【域名】时（如 WARP engage.cloudflareclient.com）必须给 endpoint 顶层 dial 级
+ * domain_resolver，否则 sing-box 1.14 起域名无确定解析上游 → 拨号解析失败/超时（实测：WARP 测速超时，
+ * Dalutone IP-server 正常）。与 buildProxyOutbound 的 outbound.domain_resolver 同口径。调用方传解析器
+ * tag（config-gen：getNodeResolverTag(config,'dial')；测速：'dns-direct'）。
+ * IP 字面量 server 不需 DNS 解析 → 不下发该字段（保持配置精简，且 IP 路径本就不受影响）。
+ */
+export function buildWireGuardEndpoint(
+  server: ServerConfig,
+  tag: string,
+  domainResolverTag?: string
+): SingBoxEndpoint {
   const s = server.wireguardSettings;
   if (!s || !s.privateKey || !s.peerPublicKey || !s.localAddress?.length) {
     throw new Error('WireGuard 配置缺少 privateKey/peerPublicKey/localAddress');
@@ -75,9 +87,14 @@ export function buildWireGuardEndpoint(server: ServerConfig, tag: string): SingB
       'WireGuard 节点无可路由网段（关外网 或 system 内核接口 且无具体段）：空 allowed_ips 会致 sing-box FATAL'
     );
   }
+  // 域名 server 才需 domain_resolver（IP 字面量直拨、无需解析）。endpoint 级显式优于仅靠
+  // route.default_domain_resolver——后者的「单 DNS server 时可省略」豁免更脆弱，且 1.14 deprecation 走向是
+  // 域名 dial 必须显式 resolver。peer 级 domain_resolver 内核不接受（实测 FATAL unknown field），故放 endpoint 顶层。
+  const needsResolver = !!domainResolverTag && !isIpLiteral(server.address);
   return {
     type: 'wireguard',
     tag,
+    ...(needsResolver ? { domain_resolver: domainResolverTag } : {}),
     // Phase 2：reverseMesh=true → system:true（真内核 WG 接口，反向可达）；缺省 false=userspace gVisor。
     // 此时 allowed_ips 已由 wireguardPeerAllowedIps 收为 specific-only（结论A）。system:true 需 helper 提权，
     // 由连接闸门/校验确保仅 helper 活跃时该节点 reverseMesh 才成立（见 server-completeness）。
@@ -628,8 +645,8 @@ export function buildTailscaleEndpoint(server: ServerConfig, tag: string): SingB
   const adv = (ts.advertiseRoutes || []).map((c) => c.trim()).filter(Boolean);
   if (adv.length) ep.advertise_routes = adv;
   // P4a 新字段（全可选；sing-box check 实证 1.14-alpha.32）：
-  //  advertise_tags：ACL 标签数组（按标签授权 tailnet）；空清单不下发。
-  //  sshServer：true → ssh_server:true（badoption bool 形式，等价 {enabled:true}）；节点跑 Tailscale SSH。
+  //  advertise_tags（Since 1.12.0）：ACL 标签数组（按标签授权 tailnet）；空清单不下发。
+  //  sshServer（ssh_server，Since 1.13.0）：true → ssh_server:true（badoption bool 形式，等价 {enabled:true}）；节点跑 Tailscale SSH。
   //  relayServerPort：>0 → relay_server_port（peer relay 入站中继监听端口）。
   const advTags = (ts.advertiseTags || []).map((tg) => tg.trim()).filter(Boolean);
   if (advTags.length) ep.advertise_tags = advTags;
@@ -766,7 +783,10 @@ export function buildOutbounds(
           continue;
         }
         try {
-          pendingEndpoints.push(buildWireGuardEndpoint(server, tag));
+          // #58：域名 server 的 WG endpoint 需 dial 级 domain_resolver，与普通协议同档（getNodeResolverTag dial）。
+          pendingEndpoints.push(
+            buildWireGuardEndpoint(server, tag, getNodeResolverTag(config, 'dial'))
+          );
           nodeTags.push(tag);
           // 不承载全隧道但有具体段（关外网 或 Phase2 system 内核接口）：节点可用、仅承载列表网段（不当默认
           // 出网）。warn 进诊断报告，便于排查「选它却不出网」。
@@ -785,17 +805,14 @@ export function buildOutbounds(
         }
         continue;
       }
-      // Tailscale：endpoint（账号制 mesh）。就绪门控——非选中且无 authKey 不发射，避免拖慢启动 +
-      // 多个未登录节点登录 URL 刷屏；选中节点即便未就绪也发射（触发交互登录 URL 流）。
-      // 1.14：剥离 stateExists（state 目录存在性误判未认证为已登录，是 #132 根因）；持久会话节点的「就绪」
-      // 不再据磁盘 state 推断，登录态统一由 api STATUS 流驱动（force-route 反应式留真机，本轮不做 always-emit）。
+      // Tailscale：endpoint（账号制 mesh）。always-emit（与 WireGuard 一致，无门控）——每个配置的 TS 节点恒发射进
+      // 主核：登录态由管理 API STATUS 流逐节点【持续】报告（需登录的显「需登录」角标，用户点角标按需登录解决，
+      // 无需「选中才发射」）；全部在 selector/nodeTags 里 → 切换走 PUT 热切换不重启（对齐 WG）。未登录 endpoint 核
+      // 不 FATAL（tsnet 等待授权）；主核 AUTH_URL 全量上报渲染端入 store（per-node），自动 toast 仅当前出口、非
+      // 出口看角标按需点开（详见 detectTailscaleAuthUrl + 渲染端登录态）。登录态(loggedIn)真值只由 STATUS 流
+      // （Running/Starting && !expired）给，不复用 state 目录为判据 → 不重蹈 #132。
       if (server.protocol.toLowerCase() === 'tailscale') {
         const ts = server.tailscaleSettings;
-        const ready = !!ts?.authKey?.trim();
-        if (server.id !== selectedServer?.id && !ready) {
-          deps.log('info', `Tailscale 节点「${server.name}」未就绪(需登录)且非选中，已跳过`);
-          continue;
-        }
         try {
           pendingEndpoints.push(buildTailscaleEndpoint(server, tag));
           nodeTags.push(tag);

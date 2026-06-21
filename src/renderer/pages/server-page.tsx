@@ -1,5 +1,6 @@
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useMemo } from 'react';
 import { useAppStore } from '@/store/app-store';
+import { api } from '@/ipc/api-client';
 import { ServerList } from '@/components/settings/server-list';
 import { ServerConfigDialog } from '@/components/settings/server-config-dialog';
 import { SubscriptionDialog } from '@/components/settings/subscription-dialog';
@@ -7,7 +8,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { Plus, RefreshCw, Rss, Server, Network, ChevronDown, Link, Zap } from 'lucide-react';
-import { isEndpointProtocol } from '../../shared/endpoint-routes';
+import { isAccountBasedProtocol, isEndpointProtocol } from '../../shared/endpoint-routes';
 import { groupServersBySubscription } from '../../shared/server-grouping';
 import {
   AlertDialog,
@@ -38,6 +39,9 @@ type ServerConfigWithId = ServerConfig;
 export function ServerPage() {
   const { t, i18n } = useTranslation();
   const config = useAppStore((state) => state.config);
+  // 「代理关时也显真实 Tailscale 登录态」触发输入：代理关 + 有组网节点 → 拉 status-only 探针读各 TS 节点登录态。
+  const proxyRunning = useAppStore((state) => state.connectionStatus?.proxyCore.running ?? false);
+  const setTailscaleStatusProbing = useAppStore((state) => state.setTailscaleStatusProbing);
 
   const {
     updatingSubId,
@@ -91,6 +95,59 @@ export function ServerPage() {
       subscriptionIds.has(tabOverride))
       ? tabOverride
       : selectedGroupKey;
+
+  // 组网 Tab 是否有 Tailscale 节点（探针只对 TS 节点有意义；WG/WARP 不参与登录态）。
+  const hasTailscaleMeshNode = meshServers.some((s) => isAccountBasedProtocol(s.protocol));
+
+  // 「代理关时也显真实登录态」：组网 Tab 激活 + 代理关 + 有 TS 节点 → 拉 status-only 探针读各节点真实登录态
+  // （驱动「检测中→已登录/需登录」角标，修「代理关 → 无 STATUS → 已登录节点误显需登录」）。代理在跑时主核 STATUS
+  // 本就有，不触发。ref 节流：同一「代理态 × 是否有 TS 节点」条件只触发一次，避免切 Tab/重渲染反复拉核（主进程
+  // 亦单飞兜底）。代理态翻转（关→开→关）会让指纹变化、允许下次代理关时重新探测。
+  // 探针指纹：含组网成员标识（排序后的 server id 拼接），而非仅数量——否则「删一节点同时增一节点」数量不变会漏探。
+  const meshFingerprint = useMemo(
+    () =>
+      meshServers
+        .map((s) => s.id)
+        .sort()
+        .join(','),
+    [meshServers]
+  );
+  const probeFingerprintRef = useRef<string>('');
+  const probeTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    const clearProbeTimeout = (): void => {
+      if (probeTimeoutRef.current) {
+        clearTimeout(probeTimeoutRef.current);
+        probeTimeoutRef.current = null;
+      }
+    };
+    if (activeTab !== 'mesh' || proxyRunning || !hasTailscaleMeshNode) {
+      // 代理开/无 TS 节点/非组网 Tab → 不在探测，复位指纹使下次满足条件时可重新触发；并清「检测中」+ 超时兜底。
+      probeFingerprintRef.current = '';
+      clearProbeTimeout();
+      setTailscaleStatusProbing(false);
+      return;
+    }
+    const fingerprint = `mesh:${meshFingerprint}`;
+    if (probeFingerprintRef.current === fingerprint) return;
+    probeFingerprintRef.current = fingerprint;
+    setTailscaleStatusProbing(true);
+    // 兜底超时：「invoke resolve 但零 STATUS」路径下（gRPC 无帧/核起即自退），handleTailscaleStatus 永不触发、
+    // probing 永卡 true → 角标永久「检测中」（review 中级：渲染端 probing 与主进程探针生命周期脱钩）。主进程探针
+    // 12s 拆核，此处 13s 后无条件退出「检测中」。STATUS 已到则该 set 被去重短路、无副作用。
+    clearProbeTimeout();
+    probeTimeoutRef.current = setTimeout(() => {
+      setTailscaleStatusProbing(false);
+      probeTimeoutRef.current = null;
+    }, 13000);
+    void api.server.probeTailscaleStatuses().catch(() => {
+      // 探针拉核失败（极少见）→ 退出「检测中」态，角标回落真实/保守显示，不阻断页面。
+      clearProbeTimeout();
+      setTailscaleStatusProbing(false);
+    });
+    // 卸载/依赖变更时清未 fire 的 13s 兜底 timeout（否则组件已卸载，timer 仍 fire setTailscaleStatusProbing → 对已卸载组件 set）。
+    return () => clearProbeTimeout();
+  }, [activeTab, proxyRunning, hasTailscaleMeshNode, meshFingerprint, setTailscaleStatusProbing]);
 
   const scrollContainerRef = useRef<HTMLDivElement>(null);
 

@@ -158,6 +158,7 @@ export const proxyApi = {
       authURL?: string;
       tailscaleIPs: string[];
       expired: boolean;
+      probe?: boolean;
     }) => void
   ): () => void {
     return ipcClient.on(IPC_CHANNELS.EVENT_TAILSCALE_STATUS, listener);
@@ -312,6 +313,14 @@ export const serverApi = {
    */
   async tailscaleLogout(serverId: string): Promise<{ runningNeedsRestart: boolean }> {
     return ipcClient.invoke(IPC_CHANNELS.TAILSCALE_LOGOUT, { serverId });
+  },
+
+  /**
+   * 多节点 status-only 探针：代理关时拉瞬态核读各 Tailscale 节点真实登录态（驱动「检测中→已登录/需登录」角标）。
+   * 不开登录 URL、不弹 toast。门控在主进程（主核运行中/无 TS 节点/已在飞 → no-op）；结果经 EVENT_TAILSCALE_STATUS 推回。
+   */
+  async probeTailscaleStatuses(): Promise<void> {
+    return ipcClient.invoke(IPC_CHANNELS.PROBE_TAILSCALE_STATUSES);
   },
 
   /**
@@ -486,14 +495,6 @@ export const connectionsApi = {
   },
   onUpdated(listener: (snap: ConnectionsSnapshot) => void): () => void {
     return ipcClient.on(IPC_CHANNELS.EVENT_CONNECTIONS_UPDATED, listener);
-  },
-  /** 连接页 mount 时订阅：通知 main 开始裁剪+推送连接快照（watcher 引用计数 +1）。fire-and-forget。 */
-  async watch(): Promise<void> {
-    return ipcClient.invoke(IPC_CHANNELS.CONNECTIONS_WATCH);
-  },
-  /** 连接页 unmount 时退订：watcher 引用计数 -1，归 0 后 main 停止裁剪+推送。fire-and-forget。 */
-  async unwatch(): Promise<void> {
-    return ipcClient.invoke(IPC_CHANNELS.CONNECTIONS_UNWATCH);
   },
   /** 关单条连接（main 经 9090 DELETE /connections/{id}；渲染端无 secret）。 */
   async close(id: string): Promise<{ ok: boolean }> {
@@ -931,23 +932,30 @@ export const appApi = {
     return ipcClient.invoke(IPC_CHANNELS.APP_UNINSTALL_ALL);
   },
   /**
-   * 打开 sing-box 官方面板：main 用运行期 api service 端口构造 /dashboard/ URL + 系统浏览器打开。
-   * 代理未运行 → 返回 { ok: false }（UI 仅在开关 on 且运行中才 enable 按钮）。
+   * 打开 sing-box 官方面板（dashboard #55）：main 开应用内窗口加载运行期 /dashboard/，并经 preload 预写 localStorage
+   * 一键直连（免手填后端）。代理未运行 → 返回 { ok: false }（UI 仅在开关 on 且运行中才 enable 按钮）。
    */
-  async openSingboxDashboard(): Promise<{ ok: boolean }> {
-    return ipcClient.invoke(IPC_CHANNELS.OPEN_SINGBOX_DASHBOARD);
+  async openSingboxDashboard(locale?: string): Promise<{ ok: boolean }> {
+    // locale=渲染端 UI 语言（i18n.language），透传给 main 对齐面板语言；省略时 main 兜底 app.getLocale()。
+    return ipcClient.invoke(IPC_CHANNELS.OPEN_SINGBOX_DASHBOARD, locale);
   },
   /**
-   * P5 Phase2：打开远端实例的 /dashboard/（main 据 instanceId 取配置推 URL + 系统浏览器打开）。
+   * 刷新 sing-box 官方面板资源：main 清本地缓存目录 → 核下次启动重拉新 zip。供设置页手动刷新。
    */
-  async openRemoteDashboard(instanceId: string): Promise<{ ok: boolean; error?: string }> {
-    return ipcClient.invoke(IPC_CHANNELS.OPEN_REMOTE_DASHBOARD, { instanceId });
+  async refreshSingboxDashboard(): Promise<{ ok: boolean }> {
+    return ipcClient.invoke(IPC_CHANNELS.REFRESH_SINGBOX_DASHBOARD);
   },
   /**
-   * P5 Phase2：远端实例连通测试（main 用 TLS+Bearer 客户端 probe 一次，secret 取自 main config，不经渲染端）。
+   * dashboard #55：取面板连接信息（url=面板 URL + apiUrl + secret）供「复制连接信息」按钮与面板 URL 显示。
+   * secret 取自 main config，不长驻渲染端 store。代理未运行 → { ok: false }。
    */
-  async testRemoteInstance(instanceId: string): Promise<{ ok: boolean; error?: string }> {
-    return ipcClient.invoke(IPC_CHANNELS.TEST_REMOTE_INSTANCE, { instanceId });
+  async getSingboxDashboardConnection(): Promise<{
+    ok: boolean;
+    url: string;
+    apiUrl: string;
+    secret: string;
+  }> {
+    return ipcClient.invoke(IPC_CHANNELS.GET_SINGBOX_DASHBOARD_CONNECTION);
   },
 };
 

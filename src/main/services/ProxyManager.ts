@@ -55,8 +55,11 @@ import {
 import { resolveNodeDomains, upstreamsForResolverMode } from './node-domain-resolver';
 import {
   isEndpointProtocol,
-  selectedExitRoutesIcmpViaProxy,
+  isAccountBasedProtocol,
   isSpeedTestable,
+  meshSelectedExitFallsBackToDirect,
+  meshAlwaysRoutesSubnets,
+  endpointForcedRouteCidrs,
 } from '../../shared/endpoint-routes';
 import { classifyCoreBuild, decideCoreOverride } from '../../shared/core-build';
 import { retry } from '../utils/retry';
@@ -64,7 +67,11 @@ import { coreVersionAtLeast } from '../../shared/version';
 import { parseTailscaleAuthLine } from '../../shared/tailscale';
 import { safeHttpUrl } from '../../shared/url';
 import { tailscaleStateExists, tailscaleStateDir } from './tailscale-state';
-import { buildTailscaleLoginConfig, tailscaleEndpointInRunningCore } from './tailscale-login-core';
+import {
+  buildTailscaleLoginConfig,
+  buildTailscaleStatusProbeConfig,
+  tailscaleEndpointInRunningCore,
+} from './tailscale-login-core';
 import { SingBoxApiClient, type TailscaleEndpointStatus } from './singbox-api-client';
 import {
   getUserDataPath,
@@ -73,6 +80,7 @@ import {
   getSingBoxPidPath,
   getCachePath,
   getCustomRulesDir,
+  getSingboxDashboardOverrideDir,
 } from '../utils/paths';
 import { ruleConditions } from '../../shared/rules';
 import { planCustomRule, buildCustomRuleFiles, condMatcherFields } from './custom-rule-files';
@@ -151,16 +159,31 @@ export interface IProxyManager {
   isStartedViaHelper(): boolean;
   // api service（sing-box 1.14 management api）运行期监听端口；「打开官方面板」IPC 据此构造 /dashboard/ URL（0=未启动）。
   getTailscaleApiPort(): number;
+  // dashboard #55：面板连接信息（运行期 api 端口 + clash secret），供「内窗口直连」预写 localStorage 与「复制连接信息」用。
+  // secret 取自 main config（不长驻渲染端 store）；代理未运行 → { ok: false }。
+  getDashboardConnectionInfo(): { ok: boolean; url: string; apiUrl: string; secret: string };
   // 运行期管理 API 客户端（sing-box 1.14 gRPC）：供 StatsService 经此订阅 Status/Connections 流；未启动核时为 null。
   getApiClient(): SingBoxApiClient | null;
   generateSingBoxConfig(config: UserConfig, resolvedIps?: Record<string, string>): SingBoxConfig;
   getResolvedNodeIps(): string[];
   on(
-    event: 'started' | 'stopped' | 'error' | 'node-hot-switched',
+    event:
+      | 'started'
+      | 'stopped'
+      | 'error'
+      | 'node-hot-switched'
+      | 'api-client-ready'
+      | 'tailscale-selected-running',
     listener: (...args: any[]) => void
   ): void;
   off(
-    event: 'started' | 'stopped' | 'error' | 'node-hot-switched',
+    event:
+      | 'started'
+      | 'stopped'
+      | 'error'
+      | 'node-hot-switched'
+      | 'api-client-ready'
+      | 'tailscale-selected-running',
     listener: (...args: any[]) => void
   ): void;
   getCoreVersion(force?: boolean): Promise<string>;
@@ -196,6 +219,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private lastResolvedHosts: Map<string, string> = new Map();
   // 杀核前「静默 StatsService」回调（停其到管理 API 的 Status/Connections gRPC 流）：核将死，提前 cancel 流避免 RST 噪音。
   private quiesceStats: (() => void) | null = null;
+  // 事件驱动出口 re-probe 去重（item 1）：记上次因「选中 TS 节点 STATUS 翻 Running」已发过 re-probe 的 serverId。
+  // STATUS 流持续推帧，仅 Running 上升沿（首次见该选中节点 Running）发一次 'tailscale-selected-running'，避免每帧触发。
+  // 切到别的节点 / 节点掉出 Running（停止/掉线）即清空，使下次重新 Running 能再发（覆盖重连）。
+  private lastTsSelectedRunningId: string | null = null;
   // P2a：启用代理 / 切接管模式（两者均经 startInternal）后延迟一次「连接 flush」的延时器。stop()/再次 start 时清。
   private connectionFlushTimer: ReturnType<typeof setTimeout> | null = null;
   // 平台提权服务（T16：原提权脚本生成 / 文件权限 / 提权复制等纯函数迁出，经 setPrivilegeService 注入；
@@ -369,6 +396,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     this.lifecycleGeneration++;
     // 新启动接管 → 清掉任何陈旧的 supersede-崩溃补发标记（防上一会话遗留的标记误触发补发，M-2′-G1 防陈旧）。
     this.crashWhileSuperseded = false;
+    // 新会话从干净状态开始：清 TS「选中节点已 Running」去重标记。stop() 断 tailscaleApiClient 后不再有 STATUS 帧
+    // 推「非 Running」来清此标记，残留的 Running 标记会让重连同一 TS 节点时新 STATUS 首帧 Running 被去重命中、
+    // 'tailscale-selected-running' 不发射 → 事件驱动出口 re-probe 丢失（退避仍兜底但失去「隧道就绪即抢先出口」）。
+    // 与 handleTailscaleStatus 的清除逻辑不冲突：那是运行期掉线/切节点时清，此处只补会话起点的重置。
+    this.lastTsSelectedRunningId = null;
     // 本次启动是否交互式（非交互=崩溃自动重启）：供 startSingBoxProcess 决定 helper 不可用时是否裸弹 osascript。
     this.startInteractive = options.interactive !== false;
     // 真正 start 即作废未决的去抖重启（崩溃自动重启直走 start、不经 stop，避免窗口内 crash 后被二次拉起）
@@ -796,11 +828,6 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       );
     }
 
-    // H3 修复：sing-box 的 cache_file 会持久化 selector 的 clash_api 选择，重启后缓存会覆盖 config
-    // 的 default。故启动后用 clash_api 把 selector 校正回 config.selectedServerId，让 FlowZ 配置成为
-    // 单一真值、压过缓存。best-effort（不阻塞启动成功）。
-    void this.reassertSelectorSelection(config);
-
     // sing-box 1.14 管理 API：核起后连 api service 订阅 Tailscale 状态（断线重连，随主核生命周期）。
     if (this.hasManagementApi()) {
       this.tailscaleApiClient?.stop();
@@ -812,11 +839,30 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         (eps) => this.handleTailscaleStatus(eps)
       );
       this.tailscaleApiClient.start();
-    }
+      // 修复（首页 stats 全 0 根因）：emit('started')（startViaHelper:3209，在 729 的 runStartWithRetry 内）早于此处
+      // api client 创建约 100 行/0.5s，故 'started' 监听器同步调的 statsService.resubscribe() 拿到 null client 早退、
+      // Status/Connections 订阅从未发起、且无 client 就绪后的二次重订。此处 client 已就绪（崩溃自动重启亦走 startInternal
+      // 同路径到此），再发一事件让 index.ts 补一次 resubscribe，使订阅在 client 真正可用后发起。
+      this.emit('api-client-ready');
 
-    // P2a：启用代理 / 切接管模式后延迟一次连接 flush（见 scheduleConnectionFlush）——RST 泄漏成真实 IP 的旧连接
-    // 逼其重连重解析（经 FakeIP 走代理），不重启内核；node 热切换不经 startInternal、由 interrupt 开关另管。
-    this.scheduleConnectionFlush(config);
+      // H3 修复：sing-box 的 cache_file 持久化 selector 旧选择、重启后覆盖 config default。故启动后用管理 API 把
+      // selector 校正回 config.selectedServerId，让 FlowZ 配置成单一真值、压过缓存。**必须在 client 创建后调**
+      // （reassertSelectorSelection 的 `if(!client)break` 在 client=null 直接放弃不重试）——原在 client 前调用致首启
+      // cache 与 config 不一致时「选 X 实际走上次出口」(出口混乱)。best-effort（不阻塞启动成功）。
+      // 时序修（E）：flush 链到 reassert 完成后。reassert（≤3s，管理 API 慢时）若晚于独立的 scheduleConnectionFlush
+      // （内部 1500ms），flush 的 CloseAllConnections 会按 cache_file 旧 selector 重连 → 出口混乱在窄窗复现。改为
+      // .finally() 串接：reassert 把 selector 校正回 config 后才安排 flush，使 flush 的重连走的是正确出口。
+      // reassert 仍 best-effort、不阻塞 start（链在 void promise 上，scheduleConnectionFlush 自身另有 1500ms 延时 +
+      // 世代 token 守卫，被 stop/重启接管即放弃）。flush 绝不丢：reassert 成功或异常 finally 都会安排。
+      void this.reassertSelectorSelection(config).finally(() =>
+        this.scheduleConnectionFlush(config)
+      );
+    } else {
+      // 无管理 API（版本 <1.14）：无 reassert 可链，直接安排 flush（与原行为一致）。
+      // P2a：启用代理 / 切接管模式后延迟一次连接 flush（见 scheduleConnectionFlush）——RST 泄漏成真实 IP 的旧连接
+      // 逼其重连重解析（经 FakeIP 走代理），不重启内核；node 热切换不经 startInternal、由 interrupt 开关另管。
+      this.scheduleConnectionFlush(config);
+    }
   }
 
   /**
@@ -1182,8 +1228,14 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         // 全局节点热切换出口（覆盖渲染端/托盘/自动换节点三条切节点路径）→ 通知重测代理出口 IP。
         // 纯规则目标热切换（kind=rules）不切换全局出口 IP，不发 node-hot-switched（避免无谓重测）。
         // 注意：所有切节点路径必须经 switchMode，否则代理 IP 会陈旧至手动刷新。
+        // payload accountBased：切换后目标是否账号制（TS）节点。监听方据此选退避预算——TS 隧道（DERP/peer 握手、
+        // 路由下发）需几秒才就绪，走常规预算（2×1000ms）会耗尽闪「暂不可用」，应改宽退避 refreshProxyPostConnect；
+        // IP 类节点即起即通、不需宽退避。currentConfig 此刻已对账到 newConfig（上面刚赋值），反查即目标节点。
         if (plan.kind === 'global' || plan.kind === 'both') {
-          this.emit('node-hot-switched');
+          const target = this.currentConfig?.servers.find(
+            (s) => s.id === this.currentConfig?.selectedServerId
+          );
+          this.emit('node-hot-switched', isAccountBasedProtocol(target?.protocol));
         }
         return;
       }
@@ -1258,12 +1310,25 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       if (!toDirect && !old.servers.some((s) => s.id === newConfig.selectedServerId)) {
         return { kind: 'none', puts: [] };
       }
-      // ICMP 兜底跨边界 guard：ICMP 规则 outbound（selectedExitRoutesIcmpViaProxy 单一真值）随选中节点是否为
-      //   全隧道 endpoint 而异（proxy-selector ↔ direct）。clash_api PUT 只改 selector 指向、不重生成 config →
-      //   跨「ICMP 走 proxy ↔ 走 direct」边界（如 WG/TS 全隧道节点 ↔ 普通代理/off-mesh）热切换后 ICMP 规则错配。
-      //   跨界即退回去抖重启（重生成 config 重算 ICMP）；同侧切换（普通↔普通 / 全隧道 endpoint↔全隧道 endpoint）
-      //   ICMP outbound 不变，仍走 PUT 热切换不受影响。
-      if (selectedExitRoutesIcmpViaProxy(old) !== selectedExitRoutesIcmpViaProxy(newConfig)) {
+      // ICMP 规则已恒走 direct（route-builder，静态不依赖选中节点）→ ICMP 不再是热切换边界。但选中节点的【其它】
+      // route 投影仍随之变，而 configGenerationNorm 已剔除 selectedServerId → 这些差异 PUT 不重生成，必须退回重启：
+      //   (1) 全隧道兜底：meshSelectedExitFallsBackToDirect 翻转 → final/smart-geo 的 userExitTag(proxy-selector↔direct)
+      //       翻转（原 ICMP guard 与此互补、隐式覆盖；ICMP 改静态后须显式保留，否则全隧道 endpoint↔off-mesh 热切 final
+      //       黑洞，并补上旧 guard 漏的 off-mesh↔普通代理 同款翻转）。
+      //   (2) force-route engaged：alwaysRouteSubnets=false 的 endpoint 仅被选中时发其内网段；切到/离开它 → 段规则增删
+      //       （保守：任一端是此类节点即重启，含被规则指向时极少数无谓重启，安全优先）。
+      const oldSel = old.servers.find((s) => s.id === old.selectedServerId);
+      const newSel = newConfig.servers.find((s) => s.id === newConfig.selectedServerId);
+      const selOnlyForcesSubnets = (s?: ServerConfig): boolean =>
+        !!s &&
+        isEndpointProtocol(s.protocol) &&
+        !meshAlwaysRoutesSubnets(s) &&
+        endpointForcedRouteCidrs(s).length > 0;
+      if (
+        meshSelectedExitFallsBackToDirect(old) !== meshSelectedExitFallsBackToDirect(newConfig) ||
+        selOnlyForcesSubnets(oldSel) ||
+        selOnlyForcesSubnets(newSel)
+      ) {
         return { kind: 'none', puts: [] };
       }
       const targetTag = resolveGlobalExitTag(newConfig.selectedServerId, this.currentIdToTagMap);
@@ -1464,6 +1529,26 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    */
   getTailscaleApiPort(): number {
     return this.tailscaleApiPort;
+  }
+
+  /**
+   * dashboard #55：面板连接信息（运行期 api 端口构造 URL + clash secret）。
+   * - url：内窗口加载地址 `http://127.0.0.1:<port>/dashboard/`（核 serve 内置/覆盖面板处）。
+   * - apiUrl：面板要连的管理 API 地址 `http://127.0.0.1:<port>`（写入面板 localStorage 的 server.url / 复制信息用）。
+   * - secret：clashApiSecret（注入 api service 的 Bearer，面板每个 RPC 须带）。取自 currentConfig，**不长驻渲染端 store**。
+   * 代理未运行（端口=0）→ { ok: false }（UI 仅运行中 enable 入口）。
+   */
+  getDashboardConnectionInfo(): { ok: boolean; url: string; apiUrl: string; secret: string } {
+    const port = this.tailscaleApiPort;
+    if (!this.getStatus().running || !port) {
+      return { ok: false, url: '', apiUrl: '', secret: '' };
+    }
+    return {
+      ok: true,
+      url: `http://127.0.0.1:${port}/dashboard/`,
+      apiUrl: `http://127.0.0.1:${port}`,
+      secret: this.currentConfig?.clashApiSecret || '',
+    };
   }
 
   /**
@@ -2104,10 +2189,15 @@ done
           secret: config.clashApiSecret || undefined,
         },
       ];
-      // sing-box 官方面板（opt-in 逃生舱）：仅开关 on 时注入 dashboard.enabled → 核首次联网拉 sing-box-dashboard
-      // 资源并于本 api service 的 /dashboard/ serve。关闭时不注入 → 核默认不出网拉 dashboard 资源。同一 service，不重复注入。
+      // sing-box 官方面板（opt-in 逃生舱）：仅开关 on 时注入 dashboard，于本 api service 的 /dashboard/ serve。
+      // 关闭时不注入 → 核默认不出网拉 dashboard 资源。同一 service，不重复注入。
+      // dashboard #55：path 指向「运行时下载覆盖 > 随包内置」目录 → 核 serve 本地文件、零联网下载、打开即时离线可用；
+      //   两者皆无（异常打包且未下载）→ path 省略，核回落联网下载兜底（保旧行为，不 brick）。
       if (config.singboxDashboard) {
-        singboxConfig.services[0].dashboard = { enabled: true };
+        const serveDir = resourceManager.resolveDashboardServeDir(getSingboxDashboardOverrideDir());
+        singboxConfig.services[0].dashboard = serveDir
+          ? { enabled: true, path: serveDir }
+          : { enabled: true };
       }
     }
 
@@ -2216,7 +2306,10 @@ done
       // WireGuard：endpoint（非 outbound）。SpeedTestService 据 type 放入测速临时配置的 endpoints[]。
       // 此处用 isEndpointProtocol 单一真值（tailscale 已上方 return null 排除，剩余 endpoint 协议即 wireguard）。
       if (isEndpointProtocol(server.protocol)) {
-        return buildWireGuardEndpoint(server, tag);
+        // #58：测速 WG endpoint 的域名 server（如 WARP）需 dial 级 domain_resolver——与下方普通协议同传
+        // 'dns-direct'（对齐测速临时配置的 route.default_domain_resolver: 'dns-direct'，223.5.5.5 UDP）。
+        // 缺它则 1.14 域名拨号无确定解析上游 → 测速超时（IP-server 节点不受影响，isIpLiteral 内部跳过下发）。
+        return buildWireGuardEndpoint(server, tag, 'dns-direct');
       }
       const map = new Map<string, string>([[server.id, tag]]);
       const ob = buildProxyOutbound(server, map, 'dns-direct');
@@ -4965,6 +5058,8 @@ exit 0
     const server = this.currentConfig?.servers.find(
       (s) => s.protocol?.toLowerCase() === 'tailscale' && s.name === nodeName
     );
+    // always-emit：每个未登录 TS 节点（含非出口）都会从主核打印登录 URL。全量上报 EVENT_TAILSCALE_AUTH_URL（带
+    // serverId）→ 渲染端 per-node 存 URL 入 store；自动 toast 仅当前出口、非出口看角标按需点开（toast 门控移到渲染端）。
     this.sendEventToRenderer(IPC_CHANNELS.EVENT_TAILSCALE_AUTH_URL, {
       nodeName,
       url,
@@ -4993,6 +5088,16 @@ exit 0
       apiClient?: SingBoxApiClient;
     }
   >();
+
+  // 多节点 status-only 探针的单飞句柄（同时至多一个）：主核未运行时拉一个含全部 TS endpoint 的瞬态核读 STATUS，
+  // 驱动各节点真实登录态（修「代理关 → 无 STATUS → 已登录节点误显需登录」）。在飞则复用（不重复 spawn）。
+  // 与 tailscaleLoginCores（每节点登录核、会开浏览器）正交：探针 status-only，不解析 AUTH_URL、不弹 toast。
+  private tailscaleStatusProbe: {
+    proc: ChildProcess;
+    timeoutTimer: NodeJS.Timeout;
+    killTimer?: NodeJS.Timeout;
+    apiClient?: SingBoxApiClient;
+  } | null = null;
 
   /**
    * 按需登录：拉起登录专用 sing-box（无 inbound/TUN，零提权，log.level:info，带独立 1.14 管理 api service）→
@@ -5214,6 +5319,148 @@ exit 0
     this.killTailscaleLogin(serverId);
   }
 
+  /**
+   * 多节点 status-only 探针：主核未运行时拉一个含**全部** Tailscale 节点 endpoint 的瞬态核，订阅 STATUS 流读各
+   * 节点真实登录态（Running/Starting→loggedIn=true，NeedsLogin→false），驱动渲染端「检测中→已登录/需登录」角标。
+   *
+   * 根因：loggedIn 只来自管理 API STATUS 流、只在核运行时有；代理关 → 无主核 STATUS → 已登录的 TS 节点被误显
+   * 「需登录」。本探针补上这条 STATUS 来源（不靠 stateExists 启发式——#132：未认证残留 state 会误判已登录）。
+   *
+   * 与 startTailscaleLogin（每节点登录核、开浏览器）的关键区别——**status-only**：不解析 stdout AUTH_URL、不开
+   * 浏览器、不弹登录 toast；NeedsLogin 节点只记 loggedIn=false（emit 带 probe 标记让渲染端探针态不弹 toast）。
+   *
+   * 门控：① 主核运行中（getStatus().running）→ 直接返回（主核 STATUS 本就有，无需探针，且避双写 state_directory
+   * 冲突）。② 无 TS 节点 → 空返。③ 单飞：已有在飞探针则复用（不重复 spawn）。
+   *
+   * 收尾：全部 endpoint STATUS 到达终态（Running/NeedsLogin 等稳定态，Starting 续等）后、或超时（~12s）→ 拆核
+   * （杀进程 + 停 apiClient + 删临时 config + 清单飞句柄），幂等 finalize（同 startTailscaleLogin 写法）。
+   */
+  async probeTailscaleLoginStates(): Promise<void> {
+    // 门控①：主核运行中 → 主核 STATUS 流已驱动登录态，无需探针（且避免与主核双写 state_directory）。
+    if (this.getStatus().running) return;
+    // 门控②：仅 Tailscale 节点；无则空返。
+    const tsServers = (this.currentConfig?.servers || []).filter(
+      (s) => s.protocol?.toLowerCase() === 'tailscale'
+    );
+    if (tsServers.length === 0) return;
+    // 门控③：单飞——已有在飞探针则复用。
+    if (this.tailscaleStatusProbe) return;
+
+    if (!require('fs').existsSync(this.singboxPath)) {
+      throw new Error(`找不到 sing-box 可执行文件: ${this.singboxPath}`);
+    }
+
+    // 独立空闲端口（排除主核 api 端口）+ 每次随机 secret——与登录核同口径，避 bind 冲突。
+    const apiPort = await this.resolveTailscaleLoginApiPort();
+    const apiSecret = require('crypto').randomBytes(16).toString('hex');
+    const probeConfig = buildTailscaleStatusProbeConfig(tsServers, {
+      port: apiPort,
+      secret: apiSecret,
+    });
+    const cfgPath = path.join(
+      getUserDataPath(),
+      `ts-probe-${require('crypto').randomBytes(6).toString('hex')}.json`
+    );
+    require('fs').writeFileSync(cfgPath, JSON.stringify(probeConfig));
+
+    // 非提权 spawn（同 startTailscaleLogin）：用户态 tailscale endpoint 零提权可起。status-only 探针不读 stdout
+    // （登录态走 api STATUS 流、无 AUTH_URL 解析）→ stdout/stderr 设 'ignore'：避免 pipe 无消费者时核 log.level:info
+    // 持续写日志填满内核缓冲(~64KB)→write 阻塞→核挂起停推 STATUS（review 中级，与必须 pipe 抓 URL 的登录核相反）。
+    const proc = spawn(this.singboxPath, ['run', '-c', cfgPath], {
+      stdio: ['ignore', 'ignore', 'ignore'],
+      env: { ...process.env },
+      windowsHide: true,
+    });
+
+    // 超时 ~12s：全部 endpoint 终态未到也拆核（避免 NeedsLogin 节点的探针核常驻）。
+    const timeoutTimer = setTimeout(() => {
+      this.logToManager('info', 'Tailscale 状态探针超时，已停止探针进程', 'sing-box');
+      this.killTailscaleStatusProbe();
+    }, 12000);
+
+    const handle: {
+      proc: ChildProcess;
+      timeoutTimer: NodeJS.Timeout;
+      killTimer?: NodeJS.Timeout;
+      apiClient?: SingBoxApiClient;
+    } = { proc, timeoutTimer };
+    this.tailscaleStatusProbe = handle;
+
+    // 幂等收尾（同 startTailscaleLogin finalize）：清 timer + 停 apiClient + 清句柄 + 删临时 config。
+    // error（spawn 失败，无后续 exit）与 exit 两路径都调，防 cfg/句柄/apiClient 泄漏（句柄残留 → 单飞恒命中、探针卡死）。
+    let finalized = false;
+    const finalize = (): void => {
+      if (finalized) return;
+      finalized = true;
+      clearTimeout(timeoutTimer);
+      clearTimeout(handle.killTimer);
+      handle.apiClient?.stop();
+      handle.apiClient = undefined;
+      this.tailscaleStatusProbe = null;
+      try {
+        require('fs').unlinkSync(cfgPath);
+      } catch {
+        /* 已删/无权限：忽略 */
+      }
+    };
+    proc.on('error', (e) => {
+      this.logToManager('error', `Tailscale 状态探针进程启动失败: ${e.message}`, 'sing-box');
+      finalize();
+    });
+    proc.on('exit', finalize);
+
+    // 终态判定：每个 endpoint 进入稳定态（非 Starting/空态）即记入 settled；全部 TS 节点 settled → 拆核。
+    // Starting 续等（认证握手中）；Running/NeedsLogin/Stopped 等为终态。按 tag 去重（一个 endpoint 多帧只记一次）。
+    const expectedTags = new Set(tsServers.map((s) => s.name));
+    const settledTags = new Set<string>();
+    handle.apiClient = new SingBoxApiClient(
+      { host: '127.0.0.1', port: apiPort },
+      apiSecret,
+      (eps) => {
+        for (const ep of eps) {
+          // tag(=server.name)→serverId（闭包 tsServers 直查，不依赖 currentConfig 当前态）。
+          const server = tsServers.find((s) => s.name === ep.endpointTag);
+          if (!server) continue;
+          // status-only：includeAuthURL=false（不带 URL）、probe=true（渲染端探针态不弹登录 toast）。
+          this.emitTailscaleStatus(server.id, ep, false, true);
+          if (
+            expectedTags.has(ep.endpointTag) &&
+            ep.backendState &&
+            ep.backendState !== 'Starting'
+          ) {
+            settledTags.add(ep.endpointTag);
+          }
+        }
+        // 全部节点到达终态 → 已读到真实登录态，拆核（无需常驻）。
+        if (settledTags.size >= expectedTags.size) {
+          this.killTailscaleStatusProbe();
+        }
+      }
+    );
+    handle.apiClient.start();
+
+    this.logToManager('info', `Tailscale 状态探针已启动（${tsServers.length} 节点）`, 'sing-box');
+  }
+
+  /** 杀状态探针核（终态/超时/退出统一收口）：SIGTERM→3s→SIGKILL 升级。幂等。Map 项/cfg 由 finalize（proc exit）删。 */
+  private killTailscaleStatusProbe(): void {
+    const handle = this.tailscaleStatusProbe;
+    if (!handle) return;
+    clearTimeout(handle.timeoutTimer);
+    if (handle.killTimer) return; // 已挂起升级 → 幂等
+    try {
+      handle.killTimer = escalateProcessKill({
+        sendSignal: (sig) => {
+          handle.proc.kill(sig);
+        },
+        schedule: (fn, ms) => setTimeout(fn, ms),
+        graceMs: 3000,
+      });
+    } catch {
+      /* 已退出：忽略 */
+    }
+  }
+
   /** sing-box 管理 API（services[{type:api}] + 状态订阅）是否可用：要求核 ≥1.14。§5 守卫已保证 start 路径恒满足；
    *  保留判定供 preflight/snapshot 等以 <1.14 fixture 直调 generateSingBoxConfig 的路径（不注入 services）。
    *  收敛「最低版本」字面量为单一谓词（注入 services + 起 api-client 共用），改最低版本只动此处。 */
@@ -5226,12 +5473,32 @@ exit 0
    * 推 EVENT_TAILSCALE_STATUS 驱动渲染端登录态。取代 1.13 stateExists/stdout 启发式。
    */
   private handleTailscaleStatus(endpoints: TailscaleEndpointStatus[]): void {
+    const selectedId = this.currentConfig?.selectedServerId;
+    let selectedRunning = false;
     for (const ep of endpoints) {
       const server = this.currentConfig?.servers.find(
         (s) => s.protocol?.toLowerCase() === 'tailscale' && s.name === ep.endpointTag
       );
       if (!server) continue;
       this.emitTailscaleStatus(server.id, ep);
+      // item 1 事件驱动出口 re-probe：选中节点是账号制 TS 且其隧道 STATUS 翻 Running（DERP/peer 握手完成、
+      // 路由已下发=隧道就绪）→ 立即触发一次代理出口 re-probe（不等满退避）。仅选中节点、仅 Running 上升沿
+      // （lastTsSelectedRunningId 去重，STATUS 持续推帧不会每帧触发）。Starting/NeedsLogin 不算就绪、不触发。
+      if (
+        server.id === selectedId &&
+        isAccountBasedProtocol(server.protocol) &&
+        ep.backendState === 'Running'
+      ) {
+        selectedRunning = true;
+        if (this.lastTsSelectedRunningId !== server.id) {
+          this.lastTsSelectedRunningId = server.id;
+          this.emit('tailscale-selected-running');
+        }
+      }
+    }
+    // 选中 TS 节点本帧不在 Running（掉线/停止/切到别的节点）→ 清去重标记，使下次重新 Running 能再发（覆盖重连）。
+    if (!selectedRunning && this.lastTsSelectedRunningId !== null) {
+      this.lastTsSelectedRunningId = null;
     }
   }
 
@@ -5245,11 +5512,15 @@ exit 0
    * includeAuthURL：是否在事件里带 authURL（驱动渲染端「需登录」toast）。主核路径=true（STATUS 是唯一 URL 来源）；
    * 瞬态核路径=false——瞬态核的登录 URL 已由 stdout AUTH_URL 解析（handleTailscaleLoginUrl 自动开浏览器 + 推
    * EVENT_TAILSCALE_AUTH_URL toast）单点承载，STATUS 不再重复带 URL（択一防同节点双发登录 toast 漂移）。
+   *
+   * probe：本条来自「多节点 status-only 探针」（代理关时读真实登录态）。渲染端据此 NeedsLogin 也不弹登录 toast
+   * （探针是后台静默查询、非用户主动登录），仅更 loggedIn 驱动「检测中→已登录/需登录」角标收敛。
    */
   private emitTailscaleStatus(
     serverId: string,
     ep: TailscaleEndpointStatus,
-    includeAuthURL = true
+    includeAuthURL = true,
+    probe = false
   ): void {
     const loggedIn =
       (ep.backendState === 'Running' || ep.backendState === 'Starting') &&
@@ -5261,6 +5532,7 @@ exit 0
       authURL: includeAuthURL ? ep.authURL || undefined : undefined,
       tailscaleIPs: ep.self?.tailscaleIPs || [],
       expired: ep.self?.expired === true,
+      probe,
     });
   }
 
@@ -5323,11 +5595,12 @@ exit 0
     // Map 项 + 临时 config 由 finalize 删（挂在 proc 'exit'/'error'）；此处不删，避免与 finalize 竞态漏清 cfg。
   }
 
-  /** app 退出/窗口关闭：杀掉全部残留瞬态登录核（无孤儿进程）。由 stop/teardownForQuit 调用。 */
+  /** app 退出/窗口关闭：杀掉全部残留瞬态登录核 + 在飞状态探针（无孤儿进程）。由 stop/teardownForQuit 调用。 */
   private killAllTailscaleLoginCores(): void {
     for (const serverId of Array.from(this.tailscaleLoginCores.keys())) {
       this.killTailscaleLogin(serverId);
     }
+    this.killTailscaleStatusProbe();
   }
 
   /**
