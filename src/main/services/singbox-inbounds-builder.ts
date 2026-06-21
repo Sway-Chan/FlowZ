@@ -1,18 +1,18 @@
 /**
  * sing-box Inbound 配置生成 —— 从 ProxyManager.generateInbounds 抽出（SingBoxConfigBuilder 抽取 Phase 2 step 8）。
  *
- * 纯函数：只读 config/resolvedIps + 注入实例态（coreVersion / probeDirectPort / probeProxyPort 值）。
+ * 纯函数：只读 config/resolvedIps + 注入实例态（probeDirectPort / probeProxyPort 值）。
  * 装配 mixed inbound（HTTP+SOCKS 同口）+ 出口探针 inbound（probe-direct/proxy-in）+ TUN inbound（平台相关
  * 排除段/MTU/stack/IPv6/macOS http_proxy platform）。config 字节等价由 config-snapshot 网验证。
  */
 
 import type { UserConfig } from '../../shared/types';
-import { coreVersionAtLeast } from '../../shared/version';
 import { localProxyPort } from '../../shared/proxy-ports';
 import type { SingBoxInbound } from './singbox-config-types';
 import {
   isIpv4Host,
   isIpv6Host,
+  hostToExcludeCidr,
   effectiveAppRules,
   getCustomDomesticDnsEndpoint,
 } from './singbox-config-helpers';
@@ -20,10 +20,10 @@ import { bypassLanCidrs, effectiveBypassLan } from '../../shared/system-proxy-by
 import { partitionCidrsByOverlap } from '../../shared/ip';
 import { FAKEIP_INET4_RANGE, FAKEIP_INET6_RANGE } from '../../shared/fakeip-filter';
 import { usesFakeIp } from './custom-rule-files';
+import { isValidMacAddress, isTunMacFilterSupported } from '../../shared/neighbor';
 
 /** 注入依赖：generateInbounds 原读的实例态。 */
 export interface InboundsDeps {
-  coreVersion: string;
   probeDirectPort: number | null;
   probeProxyPort: number | null;
 }
@@ -48,12 +48,8 @@ export function buildInbounds(
   // 症状：Instagram 消息中心无网络、WhatsApp 二维码无法扫码等 WebSocket 类应用异常。
   // NekoBox 等 sing-box 客户端默认开启 sniff，FlowZ 之前遗漏了。
   //
-  // 版本兼容：
-  //   1.12.x → sniff/sniff_override_destination 是 inbound 级别字段
-  //   1.13.x → 这两个字段均已移除。sniff（嗅出域名用于路由匹配）由路由层只 push {action:'sniff'} 替代；
-  //            sniff_override_destination（改写 outbound 目标让节点收到域名）在 1.13.0 已移除且无替代
-  //            （详见 generateRouteConfig A. 嗅探规则段注释）。
-  const useLegacySniff = !coreVersionAtLeast(deps.coreVersion, 1, 13);
+  // sing-box 1.14：sniff/sniff_override_destination inbound 级字段已移除。嗅出域名用于路由匹配由路由层
+  // push {action:'sniff'} 承担（详见 generateRouteConfig 嗅探规则段）；sniff_override_destination 无替代。
 
   // mixed-only：单个 mixed inbound 同口服务 HTTP + SOCKS（取代原 http-in + socks-in + 可选 mixed-in）。
   // 要 SOCKS 的 app 指同一端口即可。端口取单一真值 localProxyPort（mixedPort，旧配置回退 httpPort）。
@@ -63,10 +59,6 @@ export function buildInbounds(
     listen: listenAddr,
     listen_port: localProxyPort(config),
   };
-  if (useLegacySniff) {
-    mixedInbound.sniff = true;
-    mixedInbound.sniff_override_destination = true;
-  }
   inbounds.push(mixedInbound);
 
   // 出口 IP 探针 inbound（仅本地回环，端口动态分配）：经 probe-direct-in 的请求由 route.rules 头部
@@ -126,7 +118,8 @@ export function buildInbounds(
       // 用户自定义的国内 DNS（IP 型）一并排除，防 WFP 进程匹配失效时回流死循环
       const customDns = getCustomDomesticDnsEndpoint(config);
       if (customDns) {
-        excludeAddr.push(`${customDns.ip}/${isIpv6Host(customDns.ip) ? 128 : 32}`);
+        const cidr = hostToExcludeCidr(customDns.ip);
+        if (cidr) excludeAddr.push(cidr);
       }
     }
 
@@ -142,14 +135,13 @@ export function buildInbounds(
       if (!serverId) continue;
       const server = config.servers.find((s) => s.id === serverId);
       if (server?.address) {
-        if (isIpv4Host(server.address)) {
-          excludeAddr.push(`${server.address}/32`);
-        } else if (isIpv6Host(server.address)) {
-          excludeAddr.push(`${server.address}/128`);
+        if (isIpv4Host(server.address) || isIpv6Host(server.address)) {
+          const cidr = hostToExcludeCidr(server.address);
+          if (cidr) excludeAddr.push(cidr);
         } else if (resolvedIps && resolvedIps[serverId]) {
-          // 使用预解析的 IP
-          const addr = resolvedIps[serverId];
-          excludeAddr.push(isIpv6Host(addr) ? `${addr}/128` : `${addr}/32`);
+          // 使用预解析的 IP（域名节点）
+          const cidr = hostToExcludeCidr(resolvedIps[serverId]);
+          if (cidr) excludeAddr.push(cidr);
         }
       }
     }
@@ -181,22 +173,34 @@ export function buildInbounds(
         ? platformDefaultStack
         : userStack;
 
+    const autoRoute = config.tunConfig?.autoRoute ?? true;
     const tunInbound: SingBoxInbound = {
       type: 'tun',
       tag: 'tun-in',
       address: tunAddress,
       mtu: effectiveMtu,
-      auto_route: config.tunConfig?.autoRoute ?? true,
+      auto_route: autoRoute,
       strict_route: config.tunConfig?.strictRoute ?? true,
       // macOS 必须使用 gvisor 栈(3.3.18)。Windows 下 system 栈配合 Wintun 性能最强且稳定(3.4.0)。
       stack: effectiveStack,
       route_exclude_address: excludeAddr,
     };
 
-    // 兼容 sing-box 1.12.x 版本（打包核心现已全部 ≥1.13.13，此分支仅为向后兼容旧 userData 核心保留），必须在 inbound 定义 sniff 否则无法域名分流。
-    // 对于 1.13.0+，嗅探逻辑已经统一由后方 route.rules 承担，但在入站开启会报错，因此需精准版本判断。
-    if (!coreVersionAtLeast(deps.coreVersion, 1, 13)) {
-      (tunInbound as any).sniff = true;
+    // P6 局域网网关：按 MAC 限/排设备进 TUN（sing-box 1.14 include/exclude_mac_address）。
+    // 内核硬限界（实证 alpha.32）：**仅 Linux + auto_route + auto_redirect**，脏 MAC → check/启动 FATAL，
+    // include/exclude 互斥。四重门控（任一不满足即整组不发射，保持零变化、防 FATAL）：
+    //   1. 平台=Linux（isTunMacFilterSupported）；2. auto_route 开；3. 有合法 MAC（脏值剔除后非空）。
+    // 满足时：发射 auto_redirect:true（必需前置）+ 仅 include/exclude 之一（按 macFilterMode）。
+    const macMode = config.tunConfig?.macFilterMode;
+    if (macMode && isTunMacFilterSupported(process.platform) && autoRoute) {
+      const macs = (config.tunConfig?.macFilterList || [])
+        .map((m) => m.trim())
+        .filter(isValidMacAddress);
+      if (macs.length > 0) {
+        tunInbound.auto_redirect = true;
+        if (macMode === 'exclude') tunInbound.exclude_mac_address = macs;
+        else tunInbound.include_mac_address = macs;
+      }
     }
 
     // macOS 平台特定配置

@@ -7,7 +7,6 @@
 import type { ServerConfig, UserConfig, InvalidNodeInfo } from '../../shared/types';
 import type { SingBoxOutbound, SingBoxEndpoint } from './singbox-config-types';
 import { resourceManager } from './ResourceManager';
-import { coreVersionAtLeast } from '../../shared/version';
 import {
   isEndpointProtocol,
   meshNodeCarriesFullTunnel,
@@ -17,13 +16,24 @@ import {
 } from '../../shared/endpoint-routes';
 import { parseWsEarlyData } from '../../shared/ws-early-data';
 import { normalizeDuration } from '../../shared/duration';
-import { tailscaleStateDir, tailscaleStateExists } from './tailscale-state';
+import { validateTlsSpoof } from '../../shared/tls-spoof';
+import { isIpLiteral } from '../../shared/dns';
+import { tailscaleStateDir } from './tailscale-state';
 import {
   effectiveCustomRules,
   effectiveAppRules,
   getNodeResolverTag,
 } from './singbox-config-helpers';
 import { isDirectSelection, resolveGlobalExitTag } from '../../shared/direct-selection';
+
+/**
+ * 协议的 TLS 是否「在 QUIC 内自管」（hy2/tuic）：无 TCP ClientHello → 不挂 uTLS / tls.engine / fragment / spoof。
+ * 三处 QUIC 门控（tls.engine、uTLS、fragment 排除集）共用单一谓词，杜绝重抄 `!== 'hysteria2' && !== 'tuic'` 漂移。
+ */
+function isQuicManagedTls(protocol: string): boolean {
+  const p = protocol.toLowerCase();
+  return p === 'hysteria2' || p === 'tuic';
+}
 
 /** 组网节点「不承载全隧道」的原因短语，供诊断 warn 复用（Phase2 system 内核接口 vs 关外网）。 */
 function meshNonFullTunnelReason(server: ServerConfig): string {
@@ -108,7 +118,6 @@ export function buildProxyOutbound(
 ): SingBoxOutbound {
   // sing-box 要求协议类型必须是小写
   const protocol = server.protocol.toLowerCase();
-  const protocolLower = protocol;
   const tlsProtocols = ['trojan', 'anytls', 'hysteria2', 'tuic'];
 
   // 自定义协议（raw-JSON 透传）：原样下发用户的 outbound 对象，仅【强制覆盖 tag】（防撞/防注入），
@@ -181,12 +190,27 @@ export function buildProxyOutbound(
       outbound.down_mbps = server.hysteria2Settings.downMbps;
     }
 
-    // 混淆配置
-    if (server.hysteria2Settings?.obfs?.type && server.hysteria2Settings?.obfs?.password) {
+    // 混淆配置（salamander / gecko）。gecko 额外支持随机填充包长 min/max_packet_size（仅 gecko 有意义，
+    // salamander 忽略 → 仅 gecko 时下发，避免无效字段）。两类型均需 password（sing-box check：缺则 "missing obfs password"）。
+    const obfs = server.hysteria2Settings?.obfs;
+    if (obfs?.type && obfs?.password) {
       outbound.obfs = {
-        type: server.hysteria2Settings.obfs.type,
-        password: server.hysteria2Settings.obfs.password,
+        type: obfs.type,
+        password: obfs.password,
       };
+      if (obfs.type === 'gecko') {
+        if (typeof obfs.minPacketSize === 'number' && obfs.minPacketSize > 0) {
+          outbound.obfs.min_packet_size = obfs.minPacketSize;
+        }
+        if (typeof obfs.maxPacketSize === 'number' && obfs.maxPacketSize > 0) {
+          outbound.obfs.max_packet_size = obfs.maxPacketSize;
+        }
+      }
+    }
+
+    // BBR 拥塞控制 profile（standard / aggressive / conservative）。空 = 核心默认拥塞控制。
+    if (server.hysteria2Settings?.bbrProfile) {
+      outbound.bbr_profile = server.hysteria2Settings.bbrProfile;
     }
 
     // 网络类型 (tcp/udp)
@@ -228,7 +252,7 @@ export function buildProxyOutbound(
   }
 
   // TUIC 特定配置
-  if (server.protocol === 'tuic') {
+  if (protocol === 'tuic') {
     outbound.uuid = server.uuid;
     outbound.password = server.password;
 
@@ -251,7 +275,7 @@ export function buildProxyOutbound(
   }
 
   // NaiveProxy 特定配置
-  if (server.protocol === 'naive') {
+  if (protocol === 'naive') {
     outbound.username = server.username;
     outbound.password = server.password;
 
@@ -279,7 +303,7 @@ export function buildProxyOutbound(
   }
 
   // SOCKS 特定配置
-  if (server.protocol === 'socks') {
+  if (protocol === 'socks') {
     if (server.username) outbound.username = server.username;
     if (server.password) outbound.password = server.password;
     // 默认 SOCKS 版本
@@ -287,7 +311,7 @@ export function buildProxyOutbound(
   }
 
   // HTTP 特定配置
-  if (server.protocol === 'http') {
+  if (protocol === 'http') {
     if (server.username) outbound.username = server.username;
     if (server.password) outbound.password = server.password;
 
@@ -303,7 +327,7 @@ export function buildProxyOutbound(
   }
 
   // SSH 特定配置
-  if (server.protocol === 'ssh') {
+  if (protocol === 'ssh') {
     const ssh = server.sshSettings || {};
     if (ssh.user) outbound.user = ssh.user;
     if (ssh.password) outbound.password = ssh.password;
@@ -314,6 +338,10 @@ export function buildProxyOutbound(
     if (ssh.hostKeyAlgorithms && ssh.hostKeyAlgorithms.length > 0)
       outbound.host_key_algorithms = ssh.hostKeyAlgorithms;
     if (ssh.clientVersion) outbound.client_version = ssh.clientVersion;
+    // 算法协商可选项（P3d）：sing-box 字段名 cipher / mac / kex_algorithm（已 check 实证）。空数组不下发。
+    if (ssh.cipher && ssh.cipher.length > 0) outbound.cipher = ssh.cipher;
+    if (ssh.mac && ssh.mac.length > 0) outbound.mac = ssh.mac;
+    if (ssh.kexAlgorithm && ssh.kexAlgorithm.length > 0) outbound.kex_algorithm = ssh.kexAlgorithm;
 
     // SSH outbound 不需要 TLS 和传输层配置，直接返回
     return outbound;
@@ -321,12 +349,12 @@ export function buildProxyOutbound(
 
   // TLS 配置 (非 Naive 协议，因为 Naive 已在前一段处理了 tls 结构)
   if (
-    server.protocol !== 'naive' &&
+    protocol !== 'naive' &&
     (server.security === 'tls' || server.tlsSettings || tlsProtocols.includes(protocol))
   ) {
     // 为 Trojan 设置默认 ALPN ["http/1.1"] 以提高兼容性
     let finalAlpn = server.tlsSettings?.alpn;
-    if (!finalAlpn && protocolLower === 'trojan') {
+    if (!finalAlpn && protocol === 'trojan') {
       finalAlpn = ['http/1.1'];
     }
 
@@ -337,24 +365,29 @@ export function buildProxyOutbound(
       alpn: finalAlpn,
     };
 
+    // TLS 栈引擎（P3c，sing-box 1.14 tls.engine）：windows(Schannel)/apple(Network.framework) 用系统原生栈，
+    // ClientHello 指纹更真。仅对 TCP-TLS 协议下发——Hy2/TUIC 走 QUIC 自带 TLS1.3，系统 TCP-TLS 栈不适用，
+    // 表单也不对它们暴露此项。'go'/空 = 跨平台 Go TLS（核心默认），无需显式下发。windows/apple 在非对应平台
+    // 运行时 FATAL，由表单按平台过滤可选值兜底。
+    const tlsEngine = server.tlsSettings?.engine;
+    if (tlsEngine && tlsEngine !== 'go' && !isQuicManagedTls(protocol)) {
+      outbound.tls.engine = tlsEngine;
+    }
+
     // uTLS 仅适用于基于 TCP 的协议，Hysteria2 和 TUIC 使用 QUIC (UDP) 不支持 uTLS
     const fingerprint = server.tlsSettings?.fingerprint;
 
     // 默认行为：VLESS 等协议默认开启 chrome 指纹，Trojan 默认不开启（none）以通过标准 TLS 握手
     let finalFingerprint = fingerprint;
     if (!finalFingerprint) {
-      if (protocolLower === 'vless' || protocolLower === 'anytls') {
+      if (protocol === 'vless' || protocol === 'anytls') {
         finalFingerprint = 'chrome';
       } else {
         finalFingerprint = 'none';
       }
     }
 
-    if (
-      server.protocol !== 'hysteria2' &&
-      server.protocol !== 'tuic' &&
-      finalFingerprint !== 'none'
-    ) {
+    if (!isQuicManagedTls(protocol) && finalFingerprint !== 'none') {
       outbound.tls.utls = {
         enabled: true,
         fingerprint: finalFingerprint,
@@ -387,9 +420,9 @@ export function buildProxyOutbound(
 
   // 传输层配置（不适用于 hysteria2、anytls、naive）
   if (
-    server.protocol !== 'hysteria2' &&
-    server.protocol !== 'anytls' &&
-    server.protocol !== 'naive' &&
+    protocol !== 'hysteria2' &&
+    protocol !== 'anytls' &&
+    protocol !== 'naive' &&
     server.network &&
     server.network !== 'tcp'
   ) {
@@ -465,8 +498,7 @@ function applyAntiCensorshipOptions(outbound: SingBoxOutbound, server: ServerCon
   //   · naive：TLS 由 Cronet 自管，naive 出站直接拒绝 fragment 字段（实测
   //     "fragment is not supported on naive outbound" → 启动 FATAL），无论 h2/h3。
   // 注：ECH 不受此限——QUIC 与 naive(Cronet) 均原生支持 ECH。
-  const fragmentUnsupported =
-    protocolLower === 'hysteria2' || protocolLower === 'tuic' || protocolLower === 'naive';
+  const fragmentUnsupported = isQuicManagedTls(protocolLower) || protocolLower === 'naive';
 
   // ECH（隐藏 SNI）+ 每节点 TLS 分片（抗 SNI-DPI）：需已有 tls 块
   if (outbound.tls) {
@@ -483,6 +515,30 @@ function applyAntiCensorshipOptions(outbound: SingBoxOutbound, server: ServerCon
         echLines.length > 0 ? { enabled: true, config: echLines } : { enabled: true };
     }
     if (server.tlsSettings?.fragment && !fragmentUnsupported) outbound.tls.fragment = true;
+
+    // TLS spoof（P3a 抗审查，sing-box 1.14）：spoofMethod + spoofSni 成对非空才启用——下发 tls.spoof=spoofSni
+    //（伪造 ClientHello 的「诱饵 SNI」）+ tls.spoof_method。五重门控（任一不满足即不 emit，否则内核 FATAL / 行为无效）：
+    //   1. arch：ARM64 不支持（内核仅 amd64 实现）；
+    //   2. 协议：仅标准 TCP-TLS 栈（排除 hy2/tuic 的 QUIC 内 TLS、naive 的 Cronet 自管 TLS），与 fragment 同集；
+    //   3. 诱饵 SNI 必须是域名：IP 字面量内核拒（`spoof requires TLS ClientHello with SNI`）；
+    //   4. **诱饵 SNI 必须不同于真 server_name**：内核 FATAL `spoof must differ from server_name`（已真核实证）；
+    //   5. 方法合法（wrong-ack/wrong-md5/wrong-timestamp）。
+    // 注：提权（CAP_NET_RAW+NET_ADMIN / root / 管理员）是运行期生效条件，不影响配置合法性 → 此处不门控，
+    //    UI 已提示需提权；缺权时内核启动期报权限错（非配置 FATAL），属用户环境问题。
+    const spoofMethod = server.tlsSettings?.spoofMethod;
+    const spoofSni = server.tlsSettings?.spoofSni?.trim();
+    const realSni = outbound.tls.server_name;
+    // 六重门控（方法/arch/SNI 非空/SNI 非 IP/协议 TCP-TLS/SNI≠真 server_name）经 validateTlsSpoof 单一真值，
+    // 与 route action spoof（singbox-custom-rules）共用同一份。
+    if (
+      validateTlsSpoof(spoofSni, spoofMethod, process.arch, isIpLiteral, {
+        protocol: protocolLower,
+        serverSni: realSni,
+      })
+    ) {
+      outbound.tls.spoof = spoofSni;
+      outbound.tls.spoof_method = spoofMethod;
+    }
   }
 
   // Multiplex（vless/trojan/vmess/shadowsocks）；vision flow(xtls-rprx-vision) 自带流分帧、与 mux
@@ -528,9 +584,8 @@ export interface PendingRuleSelector {
   targetServerId?: string;
 }
 
-/** 注入依赖：generateOutbounds 原读/写的实例态（coreVersion 值 / gateInvalidNodes Map 就地改 / log 回调）。 */
+/** 注入依赖：generateOutbounds 原读/写的实例态（gateInvalidNodes Map 就地改 / log 回调）。 */
 export interface OutboundsDeps {
-  coreVersion: string;
   gateInvalidNodes: Map<string, InvalidNodeInfo>;
   log: (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', message: string) => void;
   // #57 resolve-ahead：域名→IP 预解析表（this.lastResolvedHosts），透传 buildProxyOutbound 写 outbound.server。
@@ -545,7 +600,7 @@ export interface OutboundsDeps {
  * 构造 Tailscale endpoint（sing-box 1.12+ 顶层 endpoints[]）。账号制 mesh，无 server address/port。
  * 默认 tsnet 用户态（system_interface 省略=false，零提权）；auth_key 可选（无则核日志出登录 URL）。
  */
-function buildTailscaleEndpoint(server: ServerConfig, tag: string): SingBoxEndpoint {
+export function buildTailscaleEndpoint(server: ServerConfig, tag: string): SingBoxEndpoint {
   const ts = server.tailscaleSettings || {};
   const stateDir = tailscaleStateDir(server.id);
   try {
@@ -572,6 +627,16 @@ function buildTailscaleEndpoint(server: ServerConfig, tag: string): SingBoxEndpo
   if (ts.ephemeral) ep.ephemeral = true;
   const adv = (ts.advertiseRoutes || []).map((c) => c.trim()).filter(Boolean);
   if (adv.length) ep.advertise_routes = adv;
+  // P4a 新字段（全可选；sing-box check 实证 1.14-alpha.32）：
+  //  advertise_tags：ACL 标签数组（按标签授权 tailnet）；空清单不下发。
+  //  sshServer：true → ssh_server:true（badoption bool 形式，等价 {enabled:true}）；节点跑 Tailscale SSH。
+  //  relayServerPort：>0 → relay_server_port（peer relay 入站中继监听端口）。
+  const advTags = (ts.advertiseTags || []).map((tg) => tg.trim()).filter(Boolean);
+  if (advTags.length) ep.advertise_tags = advTags;
+  if (ts.sshServer) ep.ssh_server = true;
+  if (typeof ts.relayServerPort === 'number' && ts.relayServerPort > 0) {
+    ep.relay_server_port = ts.relayServerPort;
+  }
   // Phase 2：reverseMesh=true → system_interface=true（真 TUN，反向可达/作 subnet router）；需 helper 提权，
   // 由连接闸门/校验确保仅 helper 活跃时成立。缺省省略=tsnet 用户态、零提权。
   if (meshUsesSystemInterface(server)) ep.system_interface = true;
@@ -639,7 +704,7 @@ function generateRuleSelectors(
 
 /**
  * 生成 outbounds（节点出站 + selector + rule-sel + direct/block/shadow-tls + detour 死引用预校验）。
- * 注入 coreVersion/gateInvalidNodes/log；返回 outbounds + 两载体 pendingEndpoints/pendingRuleSelectors
+ * 注入 gateInvalidNodes/log；返回 outbounds + 两载体 pendingEndpoints/pendingRuleSelectors
  * （由 generateSingBoxConfig 回写 this.*，供顶层 endpoints[] 注入与 hotSwitch/clash_api 回读）。
  */
 export function buildOutbounds(
@@ -720,11 +785,13 @@ export function buildOutbounds(
         }
         continue;
       }
-      // Tailscale：endpoint（账号制 mesh）。就绪门控——非选中且未就绪（无 authKey、无持久 state）不发射，
-      // 避免拖慢启动 + 多个未登录节点登录 URL 刷屏；选中节点即便未就绪也发射（触发交互登录 URL 流）。
+      // Tailscale：endpoint（账号制 mesh）。就绪门控——非选中且无 authKey 不发射，避免拖慢启动 +
+      // 多个未登录节点登录 URL 刷屏；选中节点即便未就绪也发射（触发交互登录 URL 流）。
+      // 1.14：剥离 stateExists（state 目录存在性误判未认证为已登录，是 #132 根因）；持久会话节点的「就绪」
+      // 不再据磁盘 state 推断，登录态统一由 api STATUS 流驱动（force-route 反应式留真机，本轮不做 always-emit）。
       if (server.protocol.toLowerCase() === 'tailscale') {
         const ts = server.tailscaleSettings;
-        const ready = !!ts?.authKey?.trim() || tailscaleStateExists(server.id);
+        const ready = !!ts?.authKey?.trim();
         if (server.id !== selectedServer?.id && !ready) {
           deps.log('info', `Tailscale 节点「${server.name}」未就绪(需登录)且非选中，已跳过`);
           continue;
@@ -868,17 +935,6 @@ export function buildOutbounds(
     tag: 'direct',
   });
 
-  // 版本条件：sing-box 1.12.x 需要在 outbound 层面做 override_address
-  // 因为 1.12 的路由规则不支持 override_address 字段（会被静默忽略）。
-  // 1.13+ 已将此功能迁移到路由规则，不需要额外的 outbound。
-  if (!coreVersionAtLeast(deps.coreVersion, 1, 13)) {
-    outbounds.push({
-      type: 'direct',
-      tag: 'direct-loopback',
-      override_address: '127.0.0.1',
-    });
-  }
-
   // 阻断出站
   outbounds.push({
     type: 'block',
@@ -900,6 +956,8 @@ export function buildOutbounds(
         // #57 resolve-ahead：外层 shadowtls 才是真正的 TCP 拨号目标（内层 SS 经 detour 指向它），同样命中预解析表
         // 写 IP；server_name（下方 :827）仍用 shadowTlsSettings.sni（身份），不被 IP 覆盖。与 buildProxyOutbound 同语义。
         server: deps.resolvedHosts?.get(srv.address) ?? srv.address,
+        // port `||` 非 falsy-zero bug：ShadowTLS 端口合法值 1-65535，0/未设 → 降级用主端口；
+        // 改 `??` 反而会把非法 0 透传给核致 FATAL，故 `||` 才是正确选择。
         server_port: srv.shadowTlsSettings.port || srv.port,
         version: 3,
         password: srv.shadowTlsSettings.password,

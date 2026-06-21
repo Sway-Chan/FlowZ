@@ -22,7 +22,6 @@ import {
 } from '@/components/ui/alert-dialog';
 import { useAppStore } from '@/store/app-store';
 import { parseDnsServerSpec } from '@shared/dns';
-import { controlApiPort } from '@shared/proxy-ports';
 import { DEFAULT_BYPASS_LAN } from '@shared/system-proxy-bypass';
 import { parseSpeedTestUrl, DEFAULT_SPEED_TEST_URL } from '@shared/speed-test';
 import { toast } from 'sonner';
@@ -32,7 +31,6 @@ import { SettingsCollapsible } from './settings-collapsible';
 import { ExceptionList } from './exception-list';
 import { DEFAULT_FAKEIP_FILTER_DOMAINS } from '../../../shared/fakeip-filter';
 import { HelperManagementCard } from './helper-management-card';
-import { ExternalControlSection } from './external-control-section';
 import { TerminalProxySection } from './terminal-proxy-section';
 
 const isMac = window.electron?.platform === 'darwin';
@@ -57,8 +55,6 @@ export function NetworkSettings() {
   const [localPort, setLocalPort] = useState(
     (config?.mixedPort || config?.httpPort || 7890).toString()
   );
-  // clash_api 外部控制端口（默认 9090，可改以解端口冲突死局）。失焦提交，外部变更时 resync。
-  const [controlPort, setControlPort] = useState(controlApiPort(config ?? {}).toString());
   // TUN 模式下 FakeIP ON→OFF 一次性风险确认弹窗开关（机场拒纯 IP 不可预判、无法客户端缓解）。
   const [fakeIpOffConfirmOpen, setFakeIpOffConfirmOpen] = useState(false);
   const [subInterval, setSubInterval] = useState(
@@ -71,43 +67,48 @@ export function NetworkSettings() {
     config?.dnsConfig?.foreignDns || DNS_DEFAULTS.foreignDns
   );
   const [speedTestUrl, setSpeedTestUrl] = useState(config?.speedTestUrl || DEFAULT_SPEED_TEST_URL);
+  // P2c DNS 查询超时（毫秒；空 = 用核默认，不下发）。文本态便于「清空即重置默认」与 onBlur 提交。
+  const [dnsTimeout, setDnsTimeout] = useState(
+    config?.dnsConfig?.dnsTimeoutMs != null ? String(config.dnsConfig.dnsTimeoutMs) : ''
+  );
 
   // F26：config 异步到达 / 挂载期间被外部替换（托盘改配置、备份恢复、规则 CRUD 后 loadConfig）时，
   // 回填「未被用户改动」的字段；dirty 守卫（本地值 ≠ 上次种子）避免打断正在输入的用户。
   const seededRef = useRef<{
     localPort: string;
-    controlPort: string;
     subInterval: string;
     domesticDns: string;
     foreignDns: string;
     speedTestUrl: string;
+    dnsTimeout: string;
   } | null>(null);
   useEffect(() => {
     if (!config) return;
     const snap = {
       localPort: (config.mixedPort || config.httpPort || 7890).toString(),
-      controlPort: controlApiPort(config).toString(),
       subInterval: config.subscriptionUpdateIntervalHours?.toString() || '12',
       domesticDns: config.dnsConfig?.domesticDns || DNS_DEFAULTS.domesticDns,
       foreignDns: config.dnsConfig?.foreignDns || DNS_DEFAULTS.foreignDns,
       speedTestUrl: config.speedTestUrl || DEFAULT_SPEED_TEST_URL,
+      dnsTimeout:
+        config.dnsConfig?.dnsTimeoutMs != null ? String(config.dnsConfig.dnsTimeoutMs) : '',
     };
     const prev = seededRef.current;
     setLocalPort((cur) => (prev && cur !== prev.localPort ? cur : snap.localPort));
-    setControlPort((cur) => (prev && cur !== prev.controlPort ? cur : snap.controlPort));
     setSubInterval((cur) => (prev && cur !== prev.subInterval ? cur : snap.subInterval));
     setDomesticDns((cur) => (prev && cur !== prev.domesticDns ? cur : snap.domesticDns));
     setForeignDns((cur) => (prev && cur !== prev.foreignDns ? cur : snap.foreignDns));
     setSpeedTestUrl((cur) => (prev && cur !== prev.speedTestUrl ? cur : snap.speedTestUrl));
+    setDnsTimeout((cur) => (prev && cur !== prev.dnsTimeout ? cur : snap.dnsTimeout));
     seededRef.current = snap;
   }, [
     config?.mixedPort,
     config?.httpPort,
-    config?.controlPort,
     config?.subscriptionUpdateIntervalHours,
     config?.dnsConfig?.domesticDns,
     config?.dnsConfig?.foreignDns,
     config?.speedTestUrl,
+    config?.dnsConfig?.dnsTimeoutMs,
   ]);
 
   if (!config) return null;
@@ -128,6 +129,12 @@ export function NetworkSettings() {
     updated.dnsConfig = { ...updated.dnsConfig, ...patch };
     saveConfig(updated).catch(() => toast.error(t('common.saveFailed')));
   };
+
+  // P6 局域网网关：更新 tunConfig 子字段（MAC 过滤 / 邻居解析后缀），保留其余 TUN 设置。
+  const updateTun = (patch: Partial<NonNullable<typeof config.tunConfig>>) =>
+    saveConfig({ ...config, tunConfig: { ...config.tunConfig, ...patch } }).catch(() =>
+      toast.error(t('common.saveFailed'))
+    );
 
   // FakeIP 开关切换：TUN 模式下 ON→OFF 先弹一次性风险确认（节点将收真实 IP，部分机场可能拒连，客户端无法缓解）；
   // 其它情况（开启、或非 TUN 关闭）直接落盘。
@@ -170,6 +177,27 @@ export function NetworkSettings() {
     saveConfig({ ...config, speedTestUrl: next }).catch(() => toast.error(t('common.saveFailed')));
   };
 
+  // P2c DNS 查询超时：onBlur 提交。空 = 清除（不下发，用核默认）；非空须为 1..60000 的整数毫秒，越界提示并回滚。
+  const commitDnsTimeout = () => {
+    const v = dnsTimeout.trim();
+    const stored = config.dnsConfig?.dnsTimeoutMs;
+    if (v === '') {
+      if (stored == null) return; // 本就未设，无变化
+      setDnsTimeout('');
+      updateDns({ dnsTimeoutMs: undefined });
+      return;
+    }
+    const ms = parseInt(v, 10);
+    if (isNaN(ms) || ms < 1 || ms > 60000) {
+      toast.error(t('settings.advanced.dnsTimeoutRange', 'DNS 超时须为 1-60000 毫秒'));
+      setDnsTimeout(stored != null ? String(stored) : ''); // 回滚到已存值
+      return;
+    }
+    if (ms === stored) return; // 无变化
+    setDnsTimeout(String(ms));
+    updateDns({ dnsTimeoutMs: ms });
+  };
+
   // 本地端口：失焦即生效（mixed-only 单口 HTTP+SOCKS，只写 mixedPort）。范围/冲突给提示并回滚，不需保存按钮。
   const commitLocalPort = () => {
     const portNum = parseInt(localPort, 10);
@@ -180,41 +208,9 @@ export function NetworkSettings() {
       revert();
       return;
     }
-    if (portNum === controlApiPort(config)) {
-      // 撞控制端口（clash_api）→ sing-box 两 inbound 同口必 FATAL。两者皆可改，提示改其一并回滚。
-      toast.error(
-        t('settings.advanced.portClashWithControl', '本地端口不能与控制端口相同，请改其中之一')
-      );
-      revert();
-      return;
-    }
     if (portNum === cur) return; // 无变化
     setLocalPort(portNum.toString());
     saveConfig({ ...config, mixedPort: portNum }).catch(() => toast.error(t('common.saveFailed')));
-  };
-
-  // 控制端口（clash_api external_controller）：失焦即生效。范围/与本地端口冲突给提示并回滚。
-  const commitControlPort = () => {
-    const portNum = parseInt(controlPort, 10);
-    const cur = controlApiPort(config);
-    const revert = () => setControlPort(cur.toString());
-    if (isNaN(portNum) || portNum < 1024 || portNum > 65535) {
-      toast.error(t('settings.advanced.localPortRange', '端口须为 1024-65535'));
-      revert();
-      return;
-    }
-    if (portNum === (config.mixedPort || config.httpPort || 7890)) {
-      toast.error(
-        t('settings.advanced.portClashWithControl', '本地端口不能与控制端口相同，请改其中之一')
-      );
-      revert();
-      return;
-    }
-    if (portNum === cur) return; // 无变化
-    setControlPort(portNum.toString());
-    saveConfig({ ...config, controlPort: portNum }).catch(() =>
-      toast.error(t('common.saveFailed'))
-    );
   };
 
   const numInput = (
@@ -383,6 +379,35 @@ export function NetworkSettings() {
                 onCheckedChange={(c) => updateDns({ takeoverSystemDns: c })}
               />
             </SettingsRow>
+            <SettingsRow
+              label={t('settings.advanced.optimisticCache', '乐观 DNS 缓存')}
+              description={t('settings.advanced.optimisticCacheDesc')}
+              tooltip={t('settings.advanced.optimisticCacheDescFull')}
+            >
+              <Switch
+                checked={config.dnsConfig?.optimisticCache === true}
+                onCheckedChange={(c) => updateDns({ optimisticCache: c })}
+              />
+            </SettingsRow>
+            <SettingsRow
+              label={t('settings.advanced.dnsTimeout', 'DNS 查询超时')}
+              description={t('settings.advanced.dnsTimeoutDesc')}
+              tooltip={t('settings.advanced.dnsTimeoutDescFull')}
+            >
+              <Input
+                type="text"
+                inputMode="numeric"
+                pattern="[0-9]*"
+                value={dnsTimeout}
+                onChange={(e) => setDnsTimeout(e.target.value.replace(/[^0-9]/g, ''))}
+                onBlur={commitDnsTimeout}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') e.currentTarget.blur();
+                }}
+                className="w-[120px]"
+                placeholder={t('settings.advanced.dnsTimeoutPlaceholder', '默认')}
+              />
+            </SettingsRow>
           </SettingsCollapsible>
         </CardContent>
       </Card>
@@ -397,13 +422,6 @@ export function NetworkSettings() {
             tooltip={t('settings.advanced.localPortDescFull')}
           >
             {numInput(localPort, setLocalPort, 'w-[120px]', commitLocalPort)}
-          </SettingsRow>
-          <SettingsRow
-            label={t('settings.advanced.controlPort', '控制端口')}
-            description={t('settings.advanced.controlPortDesc')}
-            tooltip={t('settings.advanced.controlPortDescFull')}
-          >
-            {numInput(controlPort, setControlPort, 'w-[120px]', commitControlPort)}
           </SettingsRow>
           <div>
             <SettingsRow
@@ -450,13 +468,80 @@ export function NetworkSettings() {
               />
             )}
           </div>
-        </CardContent>
-      </Card>
 
-      {/* 外部控制 / clash API（从「高级」节迁入，与控制端口同节就近，M2） */}
-      <Card>
-        <CardContent className="divide-y divide-border/60 pt-2">
-          <ExternalControlSection />
+          {/* P6 局域网网关（sing-box 1.14 LAN 设备识别）：邻居短名解析（Linux/macOS）+ TUN MAC 过滤（仅 Linux）。
+              仅 TUN 模式 + 受支持平台显示——非 TUN/非支持平台时这些字段构建期不发射，UI 隐藏避免误导。 */}
+          {config.proxyModeType?.toLowerCase() === 'tun' && (isLinux || isMac) && (
+            <SettingsCollapsible label={t('settings.advanced.lanGateway', '局域网网关')}>
+              <div className="space-y-3 py-1">
+                {/* 邻居短名解析后缀（Linux/macOS）：对这些后缀的单标签短名走局域网邻居解析 */}
+                <div>
+                  <SettingsRow
+                    label={t('settings.advanced.neighborDomains', '局域网短名解析')}
+                    description={t('settings.advanced.neighborDomainsDesc')}
+                    tooltip={t('settings.advanced.neighborDomainsDescFull')}
+                  />
+                  <ExceptionList
+                    value={config.tunConfig?.neighborDomains}
+                    defaults={[]}
+                    onChange={(v) => updateTun({ neighborDomains: v })}
+                    placeholder={t('settings.advanced.neighborDomainsPlaceholder', '.lan\n.home')}
+                    hint={t(
+                      'settings.advanced.neighborDomainsHint',
+                      '每行一个后缀（自动补前导点）；对该后缀下无点的短名（如 nas.lan）走局域网设备解析。'
+                    )}
+                  />
+                </div>
+
+                {/* TUN MAC 过滤（仅 Linux + auto_route + auto_redirect）：按 MAC 限/排设备进 TUN */}
+                {isLinux && (
+                  <div>
+                    <SettingsRow
+                      label={t('settings.advanced.macFilter', '按 MAC 过滤设备')}
+                      description={t('settings.advanced.macFilterDesc')}
+                      tooltip={t('settings.advanced.macFilterDescFull')}
+                    >
+                      <Select
+                        value={config.tunConfig?.macFilterMode ?? 'off'}
+                        onValueChange={(v) =>
+                          updateTun({
+                            macFilterMode: v === 'off' ? undefined : (v as 'include' | 'exclude'),
+                          })
+                        }
+                      >
+                        <SelectTrigger className="w-[140px]">
+                          <SelectValue />
+                        </SelectTrigger>
+                        <SelectContent>
+                          <SelectItem value="off">
+                            {t('settings.advanced.macFilterOff', '关闭')}
+                          </SelectItem>
+                          <SelectItem value="include">
+                            {t('settings.advanced.macFilterInclude', '仅允许')}
+                          </SelectItem>
+                          <SelectItem value="exclude">
+                            {t('settings.advanced.macFilterExclude', '排除')}
+                          </SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </SettingsRow>
+                    {config.tunConfig?.macFilterMode && (
+                      <ExceptionList
+                        value={config.tunConfig?.macFilterList}
+                        defaults={[]}
+                        onChange={(v) => updateTun({ macFilterList: v })}
+                        placeholder={'00:11:22:33:44:55\naa:bb:cc:dd:ee:ff'}
+                        hint={t(
+                          'settings.advanced.macFilterHint',
+                          '每行一个 MAC（00:11:22:33:44:55）；需 auto_route 开启，仅 Linux 生效。'
+                        )}
+                      />
+                    )}
+                  </div>
+                )}
+              </div>
+            </SettingsCollapsible>
+          )}
         </CardContent>
       </Card>
 

@@ -1,11 +1,7 @@
-import { useState, useEffect } from 'react';
 import * as z from 'zod';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { useTranslation } from 'react-i18next';
-import { useAppStore } from '@/store/app-store';
-import { encodeMajorMinor } from '@shared/version';
-import { Button } from '@/components/ui/button';
 import {
   Form,
   FormControl,
@@ -18,12 +14,10 @@ import {
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
 import { AddressField, PortField } from './shared/basic-fields';
-import { FingerprintField } from './shared/tls-fields';
 import { FormSection, FieldGrid, FieldSpan } from './shared/form-layout';
 import { FormButtons } from './shared/form-buttons';
 import { InfoTooltip } from './shared/info-tooltip';
 import type { ServerConfig } from '@/bridge/types';
-import { api } from '@/ipc';
 
 const createNaiveSchema = (t: any) =>
   z.object({
@@ -32,7 +26,6 @@ const createNaiveSchema = (t: any) =>
     username: z.string().min(1, t('servers.usernameRequired', 'Username is required')),
     password: z.string().min(1, t('servers.passwordRequired')),
     tlsServerName: z.string().optional(),
-    tlsFingerprint: z.string().optional(),
     useHttp3: z.boolean().optional(),
   });
 
@@ -46,20 +39,6 @@ interface NaiveFormProps {
 export function NaiveForm({ serverConfig, onSubmit }: NaiveFormProps) {
   const { t } = useTranslation();
   const naiveFormSchema = createNaiveSchema(t);
-  const setCurrentView = useAppStore((s) => s.setCurrentView);
-  const setSettingsSection = useAppStore((s) => s.setSettingsSection);
-
-  // naive 需 sing-box ≥1.13。仅当实测核心 <1.13 才提示更新；已支持则不打扰（修旧版无条件提示）。
-  const [needsCoreUpgrade, setNeedsCoreUpgrade] = useState(false);
-  useEffect(() => {
-    api.coreUpdate
-      .getVersionInfo()
-      .then((info) => {
-        // 与 ProxyManager/CoreUpdateService 统一用 shared 的整数编码解析；NaN<1013=false 保持原「未知则不提示」语义
-        setNeedsCoreUpgrade(encodeMajorMinor(info.currentVersion || '') < 1013);
-      })
-      .catch(() => {});
-  }, []);
 
   const getDefaultValues = (): NaiveFormValues => {
     if (serverConfig && serverConfig.protocol?.toLowerCase() === 'naive') {
@@ -69,7 +48,6 @@ export function NaiveForm({ serverConfig, onSubmit }: NaiveFormProps) {
         username: serverConfig.username || '',
         password: serverConfig.password || '',
         tlsServerName: serverConfig.tlsSettings?.serverName || '',
-        tlsFingerprint: serverConfig.tlsSettings?.fingerprint || 'none',
         useHttp3: serverConfig.naiveSettings?.useHttp3 ?? false,
       };
     }
@@ -79,7 +57,6 @@ export function NaiveForm({ serverConfig, onSubmit }: NaiveFormProps) {
       username: '',
       password: '',
       tlsServerName: '',
-      tlsFingerprint: 'none',
       useHttp3: false,
     };
   };
@@ -101,7 +78,6 @@ export function NaiveForm({ serverConfig, onSubmit }: NaiveFormProps) {
       tlsSettings: {
         serverName: values.tlsServerName?.trim() || undefined,
         allowInsecure: false,
-        fingerprint: values.tlsFingerprint || 'none',
       },
       naiveSettings: values.useHttp3 ? { useHttp3: true } : undefined,
     };
@@ -111,25 +87,6 @@ export function NaiveForm({ serverConfig, onSubmit }: NaiveFormProps) {
   return (
     <Form {...form}>
       <form onSubmit={form.handleSubmit(handleSubmit)} className="space-y-6">
-        {needsCoreUpgrade && (
-          <div className="bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-800 rounded-lg p-3 space-y-2">
-            <p className="text-sm text-amber-800 dark:text-amber-200 font-medium">
-              {t('servers.naive.versionWarning')}
-            </p>
-            <Button
-              variant="outline"
-              size="sm"
-              className="h-8 border-amber-300 dark:border-amber-700 hover:bg-amber-100 dark:hover:bg-amber-900/40 text-amber-900 dark:text-amber-100"
-              onClick={() => {
-                setSettingsSection('about');
-                setCurrentView('settings');
-              }}
-            >
-              {t('servers.naive.goUpdate')}
-            </Button>
-          </div>
-        )}
-
         <FormSection title={t('servers.basic', 'Basic')}>
           <FieldGrid cols={2}>
             <AddressField control={form.control} t={t} />
@@ -180,9 +137,6 @@ export function NaiveForm({ serverConfig, onSubmit }: NaiveFormProps) {
                   </FormItem>
                 )}
               />
-            </FieldSpan>
-            <FieldSpan>
-              <FingerprintField control={form.control} t={t} />
             </FieldSpan>
             <FieldSpan>
               <FormField

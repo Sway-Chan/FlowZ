@@ -24,6 +24,7 @@ export interface LegacyDomainRule {
  * 自定义规则类型（对应 sing-box route rule 常用全集，去冗余）。
  * 域名类：domain/domainSuffix/domainKeyword/domainRegex；
  * IP/端口类：ipCidr(目的)/sourceIpCidr(源)/port(目的)/sourcePort(源)；
+ * 源设备类（sing-box 1.14 LAN 设备识别）：sourceMac(源 MAC)/sourceHostname(源主机名)；
  * 进程类：processName/processPath；规则集类：geosite/geoip/ruleSet。
  */
 export type RuleType =
@@ -35,6 +36,9 @@ export type RuleType =
   | 'sourceIpCidr'
   | 'port'
   | 'sourcePort'
+  // sing-box 1.14 源设备识别（按 MAC / DHCP 主机名分流；仅 Linux/macOS，见 shared/neighbor.ts）。
+  | 'sourceMac'
+  | 'sourceHostname'
   | 'processName'
   | 'processPath'
   | 'geosite'
@@ -67,6 +71,15 @@ export interface Rule {
   targetServerId?: string;
   /** 规则备注说明 */
   remarks?: string;
+  /**
+   * TLS spoof（P3a 抗审查，sing-box 1.14 route action tls_spoof/tls_spoof_method）：对命中本规则的连接，
+   * 真握手前发伪造 ClientHello 骗 SNI 过滤中间盒。tlsSpoof=伪造的白名单 SNI（域名，非空才生效），
+   * tlsSpoofMethod=方法（wrong-ack/wrong-md5/wrong-timestamp）。两者须成对填写。
+   * **硬限界（同 outbound spoof，见 shared/tls-spoof.ts）**：需提权、ARM64 不支持、SNI 须为域名（非 IP 字面量）。
+   * 构建期按 arch/方法/IP 字面量门控（singbox-custom-rules applyRuleAction）。
+   */
+  tlsSpoof?: string;
+  tlsSpoofMethod?: 'wrong-ack' | 'wrong-md5' | 'wrong-timestamp';
 }
 
 /** 系统进程信息（进程快速选择器用）。 */

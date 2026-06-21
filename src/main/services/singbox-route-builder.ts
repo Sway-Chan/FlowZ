@@ -1,8 +1,8 @@
 /**
  * sing-box 路由配置生成 —— 从 ProxyManager.generateRouteConfig 抽出（SingBoxConfigBuilder 抽取 Phase 2 step 7）。
  *
- * route 子系统集成 hub：纯函数，只读 config/idToTagMap + 注入实例态依赖（coreVersion / probe 端口 /
- * lanResolverForDns / pendingEndpoints 值 + log·onDegraded 回调）。装配 sniff/探针/DNS 直连·劫持/节点排除/
+ * route 子系统集成 hub：纯函数，只读 config/idToTagMap + 注入实例态依赖（probe 端口 / lanResolverForDns /
+ * pendingEndpoints 值 + log·onDegraded 回调）。装配 sniff/探针/DNS 直连·劫持/节点排除/
  * 网银 U盾/endpoint 强制路由/私网直连/自定义规则(buildCustomRules)/应用分流/QUIC 阻断/geo rule_set/悬空剪枝。
  * config 字节等价由 config-snapshot 网验证（systemProxy/tun/global/customRules/appRules/WG/probe/blockQuic/
  * bypassLAN/win32 等矩阵）；启停/TUN 热切换真机另验。
@@ -10,7 +10,6 @@
 
 import * as path from 'path';
 import type { UserConfig } from '../../shared/types';
-import { coreVersionAtLeast } from '../../shared/version';
 import { BOOTSTRAP_DIRECT_DNS_IPS } from '../../shared/dns';
 import {
   endpointForcedRouteCidrs,
@@ -42,6 +41,7 @@ import type {
 import {
   isIpv4Host,
   isIpv6Host,
+  hostToExcludeCidr,
   DOMESTIC_BANK_AND_STOCK_DOMAINS,
   effectiveCustomRules,
   effectiveAppRules,
@@ -79,7 +79,6 @@ const udp443RejectRule = (matcher: Record<string, unknown> = {}): SingBoxRouteRu
 
 /** 注入依赖：generateRouteConfig 原读的实例态（值 + 回调），抽出后由 generateSingBoxConfig 注入。 */
 export interface RouteConfigDeps {
-  coreVersion: string;
   probeDirectPort: number | null;
   probeProxyPort: number | null;
   lanResolverForDns: string | null;
@@ -168,25 +167,23 @@ export function buildRouteConfig(
   const webrtcLeak = config.webrtcLeakProtection ?? 'off';
 
   // A. 嗅探规则（必须在前，用于识别域名）
-  // 1.13+ 必须在路由层开启 sniff，替代已移除的 inbound 级别 sniff 字段。
+  // sing-box 1.14：路由层开启 sniff，替代早期已移除的 inbound 级别 sniff 字段。恒发射，无版本门控。
   // 注意（旧注释「等效 sniff_override_destination」不准确）：sniff 只把嗅出的域名用于【路由匹配】这半边——
-  // sniff_override_destination（改写 outbound 目标，让节点收到域名）在 1.13.0 已移除且无替代。
+  // sniff_override_destination（改写 outbound 目标，让节点收到域名）已移除且无替代。
   // 故关 FakeIP 时节点仍收真实 IP，域名交付节点只能靠 FakeIP（见 generateDnsConfig / 设计 T1·T4）。
-  if (coreVersionAtLeast(deps.coreVersion, 1, 13)) {
+  rules.push({
+    action: 'sniff',
+  });
+  // WebRTC 防泄露开启时为稳健补一条显式 UDP stun sniffer：裸 {action:'sniff'} 官方语义 sniffer 留空=嗅所有
+  // 协议（含 stun），理论上已足够让下方 protocol:'stun' 命中；显式 sniffer:['stun'] 仅为稳健、免一次真机往返
+  // 才发现裸 sniff 不命中。timeout 短（300ms）避免拖慢非 STUN 的 UDP 首包。（裸 sniff 是否已足够留 Phase-0 真机确认。）
+  if (webrtcLeak !== 'off') {
     rules.push({
+      network: ['udp'],
       action: 'sniff',
+      sniffer: ['stun'],
+      timeout: '300ms',
     });
-    // WebRTC 防泄露开启时为稳健补一条显式 UDP stun sniffer：裸 {action:'sniff'} 官方语义 sniffer 留空=嗅所有
-    // 协议（含 stun），理论上已足够让下方 protocol:'stun' 命中；显式 sniffer:['stun'] 仅为稳健、免一次真机往返
-    // 才发现裸 sniff 不命中。timeout 短（300ms）避免拖慢非 STUN 的 UDP 首包。（裸 sniff 是否已足够留 Phase-0 真机确认。）
-    if (webrtcLeak !== 'off') {
-      rules.push({
-        network: ['udp'],
-        action: 'sniff',
-        sniffer: ['stun'],
-        timeout: '300ms',
-      });
-    }
   }
 
   // A2. 出口 IP 探针钉死路由（必须紧随 sniff、先于一切分流/进程规则，确保短路不受分流策略影响）：
@@ -220,11 +217,14 @@ export function buildRouteConfig(
       ...BOOTSTRAP_DIRECT_DNS_IPS.map((ip) => `${ip}/32`),
       // 用户自定义的国内 DNS（IP 型）也须在 hijack-dns 之前直连放行，否则其 53 端口查询会被劫持成 FakeIP
       ...(customDomesticDns
-        ? [`${customDomesticDns.ip}/${isIpv6Host(customDomesticDns.ip) ? 128 : 32}`]
+        ? [hostToExcludeCidr(customDomesticDns.ip)].filter((c): c is string => c !== null)
         : []),
       // 方案B：DNS 接管的内网 LAN 解析器（dns-lan 指向它）必须在 hijack-dns 之前直连放行，否则其 :53 查询会被
-      // hijack-dns 抢走 → 内网域名解析成环。私网 IPv4 /32（getLanResolverForDns 已保证私网，亦经下方私网直连可达）。
-      ...(deps.lanResolverForDns ? [`${deps.lanResolverForDns}/32`] : []),
+      // hijack-dns 抢走 → 内网域名解析成环。经 hostToExcludeCidr 族自适应（v4 /32 / v6 /128；pickLanResolverIp
+      // 现仅 IPv4，未来 IPv6 不再误拼 /32），非 IP 返 null 时 skip（getLanResolverForDns 已保证私网 IP）。
+      ...(deps.lanResolverForDns
+        ? [hostToExcludeCidr(deps.lanResolverForDns)].filter((c): c is string => c !== null)
+        : []),
     ],
     port: Array.from(new Set([53, 443, ...(customDomesticDns ? [customDomesticDns.port] : [])])),
     action: 'route',
@@ -313,8 +313,8 @@ export function buildRouteConfig(
         (h): h is string => !!h && h.length > 0
       );
       for (const host of hosts) {
-        if (isIpv4Host(host)) ipSet.add(`${host}/32`);
-        else if (isIpv6Host(host)) ipSet.add(`${host}/128`);
+        const cidr = isIpv4Host(host) || isIpv6Host(host) ? hostToExcludeCidr(host) : null;
+        if (cidr) ipSet.add(cidr);
         else domainSet.add(host);
       }
     }
@@ -340,33 +340,21 @@ export function buildRouteConfig(
     }
   }
 
-  // 0a. U盾/安全插件的本地伪域名 → 强制 127.0.0.1，完全跳过 DNS
-  // windows10.microdone.cn 等域名是 U盾厂商注册在本地的专用域名，公网 DNS 中不存在。
-  // 普通 direct outbound 会先做 DNS 解析 → NXDOMAIN → 连接失败。
-  // 版本分支：
-  //   1.12.x → 使用 direct-loopback outbound（outbound 层面 override_address）
-  //   1.13+  → 使用路由规则层面的 override_address（outbound 层面已移除此功能）
+  // 0a. U盾/安全插件的本地伪域名 → 路由规则层 override_address 强制 127.0.0.1，完全跳过 DNS。
+  // windows10.microdone.cn 等是 U盾厂商注册在本地的专用域名，公网 DNS 不存在 → 普通 direct 会 NXDOMAIN 连接失败。
+  // sing-box 1.14：override_address 收敛在路由规则层（旧 1.12.x 的 outbound 层 direct-loopback 已随硬切 §2.1 移除，
+  // 故此处不再按版本分支——分支的 else 会 push 已不存在的 direct-loopback 出站）。
   const UKEY_LOCAL_DOMAINS = ['.microdone.cn'];
   const otherBankDomains = DOMESTIC_BANK_AND_STOCK_DOMAINS.filter(
     (d) => !UKEY_LOCAL_DOMAINS.includes(d)
   );
 
-  if (coreVersionAtLeast(deps.coreVersion, 1, 13)) {
-    // 1.13+：路由规则支持 override_address
-    rules.push({
-      domain_suffix: UKEY_LOCAL_DOMAINS,
-      action: 'route',
-      outbound: 'direct',
-      override_address: '127.0.0.1',
-    });
-  } else {
-    // 1.12.x：使用专用的 direct-loopback outbound
-    rules.push({
-      domain_suffix: UKEY_LOCAL_DOMAINS,
-      action: 'route',
-      outbound: 'direct-loopback',
-    });
-  }
+  rules.push({
+    domain_suffix: UKEY_LOCAL_DOMAINS,
+    action: 'route',
+    outbound: 'direct',
+    override_address: '127.0.0.1',
+  });
 
   // 0b. 其余银行/证券域名 → 普通 direct（正常 DNS 解析，这些域名在公网真实存在）
   if (otherBankDomains.length > 0) {
@@ -617,20 +605,15 @@ export function buildRouteConfig(
     }
   }
 
-  // ICMP 兜底（仅 sing-box ≥1.13 支持 network:icmp 匹配）：放在 mesh force-route(块 0c) + bypass-LAN 之后，
+  // ICMP 兜底（sing-box network:icmp 匹配，1.14 恒支持）：放在 mesh force-route(块 0c) + bypass-LAN 之后，
   // 故组网具体段经其 endpoint、局域网私网段直连先匹配，本条只兜底其余（外网）ICMP。
   //   · final 出口为 WG/Tailscale 全隧道节点（isEndpoint 且非 direct 模式）→ 经其出口 userExitTag：
   //     endpoint 出站能转 ICMP，与 0/0 全隧道一致、防 ping 泄露真实 IP。
   //   · 普通代理（转不了 ICMP）/ specific-only mesh(userExitTag 已= 'direct' 经 D4/D7 兜底)/ direct 模式 → 直连。
-  // 版本门 <1.13 → 不发射，维持核默认（gVisor 栈本地伪应答 ICMP echo）。
-  if (coreVersionAtLeast(deps.coreVersion, 1, 13)) {
-    // ICMP→代理出口 ⟺ selectedExitRoutesIcmpViaProxy（单一真值，与 ProxyManager 热切换跨边界判定同源）：
-    //   选中 endpoint 全隧道节点时经其 userExitTag（=proxy-selector，承载全隧道）防 ping 泄露真实 IP；
-    //   普通代理 / specific-only mesh（D4/D7 兜底）/ direct 模式 → 直连。字节等价于原 isEndpoint?userExitTag:direct
-    //   展开（exitFallback ⟺ isEndpoint && !carriesFullTunnel）。
-    const icmpOutbound = selectedExitRoutesIcmpViaProxy(config) ? userExitTag : 'direct';
-    rules.push({ network: ['icmp'], action: 'route', outbound: icmpOutbound });
-  }
+  // ICMP→代理出口 ⟺ selectedExitRoutesIcmpViaProxy（单一真值，与 ProxyManager 热切换跨边界判定同源）。
+  // 硬切 1.14 后无版本门（旧 <1.13 不发射分支已随 §5 守卫恒 ≥1.14 收敛，与 :352 U盾同口径）。
+  const icmpOutbound = selectedExitRoutesIcmpViaProxy(config) ? userExitTag : 'direct';
+  rules.push({ network: ['icmp'], action: 'route', outbound: icmpOutbound });
 
   // 【QUIC 阻断】：放在自定义规则和应用分流之后，确保用户的 direct/proxy 规则优先级更高
   // 这样游戏设为直连时，进程名匹配在前，游戏的 UDP 流量不会被误拒。

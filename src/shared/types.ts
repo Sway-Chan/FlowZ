@@ -251,6 +251,14 @@ export interface TunModeConfig {
   interfaceName?: string;
   inet4Address?: string;
   inet6Address?: string;
+  // ── P6 局域网网关（sing-box 1.14 LAN 设备识别簇，仅 Linux 生效，见 shared/neighbor.ts）──
+  // TUN 按 MAC 过滤进入 TUN 的设备：'include'=仅 macFilterList 内的设备进 TUN / 'exclude'=排除它们。互斥。
+  // 仅 Linux + auto_route + auto_redirect 支持；非法 MAC / 非 Linux 时构建期不发射（防 FATAL）。
+  macFilterMode?: 'include' | 'exclude';
+  macFilterList?: string[]; // EUI-48 MAC，仅在 macFilterMode 设定时消费
+  // local DNS 邻居解析：对这些后缀的单标签短名（如 nas.lan）走局域网邻居解析（主机名→IP）。
+  // 每条须以 '.' 开头（构建期归一化）；仅 Linux/macOS 生效。供「局域网设备短名访问」场景。
+  neighborDomains?: string[];
 }
 
 // DNS 配置
@@ -277,6 +285,12 @@ export interface DnsConfig {
   // 关 → 不接管（dns-local 恢复用原 LAN DNS、内网域名正常，但 TUN 下有上述泄漏风险），供有自定义/内网 DNS 的用户用。
   // 仅 TUN 模式生效；旧配置无此字段 → 视为开。详见 docs/design/dns-ipv6-takeover.md。
   takeoverSystemDns?: boolean;
+  // P2b 乐观 DNS 缓存（sing-box 1.14 `dns.optimistic`）：缺省/false=关。开 → 缓存过期后先返回旧值、后台异步刷新，
+  // 降低尾延迟（牺牲首条过期响应的新鲜度）。映射到顶层 dns.optimistic:true（仅 true 时下发，关时省略保字节）。
+  optimisticCache?: boolean;
+  // P2c DNS 查询超时（sing-box 1.14 `dns.timeout`，毫秒）：缺省/未设=用核默认（不下发）。>0 时下发 dns.timeout:"<n>ms"，
+  // 治理慢上游不拖整体解析。sanitize 丢弃 ≤0 / 非有限 / 超合理范围（1..60000ms）的值（见 ConfigManager.validateConfig）。
+  dnsTimeoutMs?: number;
 }
 
 // ============================================================================
@@ -290,6 +304,34 @@ export interface RegionRoutingConfig {
   enabled: boolean; // 总开关：true=按地区自动分流(本地直连·海外代理)；false=只用自定义规则
   region: RegionId; // 选用哪套地区 geo
   reverse: boolean; // 反向：本地走代理·海外直连（region=cn+reverse=回国）
+}
+
+// ============================================================================
+// 远程实例（sing-box 1.14 远程控制，P5 Phase2）
+// ============================================================================
+
+/**
+ * 远程 sing-box 实例（FlowZ 当客户端连远端 ≥1.14 核的管理 API）。
+ * - host/port：远端 api service 监听地址（必填）。
+ * - secret：远端 api service 的鉴权 secret（Bearer per-call）。**反向可读存**——Bearer 必须发原值，无法哈希；
+ *   存于 config.json（0o600，与 clashApiSecret 同保护级）。**渲染端不回读明文**：UI 仅写（保存新值），列表只显
+ *   「已设置/未设置」占位，CONFIG_GET 经 sanitize 不下发明文（见 ConfigManager.sanitizeRemoteSecretsForRenderer）。
+ * - tls：远端走 TLS（远程强制启用，见 dashboard-remote.md §2.4）；ca=自签 PEM CA，skipVerify=跳过校验（不安全便利档）。
+ * - dashboardUrl：可选，远端 /dashboard/ 的完整 URL（openExternal 用，留空则由 host/port 推 https）。
+ */
+export interface RemoteInstance {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  secret?: string;
+  tls?: {
+    ca?: string;
+    skipVerify?: boolean;
+  };
+  dashboardUrl?: string;
+  // 渲染端只读：CONFIG_GET 经 stripRemoteSecrets 注入「是否已设置 secret」占位（明文不下发）。永不持久化（保存前被剔除）。
+  hasSecret?: boolean;
 }
 
 // ============================================================================
@@ -427,6 +469,20 @@ export interface UserConfig {
   // clash_api(127.0.0.1:9090) 鉴权 secret：首次启动随机生成并持久化，统一管所有 clash_api 访问(含 external_ui)。
   // 内部调用(热切换/流量统计/拓扑)带 Authorization；防恶意网页跨域读连接历史。可在设置里查看/重置。
   clashApiSecret?: string;
+
+  // sing-box 1.14 官方面板（opt-in 逃生舱）：开关 on 时在 api service（management api）注入 dashboard.enabled，
+  // 核首次联网从官方仓拉 sing-box-dashboard 资源并于 api 监听口 /dashboard/ serve。默认关（undefined=false）；
+  // 不随包静态文件，关时核绝不出网拉资源。非 boolean 一律 sanitize 删除（同 appRoutingEnabled 标准，不回填默认）。
+  singboxDashboard?: boolean;
+
+  // sing-box 1.14 远程实例控制（P5 Phase2）：FlowZ 当客户端连远端核的管理 API（增删改 + 打开远端面板）。
+  // secret 反向可读存于 config.json（0o600）但 CONFIG_GET 经 sanitize 不下发明文给渲染端（详见 RemoteInstance 注释）。
+  // 非法/缺字段实例在 validateConfig 整条丢弃（sanitize 而非 throw，避免污染配置致 loadConfig 全丢）。
+  remoteInstances?: RemoteInstance[];
+
+  // 当前活动实例：'local'（默认，本地核）| 某条 remoteInstances.id。validateConfig 收敛非法值回落 undefined（=本地）。
+  // 当前批次仅落「远程配置 + 客户端 TLS + 打开远端 dashboard」核心闭环；原生页实时镜像远端状态留 TODO（见 dashboard-remote.md §2.3）。
+  activeInstanceId?: string;
 
   // macOS 提权 helper：用户已忽略「安装提权 helper」启动提示（不再每次启动 TUN 时弹）。可在设置里重新安装。
   // 注：socket 鉴权 token 刻意不放这里——它存独立文件，避免被渲染端整体回写 config 时清零。

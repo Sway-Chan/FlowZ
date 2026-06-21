@@ -3,14 +3,34 @@
  * buildProxyOutbound 由 protocol-parser/config-snapshot 集成覆盖；此处锁 step9 抽入的 WG endpoint 构造默认值
  * （keepalive=25 / allowed_ips 全量 / mtu 兜底）与 isNodeUsable naive 门控（resourceManager spy）。
  */
+// buildTailscaleEndpoint 调用 tailscaleStateDir(→ electron app.getPath) + mkdirSync。mock tailscale-state
+// 把 state 目录指向 tmp，避免依赖 electron（与 tailscale-state.test 同款隔离思路，但只 mock 路径产出）。
+import * as os from 'os';
+import * as fs from 'fs';
+import * as path from 'path';
+const TS_TMP = fs.mkdtempSync(path.join(os.tmpdir(), 'flowz-ts-ep-'));
+jest.mock('../tailscale-state', () => ({
+  tailscaleStateDir: (id: string) => `${require('os').tmpdir()}/flowz-ts-ep-state/${id}`,
+}));
+
 import {
   buildWireGuardEndpoint,
+  buildTailscaleEndpoint,
   buildProxyOutbound,
   isNodeUsable,
   prunedSelectorDefault,
 } from '../singbox-outbound-builder';
 import { resourceManager } from '../ResourceManager';
 import type { ServerConfig } from '../../../shared/types';
+
+afterAll(() => {
+  try {
+    fs.rmSync(TS_TMP, { recursive: true, force: true });
+    fs.rmSync(`${os.tmpdir()}/flowz-ts-ep-state`, { recursive: true, force: true });
+  } catch {
+    /* ignore */
+  }
+});
 
 const wgServer = (over: Partial<ServerConfig> = {}): ServerConfig =>
   ({
@@ -364,6 +384,163 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
     expect(ob.client_version).toBe('SSH-2.0-OpenSSH_9.0');
   });
 
+  // P3d：SSH cipher/mac/kex_algorithm。字段名以 sing-box check 实证为准（cipher/mac/kex_algorithm，
+  // 非 ciphers/macs/key_exchange——后两者 sing-box decode FATAL "unknown field"）。
+  it('ssh：cipher/mac/kexAlgorithm → cipher/mac/kex_algorithm（sing-box 实证字段名）', () => {
+    const ob = buildProxyOutbound(
+      node({
+        protocol: 'ssh',
+        port: 22,
+        sshSettings: {
+          user: 'root',
+          cipher: ['aes128-gcm@openssh.com', 'chacha20-poly1305@openssh.com'],
+          mac: ['hmac-sha2-256'],
+          kexAlgorithm: ['curve25519-sha256'],
+        },
+      }),
+      tags
+    ) as any;
+    expect(ob.cipher).toEqual(['aes128-gcm@openssh.com', 'chacha20-poly1305@openssh.com']);
+    expect(ob.mac).toEqual(['hmac-sha2-256']);
+    expect(ob.kex_algorithm).toEqual(['curve25519-sha256']);
+  });
+
+  it('ssh：cipher/mac/kexAlgorithm 空数组不下发（向后兼容）', () => {
+    const ob = buildProxyOutbound(
+      node({
+        protocol: 'ssh',
+        port: 22,
+        sshSettings: { user: 'root', cipher: [], mac: [], kexAlgorithm: [] },
+      }),
+      tags
+    ) as any;
+    expect(ob.cipher).toBeUndefined();
+    expect(ob.mac).toBeUndefined();
+    expect(ob.kex_algorithm).toBeUndefined();
+  });
+
+  // P3b：Hysteria2 obfs（salamander/gecko）+ min/max_packet_size（仅 gecko）+ bbr_profile。
+  it('hysteria2：salamander obfs → obfs.type=salamander，不下发 min/max_packet_size', () => {
+    const ob = buildProxyOutbound(
+      node({
+        protocol: 'hysteria2',
+        password: 'pw',
+        security: 'tls',
+        hysteria2Settings: {
+          obfs: { type: 'salamander', password: 'o', minPacketSize: 100, maxPacketSize: 1200 },
+        },
+      }),
+      tags
+    ) as any;
+    expect(ob.obfs.type).toBe('salamander');
+    expect(ob.obfs.password).toBe('o');
+    // salamander 忽略包长字段：即便表单残留也不下发（避免无效字段）
+    expect(ob.obfs.min_packet_size).toBeUndefined();
+    expect(ob.obfs.max_packet_size).toBeUndefined();
+  });
+
+  it('hysteria2：gecko obfs → obfs.type=gecko + min/max_packet_size 下发', () => {
+    const ob = buildProxyOutbound(
+      node({
+        protocol: 'hysteria2',
+        password: 'pw',
+        security: 'tls',
+        hysteria2Settings: {
+          obfs: { type: 'gecko', password: 'o', minPacketSize: 100, maxPacketSize: 1200 },
+        },
+      }),
+      tags
+    ) as any;
+    expect(ob.obfs.type).toBe('gecko');
+    expect(ob.obfs.min_packet_size).toBe(100);
+    expect(ob.obfs.max_packet_size).toBe(1200);
+  });
+
+  it('hysteria2：obfs 缺 password → 不下发整个 obfs（sing-box: missing obfs password）', () => {
+    const ob = buildProxyOutbound(
+      node({
+        protocol: 'hysteria2',
+        password: 'pw',
+        security: 'tls',
+        hysteria2Settings: { obfs: { type: 'gecko' } },
+      }),
+      tags
+    ) as any;
+    expect(ob.obfs).toBeUndefined();
+  });
+
+  it('hysteria2：bbrProfile → bbr_profile（standard/aggressive/conservative）', () => {
+    const ob = buildProxyOutbound(
+      node({
+        protocol: 'hysteria2',
+        password: 'pw',
+        security: 'tls',
+        hysteria2Settings: { bbrProfile: 'aggressive' },
+      }),
+      tags
+    ) as any;
+    expect(ob.bbr_profile).toBe('aggressive');
+  });
+
+  it('hysteria2：未设 obfs/bbrProfile → 均不下发（向后兼容）', () => {
+    const ob = buildProxyOutbound(
+      node({ protocol: 'hysteria2', password: 'pw', security: 'tls', hysteria2Settings: {} }),
+      tags
+    ) as any;
+    expect(ob.obfs).toBeUndefined();
+    expect(ob.bbr_profile).toBeUndefined();
+  });
+
+  // P3c：TLS engine。仅对 TCP-TLS 协议下发；'go'/空省略；Hy2/TUIC（QUIC）即便设了也不下发。
+  it('tls engine：trojan engine=windows → tls.engine=windows', () => {
+    const ob = buildProxyOutbound(
+      node({
+        protocol: 'trojan',
+        password: 'pw',
+        security: 'tls',
+        tlsSettings: { serverName: 'a.com', engine: 'windows' },
+      }),
+      tags
+    ) as any;
+    expect(ob.tls.engine).toBe('windows');
+  });
+
+  it('tls engine：engine=go 或未设 → 省略（用核心默认 Go TLS）', () => {
+    const goOb = buildProxyOutbound(
+      node({
+        protocol: 'trojan',
+        password: 'pw',
+        security: 'tls',
+        tlsSettings: { serverName: 'a.com', engine: 'go' },
+      }),
+      tags
+    ) as any;
+    expect(goOb.tls.engine).toBeUndefined();
+    const noneOb = buildProxyOutbound(
+      node({
+        protocol: 'trojan',
+        password: 'pw',
+        security: 'tls',
+        tlsSettings: { serverName: 'a.com' },
+      }),
+      tags
+    ) as any;
+    expect(noneOb.tls.engine).toBeUndefined();
+  });
+
+  it('tls engine：hysteria2(QUIC) 即便设 engine 也不下发（QUIC 自带 TLS1.3）', () => {
+    const ob = buildProxyOutbound(
+      node({
+        protocol: 'hysteria2',
+        password: 'pw',
+        security: 'tls',
+        tlsSettings: { serverName: 'a.com', engine: 'apple' },
+      }),
+      tags
+    ) as any;
+    expect(ob.tls?.engine).toBeUndefined();
+  });
+
   it('未设置这些可选项 → 不下发（向后兼容）', () => {
     const tuic = buildProxyOutbound(
       node({ protocol: 'tuic', uuid: 'u', password: 'p', tuicSettings: {} }),
@@ -459,5 +636,208 @@ describe('buildProxyOutbound — http(H2)/gRPC 传输生成', () => {
       tags
     );
     expect(ob.transport?.type).toBe('http');
+  });
+});
+
+// buildTailscaleEndpoint — P4a 新字段（advertise_tags / ssh_server / relay_server_port）。
+// schema 经 resources/linux/sing-box check（1.14-alpha.32）实证：
+//  advertise_tags=Listable[string]；ssh_server=badoption(bool|{enabled})，FlowZ 以 bool 下发；
+//  relay_server_port=int（唯一 relay_server_* 字段，无 relay_server 开关）。
+const tsServer = (over: Partial<ServerConfig> = {}): ServerConfig =>
+  ({
+    id: 'ts1',
+    name: 'TS',
+    protocol: 'tailscale',
+    tailscaleSettings: {},
+    ...over,
+  }) as unknown as ServerConfig;
+
+describe('buildTailscaleEndpoint — P4a 新字段', () => {
+  it('基础 endpoint：type/tag/state_directory，无可选字段时不下发 P4a 字段', () => {
+    const ep = buildTailscaleEndpoint(tsServer(), 'TS');
+    expect(ep.type).toBe('tailscale');
+    expect(ep.tag).toBe('TS');
+    expect(ep.state_directory).toContain('ts1');
+    expect(ep.advertise_tags).toBeUndefined();
+    expect(ep.ssh_server).toBeUndefined();
+    expect(ep.relay_server_port).toBeUndefined();
+  });
+
+  it('advertise_tags：过滤空白后下发数组；全空 → 不下发', () => {
+    const ep = buildTailscaleEndpoint(
+      tsServer({ tailscaleSettings: { advertiseTags: [' tag:server ', '', 'tag:exit'] } }),
+      'TS'
+    );
+    expect(ep.advertise_tags).toEqual(['tag:server', 'tag:exit']);
+
+    const empty = buildTailscaleEndpoint(
+      tsServer({ tailscaleSettings: { advertiseTags: ['', '  '] } }),
+      'TS'
+    );
+    expect(empty.advertise_tags).toBeUndefined();
+  });
+
+  it('ssh_server：true → ssh_server:true（bool 形式）；false/缺省 → 不下发', () => {
+    expect(
+      buildTailscaleEndpoint(tsServer({ tailscaleSettings: { sshServer: true } }), 'TS').ssh_server
+    ).toBe(true);
+    expect(
+      buildTailscaleEndpoint(tsServer({ tailscaleSettings: { sshServer: false } }), 'TS').ssh_server
+    ).toBeUndefined();
+  });
+
+  it('relay_server_port：正整数下发；0 / 负数 / 非数字 → 不下发', () => {
+    expect(
+      buildTailscaleEndpoint(tsServer({ tailscaleSettings: { relayServerPort: 8080 } }), 'TS')
+        .relay_server_port
+    ).toBe(8080);
+    expect(
+      buildTailscaleEndpoint(tsServer({ tailscaleSettings: { relayServerPort: 0 } }), 'TS')
+        .relay_server_port
+    ).toBeUndefined();
+    expect(
+      buildTailscaleEndpoint(tsServer({ tailscaleSettings: { relayServerPort: -1 } }), 'TS')
+        .relay_server_port
+    ).toBeUndefined();
+  });
+});
+
+// P3a：outbound TLS spoof（sing-box 1.14 tls.spoof/spoof_method，抗审查）。
+// spoofMethod + spoofSni（诱饵 SNI，须不同于真 server_name）成对启用 → tls.spoof=spoofSni + tls.spoof_method。
+// 五重门控：arch(非 ARM64) + 协议(TCP-TLS) + 诱饵 SNI 非空 + 非 IP 字面量 + 不同于真 server_name + 方法合法。
+// 本机 process.arch=x64（支持），ARM64 路径单独 mock process.arch 验证。
+describe('buildProxyOutbound — TLS spoof（P3a 抗审查）', () => {
+  // CI 修复：spoof 门控读 process.arch（ARM64 不支持，内核仅 amd64 实现）。正向用例统一 mock x64，使其与 CI runner
+  // 实际 arch 无关（macOS runner = arm64，否则正向用例误判失败）；下方 ARM64 负向用例在体内自 mock arm64 再还原。
+  const REAL_ARCH = process.arch;
+  beforeAll(() => Object.defineProperty(process, 'arch', { value: 'x64', configurable: true }));
+  afterAll(() => Object.defineProperty(process, 'arch', { value: REAL_ARCH, configurable: true }));
+  const tags = new Map<string, string>();
+  const node = (over: Partial<ServerConfig>): ServerConfig =>
+    ({ id: 'n', name: 'N', address: 'node.example.com', port: 443, ...over }) as ServerConfig;
+
+  it('诱饵 SNI（不同于真 SNI）+ 合法方法 → tls.spoof=诱饵 + tls.spoof_method（trojan）', () => {
+    const ob = buildProxyOutbound(
+      node({
+        protocol: 'trojan',
+        password: 'pw',
+        security: 'tls',
+        tlsSettings: {
+          serverName: 'real.example.com',
+          spoofSni: 'decoy.microsoft.com',
+          spoofMethod: 'wrong-ack',
+        },
+      }),
+      tags
+    ) as any;
+    expect(ob.tls.server_name).toBe('real.example.com');
+    expect(ob.tls.spoof).toBe('decoy.microsoft.com'); // 诱饵，非真 SNI
+    expect(ob.tls.spoof_method).toBe('wrong-ack');
+  });
+
+  it('诱饵 SNI == 真 server_name → 不下发（内核 FATAL `spoof must differ from server_name`）', () => {
+    const ob = buildProxyOutbound(
+      node({
+        protocol: 'vless',
+        uuid: 'u',
+        security: 'tls',
+        tlsSettings: {
+          serverName: 'same.example.com',
+          spoofSni: 'same.example.com',
+          spoofMethod: 'wrong-timestamp',
+        },
+      }),
+      tags
+    ) as any;
+    expect(ob.tls.spoof).toBeUndefined();
+    expect(ob.tls.spoof_method).toBeUndefined();
+  });
+
+  it('诱饵 SNI 为 IP 字面量 → 不下发（内核拒 `spoof requires TLS ClientHello with SNI`）', () => {
+    const ob = buildProxyOutbound(
+      node({
+        protocol: 'trojan',
+        password: 'pw',
+        security: 'tls',
+        tlsSettings: {
+          serverName: 'real.example.com',
+          spoofSni: '203.0.113.9',
+          spoofMethod: 'wrong-ack',
+        },
+      }),
+      tags
+    ) as any;
+    expect(ob.tls.spoof).toBeUndefined();
+    expect(ob.tls.spoof_method).toBeUndefined();
+  });
+
+  it('有方法但诱饵 SNI 留空 → 不下发（成对才生效）', () => {
+    const ob = buildProxyOutbound(
+      node({
+        protocol: 'trojan',
+        password: 'pw',
+        security: 'tls',
+        tlsSettings: { serverName: 'real.example.com', spoofMethod: 'wrong-ack' },
+      }),
+      tags
+    ) as any;
+    expect(ob.tls.spoof).toBeUndefined();
+    expect(ob.tls.spoof_method).toBeUndefined();
+  });
+
+  it('hysteria2(QUIC) 即便成对设置也不下发（无 TCP ClientHello）', () => {
+    const ob = buildProxyOutbound(
+      node({
+        protocol: 'hysteria2',
+        password: 'pw',
+        security: 'tls',
+        tlsSettings: {
+          serverName: 'a.com',
+          spoofSni: 'decoy.microsoft.com',
+          spoofMethod: 'wrong-ack',
+        },
+      }),
+      tags
+    ) as any;
+    expect(ob.tls?.spoof).toBeUndefined();
+    expect(ob.tls?.spoof_method).toBeUndefined();
+  });
+
+  it('未设 spoofMethod → 不下发（向后兼容）', () => {
+    const ob = buildProxyOutbound(
+      node({
+        protocol: 'trojan',
+        password: 'pw',
+        security: 'tls',
+        tlsSettings: { serverName: 'a.com' },
+      }),
+      tags
+    ) as any;
+    expect(ob.tls.spoof).toBeUndefined();
+    expect(ob.tls.spoof_method).toBeUndefined();
+  });
+
+  it('ARM64（mock process.arch=arm64）→ 不下发 spoof（内核仅 amd64 实现）', () => {
+    const orig = process.arch;
+    Object.defineProperty(process, 'arch', { value: 'arm64', configurable: true });
+    try {
+      const ob = buildProxyOutbound(
+        node({
+          protocol: 'trojan',
+          password: 'pw',
+          security: 'tls',
+          tlsSettings: {
+            serverName: 'real.example.com',
+            spoofSni: 'decoy.microsoft.com',
+            spoofMethod: 'wrong-ack',
+          },
+        }),
+        tags
+      ) as any;
+      expect(ob.tls.spoof).toBeUndefined();
+      expect(ob.tls.spoof_method).toBeUndefined();
+    } finally {
+      Object.defineProperty(process, 'arch', { value: orig, configurable: true });
+    }
   });
 });

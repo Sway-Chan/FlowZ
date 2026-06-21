@@ -17,6 +17,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { AddressField, PortField } from './shared/basic-fields';
 import { FormSection, FieldGrid, FieldSpan } from './shared/form-layout';
 import { FormButtons } from './shared/form-buttons';
+import { splitTextList } from './shared/parse-list';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation, Trans } from 'react-i18next';
 
@@ -35,6 +36,10 @@ const createSshSchema = (t: any) =>
     hostKey: z.string().optional(),
     hostKeyAlgorithms: z.string().optional(),
     clientVersion: z.string().optional(),
+    // 算法协商（可选；逗号/换行分隔）
+    cipher: z.string().optional(),
+    mac: z.string().optional(),
+    kexAlgorithm: z.string().optional(),
   });
 
 type SshFormValues = z.infer<ReturnType<typeof createSshSchema>>;
@@ -71,6 +76,9 @@ export function SshForm({ serverConfig, onSubmit }: SshFormProps) {
         hostKey: ssh?.hostKey?.join('\n') || '',
         hostKeyAlgorithms: ssh?.hostKeyAlgorithms?.join(', ') || '',
         clientVersion: ssh?.clientVersion || '',
+        cipher: ssh?.cipher?.join(', ') || '',
+        mac: ssh?.mac?.join(', ') || '',
+        kexAlgorithm: ssh?.kexAlgorithm?.join(', ') || '',
       };
     }
     return {
@@ -84,6 +92,9 @@ export function SshForm({ serverConfig, onSubmit }: SshFormProps) {
       hostKey: '',
       hostKeyAlgorithms: '',
       clientVersion: '',
+      cipher: '',
+      mac: '',
+      kexAlgorithm: '',
     };
   };
 
@@ -126,6 +137,14 @@ export function SshForm({ serverConfig, onSubmit }: SshFormProps) {
     if (values.clientVersion?.trim()) {
       sshSettings.clientVersion = values.clientVersion.trim();
     }
+
+    // 算法协商可选项（逗号/空白/换行分隔）→ sing-box cipher / mac / kex_algorithm。复用 splitTextList 单一真值。
+    const cipher = splitTextList(values.cipher);
+    if (cipher.length) sshSettings.cipher = cipher;
+    const mac = splitTextList(values.mac);
+    if (mac.length) sshSettings.mac = mac;
+    const kexAlgorithm = splitTextList(values.kexAlgorithm);
+    if (kexAlgorithm.length) sshSettings.kexAlgorithm = kexAlgorithm;
 
     const config: any = {
       protocol: 'ssh' as const,
@@ -309,6 +328,54 @@ export function SshForm({ serverConfig, onSubmit }: SshFormProps) {
                     <Input placeholder="SSH-2.0-OpenSSH_9.0" {...field} />
                   </FormControl>
                   <FormDescription>{t('servers.ssh.clientVersionDesc')}</FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name="cipher"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>{t('servers.ssh.cipher')}</FormLabel>
+                  <FormControl>
+                    <Input
+                      placeholder="aes128-gcm@openssh.com, chacha20-poly1305@openssh.com"
+                      {...field}
+                    />
+                  </FormControl>
+                  <FormDescription>{t('servers.ssh.cipherDesc')}</FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name="mac"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>{t('servers.ssh.mac')}</FormLabel>
+                  <FormControl>
+                    <Input placeholder="hmac-sha2-256, hmac-sha2-512" {...field} />
+                  </FormControl>
+                  <FormDescription>{t('servers.ssh.macDesc')}</FormDescription>
+                  <FormMessage />
+                </FormItem>
+              )}
+            />
+            <FormField
+              control={form.control}
+              name="kexAlgorithm"
+              render={({ field }) => (
+                <FormItem>
+                  <FormLabel>{t('servers.ssh.kexAlgorithm')}</FormLabel>
+                  <FormControl>
+                    <Input
+                      placeholder="curve25519-sha256, diffie-hellman-group14-sha256"
+                      {...field}
+                    />
+                  </FormControl>
+                  <FormDescription>{t('servers.ssh.kexAlgorithmDesc')}</FormDescription>
                   <FormMessage />
                 </FormItem>
               )}

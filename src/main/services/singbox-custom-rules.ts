@@ -10,6 +10,13 @@
 import * as path from 'path';
 import type { Rule, CustomRuleSet, RuleResource, RuleCondition } from '../../shared/types';
 import { ruleConditions } from '../../shared/rules';
+import { validateTlsSpoof } from '../../shared/tls-spoof';
+import { isIpLiteral } from '../../shared/dns';
+import {
+  isValidMacAddress,
+  isValidSourceHostname,
+  isSourceDeviceMatchSupported,
+} from '../../shared/neighbor';
 import {
   EXT_TYPES,
   planCustomRule,
@@ -50,7 +57,7 @@ export function buildCustomRules(
   // 把一个条件的 type→字段累积到 target（值并集；geosite/geoip→rule_set tag；ruleSet→注册定义+tag）。返回 hasMatcher。
   const applyConditionFields = (cond: RuleCondition, target: SingBoxRouteRule): boolean => {
     // EXT 类型（域名/IP/端口/进程 系）委托单一真值 condMatcherFields——与外化文件内容永不漂移。
-    // geosite/geoip/ruleSet 不可 headless 表达，留 inline（下方 switch）。
+    // geosite/geoip/ruleSet 与源设备类（sourceMac/sourceHostname）不可 headless 表达，留 inline（下方 switch）。
     if (EXT_TYPES.has(cond.type)) {
       const fields = condMatcherFields(cond);
       if (!fields) return false;
@@ -63,6 +70,23 @@ export function buildCustomRules(
     const vals = (cond.values || []).map((v) => v.trim()).filter(Boolean);
     if (vals.length === 0) return false;
     switch (cond.type) {
+      case 'sourceMac': {
+        // P6：源设备 MAC（sing-box 1.14 source_mac_address）。**仅 Linux/macOS**——win32 上内核不支持，发射即 FATAL，
+        // 故平台不支持时整条不产 matcher（fail-closed，与脏 MAC 过滤同口径）。脏 MAC 过滤（合法值才下发，杜绝脏值入 config）。
+        if (!isSourceDeviceMatchSupported(process.platform)) return false;
+        const macs = vals.filter(isValidMacAddress);
+        if (macs.length === 0) return false; // 全脏 → 不产 matcher、不留空数组在 target
+        target.source_mac_address = pushU(target.source_mac_address, macs);
+        return true;
+      }
+      case 'sourceHostname': {
+        // P6：源设备主机名（sing-box 1.14 source_hostname，DHCP 租约名）。仅 Linux/macOS（同上）。
+        if (!isSourceDeviceMatchSupported(process.platform)) return false;
+        const hosts = vals.filter(isValidSourceHostname);
+        if (hosts.length === 0) return false;
+        target.source_hostname = pushU(target.source_hostname, hosts);
+        return true;
+      }
       case 'geosite':
         // 裸标签 → geosite-<tag>（lowercase 对齐 getRequiredGeoCategories 与远程 .srs 文件名）
         target.rule_set = pushU(
@@ -178,7 +202,8 @@ export function buildCustomRules(
           selectedServerId,
           idToTagMap,
           selectedServerTag,
-          rule.id
+          rule.id,
+          { spoof: rule.tlsSpoof, method: rule.tlsSpoofMethod }
         );
         rules.push(extRule);
         continue;
@@ -242,7 +267,8 @@ export function buildCustomRules(
       selectedServerId,
       idToTagMap,
       selectedServerTag,
-      rule.id
+      rule.id,
+      { spoof: rule.tlsSpoof, method: rule.tlsSpoofMethod }
     );
     rules.push(finalRule);
   }
@@ -267,7 +293,9 @@ function applyRuleAction(
   _selectedServerId?: string, // 3b 后不再用于条件判断（保留位参以不动调用方），下划线跳过未用检查
   idToTagMap?: Map<string, string>,
   selectedServerTag: string = 'proxy',
-  ruleId?: string // rule-sel selector 命名所需（customRule.id）；缺省则回落旧行为
+  ruleId?: string, // rule-sel selector 命名所需（customRule.id）；缺省则回落旧行为
+  // P3a：route action TLS spoof（成对的 spoof SNI + 方法）。block 规则不挂（reject 无握手）。
+  tlsSpoof?: { spoof?: string; method?: string }
 ): void {
   // 设置出站
   if (action === 'proxy') {
@@ -294,5 +322,18 @@ function applyRuleAction(
   } else {
     // 如果没有指定，默认使用主节点
     singboxRule.outbound = selectedServerTag;
+  }
+
+  // P3a：route action TLS spoof（sing-box 1.14 tls_spoof/tls_spoof_method）。仅非 block 规则挂（block=reject 无握手）。
+  // 门控（方法合法 / arch 支持 / SNI 非空且非 IP 字面量）经 validateTlsSpoof 单一真值，与 outbound spoof 共用。
+  // route action 规则无固定协议 / 无单一 server_name 上下文 → 不传 protocol / serverSni（那两层仅 outbound 适用）。
+  // 提权是运行期生效条件，不影响配置合法性 → 不门控（UI 已提示）。
+  if (action !== 'block') {
+    const spoofSni = (tlsSpoof?.spoof || '').trim();
+    const method = tlsSpoof?.method;
+    if (validateTlsSpoof(spoofSni, method, process.arch, isIpLiteral)) {
+      singboxRule.tls_spoof = spoofSni;
+      singboxRule.tls_spoof_method = method;
+    }
   }
 }

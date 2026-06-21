@@ -22,7 +22,6 @@ import { ProxyErrorCode } from '../../shared/types';
 import type { ILogManager } from './LogManager';
 import { HelperManager } from './HelperManager';
 import type { IPrivilegedHelper } from './IPrivilegedHelper';
-import { ClashApiClient } from './ClashApiClient';
 import { PlatformPrivilegeService } from './PlatformPrivilegeService';
 import { type ISystemProxyManager, SystemProxyBase } from './SystemProxyManager';
 import { type ISystemDnsManager } from './SystemDnsManager';
@@ -34,6 +33,7 @@ import {
   isIpv6Host,
   effectiveAppRules,
   applyRuleSetPrune,
+  buildIdToTagMap,
 } from './singbox-config-helpers';
 import { buildDnsConfig } from './singbox-dns-builder';
 import { buildRouteConfig } from './singbox-route-builder';
@@ -58,17 +58,14 @@ import {
   selectedExitRoutesIcmpViaProxy,
   isSpeedTestable,
 } from '../../shared/endpoint-routes';
+import { classifyCoreBuild, decideCoreOverride } from '../../shared/core-build';
 import { retry } from '../utils/retry';
 import { coreVersionAtLeast } from '../../shared/version';
 import { parseTailscaleAuthLine } from '../../shared/tailscale';
 import { safeHttpUrl } from '../../shared/url';
 import { tailscaleStateExists, tailscaleStateDir } from './tailscale-state';
-import {
-  buildTailscaleLoginConfig,
-  tailscaleEndpointInRunningCore,
-  runLoginPollLifecycle,
-  makeLoginPoll,
-} from './tailscale-login-core';
+import { buildTailscaleLoginConfig, tailscaleEndpointInRunningCore } from './tailscale-login-core';
+import { SingBoxApiClient, type TailscaleEndpointStatus } from './singbox-api-client';
 import {
   getUserDataPath,
   getSingBoxConfigPath,
@@ -152,6 +149,10 @@ export interface IProxyManager {
   switchMode(config: UserConfig): Promise<void>;
   getStatus(): ProxyStatus;
   isStartedViaHelper(): boolean;
+  // api service（sing-box 1.14 management api）运行期监听端口；「打开官方面板」IPC 据此构造 /dashboard/ URL（0=未启动）。
+  getTailscaleApiPort(): number;
+  // 运行期管理 API 客户端（sing-box 1.14 gRPC）：供 StatsService 经此订阅 Status/Connections 流；未启动核时为 null。
+  getApiClient(): SingBoxApiClient | null;
   generateSingBoxConfig(config: UserConfig, resolvedIps?: Record<string, string>): SingBoxConfig;
   getResolvedNodeIps(): string[];
   on(
@@ -193,12 +194,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   // 前用并发多上游 DoH 填充，由 generateSingBoxConfig 透传 buildOutbounds → buildProxyOutbound 写 outbound.server。
   // 空 Map=现状（域名）：snapshot/preflight/speedtest/未启动路径恒空 → 生成物逐字节回现状。模块级 TTL 缓存使重启廉价。
   private lastResolvedHosts: Map<string, string> = new Map();
-  // 杀核前「静默 clash_api 客户端」回调（停 StatsService 轮询 + 关其到 9090 的 keep-alive 连接）：让 client 主动关
-  // → 9090 不进 TIME_WAIT → 下次用户态 sing-box 免撞 root TIME_WAIT 等 30s（P0-2 治本 TIME_WAIT）。
-  private quiesceClashClients: (() => void) | null = null;
-  // clash_api 专属 HTTP 客户端（端口默认 9090，可经 config.controlPort 改；T15：原 clashApiAgent 字段 + clashApiRequest/clashAuthHeaders/
-  // destroyClashApiAgent 收口进 ClashApiClient，与 StatsService 共用单一 agent）。经 setClashApiClient 注入。
-  private clashApiClient: ClashApiClient | null = null;
+  // 杀核前「静默 StatsService」回调（停其到管理 API 的 Status/Connections gRPC 流）：核将死，提前 cancel 流避免 RST 噪音。
+  private quiesceStats: (() => void) | null = null;
   // P2a：启用代理 / 切接管模式（两者均经 startInternal）后延迟一次「连接 flush」的延时器。stop()/再次 start 时清。
   private connectionFlushTimer: ReturnType<typeof setTimeout> | null = null;
   // 平台提权服务（T16：原提权脚本生成 / 文件权限 / 提权复制等纯函数迁出，经 setPrivilegeService 注入；
@@ -264,6 +261,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private gateInvalidNodes = new Map<string, InvalidNodeInfo>();
   // 本次 start 是否已用过「run-FATAL dependency not found」解析修正腿（A7 备用腿，单次闸，防重写抖动）。
   private refFixAttempted = false;
+  // libcronet 启动失败自愈（T2 冷路径）一次性闸：本次 start 内命中 cronet FATAL → strong 重拷 + 重启一次，
+  // 仅一次（防「拷不动/版本错位反复 restored」抖动循环）。每次 start 复位（与 refFixAttempted 同生命周期）。
+  private cronetHealAttempted = false;
+  // 诊断计数（本会话累计，跨多次 start 累加）：自愈触发次数 / 失败次数，纳入诊断报告供「库被反复删（疑杀软）」定位。
+  private cronetHealTriggeredCount = 0;
+  private cronetHealFailedCount = 0;
   // 出口 IP 探针 inbound 的动态端口（每次 start 重新分配）：probe-direct-in → direct 出站，
   // probe-proxy-in → proxy-selector。经此两口发请求，能在「三种接管 × 三种分流」全矩阵下稳定测出
   // 真实直连出口 IP 与代理出口 IP（inbound 规则在 route.rules 头部短路，不受分流策略影响）。
@@ -274,6 +277,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private logManager: ILogManager | null = null;
   // 隐私模式 provider（index 注入 getPrivacyMode）：隐私开 → sing-box 日志级别抬到 ≥warn，不记访问域名/SNI。
   private privacyProvider: () => boolean = () => false;
+  // sing-box 1.14 管理 API：统一管理面客户端（Tailscale 状态订阅 + clash 等价方法）+ 其 api service 端口（clash 端口 +1，独立共存）。
+  private tailscaleApiClient: SingBoxApiClient | null = null;
+  private tailscaleApiPort = 0;
   private lastLogMessage: string = '';
   private lastLogCount: number = 0;
   private lastLogTime: number = 0;
@@ -419,6 +425,58 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     this.coreVersion = await this.getCoreVersion(true);
     this.logToManager('info', `检测到 sing-box 核心版本: ${this.coreVersion}`);
 
+    // §5 核覆盖 reconcile + 最低版本守卫：内置核是种子（强制落位），决策只针对本机在用的【非内置】核。
+    //  官方 <内置 → 内置替换（取更新随包核）；官方 ≥内置 → 保持（不降级用户装的官方核）；
+    //  fork/unknown → 保持（绝不覆盖用户的 fork/自建核），≤内置 → 发基线兼容警告。
+    // 配置已硬切 1.14，<1.14 核会 unknown-field FATAL，故覆盖决策后仍 <1.14 → 明确报错（含 fork 专属引导）。
+    {
+      const bundledCore = coreManifest.bundledCoreVersion;
+      const coreKind = classifyCoreBuild(this.coreVersionLine || `version ${this.coreVersion}`);
+      const { reseed, warn } = decideCoreOverride(coreKind, this.coreVersion, bundledCore);
+      if (reseed) {
+        this.logToManager(
+          'info',
+          `官方内核 ${this.coreVersion} 旧于随包基线 ${bundledCore}，用随包核替换...`
+        );
+        try {
+          // §5 两平台统一经 ensureWritableCore(true)：linux force 覆盖可写核；darwin 经注入的 helper installCore
+          // 重播种随包核到受保护目录（root-only，helper 上方 maybePromptHelperGate 已引导在位）。临时目录复制 +
+          // installCore 编排已下沉 ResourceManager（平台感知，免 ProxyManager 内联）。修：app 更新后受保护目录旧核不自愈。
+          // darwin helperManager 恒为 HelperManager（win 才注入 WindowsServiceHelper）；installCore 是具体方法非接口成员，故 cast。
+          if (process.platform === 'darwin') this.helperManager ??= new HelperManager();
+          this.singboxPath = await resourceManager.ensureWritableCore(true, {
+            installCore: (seedDir) => (this.helperManager as HelperManager).installCore(seedDir),
+          });
+        } catch (e) {
+          this.logToManager('warn', `随包内核刷新失败: ${(e as Error)?.message ?? e}`);
+        }
+        this.coreVersion = await this.getCoreVersion(true);
+        this.logToManager('info', `内核已用随包版刷新至 ${this.coreVersion}`);
+      }
+      if (warn) {
+        this.logToManager(
+          'warn',
+          `检测到非官方内核 ${this.coreVersion} 低于随包基线 ${bundledCore}，可能与新版配置不兼容（连接异常/功能缺失）；建议手动升级内核或在「设置 · 内核 · 重置到出厂」切回随包官方核`
+        );
+        this.sendEventToRenderer(IPC_CHANNELS.EVENT_CORE_BASELINE_WARNING, {
+          current: this.coreVersion,
+          bundled: bundledCore,
+          kind: coreKind,
+        });
+      }
+      // 覆盖决策后仍 <1.14（仅 fork/unknown 旧核会到此；官方旧核已重播种到 ≥内置≥1.14）→ 配置 FATAL 前明确报错。
+      if (!coreVersionAtLeast(this.coreVersion, 1, 14)) {
+        throw new Error(
+          coreKind === 'official'
+            ? `当前 sing-box 内核版本 ${this.coreVersion} 低于所需的 1.14。请重新安装应用以获取随包内核，或在「设置 · 内核」更新到 1.14 及以上。`
+            : `当前使用的非官方内核 ${this.coreVersion} 低于所需的 1.14，与新版配置不兼容。请手动升级该内核到 ≥1.14，或在「设置 · 内核 · 重置到出厂」切回随包官方核。`
+        );
+      }
+    }
+
+    // 1.14 管理 API 端口：解析一个空闲本地端口（排除 clash/用户端口），避免硬编 clash+1 撞占致 services bind FATAL（A1）。
+    this.tailscaleApiPort = await this.resolveTailscaleApiPort(config);
+
     // 修复可能被 root 创建的文件权限（从 TUN 模式切换到系统代理模式时）
     await this.fixFilePermissions();
 
@@ -484,6 +542,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     //      之前）：每次 start 重新判定坏节点，换核 / 修好配置后自动复活，不跨会话残留。
     this.gateInvalidNodes.clear();
     this.refFixAttempted = false;
+    this.cronetHealAttempted = false; // T2：每次 start 复位 cronet 自愈一次性闸（换核/修好后可再触发一次）
 
     // 3.8 方案B：DNS 接管激活时,先读接管前的内网 LAN 解析器(私网 IPv4),供 generateDnsConfig 把内网/captive 域名
     //     重定向到它(takeover 把系统 DNS 改公网 8.8.8.8 后 dns-local 解不了内网/可能环)。必须在 generateSingBoxConfig
@@ -556,88 +615,133 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       await this.deletePidFile();
     }
 
+    // 4.9 libcronet 启动前自愈（对称化）：linux/win 起内核前确保 cronet 在核心同目录、且与内置 bundle 大小一致
+    //     （缺失/0 字节/截断/版本错位 → 从内置重拷）。覆盖 Windows 常规启动不补的盲区（Linux 既有 ensureWritableCore
+    //     内的 beside 保留，此处对其幂等）；mac 静态编入 cronet，ensureCronetReadyForLaunch 内部跳过。热路径仅 stat。
+    await this.ensureCronetReadyForLaunch();
+
     // 5. 启动 sing-box 进程
-    await retry(() => this.startSingBoxProcess(), {
-      maxRetries: 2,
-      delay: 2000,
-      exponentialBackoff: true,
-      shouldRetry: (error) => {
-        // 启动 gate 备用腿（补 check 盲区）：run 阶段 `dependency[X] not found` FATAL（detour/selector 幽灵
-        // tag）→ 允许重试一次（onRetry 会解析 tag、pruneTagsClosure 修正重写盘），refFixAttempted 闸保证只修一次。
-        if (/dependency\[(.+?)\] not found/i.test(error.message)) {
-          return !this.refFixAttempted;
-        }
-        // 只对特定错误进行重试
-        const message = error.message.toLowerCase();
+    const runStartWithRetry = (): Promise<void> =>
+      retry(() => this.startSingBoxProcess(), {
+        maxRetries: 2,
+        delay: 2000,
+        exponentialBackoff: true,
+        shouldRetry: (error) => {
+          // 启动 gate 备用腿（补 check 盲区）：run 阶段 `dependency[X] not found` FATAL（detour/selector 幽灵
+          // tag）→ 允许重试一次（onRetry 会解析 tag、pruneTagsClosure 修正重写盘），refFixAttempted 闸保证只修一次。
+          if (/dependency\[(.+?)\] not found/i.test(error.message)) {
+            return !this.refFixAttempted;
+          }
+          // libcronet 缺库 FATAL：内层裸重试无意义（库还是坏的）→ 不重试，交由外层 cronet 自愈闭环 strong 重拷后整体重启一次。
+          if (this.isCronetLibError(error.message)) {
+            return false;
+          }
+          // 只对特定错误进行重试
+          const message = error.message.toLowerCase();
 
-        // 不重试的错误类型
-        const nonRetryableErrors = [
-          '找不到',
-          '权限',
-          'permission',
-          'enoent',
-          'eacces',
-          'eperm',
-          '配置文件格式错误',
-          'invalid config',
-        ];
+          // 不重试的错误类型
+          const nonRetryableErrors = [
+            '找不到',
+            '权限',
+            'permission',
+            'enoent',
+            'eacces',
+            'eperm',
+            '配置文件格式错误',
+            'invalid config',
+          ];
 
-        // 如果是不可重试的错误，直接失败
-        if (nonRetryableErrors.some((pattern) => message.includes(pattern))) {
-          return false;
-        }
+          // 如果是不可重试的错误，直接失败
+          if (nonRetryableErrors.some((pattern) => message.includes(pattern))) {
+            return false;
+          }
 
-        // 其他错误可以重试
-        return true;
-      },
-      onRetry: (error, attempt) => {
-        this.logToManager('warn', `启动失败，正在进行第 ${attempt} 次重试: ${error.message}`);
-        // 端口被占（含探针端口在 osascript 授权窗口内被抢占）→ 重分配探针端口并重写配置（review P1-4）。
-        // retry 在 onRetry 后有 2s+ 退避，足够这段 ms 级异步完成。
-        if (/address already in use|in use|bind|eaddrinuse/i.test(error.message)) {
-          void (async () => {
-            try {
-              await this.allocateProbePorts(config);
-              // T9：用已 prune 的 singboxConfig（捕获 startInternal :746 外层变量），不重新 generateSingBoxConfig
-              //     ——否则会丢掉 :754 checkAndPruneConfig 已就地剔除的坏节点，导致坏节点回流重撞 FATAL。
-              //     仅把新探针端口回填到对应 inbound.listen_port（allocateProbePorts 只改 this.probe*Port 字段，
-              //     不改 singboxConfig 对象；不回填则 sing-box 仍 bind 旧冲突端口）。
-              for (const ib of singboxConfig.inbounds) {
-                if (ib.tag === 'probe-direct-in' && this.probeDirectPort) {
-                  ib.listen_port = this.probeDirectPort;
-                } else if (ib.tag === 'probe-proxy-in' && this.probeProxyPort) {
-                  ib.listen_port = this.probeProxyPort;
+          // 其他错误可以重试
+          return true;
+        },
+        onRetry: (error, attempt) => {
+          this.logToManager('warn', `启动失败，正在进行第 ${attempt} 次重试: ${error.message}`);
+          // 端口被占（含探针端口在 osascript 授权窗口内被抢占）→ 重分配探针端口并重写配置（review P1-4）。
+          // retry 在 onRetry 后有 2s+ 退避，足够这段 ms 级异步完成。
+          if (/address already in use|in use|bind|eaddrinuse/i.test(error.message)) {
+            void (async () => {
+              try {
+                await this.allocateProbePorts(config);
+                // T9：用已 prune 的 singboxConfig（捕获 startInternal :746 外层变量），不重新 generateSingBoxConfig
+                //     ——否则会丢掉 :754 checkAndPruneConfig 已就地剔除的坏节点，导致坏节点回流重撞 FATAL。
+                //     仅把新探针端口回填到对应 inbound.listen_port（allocateProbePorts 只改 this.probe*Port 字段，
+                //     不改 singboxConfig 对象；不回填则 sing-box 仍 bind 旧冲突端口）。
+                for (const ib of singboxConfig.inbounds) {
+                  if (ib.tag === 'probe-direct-in' && this.probeDirectPort) {
+                    ib.listen_port = this.probeDirectPort;
+                  } else if (ib.tag === 'probe-proxy-in' && this.probeProxyPort) {
+                    ib.listen_port = this.probeProxyPort;
+                  }
                 }
+                await this.writeSingBoxConfig(singboxConfig);
+              } catch {
+                /* 忽略：下次尝试用现有配置 */
               }
-              await this.writeSingBoxConfig(singboxConfig);
-            } catch {
-              /* 忽略：下次尝试用现有配置 */
-            }
-          })();
+            })();
+          }
+          // 启动 gate 备用腿：run 阶段 `dependency[X] not found` → 解析幽灵 tag、pruneTagsClosure 修正重写盘，
+          // 只修一次（refFixAttempted 闸）。tag 经 idToTagMap 进 gateInvalidNodes，下次 generateSingBoxConfig 跳过。
+          const depMatch = /dependency\[(.+?)\] not found/i.exec(error.message);
+          if (depMatch && !this.refFixAttempted) {
+            this.refFixAttempted = true;
+            void (async () => {
+              try {
+                const cfg = this.generateSingBoxConfig(config, resolvedServerIps);
+                this.pruneTagsClosure(cfg, config, new Set([depMatch[1]]), 'detour');
+                await this.writeSingBoxConfig(cfg);
+                this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_INVALID_NODES, [
+                  ...this.gateInvalidNodes.values(),
+                ]);
+              } catch (e) {
+                this.logToManager(
+                  'warn',
+                  `启动 gate 引用修正失败（将按现有配置重试）: ${(e as Error)?.message ?? e}`
+                );
+              }
+            })();
+          }
+        },
+      });
+
+    // T2 libcronet 启动失败冷路径闭环：起核失败且命中 cronet 缺库 FATAL（linux/win）→ strong（hash 强校验）
+    // 重拷 → 若 restored 则整体重启内核一次（一次性 cronetHealAttempted 闸，防抖动循环）→ 仍失败/未恢复 →
+    // 抛原错误（带可读文案，由 start() 收口落终态），不再重试。mac 无独立库不进此分支。
+    try {
+      await runStartWithRetry();
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (!this.cronetHealAttempted && this.isCronetLibError(msg)) {
+        this.cronetHealAttempted = true;
+        this.cronetHealTriggeredCount++;
+        const loadDir = path.dirname(this.getSingBoxPath());
+        this.logToManager(
+          'warn',
+          `内核启动失败疑因 libcronet 缺失/损坏，正在强校验自愈（hash）后重启一次: ${msg}`
+        );
+        const heal = await resourceManager.ensureCronetHealthy(loadDir, { strong: true });
+        if (heal.action === 'restored') {
+          this.logToManager('info', `libcronet 已从内置恢复，重启内核一次...`);
+          try {
+            await runStartWithRetry();
+          } catch (e) {
+            // 重拷成功但重启仍失败（库与核版本不匹配等）→ 计失败数（否则诊断「触发但最终失败」漏计），抛出由 start() 收口。
+            this.cronetHealFailedCount++;
+            throw e;
+          }
+        } else {
+          // 未恢复（拷贝失败/无内置库）→ 计失败数 + 抛原错误（含 cronet 文案，UI 引导改协议/查权限）。
+          this.cronetHealFailedCount++;
+          throw err;
         }
-        // 启动 gate 备用腿：run 阶段 `dependency[X] not found` → 解析幽灵 tag、pruneTagsClosure 修正重写盘，
-        // 只修一次（refFixAttempted 闸）。tag 经 idToTagMap 进 gateInvalidNodes，下次 generateSingBoxConfig 跳过。
-        const depMatch = /dependency\[(.+?)\] not found/i.exec(error.message);
-        if (depMatch && !this.refFixAttempted) {
-          this.refFixAttempted = true;
-          void (async () => {
-            try {
-              const cfg = this.generateSingBoxConfig(config, resolvedServerIps);
-              this.pruneTagsClosure(cfg, config, new Set([depMatch[1]]), 'detour');
-              await this.writeSingBoxConfig(cfg);
-              this.sendEventToRenderer(IPC_CHANNELS.EVENT_PROXY_INVALID_NODES, [
-                ...this.gateInvalidNodes.values(),
-              ]);
-            } catch (e) {
-              this.logToManager(
-                'warn',
-                `启动 gate 引用修正失败（将按现有配置重试）: ${(e as Error)?.message ?? e}`
-              );
-            }
-          })();
-        }
-      },
-    });
+      } else {
+        throw err;
+      }
+    }
 
     // 系统代理单一写者收口（拆双轨）：systemProxy 模式 → 置系统代理（marker + 防自指在 SystemProxyManager 内，
     // 杜绝把自己当原始保存致 disable restore 死端口）；TUN/manual 模式 → 反向清掉可能残留的系统代理
@@ -697,6 +801,19 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 单一真值、压过缓存。best-effort（不阻塞启动成功）。
     void this.reassertSelectorSelection(config);
 
+    // sing-box 1.14 管理 API：核起后连 api service 订阅 Tailscale 状态（断线重连，随主核生命周期）。
+    if (this.hasManagementApi()) {
+      this.tailscaleApiClient?.stop();
+      // 修复（P0）：api service 注入了 secret（= clashApiSecret）→ 每个 RPC 须带 Bearer，否则真机被拒认证。
+      // 客户端接收 secret 经 call credentials 注入 Bearer；空串退化免认证。endpoint host 为 Phase 2 远程预留（本地恒 127.0.0.1）。
+      this.tailscaleApiClient = new SingBoxApiClient(
+        { host: '127.0.0.1', port: this.tailscaleApiPort },
+        config.clashApiSecret || '',
+        (eps) => this.handleTailscaleStatus(eps)
+      );
+      this.tailscaleApiClient.start();
+    }
+
     // P2a：启用代理 / 切接管模式后延迟一次连接 flush（见 scheduleConnectionFlush）——RST 泄漏成真实 IP 的旧连接
     // 逼其重连重解析（经 FakeIP 走代理），不重启内核；node 热切换不经 startInternal、由 interrupt 开关另管。
     this.scheduleConnectionFlush(config);
@@ -706,27 +823,31 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
    * 启动后把各 selector 选择校正回用户意图（压过 cache_file 持久化的旧选择，修 H3）：
    *  - proxy-selector → currentConfig.selectedServerId（启动窗口内用户热切则跟随最新）。
    *  - 各 rule-sel-<id> → currentConfig 中对应规则的 targetServerId（防 cache_file 把规则选择回弹到旧节点）。
-   * best-effort + 短重试，clash_api 刚起可能未就绪；失败不影响启动（cache/default 仍是有效节点）。
-   * proxy-selector 成功后再 reassert rule-sel（clash_api 已就绪，rule-sel 通常首轮即成）。
+   * best-effort + 短重试，管理 API 刚起可能未就绪；失败不影响启动（cache/default 仍是有效节点）。
+   * proxy-selector 成功后再 reassert rule-sel（管理 API 已就绪，rule-sel 通常首轮即成）。
    */
   private async reassertSelectorSelection(config: UserConfig): Promise<void> {
-    // 阶段 1：proxy-selector（带重试，等 clash_api 就绪）
+    // 阶段 1：proxy-selector（带重试，等管理 API 就绪）
     for (let i = 0; i < 10; i++) {
       if (!this.singboxProcess && !this.singboxPid) return; // 已停止则放弃
-      if (this.stopping) return; // 主动停止/重启中：勿在 destroyClashApiAgent 后又用新 agent 重连 9090（M-1：防杀核前重建连接致 9090 TIME_WAIT）
+      if (this.stopping) return; // 主动停止/重启中：勿在杀核窗口里重连管理 API（核将死）
       // 每轮读最新 currentConfig.selectedServerId：若启动窗口内用户已热切到别的节点，则用新节点、
       // 不要把它 revert 回启动时的旧节点。
       const targetId = this.currentConfig?.selectedServerId ?? config.selectedServerId;
       const tag = this.currentIdToTagMap?.get(targetId as string);
       if (!tag) break;
-      const res =
-        (await this.clashApiClient?.request('/proxies/proxy-selector', 'PUT', { name: tag })) ??
-        ({ ok: false, status: 0 } as const);
-      if (res.ok) break;
-      // clash_api 未就绪/瞬时失败 → 短延迟后重试
-      await new Promise((r) => setTimeout(r, 300));
+      const client = this.tailscaleApiClient;
+      if (!client) break; // 管理 API 客户端未创建（核未起/无管理 API）→ 放弃，cache/default 兜底
+      try {
+        // gRPC SelectOutbound throws on error（与 clash_api 的 {ok,status} 不同）：成功即跳出，异常进重试腿。
+        await client.selectOutbound('proxy-selector', tag);
+        break;
+      } catch {
+        // 管理 API 未就绪/瞬时失败 → 短延迟后重试
+        await new Promise((r) => setTimeout(r, 300));
+      }
     }
-    // 阶段 2：各 rule-sel（无重试——proxy-selector 已就绪证 clash_api 可用；失败由 cache/default 兜底）
+    // 阶段 2：各 rule-sel（无重试——proxy-selector 已就绪证管理 API 可用；失败由 cache/default 兜底）
     await this.reassertRuleSelectors(config);
   }
 
@@ -748,9 +869,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       if (!entry) return;
       const memberTag = idToTag.get(targetServerId);
       if (!memberTag) return; // 目标被 gate 剔除/不存在 → 跳过（selector default 仍有效，不 FATAL）
-      void this.clashApiClient?.request(`/proxies/${entry.selectorTag}`, 'PUT', {
-        name: memberTag,
-      });
+      // gRPC SelectOutbound throws on error；best-effort fire-and-forget（失败由 cache/default 兜底，不阻塞）。
+      void this.tailscaleApiClient?.selectOutbound(entry.selectorTag, memberTag).catch(() => {});
     };
 
     for (const rule of cur.customRules || []) {
@@ -770,6 +890,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // Phase 2：停止/退出语境一并杀掉残留的瞬态登录核（无孤儿进程）。放早退之前——列表直接点登录时
     // 主核未运行，下方 `!singboxProcess && !singboxPid` 会早退，故在此先收瞬态核。
     this.killAllTailscaleLoginCores();
+    // 1.14 管理 API 客户端随核停（停订阅 + 关连接）。
+    this.tailscaleApiClient?.stop();
+    this.tailscaleApiClient = null;
     // 生命周期世代 +1：标记一次停止接管（退避中的 attemptAutoRestart 比对到变化即让位，M-2′/L-1′）。
     this.lifecycleGeneration++;
     // 取消未决的去抖重启（停止/退出优先于 trailing 重启，避免停了又被自动拉起）
@@ -914,8 +1037,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private static readonly CONNECTION_FLUSH_DELAY_MS = 1500;
 
   /**
-   * 启用代理 / 切接管模式后（两者均经 startInternal；node 热切换走 clash_api PUT 不经此路径）延迟一次
-   * clash_api `DELETE /connections`，RST 掉 sing-box 跟踪的连接——重点是 app 早于 TUN 建立、泄漏成真实 IP
+   * 启用代理 / 切接管模式后（两者均经 startInternal；node 热切换走管理 API SelectOutbound 不经此路径）延迟一次
+   * 管理 API `CloseAllConnections`，RST 掉 sing-box 跟踪的连接——重点是 app 早于 TUN 建立、泄漏成真实 IP
    * 的旧连接：它们的后续包经 TUN 重新进表后被 RST → app 重连 → DNS 重新经 FakeIP 反查 → 走代理。
    * **不重启内核**（与「切节点」的 interrupt_exist_connections 开关正交）。仅 TUN：systemProxy 的旧连接多在
    * sing-box 表外、flush 够不着，且会误伤已代理连接。
@@ -930,15 +1053,18 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       this.connectionFlushTimer = null;
       if (gen !== this.lifecycleGeneration) return; // 已被新的 start/stop 接管
       if (!this.singboxProcess && !this.singboxPid) return; // 核已停
-      void this.clashApiClient
-        ?.request('/connections', 'DELETE')
-        .then((r) =>
+      // gRPC CloseAllConnections throws on error；best-effort（与启用流程正交，失败仅记日志）。
+      void this.tailscaleApiClient
+        ?.closeAllConnections()
+        .then(() =>
+          this.logToManager('info', '启用后连接 flush：管理 API CloseAllConnections → ok')
+        )
+        .catch((e) =>
           this.logToManager(
             'info',
-            `启用后连接 flush：clash_api DELETE /connections → ${r.ok ? 'ok' : `失败(${r.status})`}`
+            `启用后连接 flush：管理 API CloseAllConnections 失败(${(e as Error)?.message ?? e})`
           )
-        )
-        .catch(() => {});
+        );
     }, ProxyManager.CONNECTION_FLUSH_DELAY_MS);
   }
 
@@ -1327,50 +1453,69 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     );
   }
 
-  /** destroy 并重建 clash_api agent（杀核前调，防 9090 root TIME_WAIT）。T15：delegate client.destroyAgent。 */
-  private destroyClashApiAgent(): void {
-    this.clashApiClient?.destroyAgent();
-  }
-
-  /** 当前 clash_api secret（供 StatsService 等其它主进程内部 clash_api 调用带鉴权）。 */
-  getClashApiSecret(): string {
-    return this.currentConfig?.clashApiSecret || '';
-  }
-
-  /** 当前 clash_api 控制端口（ClashApiClient/StatsService/端口冲突清理 统一取用；缺省 9090，可经 config.controlPort 改）。 */
+  /** 启动前端口冲突清理用的控制端口（缺省 9090，可经 config.controlPort 改）。clash_api 已移除，仅 resolveClashApiPortConflict 残留用作清理目标端口。 */
   getClashApiPort(): number {
     return controlApiPort(this.currentConfig ?? {});
   }
 
   /**
-   * 关闭连接（连接信息页用）：直调 ClashApiClient（专属 agent + Bearer secret 内部封装，渲染端不持 secret）。
-   * id 给定 → DELETE /connections/{id}（关单条）；id 省略 → DELETE /connections（关全部 = CloseAllConnections + ResetNetwork）。
-   * 不抛异常，按 { ok, status } 语义返回（与 reassert/hotSwitch 同治）。
+   * 当前 api service（sing-box 1.14 management api）监听端口。startInternal 经 resolveTailscaleApiPort 解析的空闲动态端口，
+   * 渲染端构造不出，故「打开官方面板」IPC 用此取运行期端口构造 /dashboard/ URL。未启动时为 0（dashboard 仅运行中可用）。
    */
-  async closeConnection(id?: string): Promise<{ ok: boolean; status: number }> {
-    const pathName = id ? `/connections/${encodeURIComponent(id)}` : '/connections';
-    // T15：直调 client.request（原 clashApiRequest wrapper 已删）。client 未注入 → fallback {ok:false}。
-    return (
-      this.clashApiClient?.request(pathName, 'DELETE') ?? Promise.resolve({ ok: false, status: 0 })
-    );
+  getTailscaleApiPort(): number {
+    return this.tailscaleApiPort;
   }
 
   /**
-   * clash_api 热切换任一 selector 的选中成员（PUT /proxies/<selectorTag>）。
+   * 运行期管理 API 客户端（sing-box 1.14 gRPC）。StatsService 经此订阅 Status/Connections 流（取代 clash_api 轮询）。
+   * 随主核生命周期：startInternal 内核起后创建（this.tailscaleApiClient），stop() 置 null。未启动核时返回 null
+   * → StatsService 据此判定不开流（核未就绪）。
+   */
+  getApiClient(): SingBoxApiClient | null {
+    return this.tailscaleApiClient;
+  }
+
+  /**
+   * 关闭连接（连接信息页用）：直调管理 API gRPC（Bearer secret 内部封装，渲染端不持 secret）。
+   * id 给定 → CloseConnection(id)（关单条）；id 省略 → CloseAllConnections()（关全部）。
+   * gRPC 抛错（与 clash_api 的 {ok,status} 不同）→ catch 包成 { ok:false, status:0 }，维持原签名/语义（与 reassert/hotSwitch 同治）。
+   * status：成功 200（无 HTTP 状态码，仅用于 UI 判 ok）；失败 0（管理 API 未就绪/调用异常）。
+   */
+  async closeConnection(id?: string): Promise<{ ok: boolean; status: number }> {
+    const client = this.tailscaleApiClient;
+    if (!client) return { ok: false, status: 0 }; // 客户端未就绪（核未起）→ fallback
+    try {
+      if (id) await client.closeConnection(id);
+      else await client.closeAllConnections();
+      return { ok: true, status: 200 };
+    } catch {
+      return { ok: false, status: 0 };
+    }
+  }
+
+  /**
+   * 管理 API 热切换任一 selector 的选中成员（gRPC SelectOutbound）。
    * 泛化自 hotSwitchNode：全局 proxy-selector 与各 rule-sel-<id> 复用同一原语。
-   * @returns true=PUT 成功；false=定位失败或 HTTP 非 2xx（调用方退回去抖重启兜底）。
+   * @returns true=切换成功；false=定位失败或 gRPC 抛错（调用方退回去抖重启兜底）。
    */
   private async hotSwitchSelector(selectorTag: string, memberTag: string): Promise<boolean> {
     if (!memberTag) return false;
-    // T15：直调 client.request（原 clashApiRequest wrapper 已删）。client 未注入 → fallback {ok:false}。
-    const res =
-      (await this.clashApiClient?.request(`/proxies/${selectorTag}`, 'PUT', { name: memberTag })) ??
-      ({ ok: false, status: 0 } as const);
-    if (!res.ok) {
-      this.logToManager('warn', `clash_api 热切换 ${selectorTag} 失败（HTTP ${res.status}）`);
+    const client = this.tailscaleApiClient;
+    if (!client) {
+      this.logToManager('warn', `管理 API 客户端未就绪，无法热切换 ${selectorTag}`);
       return false;
     }
-    this.logToManager('info', `已热切换 ${selectorTag} → ${memberTag}（clash_api，无重启）`);
+    // gRPC SelectOutbound throws on error（与 clash_api 的 {ok,status} 不同）：catch 包成 false，退去抖重启兜底。
+    try {
+      await client.selectOutbound(selectorTag, memberTag);
+    } catch (e) {
+      this.logToManager(
+        'warn',
+        `管理 API 热切换 ${selectorTag} 失败：${(e as Error)?.message ?? e}`
+      );
+      return false;
+    }
+    this.logToManager('info', `已热切换 ${selectorTag} → ${memberTag}（管理 API，无重启）`);
     return true;
   }
 
@@ -1427,8 +1572,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       // 又避免在全量 stdout 上误匹配后续行（如 Environment 的 `go1.25.10` 含 `1.25.10`）。
       const line = await this.spawnCoreVersionFirstLine();
       this.coreVersionLine = line; // 顺带缓存原始行（含 fork 后缀）供内核来源判定
-      const match = line.match(/(?:version\s+|v)(\d+\.\d+(\.\d+)?)/i);
-      const secondMatch = line.match(/(\d+\.\d+\.\d+)/);
+      // 保留 prerelease 后缀（如 1.14.0-alpha.32）：供 compareSemver 排序预览版（alpha.32<alpha.33<…<正式），
+      // 驱动「预览→正式可升、正式↛预览」更新逻辑。coreVersionAtLeast/encodeMajorMinor 已容忍后缀。
+      const match = line.match(/(?:version\s+|v)(\d+\.\d+(?:\.\d+)?(?:-[0-9A-Za-z.]+)?)/i);
+      const secondMatch = line.match(/(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)/);
       const detected = match
         ? match[1]
         : secondMatch
@@ -1469,8 +1616,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
-   * 为「核心更新预检」生成针对目标版本的配置 JSON：用当前活动配置 + 目标核心版本的生成风格
-   * （<1.13 走 inbound sniff，≥1.13 走 route action），供 sing-box check 校验新核心能否解析。
+   * 为「核心更新预检」生成针对目标版本的配置 JSON：用当前活动配置 + 目标核心版本（this.coreVersion 临时设为
+   * targetVersion），供 sing-box check 校验新核能否解析。配置已硬切 1.14（route 层 sniff 无条件、services 仅
+   * hasManagementApi(≥1.14) 注入），故 targetVersion<1.14 的预检配置不含 1.14-only 字段。
    * 无活动配置（代理从未启动）时返回 null —— 调用方仅校验二进制可执行即可。
    */
   buildPreflightConfigJson(targetVersion: string): string | null {
@@ -1486,6 +1634,63 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     } finally {
       this.coreVersion = savedVersion;
     }
+  }
+
+  /**
+   * 为 1.14 管理 API service 解析一个空闲本地端口（net.listen 0，排除 clash 端口与用户代理端口）。每次 start 重解析，
+   * 避免硬编 clash+1 被占 → services bind FATAL（A1）。解析失败（极少见）兜底 clash+1（与旧行为一致）。
+   */
+  private async resolveTailscaleApiPort(config: UserConfig): Promise<number> {
+    const exclude = new Set<number>(
+      [controlApiPort(config), config.httpPort, config.socksPort, config.mixedPort].filter(
+        (p): p is number => typeof p === 'number' && p > 0
+      )
+    );
+    return this.resolveFreeLocalPort(exclude, controlApiPort(config) + 1);
+  }
+
+  /**
+   * 瞬态登录核管理 API 端口：独立解析一个空闲本地端口，**排除主核 api 端口**（this.tailscaleApiPort，主核运行
+   * 中则已占）+ 用户代理端口，避两个 api service bind 撞端口。主核未运行（tailscaleApiPort=0）则该排除项无效，
+   * 自然不影响。兜底用一个高位偏移（避与主核兜底 controlApiPort+1 撞）。
+   */
+  private async resolveTailscaleLoginApiPort(): Promise<number> {
+    const cfg: Partial<UserConfig> = this.currentConfig ?? {};
+    const exclude = new Set<number>(
+      [
+        this.tailscaleApiPort,
+        controlApiPort(cfg),
+        cfg.httpPort,
+        cfg.socksPort,
+        cfg.mixedPort,
+      ].filter((p): p is number => typeof p === 'number' && p > 0)
+    );
+    return this.resolveFreeLocalPort(exclude, controlApiPort(cfg) + 2);
+  }
+
+  /**
+   * 解析一个空闲 127.0.0.1 本地端口（listen(0) 拿系统分配口 → 立即关 → 不在 exclude 集才采用）。IPv4 端口
+   * 探测单一真值：主核 api / 瞬态登录核 api 共用，避端口探测逻辑多份漂移。5 次重试仍撞 exclude → 返回 fallback。
+   */
+  private async resolveFreeLocalPort(exclude: Set<number>, fallback: number): Promise<number> {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const srv = net.createServer();
+      try {
+        const port = await new Promise<number>((resolve, reject) => {
+          srv.once('error', reject);
+          srv.listen(0, '127.0.0.1', () => resolve((srv.address() as net.AddressInfo).port));
+        });
+        await new Promise<void>((resolve) => srv.close(() => resolve()));
+        if (!exclude.has(port)) return port;
+      } catch {
+        try {
+          srv.close();
+        } catch {
+          /* ignore */
+        }
+      }
+    }
+    return fallback;
   }
 
   /**
@@ -1822,46 +2027,19 @@ done
       }
     }
 
-    // 获取用户数据目录用于缓存文件
-    const userDataPath = getUserDataPath();
+    // 获取缓存数据库路径（experimental.cache_file）
     const cachePath = getCachePath();
 
     // 关键优化：预先生成 ID 到 Tag 的唯一映射，使用服务器名称作为 Tag，确保拓扑和日志显示友好名称
-    // 这样做之后内容拓扑（Clash API）和日志中显示的将是“香港 01”而不是“proxy-uuid”
-    const idToTagMap = new Map<string, string>();
-    // 预占内置出站 tag，防止用户把节点命名为 proxy-selector/direct/block 等导致 tag 撞车启动 FATAL
-    const usedTags = new Set<string>([
-      'proxy-selector',
-      'direct',
-      'block',
-      'direct-loopback',
-      'probe-direct-in',
-      'probe-proxy-in',
-    ]);
-
-    const getUniqueTag = (server: ServerConfig) => {
-      let baseTag = server.name.trim() || '未命名节点';
-      let tag = baseTag;
-      let count = 1;
-      while (usedTags.has(tag)) {
-        tag = `${baseTag} (${count})`;
-        count++;
-      }
-      usedTags.add(tag);
-      return tag;
-    };
-
-    // 为所有服务器预生成 Tag
-    for (const s of config.servers) {
-      idToTagMap.set(s.id, getUniqueTag(s));
-    }
+    // 这样做之后内容拓扑（Clash API）和日志中显示的将是“香港 01”而不是“proxy-uuid”。去重规则
+    // （预占内置 tag + 撞名追加 (n)）抽到 buildIdToTagMap 单一真值，dns-builder 按名解析 tailscale endpoint 共用同一份。
+    const idToTagMap = buildIdToTagMap(config.servers);
     // 记录本次生成的 id→tag 映射，供 clash_api 热切换定位 selector 成员 tag（见 hotSwitchNode）
     this.currentIdToTagMap = idToTagMap;
 
     // outbounds 须先于 route/endpoints 生成：其产出的两载体（pendingEndpoints / pendingRuleSelectors）
     // 由下方 route deps + endpoints 注入 + 末尾 currentRuleTargetMap 回填消费。回写 this.* 维持原时序。
     const outboundsResult = buildOutbounds(selectedServer, config, idToTagMap, {
-      coreVersion: this.coreVersion,
       gateInvalidNodes: this.gateInvalidNodes,
       log: (level, message) => this.logToManager(level, message),
       // #57 resolve-ahead：透传预解析表（startInternal 前置填充）。空 Map → buildProxyOutbound 回退原域名（现状）。
@@ -1877,17 +2055,19 @@ done
 
     const singboxConfig: SingBoxConfig = {
       log: buildLogConfig(config, this.privacyProvider()),
-      dns: buildDnsConfig(config, 'proxy-selector', this.lanResolverForDns, (level, message) =>
-        this.logToManager(level, message)
+      dns: buildDnsConfig(
+        config,
+        'proxy-selector',
+        this.lanResolverForDns,
+        idToTagMap,
+        (level, message) => this.logToManager(level, message)
       ),
       inbounds: buildInbounds(config, resolvedIps, {
-        coreVersion: this.coreVersion,
         probeDirectPort: this.probeDirectPort,
         probeProxyPort: this.probeProxyPort,
       }),
       outbounds: outboundsResult.outbounds,
       route: buildRouteConfig(config, idToTagMap, {
-        coreVersion: this.coreVersion,
         probeDirectPort: this.probeDirectPort,
         probeProxyPort: this.probeProxyPort,
         lanResolverForDns: this.lanResolverForDns,
@@ -1902,14 +2082,7 @@ done
           enabled: true,
           path: cachePath,
           store_fakeip: true,
-          store_rdrc: true,
-        },
-        clash_api: {
-          external_controller: `127.0.0.1:${controlApiPort(config)}`,
-          external_ui: path.join(userDataPath, 'ui'),
-          // 随机 secret 鉴权（持久化于 config）：内部调用带 Authorization，防恶意网页跨域读连接历史
-          secret: config.clashApiSecret || '',
-          default_mode: 'rule',
+          store_dns: true,
         },
       },
     };
@@ -1918,6 +2091,24 @@ done
     // proxy-selector / rule-sel / route 中作为成员被引用，与 outbound 一视同仁）。
     if (this.pendingEndpoints.length > 0) {
       singboxConfig.endpoints = this.pendingEndpoints;
+    }
+
+    // sing-box 1.14 管理 API：注入 api service（h2c gRPC，与 clash_api 共存、端口独立）。Tailscale 状态/登出经此。
+    // hasManagementApi 门控（start 路径经 §5 守卫恒 ≥1.14；preflight/snapshot 以 <1.14 fixture 调时不注入，1.13 无 services schema 会 FATAL）。
+    if (this.hasManagementApi()) {
+      singboxConfig.services = [
+        {
+          type: 'api',
+          listen: '127.0.0.1',
+          listen_port: this.tailscaleApiPort,
+          secret: config.clashApiSecret || undefined,
+        },
+      ];
+      // sing-box 官方面板（opt-in 逃生舱）：仅开关 on 时注入 dashboard.enabled → 核首次联网拉 sing-box-dashboard
+      // 资源并于本 api service 的 /dashboard/ serve。关闭时不注入 → 核默认不出网拉 dashboard 资源。同一 service，不重复注入。
+      if (config.singboxDashboard) {
+        singboxConfig.services[0].dashboard = { enabled: true };
+      }
     }
 
     // 路由规则若指向「已被跳过/不存在的出站」（如缺 libcronet 被跳过的 naive 节点），sing-box 会以
@@ -3196,14 +3387,9 @@ exit 0
           args = ['run', '-c', this.configPath];
         }
 
-        // 启动进程
-        // 关键：为 sing-box 1.12.x 注入环境变量以启用已弃用的 override_address 功能
-        // 这是银行 U盾本地域名（如 windows10.microdone.cn → 127.0.0.1）正常工作的前提。
-        // 1.13+ 已将此功能迁移到路由规则，不需要此环境变量。
+        // 启动进程（spawn 环境继承主进程；旧 1.12.x 的 ENABLE_DEPRECATED_DESTINATION_OVERRIDE_FIELDS env 已随
+        // 硬切 1.14 + §5 守卫剥离——live 核恒 ≥1.14、配置亦不再含 sniff_override_destination，U盾域名走路由规则）。
         const spawnEnv = { ...process.env };
-        if (!coreVersionAtLeast(this.coreVersion, 1, 13)) {
-          spawnEnv['ENABLE_DEPRECATED_DESTINATION_OVERRIDE_FIELDS'] = 'true';
-        }
 
         this.singboxProcess = spawn(command, args, {
           stdio: ['ignore', 'pipe', 'pipe'],
@@ -3459,16 +3645,13 @@ exit 0
    * 停止 sing-box 进程
    */
   private async stopSingBoxProcess(opts?: { quitting?: boolean }): Promise<void> {
-    // 杀核前先静默 clash_api 客户端（停 StatsService 轮询 + RST 掉其到 9090 的 keep-alive 连接）：让 client 主动
-    // 关闭 → 9090 不进 TIME_WAIT → 下次用户态 sing-box 免撞 root TIME_WAIT 等 30s（P0-2 治本）。同步、不阻塞。
+    // 杀核前先静默 StatsService：停其到管理 API 的 Status/Connections gRPC 流（核将死，提前 cancel 避免 RST 噪音）。
+    // 同步、不阻塞。tailscaleApiClient 自身的 Tailscale 状态流由上层 stop() 另行 stop（gRPC 客户端各自管理生命周期）。
     try {
-      this.quiesceClashClients?.();
+      this.quiesceStats?.();
     } catch {
       /* 忽略 */
     }
-    // 同时 RST 掉 ProxyManager 自己到 9090 的 keep-alive 连接（reassert/hotSwitch 的专属 agent），与 StatsService
-    // 一并收口 → 杀核前所有 9090 client 主动关 → 9090 不进 root TIME_WAIT（P0-2 收口全量，含原 undici 池漏网）。
-    this.destroyClashApiAgent();
 
     // macOS TUN 模式：sing-box 以 root 权限在后台运行，需要用 osascript 终止。
     // T16 子 commit 3：实现迁入 PlatformPrivilegeService.stopElevated（darwin 分支），此处 delegate。
@@ -3864,17 +4047,12 @@ exit 0
     this.systemDnsManager = systemDnsManager;
   }
 
-  /** 注入「杀核前静默 clash_api 客户端」回调（停 StatsService + 关其 9090 连接）。防 9090 TIME_WAIT（P0-2）。 */
-  setQuiesceClashClients(cb: () => void): void {
-    this.quiesceClashClients = cb;
+  /** 注入「杀核前静默 StatsService」回调（停其到管理 API 的 Status/Connections gRPC 流）。杀核前提前 cancel 流避免 RST 噪音。 */
+  setQuiesceStats(cb: () => void): void {
+    this.quiesceStats = cb;
   }
 
-  /** 注入 ClashApiClient（T15：clash_api 调用收口到单一 client，与 StatsService 共用 agent）。 */
-  setClashApiClient(client: ClashApiClient): void {
-    this.clashApiClient = client;
-  }
-
-  /** 注入平台提权服务（T16：原提权纯函数迁出，delegate 后调用点零改动）。镜像 setClashApiClient 注入。 */
+  /** 注入平台提权服务（T16：原提权纯函数迁出，delegate 后调用点零改动）。 */
   setPrivilegeService(service: PlatformPrivilegeService): void {
     this.privilegeService = service;
   }
@@ -4770,8 +4948,6 @@ exit 0
 
   /** 已推送过的 Tailscale 登录 URL（核会重复打印同一行，按 url 去重防刷屏）。urls 为一次性 token、量小，不清理。 */
   private tailscaleAuthSeen = new Set<string>();
-  /** 正在轮询登录成功的节点 serverId 集合（每节点最多一个在飞轮询，防同一节点重复 URL 各起一轮）。 */
-  private tailscaleAuthPolling = new Set<string>();
 
   /**
    * 抓 Tailscale 交互登录 URL（无 auth_key 时核日志出 `endpoint/tailscale[<tag>]: Waiting for authentication: <url>`）
@@ -4795,59 +4971,8 @@ exit 0
       serverId: server?.id,
     });
     this.logToManager('info', `Tailscale 节点「${nodeName}」需要登录授权`, 'sing-box');
-    // 登录成功检测（log-level 无关）：会话文件出现即判成功 → 推 EVENT_TAILSCALE_AUTH_OK
-    //   （渲染端 dismiss Infinity toast + 刷新角标，dismiss 用同一 serverId-优先 id）。
-    if (server) this.watchTailscaleLogin(server.id, nodeName);
-  }
-
-  /** 交互登录成功统一发射：推 EVENT_TAILSCALE_AUTH_OK + 记 info 日志（Phase1 主核检测 / Phase2 瞬态核两路共用）。 */
-  private emitTailscaleAuthOk(serverId: string, nodeName: string): void {
-    this.sendEventToRenderer(IPC_CHANNELS.EVENT_TAILSCALE_AUTH_OK, { serverId, nodeName });
-    this.logToManager('info', `Tailscale 节点「${nodeName}」登录成功`, 'sing-box');
-  }
-
-  /**
-   * 轮询某 Tailscale 节点的 state 目录直到登录成功 / 超时 / 进程已停（取消）。每节点单飞。
-   * 成功 → 发 EVENT_TAILSCALE_AUTH_OK + 记 info 日志；超时/取消静默收尾（toast 仍在，用户可重试）。
-   * 轮询纯逻辑在 tailscale-state.pollTailscaleLoginSuccess（check/sleep 可注入、单测覆盖）。
-   * 生命周期编排复用 runLoginPollLifecycle（与 Phase2 瞬态核同路径）；Phase1 是主核日志检测、无瞬态核可杀，
-   * 故 kill 为 no-op（不动主核生命周期）。tailscaleAuthPolling 单飞去重收尾不变。
-   */
-  private watchTailscaleLogin(serverId: string, nodeName: string): void {
-    if (this.tailscaleAuthPolling.has(serverId)) return; // 同节点已在轮询
-    this.tailscaleAuthPolling.add(serverId);
-    void runLoginPollLifecycle({
-      poll: makeLoginPoll(
-        () => tailscaleStateExists(serverId),
-        // 取消轮询（避免后台空转到 2min + 对已切走的节点误发 AUTH_OK）：进程已停 **或** 该节点已不在运行主核里。
-        //   ① 进程存活判据用 getStatus().running（同 UI/健康检查的 activePid 口径）：覆盖全部启动路径——helper
-        //     零提权 / osascript / UAC 后台进程经 singboxPid，直接 spawn（system 代理 / Linux TUN）经 pid。
-        //     ⚠️ 不能只用 `singboxProcess === null`：helper 路径经 socket 起核、从不 spawn 子进程，singboxProcess
-        //     恒 null → 轮询会一进入就误判取消、AUTH_OK 永不发射。
-        //   ② tailscaleEndpointInRunningCore（单一真值，与双写防护同款）：节点已切走且未就绪、或已从运行配置删除
-        //     → 主核不再带其 endpoint，继续轮询既空转又可能对已切走节点误发 AUTH_OK。**不破坏成功路径**：登录成功
-        //     瞬间 state 落盘 → stateExists=true → ready=true → 仍判「在主核里」不取消 → check 命中发 AUTH_OK
-        //     （pollTailscaleLoginSuccess 同轮先 isCancelled 后 check，state 已落盘则 isCancelled 不会误杀）。
-        () =>
-          !this.getStatus().running ||
-          !tailscaleEndpointInRunningCore(
-            serverId,
-            this.getStatus().running,
-            this.currentConfig,
-            tailscaleStateExists(serverId)
-          )
-      ),
-      onSuccess: () => this.emitTailscaleAuthOk(serverId, nodeName),
-      kill: () => {
-        /* Phase1：主核日志检测，无瞬态核可杀（不动主核生命周期） */
-      },
-    })
-      .catch(() => {
-        /* 轮询本身失败安全（check 已 try/catch），此处兜底防 unhandled rejection */
-      })
-      .finally(() => {
-        this.tailscaleAuthPolling.delete(serverId);
-      });
+    // 登录成功不再靠 state 目录轮询（stateExists 误判未认证为已登录是 #132 根因，已剥离）：主核 endpoint
+    // 的登录成功由 api STATUS 流（backendState→Running）反映，驱动渲染端登录态点亮 + dismiss 登录 toast。
   }
 
   // ==== Phase 2：按需瞬态登录核 ====
@@ -4860,17 +4985,25 @@ exit 0
     {
       proc: ChildProcess;
       timeoutTimer: NodeJS.Timeout;
-      cancelled: boolean;
       // SIGTERM 后的 SIGKILL 升级 timer：进程拒绝 SIGTERM 时宽限期到点强杀（防泄漏 + 卡 alreadyRunning）。
       // finalize（proc exit/error）会 clearTimeout 它，进程优雅退出则升级被取消。
       killTimer?: NodeJS.Timeout;
+      // 瞬态核独立的 1.14 管理 API 客户端（镜像主核 tailscaleApiClient，但各自端口/secret/stop，互不干扰）：
+      // 订阅瞬态核 STATUS 流 → backendState=Running 即驱动 loggedIn 验真登录态。finalize 须 stop() 它防泄漏。
+      apiClient?: SingBoxApiClient;
     }
   >();
 
   /**
-   * 按需登录：拉起登录专用 sing-box（无 inbound/clash_api/TUN，零提权，log.level:info）→ 读其 stdout
-   * 逐行抓登录 URL → ① shell.openExternal 自动开浏览器 ② 系统通知（点击再开一次）③ 推 AUTH_URL 给渲染端
-   * （可关闭 toast 记录）→ 轮询 state 目录成功 → 杀瞬态核 + 推 AUTH_OK。超时（~2min）/取消同样杀核。
+   * 按需登录：拉起登录专用 sing-box（无 inbound/TUN，零提权，log.level:info，带独立 1.14 管理 api service）→
+   * ① 读其 stdout 逐行抓登录 URL → shell.openExternal 自动开浏览器 + 系统通知 + 推 AUTH_URL 给渲染端；
+   * ② 经独立 SingBoxApiClient 订阅瞬态核 STATUS 流 → backendState=Running（已认证/valid state 秒回 Running，
+   *    无需浏览器）→ EVENT_TAILSCALE_STATUS 驱动渲染端 loggedIn=true（与主核同通道，复用 handleTailscaleStatus）
+   *    → 杀瞬态核（state 已落盘）。超时（~2min）/取消同样杀核。
+   *
+   * 根治 #132：登录成功验真改由瞬态核 STATUS（Running）反映、不再靠 stateExists 启发式（误判未认证 state 为
+   * 已登录）。故 startTailscaleLogin 入口不再以 stateExists 短路 alreadyLoggedIn——有 valid state 也起瞬态核，
+   * 让其 STATUS 秒回 Running 验真（无浏览器）；纯 authKey 仍直接 alreadyLoggedIn（无需交互登录此路径）。
    *
    * 双写防护：若该节点 endpoint 已在运行中的主核里（选中 OR 就绪），不起瞬态核——两个进程写同一
    * state_directory 会冲突；此时节点要么已登录、要么主核已在出 URL（Phase 1）。
@@ -4883,8 +5016,9 @@ exit 0
     if (!server || server.protocol?.toLowerCase() !== 'tailscale') {
       throw new Error('startTailscaleLogin: 非 Tailscale 节点');
     }
-    // 已登录（authKey 或 state 已落盘）→ 无需登录。
-    if (server.tailscaleSettings?.authKey?.trim() || tailscaleStateExists(server.id)) {
+    // 已登录（authKey 配置即免交互登录）→ 无需登录。注意：不再以 stateExists 短路（#132 根因——未认证的
+    // 残留 state 会被误判已登录）；有 state 也起瞬态核，让其 STATUS 秒回 Running 验真（valid → loggedIn=true 无浏览器）。
+    if (server.tailscaleSettings?.authKey?.trim()) {
       return { started: false, reason: 'alreadyLoggedIn' };
     }
     // 双写防护：endpoint 已在运行主核里 → 不起瞬态核（避免双写 state_directory 冲突）。
@@ -4907,7 +5041,11 @@ exit 0
       throw new Error(`找不到 sing-box 可执行文件: ${this.singboxPath}`);
     }
 
-    const loginConfig = buildTailscaleLoginConfig(server);
+    // 瞬态核管理 API：独立空闲端口（排除主核 api 端口 this.tailscaleApiPort 避 bind 冲突）+ 每次随机 secret。
+    // 镜像主核 STATUS 订阅给瞬态核：使其 backendState 流可达，登录成功（Running）经 STATUS 验真驱动渲染端。
+    const apiPort = await this.resolveTailscaleLoginApiPort();
+    const apiSecret = require('crypto').randomBytes(16).toString('hex');
+    const loginConfig = buildTailscaleLoginConfig(server, { port: apiPort, secret: apiSecret });
     const cfgPath = path.join(
       getUserDataPath(),
       `ts-login-${require('crypto').randomBytes(6).toString('hex')}.json`
@@ -4915,10 +5053,8 @@ exit 0
     require('fs').writeFileSync(cfgPath, JSON.stringify(loginConfig));
 
     // 直接以 app 用户 spawn 非提权进程（绝不走 helper/TUN/提权）。用户态 tailscale endpoint 零提权可起。
+    // env 继承主进程（旧 1.12.x ENABLE_DEPRECATED_DESTINATION_OVERRIDE_FIELDS 已随硬切 1.14 + §5 守卫剥离）。
     const spawnEnv = { ...process.env };
-    if (!coreVersionAtLeast(this.coreVersion, 1, 13)) {
-      spawnEnv['ENABLE_DEPRECATED_DESTINATION_OVERRIDE_FIELDS'] = 'true';
-    }
     const proc = spawn(this.singboxPath, ['run', '-c', cfgPath], {
       stdio: ['ignore', 'pipe', 'pipe'],
       env: spawnEnv,
@@ -4938,24 +5074,24 @@ exit 0
     const handle: {
       proc: ChildProcess;
       timeoutTimer: NodeJS.Timeout;
-      cancelled: boolean;
       killTimer?: NodeJS.Timeout;
-    } = { proc, timeoutTimer, cancelled: false };
+      apiClient?: SingBoxApiClient;
+    } = { proc, timeoutTimer };
     this.tailscaleLoginCores.set(server.id, handle);
 
-    // 幂等收尾：置 cancelled（收敛轮询）+ 清 timer + 删 Map + 删临时 config。error 与 exit 两路径都调它。
-    //  - spawn 失败（ENOENT/EACCES…）只 emit 'error' 不 emit 'exit'：收尾只挂 exit 会致 cfg 文件 + Map 项双泄漏
+    // 幂等收尾：清 timer + 停瞬态 api client（停订阅 + 关连接，防泄漏）+ 删 Map + 删临时 config。error 与 exit 两路径都调它。
+    //  - spawn 失败（ENOENT/EACCES…）只 emit 'error' 不 emit 'exit'：收尾只挂 exit 会致 cfg 文件 + Map 项 + apiClient 泄漏
     //    （Map 残留 → 该节点再点登录恒返回 alreadyRunning 卡死）。故 error 路径也须 finalize。
-    //  - 瞬态核**自行崩溃/退出**（非经 killTailscaleLogin，如核拒绝 config / panic）时置 handle.cancelled=true 是关键：
-    //    否则 runLoginPollLifecycle 的 isCancelled(=()=>handle.cancelled) 永为 false → poll 空转到 2min 才超时。
     let finalized = false;
     const finalize = (): void => {
       if (finalized) return;
       finalized = true;
-      handle.cancelled = true;
       clearTimeout(timeoutTimer);
       // 进程已退出（优雅 SIGTERM 或自行崩溃）→ 取消挂起的 SIGKILL 升级，防 timer 泄漏。
       clearTimeout(handle.killTimer);
+      // 瞬态 api client 停订阅 + 关 gRPC 连接（与主核 tailscaleApiClient 独立、各自 stop，互不干扰）。stop() 幂等。
+      handle.apiClient?.stop();
+      handle.apiClient = undefined;
       this.tailscaleLoginCores.delete(server.id);
       try {
         require('fs').unlinkSync(cfgPath);
@@ -4984,8 +5120,20 @@ exit 0
       this.logToManager('error', `Tailscale 登录进程启动失败: ${e.message}`, 'sing-box');
       finalize();
     });
-    // 进程退出（正常被杀 / 自行崩溃 / 核拒绝 config）：finalize 置 cancelled 收敛轮询并清 cfg/Map。
+    // 进程退出（正常被杀 / 自行崩溃 / 核拒绝 config）：finalize 清 timer/cfg/Map/apiClient（幂等）。
     proc.on('exit', finalize);
+
+    // 瞬态核 STATUS 订阅（镜像主核 startInternal:752 那段，但独立 client/端口/secret/stop）：连瞬态核的管理
+    // api service（127.0.0.1:apiPort）订阅 SubscribeTailscaleStatus → handleTailscaleStatus 把 endpointTag
+    // (=server.name)→serverId 映射、emit EVENT_TAILSCALE_STATUS（与主核同通道，复用 handleTailscaleStatus:loggedIn）。
+    // backendState=Running（已登录；valid 既有 state 会秒回 Running 无需浏览器）→ STATUS 已驱动 loggedIn=true，
+    // 此处额外杀瞬态核（state 已落盘，无需常驻；NeedsLogin 则保活等用户点 URL 授权）。secret 经 Bearer 注入。
+    handle.apiClient = new SingBoxApiClient(
+      { host: '127.0.0.1', port: apiPort },
+      apiSecret,
+      (eps) => this.handleTransientTailscaleStatus(server, eps)
+    );
+    handle.apiClient.start();
 
     this.logToManager(
       'info',
@@ -4993,19 +5141,35 @@ exit 0
       'sing-box'
     );
 
-    // 轮询 state 目录成功（log-level 无关）→ 成功后发 AUTH_OK，无论成功/超时/取消都收尾杀核。取消判据 =
-    // 该瞬态核已被杀（handle.cancelled）：不能用主核 getStatus().running（主核可能根本没运行，列表直接点登录场景）。
-    // 生命周期编排（poll/onSuccess/kill）抽到 tailscale-login-core.runLoginPollLifecycle（注入式、单测覆盖三路径）。
-    void runLoginPollLifecycle({
-      poll: makeLoginPoll(
-        () => tailscaleStateExists(server.id),
-        () => handle.cancelled
-      ),
-      onSuccess: () => this.emitTailscaleAuthOk(server.id, server.name),
-      kill: () => this.killTailscaleLogin(server.id),
-    });
-
+    // 登录成功验真由瞬态核 STATUS 流（backendState=Running）反映、驱动渲染端登录态（取代 #132 stateExists 启发式）。
+    // 瞬态核的收尾由 timeoutTimer(120s) + proc 'exit'/'error'→finalize + STATUS=Running 主动杀核 + 退出时
+    // killAllTailscaleLoginCores 兜底（真机阶段定瞬态核去留）。
     return { started: true };
+  }
+
+  /**
+   * 瞬态登录核 STATUS 回调：endpointTag(=server.name)→serverId 用闭包绑定的 server 直接定位（不依赖 currentConfig
+   * ——点列表登录时主核可能未运行/不含该节点），经 emitTailscaleStatus 推 EVENT_TAILSCALE_STATUS 与主核同通道
+   * 驱动渲染端 loggedIn（纯 STATUS，不碰 stateExists）。瞬态核只含本节点 endpoint，按 tag=server.name 过滤。
+   *
+   * 额外——backendState=Running（已认证、state 已落盘）→ 主动杀瞬态核（无需常驻；NeedsLogin/Starting 则保活
+   * 等用户在浏览器完成授权）。
+   */
+  private handleTransientTailscaleStatus(
+    server: ServerConfig,
+    endpoints: TailscaleEndpointStatus[]
+  ): void {
+    const ep = endpoints.find((e) => e.endpointTag === server.name);
+    if (!ep) return;
+    // includeAuthURL=false：瞬态核登录 URL 由 stdout AUTH_URL 单点承载（自动开浏览器 + toast），STATUS 不重复带 URL。
+    this.emitTailscaleStatus(server.id, ep, false);
+    // 本节点已认证（Running）→ state 已落盘，杀瞬态核（finalize 会停 apiClient + 清理）。
+    // 在 STATUS 流回调栈内调 killTailscaleLogin 安全：它只发 SIGTERM（异步），apiClient.stop() 由 proc 'exit'
+    // 的 finalize 在后续 tick 触发，不在本回调栈内同步 cancel 正派发的 stream；即便同步，SubscribeTailscaleStatus
+    // 'data' 的 `if(this.stopped)return` 守卫也挡住重入。
+    if (ep.backendState === 'Running') {
+      this.killTailscaleLogin(server.id);
+    }
   }
 
   /** 抓到瞬态登录核的 URL：自动开浏览器 + 系统通知（点击再开）+ 推渲染端可关闭 toast（Phase 1 提示条复用）。 */
@@ -5050,11 +5214,62 @@ exit 0
     this.killTailscaleLogin(serverId);
   }
 
+  /** sing-box 管理 API（services[{type:api}] + 状态订阅）是否可用：要求核 ≥1.14。§5 守卫已保证 start 路径恒满足；
+   *  保留判定供 preflight/snapshot 等以 <1.14 fixture 直调 generateSingBoxConfig 的路径（不注入 services）。
+   *  收敛「最低版本」字面量为单一谓词（注入 services + 起 api-client 共用），改最低版本只动此处。 */
+  private hasManagementApi(): boolean {
+    return coreVersionAtLeast(this.coreVersion, 1, 14);
+  }
+
   /**
-   * 退出登录：清该节点 Tailscale state 目录（持久会话），下次需重新交互登录。保留节点配置/authKey。
+   * sing-box 1.14 管理 API 状态流回调（主核）：endpointTag(=server.name)→serverId（经 currentConfig 反查），
+   * 推 EVENT_TAILSCALE_STATUS 驱动渲染端登录态。取代 1.13 stateExists/stdout 启发式。
+   */
+  private handleTailscaleStatus(endpoints: TailscaleEndpointStatus[]): void {
+    for (const ep of endpoints) {
+      const server = this.currentConfig?.servers.find(
+        (s) => s.protocol?.toLowerCase() === 'tailscale' && s.name === ep.endpointTag
+      );
+      if (!server) continue;
+      this.emitTailscaleStatus(server.id, ep);
+    }
+  }
+
+  /**
+   * 单 endpoint STATUS → EVENT_TAILSCALE_STATUS（serverId→渲染端）。主核（handleTailscaleStatus，name 反查）
+   * 与瞬态登录核（handleTransientTailscaleStatus，serverId 闭包绑定）共用，loggedIn 计算单一真值（防漂移）。
+   *
+   * loggedIn = 已认证(Running||Starting) 且 key 未过期。key 过期(self.expired)即便 backendState 仍短暂 Running，
+   * 也判未登录 → 渲染端「需登录」角标亮、引导重新认证（取代旧 expired→回落需登录启发式）。
+   *
+   * includeAuthURL：是否在事件里带 authURL（驱动渲染端「需登录」toast）。主核路径=true（STATUS 是唯一 URL 来源）；
+   * 瞬态核路径=false——瞬态核的登录 URL 已由 stdout AUTH_URL 解析（handleTailscaleLoginUrl 自动开浏览器 + 推
+   * EVENT_TAILSCALE_AUTH_URL toast）单点承载，STATUS 不再重复带 URL（択一防同节点双发登录 toast 漂移）。
+   */
+  private emitTailscaleStatus(
+    serverId: string,
+    ep: TailscaleEndpointStatus,
+    includeAuthURL = true
+  ): void {
+    const loggedIn =
+      (ep.backendState === 'Running' || ep.backendState === 'Starting') &&
+      ep.self?.expired !== true;
+    this.sendEventToRenderer(IPC_CHANNELS.EVENT_TAILSCALE_STATUS, {
+      serverId,
+      backendState: ep.backendState,
+      loggedIn,
+      authURL: includeAuthURL ? ep.authURL || undefined : undefined,
+      tailscaleIPs: ep.self?.tailscaleIPs || [],
+      expired: ep.self?.expired === true,
+    });
+  }
+
+  /**
+   * 退出登录：节点在运行主核里 → 调 1.14 管理 API TailscaleLogout(endpointTag) 让内核即时下线该 endpoint；
+   * 并清该节点 state 目录（瞬态核写的持久会话兜底，下次需重新交互登录）。保留节点配置/authKey。
    * 先取消该节点在飞的瞬态登录核（若有），避免它在清目录后又写回 state。
-   * 若该 endpoint 正在运行中的主核里（state 是其内存会话的落盘），清目录不立即断开内存会话 →
-   * 回传 runningNeedsRestart 供 UI 提示重启代理才彻底生效（真机验证 caveat）。
+   * 若该 endpoint 正在运行中的主核里，回传 runningNeedsRestart 供 UI 提示（api logout 已尽力即时下线，
+   * 但 force-route 反应式未做、彻底生效仍可能需重启 → 行为不变，真机验证 caveat）。
    */
   async tailscaleLogout(serverId: string): Promise<{ runningNeedsRestart: boolean }> {
     this.cancelTailscaleLogin(serverId);
@@ -5064,18 +5279,31 @@ exit 0
       this.currentConfig,
       tailscaleStateExists(serverId)
     );
+    // 节点在运行主核里 → 经 api 让内核原生登出该 endpoint（endpointTag=server.name）。api 不可达/未起则吞错，
+    // 仍走下方清 state 目录兜底（瞬态核登录写的会话）。
+    if (inRunningCore && this.tailscaleApiClient) {
+      const server = this.currentConfig?.servers.find((s) => s.id === serverId);
+      if (server) {
+        await this.tailscaleApiClient.logout(server.name).catch((e) => {
+          this.logToManager(
+            'warn',
+            `Tailscale api 登出失败（已回退清 state 目录）: ${e?.message ?? e}`,
+            'sing-box'
+          );
+        });
+      }
+    }
     await require('fs')
       .promises.rm(tailscaleStateDir(serverId), { recursive: true, force: true })
       .catch(() => {});
-    this.logToManager('info', `Tailscale 节点已退出登录（已清 state 目录）`, 'sing-box');
+    this.logToManager('info', `Tailscale 节点已退出登录`, 'sing-box');
     return { runningNeedsRestart: inRunningCore };
   }
 
-  /** 杀某节点瞬态登录核（成功/超时/取消/出错统一收口）：置 cancelled 中止轮询 + kill 进程 + 清 timer/Map。幂等。 */
+  /** 杀某节点瞬态登录核（超时/取消/出错统一收口）：kill 进程 + 清 timer/Map。幂等。 */
   private killTailscaleLogin(serverId: string): void {
     const handle = this.tailscaleLoginCores.get(serverId);
     if (!handle) return;
-    handle.cancelled = true;
     clearTimeout(handle.timeoutTimer);
     // 已挂起一次升级（重复调用幂等）→ 不重复发信号/排第二个 timer。
     if (handle.killTimer) return;
@@ -5411,11 +5639,35 @@ exit 0
   }
 
   /**
+   * 识别 libcronet 缺失/损坏致的内核 FATAL：缺库时 sing-box 在构建 naive outbound 阶段报
+   * `cronet: library not found`（Windows 还提示 `Place libcronet.dll in the executable directory or PATH`）。
+   * 命中即触发 T2 冷路径自愈闭环（strong 重拷 + 重启一次）。
+   */
+  private isCronetLibError(message: string): boolean {
+    const m = message.toLowerCase();
+    // 收紧：去掉裸 `not found`（否则用户自建名含 "cronet" 的 selector 报 `dependency[cronet] not found`
+    // 会被误判为缺库 → 虚触发一次 strong 重拷+重启）。仅匹配 libcronet 真实缺库消息。
+    return (
+      m.includes('cronet') &&
+      (m.includes('library not found') ||
+        m.includes('libcronet') ||
+        m.includes('executable directory'))
+    );
+  }
+
+  /** T2 诊断：本会话 libcronet 自愈触发/失败计数（纳入诊断报告供「库被反复删（疑杀软）」定位）。 */
+  getCronetHealStats(): { triggered: number; failed: number } {
+    return { triggered: this.cronetHealTriggeredCount, failed: this.cronetHealFailedCount };
+  }
+
+  /**
    * 与 translateErrorMessage 同序镜像分类，仅并行产出结构化错误码；translateErrorMessage 的输出
    * （含日志路径）保持逐字不变，零回归风险。新增 includes 分支顺序必须与上面一致。
    */
   private classifyCoreError(message: string): ProxyErrorCode {
     const lowerMessage = message.toLowerCase();
+    // libcronet 缺库 FATAL 优先识别（结构化错误码，供诊断/UI 分类）：与 translate 侧文案无冲突（translate 无 cronet 分支 → 原样返回）。
+    if (this.isCronetLibError(lowerMessage)) return ProxyErrorCode.CRONET_LIB_MISSING;
     if (lowerMessage.includes('report handshake success: connection refused'))
       return ProxyErrorCode.DEST_CONNECTION_REFUSED;
     if (
@@ -5625,5 +5877,25 @@ exit 0
    */
   private getSingBoxPath(): string {
     return resourceManager.getSingBoxPath();
+  }
+
+  /**
+   * 起内核前的 libcronet 自愈钩子（对称化 §4.3）：linux/win 对核心实际加载目录（dirname(getSingBoxPath())）
+   * 调 ensureCronetHealthy（strong=false 热路径，仅 size 快筛），确保 cronet 缺失/损坏在启动前从内置 bundle 恢复。
+   * macOS 跳过（cronet 静态编入 sing-box，无独立库）。best-effort：自愈失败仅告警不阻断启动——naive 不可用时
+   * sing-box 会自报 cronet 错误并由现有降级兜底（跳过 naive 节点 + 可读报错），其它协议节点不受影响。
+   */
+  private async ensureCronetReadyForLaunch(): Promise<void> {
+    if (process.platform !== 'linux' && process.platform !== 'win32') return;
+    const loadDir = path.dirname(this.getSingBoxPath());
+    const r = await resourceManager.ensureCronetHealthy(loadDir);
+    if (r.action === 'restored') {
+      this.logToManager('info', `启动前 libcronet 自愈：已从内置恢复到 ${loadDir}`);
+    } else if (r.action === 'failed') {
+      this.logToManager(
+        'warn',
+        `启动前 libcronet 自愈失败：${r.reason ?? ''}（naive 节点可能不可用）`
+      );
+    }
   }
 }

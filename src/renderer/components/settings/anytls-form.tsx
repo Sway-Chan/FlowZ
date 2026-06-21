@@ -19,11 +19,18 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { FormButtons } from './shared/form-buttons';
-import { EchField } from './shared/anti-censor-fields';
 import { AddressField, PortField } from './shared/basic-fields';
-import { TlsServerNameField, FingerprintField, AllowInsecureField } from './shared/tls-fields';
+import { TlsServerNameField, FingerprintField, TlsAdvancedFields } from './shared/tls-fields';
 import { RealityPublicKeyField, RealityShortIdField } from './shared/reality-fields';
-import { echSchemaShape, echDefaults, readEchDefault } from './shared/field-schemas';
+import {
+  echSchemaShape,
+  echDefaults,
+  readEchDefault,
+  tlsSpoofSchemaShape,
+  tlsSpoofDefaults,
+  readTlsSpoofDefault,
+  buildTlsSpoofSettings,
+} from './shared/field-schemas';
 import { FormSection, FieldGrid, FieldSpan } from './shared/form-layout';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
@@ -42,6 +49,7 @@ const createAnyTlsSchema = (t: any) =>
     security: z.enum(['tls', 'reality']),
     tlsServerName: z.string().optional(),
     tlsFingerprint: z.string().optional(),
+    tlsEngine: z.string().optional(),
     tlsAllowInsecure: z.boolean(),
     realityPublicKey: z.string().optional(),
     realityShortId: z.string().optional(),
@@ -49,6 +57,7 @@ const createAnyTlsSchema = (t: any) =>
     idleSessionTimeout: z.string().optional(),
     minIdleSession: z.number().int().min(0).optional(),
     ...echSchemaShape,
+    ...tlsSpoofSchemaShape,
   });
 
 type AnyTlsFormValues = z.infer<ReturnType<typeof createAnyTlsSchema>>;
@@ -71,6 +80,7 @@ export function AnyTlsForm({ serverConfig, onSubmit }: AnyTlsFormProps) {
         security: (serverConfig.security === 'reality' ? 'reality' : 'tls') as 'tls' | 'reality',
         tlsServerName: serverConfig.tlsSettings?.serverName || '',
         tlsFingerprint: serverConfig.tlsSettings?.fingerprint || 'chrome',
+        tlsEngine: serverConfig.tlsSettings?.engine || 'go',
         tlsAllowInsecure: serverConfig.tlsSettings?.allowInsecure || false,
         realityPublicKey: serverConfig.realitySettings?.publicKey || '',
         realityShortId: serverConfig.realitySettings?.shortId || '',
@@ -78,6 +88,7 @@ export function AnyTlsForm({ serverConfig, onSubmit }: AnyTlsFormProps) {
         idleSessionTimeout: serverConfig.anyTlsSettings?.idleSessionTimeout || '',
         minIdleSession: serverConfig.anyTlsSettings?.minIdleSession ?? undefined,
         ...readEchDefault(serverConfig),
+        ...readTlsSpoofDefault(serverConfig),
       };
     }
     return {
@@ -87,6 +98,7 @@ export function AnyTlsForm({ serverConfig, onSubmit }: AnyTlsFormProps) {
       security: 'tls',
       tlsServerName: '',
       tlsFingerprint: 'chrome',
+      tlsEngine: 'go',
       tlsAllowInsecure: false,
       realityPublicKey: '',
       realityShortId: '',
@@ -94,6 +106,7 @@ export function AnyTlsForm({ serverConfig, onSubmit }: AnyTlsFormProps) {
       idleSessionTimeout: '',
       minIdleSession: undefined,
       ...echDefaults,
+      ...tlsSpoofDefaults,
     };
   };
 
@@ -112,9 +125,14 @@ export function AnyTlsForm({ serverConfig, onSubmit }: AnyTlsFormProps) {
       tlsSettings: {
         serverName: values.tlsServerName?.trim() || undefined,
         fingerprint: values.tlsFingerprint || 'chrome',
+        engine:
+          values.security === 'tls' && values.tlsEngine && values.tlsEngine !== 'go'
+            ? values.tlsEngine
+            : undefined,
         allowInsecure: values.security === 'tls' ? values.tlsAllowInsecure : false,
         ech: values.ech ? true : undefined,
         echConfig: values.echConfig?.trim() || undefined,
+        ...(values.security === 'tls' ? buildTlsSpoofSettings(values) : {}),
       },
     };
 
@@ -215,22 +233,13 @@ export function AnyTlsForm({ serverConfig, onSubmit }: AnyTlsFormProps) {
         {/* 高级仅 TLS 模式有可选项（SNI/指纹/insecure/ECH）；Reality 模式全为基础项，故无高级区。 */}
         {isTls && (
           <FormSection title={t('servers.advanced', 'Advanced')} collapsible defaultOpen={false}>
-            <FieldGrid cols={2}>
-              <TlsServerNameField
-                control={form.control}
-                t={t}
-                labelKey="servers.sni"
-                descKey="servers.sniDesc"
-                optional
-              />
-              <FingerprintField control={form.control} t={t} />
-              <FieldSpan>
-                <AllowInsecureField control={form.control} t={t} />
-              </FieldSpan>
-              <FieldSpan>
-                <EchField control={form.control} t={t} />
-              </FieldSpan>
-            </FieldGrid>
+            <TlsAdvancedFields
+              control={form.control}
+              t={t}
+              sniLabelKey="servers.sni"
+              sniDescKey="servers.sniDesc"
+              sniOptional
+            />
           </FormSection>
         )}
 

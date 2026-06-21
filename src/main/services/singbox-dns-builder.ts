@@ -9,6 +9,7 @@ import * as path from 'path';
 import type { UserConfig } from '../../shared/types';
 import { parseDnsServerSpec, type ParsedDnsServer } from '../../shared/dns';
 import { ruleConditions } from '../../shared/rules';
+import { normalizeNeighborDomain, isSourceDeviceMatchSupported } from '../../shared/neighbor';
 import { effectiveRegionRouting, REGION_LOCAL_GEO } from '../../shared/region-routing';
 import { planCustomRule, customRuleFileBase, usesFakeIp } from './custom-rule-files';
 import { getCustomRulesDir } from '../utils/paths';
@@ -41,6 +42,26 @@ type DnsLogFn = (level: 'debug' | 'info' | 'warn' | 'error' | 'fatal', message: 
 /** 域名 → [精确域名, `.域名`(后缀匹配)]：同时覆盖 exact 与 subdomain（sing-box domain_suffix 语义）。 */
 const withDotPrefix = (d: string): string[] => [d, `.${d}`];
 
+// P4b 内部预留 tag：tailscale 按名解析 DNS server 的固定 tag。不与节点 tag 撞车（节点 tag=节点显示名，
+// 不会取此前缀；与 ProxyManager.usedTags 内置保留 tag 同理为内部固定 tag）。
+const TS_NAME_DNS_TAG = 'dns-tailscale';
+
+/**
+ * 「选中的 mesh tailscale 节点」的 endpoint tag，供按名解析 DNS server 引用。直接读 buildIdToTagMap 产出的
+ * idToTagMap（id→唯一 tag 单一真值），不再复刻去重循环——杜绝与 ProxyManager 侧推导漂移（tag 须逐字节一致，
+ * 否则 sing-box FATAL）。非选中 / 选中节点非 tailscale → null。
+ */
+function selectedTailscaleEndpointTag(
+  config: UserConfig,
+  idToTagMap: Map<string, string>
+): string | null {
+  const selectedId = config.selectedServerId;
+  if (!selectedId) return null;
+  const selected = config.servers.find((s) => s.id === selectedId);
+  if (!selected || selected.protocol.toLowerCase() !== 'tailscale') return null;
+  return idToTagMap.get(selectedId) ?? null;
+}
+
 /** 内网 / 反向解析后缀（非 .local 组播）：内网域 .lan / .home.arpa + 反查 .arpa。 */
 const INTERNAL_DNS_SUFFIXES = ['.arpa', '.lan', '.home.arpa'];
 
@@ -48,6 +69,8 @@ export function buildDnsConfig(
   config: UserConfig,
   selectedServerTag: string,
   lanResolverForDns: string | null,
+  // id→唯一 tag 映射（buildIdToTagMap 单一真值）：tailscale 按名解析的 endpoint tag 直接读它，免重抄去重循环。
+  idToTagMap: Map<string, string>,
   log: DnsLogFn
 ): SingBoxDnsConfig {
   const proxyMode = (config.proxyMode || 'smart').toLowerCase();
@@ -151,6 +174,28 @@ export function buildDnsConfig(
     buildUserDns('dns-remote', foreign, selectedServerTag),
   ];
 
+  // P6 局域网网关：local DNS server 邻居解析（sing-box 1.14 neighbor_domain）——对这些后缀的单标签短名
+  // （如 nas.lan）走局域网邻居解析（主机名→IP），实现「按局域网设备短名访问」。内核硬限界（实证 alpha.32）：
+  //   · 每条须以 '.' 开头（normalizeNeighborDomain 归一化，否则 init FATAL）；· 仅 type:'local' server 支持；
+  //   · 平台限 Linux/macOS（与 source_mac/hostname 同 neighbor 子系统）。
+  // 仅当用户配置了 neighborDomains 且平台支持时附到 dns-local（缺省=空，配置字节零变化、snapshot 零回归）。
+  if (isSourceDeviceMatchSupported(process.platform)) {
+    const neighborDomains = Array.from(
+      new Set(
+        (config.tunConfig?.neighborDomains || [])
+          .map((d) => normalizeNeighborDomain(d))
+          .filter((d): d is string => !!d)
+      )
+    );
+    if (neighborDomains.length > 0) {
+      const local = dnsServers.find((s) => s.tag === 'dns-local');
+      if (local) {
+        local.neighbor_domain = neighborDomains;
+        log('info', `local DNS 邻居解析后缀: ${neighborDomains.join(', ')}`);
+      }
+    }
+  }
+
   if (enableFakeIp) {
     dnsServers.push({
       // FakeIP 服务器：返回虚假 IP，由 sniff 识别真实域名
@@ -203,6 +248,16 @@ export function buildDnsConfig(
     // 关 FakeIP：补 reverse_mapping，让无 SNI/ECH 的连接也能用 DNS 反查域名做路由匹配（不改节点收 IP 事实，见设计 T3）。
     // 开 FakeIP 时不加（FakeIP 本身已提供域名↔假 IP 的双向映射）。
     ...(enableFakeIp ? {} : { reverse_mapping: true }),
+    // P2b 乐观 DNS 缓存（1.14 顶层 dns.optimistic）：仅开关 true 时下发，关时省略保持配置字节不变（snapshot 零回归）。
+    // 过期先返旧值后台刷新降尾延迟（schema 实证：dns.optimistic 接受 boolean）。
+    ...(userDnsConfig.optimisticCache === true ? { optimistic: true } : {}),
+    // P2c DNS 查询超时（1.14 顶层 dns.timeout，Go duration 字符串）：仅有效正毫秒时下发 "<n>ms"，未设/非法省略用核默认。
+    // sanitize（ConfigManager.validateConfig）已保证落盘值为 1..60000 的有限正整数；此处再防御性校验避免 emit "0ms"/NaN。
+    ...(typeof userDnsConfig.dnsTimeoutMs === 'number' &&
+    Number.isFinite(userDnsConfig.dnsTimeoutMs) &&
+    userDnsConfig.dnsTimeoutMs > 0
+      ? { timeout: `${Math.round(userDnsConfig.dnsTimeoutMs)}ms` }
+      : {}),
   };
   const dnsRules: SingBoxDnsRule[] = [];
 
@@ -413,6 +468,47 @@ export function buildDnsConfig(
           server: 'dns-remote',
         } as SingBoxDnsRule);
       }
+    }
+  }
+
+  // P4b ⭐tailnet 按名解析（仅选中此 mesh tailscale 节点为主出口时生效）：注入 tailscale DNS server +
+  // preferred_by 规则。preferred_by 让 tailnet search domain / MagicDNS 短名自动归位到此节点解析——
+  // 替代硬编码后缀。与 doh.pub/google **并存**：仅 preferred_by 命中的 tailnet 名走 dns-tailscale，
+  // 其余域名规则/final 不变（preferred_by 规则置于尾部 catch-all 之前，不影响既有分流字节）。
+  // accept_search_domain 与 preferred_by 强联动：accept_search_domain 提供短名解析能力，preferred_by 决定
+  // 哪些名字优先归它——故二者同开同关（resolveByName 一个开关同时拉起 server.accept_search_domain + 规则）。
+  const tsResolveNode = (() => {
+    const selectedId = config.selectedServerId;
+    if (!selectedId) return null;
+    const sel = config.servers.find((s) => s.id === selectedId);
+    if (!sel || sel.protocol.toLowerCase() !== 'tailscale') return null;
+    if (!sel.tailscaleSettings?.resolveByName) return null;
+    return sel;
+  })();
+  if (tsResolveNode) {
+    const epTag = selectedTailscaleEndpointTag(config, idToTagMap);
+    if (epTag) {
+      dnsServers.push({
+        tag: TS_NAME_DNS_TAG,
+        type: 'tailscale',
+        // tailscale DNS server 必填：引用该 mesh 节点的 endpoint tag（缺失则 sing-box FATAL）。
+        endpoint: epTag,
+        accept_search_domain: true,
+        ...(tsResolveNode.tailscaleSettings?.acceptDefaultResolvers
+          ? { accept_default_resolvers: true }
+          : {}),
+      });
+      // preferred_by 规则须置于「全量 catch-all（smart/global 的 fallthrough / FakeIP query_type 全匹配）」**之前**，
+      // 否则无条件 catch-all 先短路、preferred_by 永不命中。故 unshift 到规则链最前（tailnet 名为具体名优先归位，
+      // 高优先合理；非 tailnet 名不被 preferred_by 命中，照常 fallthrough 既有规则，字节不变）。
+      dnsRules.unshift({
+        preferred_by: [TS_NAME_DNS_TAG],
+        action: 'route',
+        server: TS_NAME_DNS_TAG,
+      } as SingBoxDnsRule);
+      log('info', `Tailscale 按名解析已启用：tailnet 名 → ${TS_NAME_DNS_TAG}(endpoint=${epTag})`);
+    } else {
+      log('warn', 'Tailscale 按名解析已开启，但未能定位选中节点的 endpoint tag，已跳过');
     }
   }
 

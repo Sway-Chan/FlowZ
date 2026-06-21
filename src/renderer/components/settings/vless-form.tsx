@@ -19,20 +19,25 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { FormButtons } from './shared/form-buttons';
-import { EchField, MultiplexFields } from './shared/anti-censor-fields';
+import { MultiplexFields } from './shared/anti-censor-fields';
 import { AddressField, PortField } from './shared/basic-fields';
-import { TlsServerNameField, FingerprintField, AllowInsecureField } from './shared/tls-fields';
+import { TlsServerNameField, FingerprintField, TlsAdvancedFields } from './shared/tls-fields';
 import { WsPathField, WsHostField, GrpcServiceNameField } from './shared/transport-fields';
 import { RealityPublicKeyField, RealityShortIdField } from './shared/reality-fields';
 import { FormSection, FieldGrid, FieldSpan } from './shared/form-layout';
+import { normalizeNetworkUpper } from './shared/normalize-network';
 import {
   echSchemaShape,
   multiplexSchemaShape,
+  tlsSpoofSchemaShape,
   echDefaults,
   multiplexDefaults,
+  tlsSpoofDefaults,
   readEchDefault,
   readMultiplexDefaults,
+  readTlsSpoofDefault,
   buildMultiplexSettings,
+  buildTlsSpoofSettings,
   readTransportDefaults,
   buildTransportSettings,
 } from './shared/field-schemas';
@@ -57,6 +62,7 @@ const createVlessSchema = (t: any) =>
     tlsServerName: z.string().optional(),
     tlsAllowInsecure: z.boolean(),
     tlsFingerprint: z.string().optional(),
+    tlsEngine: z.string().optional(),
     realityPublicKey: z.string().optional(),
     realityShortId: z.string().optional(),
     wsPath: z.string().optional(),
@@ -64,6 +70,7 @@ const createVlessSchema = (t: any) =>
     grpcServiceName: z.string().optional(),
     ...echSchemaShape,
     ...multiplexSchemaShape,
+    ...tlsSpoofSchemaShape,
   });
 
 type VlessFormValues = z.infer<ReturnType<typeof createVlessSchema>>;
@@ -76,17 +83,6 @@ interface VlessFormProps {
 export function VlessForm({ serverConfig, onSubmit }: VlessFormProps) {
   const { t } = useTranslation();
   const vlessFormSchema = createVlessSchema(t);
-
-  const normalizeNetwork = (
-    n: string | undefined
-  ): 'Tcp' | 'Ws' | 'Grpc' | 'Http' | 'HttpUpgrade' => {
-    const lower = (n || 'tcp').toLowerCase();
-    if (lower === 'ws' || lower === 'websocket') return 'Ws';
-    if (lower === 'httpupgrade') return 'HttpUpgrade';
-    if (lower === 'grpc') return 'Grpc';
-    if (lower === 'h2' || lower === 'http' || lower === 'http2') return 'Http';
-    return 'Tcp';
-  };
 
   const normalizeSecurity = (s: string | undefined): 'None' | 'Tls' | 'Reality' => {
     const lower = (s || 'tls').toLowerCase();
@@ -103,16 +99,18 @@ export function VlessForm({ serverConfig, onSubmit }: VlessFormProps) {
         uuid: serverConfig.uuid || '',
         encryption: serverConfig.encryption?.toLowerCase() || 'none',
         flow: serverConfig.flow || '',
-        network: normalizeNetwork(serverConfig.network),
+        network: normalizeNetworkUpper(serverConfig.network),
         security: normalizeSecurity(serverConfig.security),
         tlsServerName: serverConfig.tlsSettings?.serverName || '',
         tlsAllowInsecure: serverConfig.tlsSettings?.allowInsecure || false,
         tlsFingerprint: serverConfig.tlsSettings?.fingerprint || 'chrome',
+        tlsEngine: serverConfig.tlsSettings?.engine || 'go',
         realityPublicKey: serverConfig.realitySettings?.publicKey || '',
         realityShortId: serverConfig.realitySettings?.shortId || '',
         ...readTransportDefaults(serverConfig),
         ...readEchDefault(serverConfig),
         ...readMultiplexDefaults(serverConfig),
+        ...readTlsSpoofDefault(serverConfig),
       };
     }
     return {
@@ -126,11 +124,13 @@ export function VlessForm({ serverConfig, onSubmit }: VlessFormProps) {
       tlsServerName: '',
       tlsAllowInsecure: false,
       tlsFingerprint: 'chrome',
+      tlsEngine: 'go',
       realityPublicKey: '',
       realityShortId: '',
       ...readTransportDefaults(),
       ...echDefaults,
       ...multiplexDefaults,
+      ...tlsSpoofDefaults,
     };
   };
 
@@ -158,8 +158,13 @@ export function VlessForm({ serverConfig, onSubmit }: VlessFormProps) {
               serverName: values.tlsServerName?.trim() || null,
               allowInsecure: security === 'tls' ? values.tlsAllowInsecure : false,
               fingerprint: values.tlsFingerprint || 'chrome',
+              engine:
+                security === 'tls' && values.tlsEngine && values.tlsEngine !== 'go'
+                  ? values.tlsEngine
+                  : undefined,
               ech: values.ech ? true : undefined,
               echConfig: values.echConfig?.trim() || undefined,
+              ...(security === 'tls' ? buildTlsSpoofSettings(values) : {}),
             }
           : null,
       realitySettings:
@@ -326,18 +331,7 @@ export function VlessForm({ serverConfig, onSubmit }: VlessFormProps) {
         </FormSection>
 
         <FormSection title={t('servers.advanced', 'Advanced')} collapsible defaultOpen={false}>
-          {isTlsEnabled && (
-            <FieldGrid cols={2}>
-              <TlsServerNameField control={form.control} t={t} />
-              <FingerprintField control={form.control} t={t} />
-              <FieldSpan>
-                <AllowInsecureField control={form.control} t={t} />
-              </FieldSpan>
-              <FieldSpan>
-                <EchField control={form.control} t={t} />
-              </FieldSpan>
-            </FieldGrid>
-          )}
+          {isTlsEnabled && <TlsAdvancedFields control={form.control} t={t} />}
 
           {showPathHostFields && (
             <FieldGrid cols={2}>

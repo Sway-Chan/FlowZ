@@ -5,12 +5,47 @@
  */
 
 import { isIpv4 } from '../../shared/ip';
-import type { UserConfig, Rule, AppRule, CustomAppPreset } from '../../shared/types';
-import { parseDnsServerSpec } from '../../shared/dns';
+import type { UserConfig, ServerConfig, Rule, AppRule, CustomAppPreset } from '../../shared/types';
+import { parseDnsServerSpec, isIpv6Literal } from '../../shared/dns';
 import { ruleConditions } from '../../shared/rules';
 import { getAppPreset } from '../../shared/app-rules-preset';
 import { BUILTIN_GEO_RULESETS } from './builtin-geo-rulesets';
 import type { SingBoxConfig, SingBoxRouteRule } from './singbox-config-types';
+
+/**
+ * 内置出站/inbound 保留 tag：节点显示名撞这些会致 sing-box tag 冲突 FATAL，故去重时预占。
+ * 单一真值——id→tag 映射与「按名解析 tailscale endpoint tag」均以此为基准（杜绝多处重抄漂移）。
+ */
+const RESERVED_OUTBOUND_TAGS: readonly string[] = [
+  'proxy-selector',
+  'direct',
+  'block',
+  'direct-loopback',
+  'probe-direct-in',
+  'probe-proxy-in',
+];
+
+/**
+ * 按节点顺序生成「serverId → 唯一 tag（=节点显示名，撞名/撞保留 tag 追加 (n)）」映射。
+ * 单一真值：ProxyManager（config-gen）与 dns-builder（tailscale endpoint 按名解析）共用同一份去重规则，
+ * 避免两处各自重放循环漂移（tailscale endpoint tag 须与 outbound tag 逐字节一致，否则 sing-box FATAL）。
+ */
+export function buildIdToTagMap(servers: ServerConfig[]): Map<string, string> {
+  const idToTagMap = new Map<string, string>();
+  const usedTags = new Set<string>(RESERVED_OUTBOUND_TAGS);
+  for (const s of servers) {
+    const baseTag = s.name.trim() || '未命名节点';
+    let tag = baseTag;
+    let count = 1;
+    while (usedTags.has(tag)) {
+      tag = `${baseTag} (${count})`;
+      count++;
+    }
+    usedTags.add(tag);
+    idToTagMap.set(s.id, tag);
+  }
+  return idToTagMap;
+}
 
 /**
  * 国内常见网银 U盾插件及本地证券/炒股软件的专属域名
@@ -49,9 +84,37 @@ export const DOMESTIC_BANK_AND_STOCK_DOMAINS = [
 /** 主机字符串是否为 IPv4 字面量（收敛到 shared/ip.isIpv4 严格判定，与 DNS 分类同源，避免不一致）。 */
 export const isIpv4Host = (host: string): boolean => isIpv4(host);
 
-/** 主机字符串是否为 IPv6 字面量。 */
-export const isIpv6Host = (host: string): boolean =>
-  /^[0-9a-fA-F:]+$/.test(host) && host.includes(':');
+/**
+ * 主机字符串是否为 IPv6 字面量（收敛到 shared/dns.isIpv6Literal 单一真值：去方括号 + ≥2 冒号，含
+ * IPv4-mapped 末段点分；与 /simplify F3 spoof 守卫同口径）。相比原 `/^[0-9a-fA-F:]+$/ && includes(':')`：
+ *  (1) 收紧——原 1 个冒号即放行，把 'dead:beef' 等畸形串误判为 IPv6，现 ≥2 冒号方为 IPv6（拒畸形串）；
+ *  (2) 纳入方括号——原带方括号（'[::1]'）因含 '[' ']' 不匹配正则被判 false，现去方括号后正确归类为 IPv6；
+ *  (3) 纳入 IPv4-mapped（R4-1）——'::ffff:1.2.3.4'/'::1.2.3.4' 因含 '.' 原被拒，现末段为严格 IPv4 时归类为
+ *      IPv6，与 api-client target()（含 ':' 即当 IPv6 包裹）对该地址结论一致 → builders 闸门接纳、CIDR 拼 /128。
+ * 真 IPv6（裸 ≥2 冒号）/ 真域名（无冒号）判定不变。
+ */
+export const isIpv6Host = (host: string): boolean => isIpv6Literal(host);
+
+/**
+ * 去 IPv6 字面量方括号：仅当两端**配对**方括号时脱（'[::1]' → '::1'）。畸形输入（单边 '[::1' / '::1]'、
+ * 空 '' / '[]'）原样返回——避免把单边括号串截成误判 IP 的形态，让下游 isIp 判定据实拒之。裸地址/域名/IPv4 原样返回。
+ */
+export const stripHostBrackets = (host: string): string =>
+  host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host;
+
+/**
+ * IP 字面量 host → 单 IP 排除 CIDR（IPv6 → /128，IPv4 → /32）；**非 IP / 空 / 畸形输入返回 null**，调用方 skip。
+ * 防护：'' / '[]' 经 stripHostBrackets → 空串，旧实现会拼出非法 '/32'；域名同理。仅真 IP（v4 严格 / v6 含
+ * IPv4-mapped）才产 CIDR，保持「仅真 IP 才排除」语义（当前调用方均已 isIpv4Host||isIpv6Host 预闸，本防护使 helper 自身健壮）。
+ * 先脱方括号：节点 address 经 Clash YAML 导入 / 表单输入可能保留 '[::1]' 方括号（ProtocolParser 会脱、这两条路径不脱），
+ * 直接拼 '[::1]/128' 是非法 CIDR，故脱括号后再拼（与 isIpv6Host 去括号判定同口径）。
+ */
+export const hostToExcludeCidr = (host: string): string | null => {
+  const bare = stripHostBrackets(host);
+  if (isIpv6Host(bare)) return `${bare}/128`;
+  if (isIpv4Host(bare)) return `${bare}/32`;
+  return null;
+};
 
 /**
  * #57 节点域名解析器档位 → 实际使用的 DNS server tag。

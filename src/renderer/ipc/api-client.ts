@@ -146,11 +146,21 @@ export const proxyApi = {
   },
 
   /**
-   * 监听 Tailscale 交互登录成功（主进程轮询 state 目录检出，log-level 无关）。
-   * 渲染端据此 dismiss 那条 Infinity 登录 toast + 刷新登录态角标。
+   * 监听 sing-box 1.14 管理 API 推送的 Tailscale 节点真实态（backendState/loggedIn/authURL/IP/expired）。
+   * 取代 1.13 的「轮询 state 目录 + AUTH_OK」启发式：登录成功（Running/Starting）、需登录（NeedsLogin+authURL）、
+   * 过期（expired）全由此流驱动，与日志等级无关。
    */
-  onTailscaleAuthOk(listener: (data: { serverId: string; nodeName: string }) => void): () => void {
-    return ipcClient.on(IPC_CHANNELS.EVENT_TAILSCALE_AUTH_OK, listener);
+  onTailscaleStatus(
+    listener: (data: {
+      serverId: string;
+      backendState: string;
+      loggedIn: boolean;
+      authURL?: string;
+      tailscaleIPs: string[];
+      expired: boolean;
+    }) => void
+  ): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_TAILSCALE_STATUS, listener);
   },
 
   /**
@@ -158,6 +168,13 @@ export const proxyApi = {
    */
   onSystemProxyResidual(listener: (data: { proxy: string }) => void): () => void {
     return ipcClient.on(IPC_CHANNELS.EVENT_SYSTEM_PROXY_RESIDUAL, listener);
+  },
+
+  /** #40：非官方核 ≤ 随包基线 → 兼容风险提醒（启动 reconcile emit）。 */
+  onCoreBaselineWarning(
+    listener: (data: { current: string; bundled: string; kind: string }) => void
+  ): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_CORE_BASELINE_WARNING, listener);
   },
 };
 
@@ -270,14 +287,6 @@ export const serverApi = {
    */
   async delete(serverId: string): Promise<void> {
     return ipcClient.invoke(IPC_CHANNELS.SERVER_DELETE, { serverId });
-  },
-
-  /**
-   * Tailscale 节点真实登录态（Phase 1）：serverId → loggedIn（hasAuthKey || state 目录存在）。
-   * 仅含 Tailscale 节点；渲染端据此驱动「需登录」角标，与日志等级无关。
-   */
-  async getTailscaleLoginStates(): Promise<Record<string, boolean>> {
-    return ipcClient.invoke(IPC_CHANNELS.TAILSCALE_GET_LOGIN_STATES);
   },
 
   /**
@@ -848,6 +857,7 @@ export const subscriptionApi = {
 export interface BackupInfo {
   serverCount: number;
   manualServerCount: number;
+  meshServerCount: number;
   subscriptionCount: number;
   ruleCount: number;
   ruleSetCount: number;
@@ -919,6 +929,25 @@ export const appApi = {
    */
   async uninstallAll(): Promise<{ ok: boolean; error?: string }> {
     return ipcClient.invoke(IPC_CHANNELS.APP_UNINSTALL_ALL);
+  },
+  /**
+   * 打开 sing-box 官方面板：main 用运行期 api service 端口构造 /dashboard/ URL + 系统浏览器打开。
+   * 代理未运行 → 返回 { ok: false }（UI 仅在开关 on 且运行中才 enable 按钮）。
+   */
+  async openSingboxDashboard(): Promise<{ ok: boolean }> {
+    return ipcClient.invoke(IPC_CHANNELS.OPEN_SINGBOX_DASHBOARD);
+  },
+  /**
+   * P5 Phase2：打开远端实例的 /dashboard/（main 据 instanceId 取配置推 URL + 系统浏览器打开）。
+   */
+  async openRemoteDashboard(instanceId: string): Promise<{ ok: boolean; error?: string }> {
+    return ipcClient.invoke(IPC_CHANNELS.OPEN_REMOTE_DASHBOARD, { instanceId });
+  },
+  /**
+   * P5 Phase2：远端实例连通测试（main 用 TLS+Bearer 客户端 probe 一次，secret 取自 main config，不经渲染端）。
+   */
+  async testRemoteInstance(instanceId: string): Promise<{ ok: boolean; error?: string }> {
+    return ipcClient.invoke(IPC_CHANNELS.TEST_REMOTE_INSTANCE, { instanceId });
   },
 };
 

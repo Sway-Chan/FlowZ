@@ -3,6 +3,10 @@ import * as path from 'path';
 import * as fs from 'fs/promises';
 import type { LogLevel } from '../../shared/types';
 import type { LogManager } from './LogManager';
+import { sha256File } from '../../shared/file-hash';
+
+/** libcronet 自愈动作：ok=已就位无需动 / restored=刚从内置 bundle 重拷 / failed=拷贝失败（已告警，调用方降级）。 */
+export type CronetHealAction = 'ok' | 'restored' | 'failed';
 
 /**
  * 资源文件管理器
@@ -309,9 +313,36 @@ export class ResourceManager {
   }
 
   /**
-   * 确保 Linux 下使用用户目录的可写核心，以解决 AppImage (EROFS) 的权限和更新问题
+   * 确保「现役核」就位并返回其路径——平台感知的随包核播种入口（§5 两平台统一调用 ensureWritableCore(true)）：
+   *  - linux：用户目录可写核（解决 AppImage EROFS + setcap），force 时随包核覆盖刷新；
+   *  - darwin：受保护目录 root-only，force 时经已装 helper install-core 重播种随包核（免密码）——复制到干净临时
+   *    目录再装（避免带入同目录 helper/LICENSE），macOS 无 libcronet 静态编入只播 sing-box。需注入 deps.installCore
+   *    （由 ProxyManager 传 HelperManager.installCore，保持本模块零 HelperManager 依赖）；缺注入 / 非 force → no-op
+   *    回落 getSingBoxPath（行为同改动前：受保护目录无核则用 bundle 出厂核）；
+   *  - 其它平台：no-op 返回 getSingBoxPath。
+   *
+   * @param deps.installCore darwin 重播种用——把 seedDir 内的随包核经提权 helper 装进受保护目录（{ok,error}）。
    */
-  async ensureWritableCore(): Promise<string> {
+  async ensureWritableCore(
+    force = false,
+    deps?: { installCore?: (seedDir: string) => Promise<{ ok: boolean; error?: string }> }
+  ): Promise<string> {
+    if (this.platform === 'darwin') {
+      // 仅 force（§5 reseed 决策）+ 注入了 helper installCore 时才重播种；否则 no-op（保持改动前行为）。
+      if (force && deps?.installCore) {
+        try {
+          const os = require('os') as typeof import('os');
+          const seedDir = path.join(os.tmpdir(), 'flowz-core-reseed');
+          await fs.mkdir(seedDir, { recursive: true });
+          await fs.copyFile(this.getBundledSingBoxPath(), path.join(seedDir, 'sing-box'));
+          const r = await deps.installCore(seedDir);
+          if (!r.ok) this.log('warn', `随包内核重播种失败: ${r.error ?? ''}`);
+        } catch (e) {
+          this.log('warn', `随包内核刷新失败: ${(e as Error)?.message ?? e}`);
+        }
+      }
+      return this.getSingBoxPath();
+    }
     if (this.platform !== 'linux') {
       return this.getSingBoxPath();
     }
@@ -320,8 +351,9 @@ export class ResourceManager {
     const updateDir = path.join(userDataPath, 'core_update');
     const targetPath = path.join(updateDir, 'sing-box');
 
-    // 检查是否已经有可写核心
-    if (await this.fileExists(targetPath)) {
+    // 检查是否已经有可写核心（force=true 跳过复用、强制用随包核覆盖——§5 最低版本守卫：升级遗留的旧可写核
+    // 会被硬切 1.14 的配置 FATAL，须随包 1.14 核覆盖刷新）
+    if (!force && (await this.fileExists(targetPath))) {
       // 已有可写核心：仍需确保 libcronet 在旁（naive 出站靠 purego 同目录/系统库路径加载）
       await this.ensureCronetBeside(updateDir);
       return targetPath;
@@ -330,7 +362,7 @@ export class ResourceManager {
     // 创建目录
     await fs.mkdir(updateDir, { recursive: true });
 
-    // 从应用内置的包中复制
+    // 从应用内置的包中复制（force 时 copyFile 覆盖旧核）
     const platformDir = this.getPlatformResourceDir();
     const sourcePath = path.join(platformDir, 'sing-box');
 
@@ -372,12 +404,21 @@ export class ResourceManager {
       // （purego 从二进制同目录加载）：Linux/便携=可写核心目录(已由 ensureCronetBeside 拷入)，
       // 非便携 win=内置 resources 目录。不以"内置存在"直接判可用——否则 beside 拷贝失败仍误判"可用"→ FATAL。
       const coreDir = path.dirname(this.getSingBoxPath());
-      if (fsSync.existsSync(path.join(coreDir, libName))) {
+      const dstLib = path.join(coreDir, libName);
+      const bundledLib = path.join(this.getPlatformResourceDir(), libName);
+      if (fsSync.existsSync(dstLib)) {
+        // 存在但损坏（0 字节/截断/版本错位 → size≠bundle）判 copy-failed：当前不可用，可经自愈恢复（语义同瞬时故障）。
+        // 仅在内置存在时比对（无内置=无权威源，回落原存在性判定，避免把可用库误判损坏）。
+        if (
+          fsSync.existsSync(bundledLib) &&
+          fsSync.statSync(dstLib).size !== fsSync.statSync(bundledLib).size
+        ) {
+          return 'copy-failed';
+        }
         return 'available';
       }
       // 加载目录缺库：区分"内置压根没有"（真·无库）与"内置有但 ensureCronetBeside 拷贝失败"（瞬时故障）。
       // 后者不应永久按"无库/macOS 无预编译库"拒用 naive，应提示拷贝/权限问题，可通过重试/修权限恢复。
-      const bundledLib = path.join(this.getPlatformResourceDir(), libName);
       return fsSync.existsSync(bundledLib) ? 'copy-failed' : 'no-lib';
     } catch {
       return 'no-lib';
@@ -391,21 +432,76 @@ export class ResourceManager {
 
   /**
    * 把内置的 libcronet 复制到与（可写/已更新）核心同一目录，供 naive 出站(purego) 加载。
-   * 供 ensureWritableCore 与核心更新写盘后调用。内置无 libcronet 或已存在则跳过。
+   * 供 ensureWritableCore 与核心更新写盘后调用。薄 wrapper → ensureCronetHealthy（strong=false 热路径，
+   * 仅 size 快筛，零 hash 成本）。旧名保留：既有调用点（ensureWritableCore / CoreUpdateService）零改动。
    */
   async ensureCronetBeside(coreDir: string): Promise<void> {
+    await this.ensureCronetHealthy(coreDir);
+  }
+
+  /**
+   * libcronet 缺失/损坏自愈（完整性感知的播种）：从内置 bundle 把 libcronet 恢复到核心同目录。
+   * 权威源恒为内置 bundle（与 sing-box 同包、版本天然一致），离线可恢复——不联网下载。
+   *
+   * 判据（见 cronetNeedsRestore）：dst 缺失 / size(dst)≠size(src)（热路径快筛，抓 0 字节/截断/版本错位）；
+   * strong=true 时额外比 sha256（冷路径，启动失败后强校验）。修复走 atomicCopy（dst.tmp + rename，原子规避半写/AV 锁）。
+   *
+   * @returns action：ok（无需动，含 mac-x64 等无内置库 reason='no-bundled-lib'）/ restored（已重拷）/
+   *          failed（拷贝失败，已告警，调用方回落 naive 降级，不裸崩）。
+   */
+  async ensureCronetHealthy(
+    coreDir: string,
+    opts: { strong?: boolean } = {}
+  ): Promise<{ action: CronetHealAction; reason?: string }> {
     const name = this.getCronetLibFilename();
     const src = path.join(this.getPlatformResourceDir(), name);
     const dst = path.join(coreDir, name);
+    // 内置无该平台库（mac-x64 等）→ 无权威源、无可恢复对象，按现状跳过（与改动前 ensureCronetBeside 行为一致）。
+    if (!(await this.fileExists(src))) return { action: 'ok', reason: 'no-bundled-lib' };
     try {
-      if ((await this.fileExists(src)) && !(await this.fileExists(dst))) {
-        await fs.copyFile(src, dst);
-      }
+      const need = await this.cronetNeedsRestore(src, dst, opts.strong === true);
+      if (!need) return { action: 'ok' };
+      await this.atomicCopy(src, dst);
+      this.log('info', `libcronet 自愈：restored（${opts.strong ? 'hash' : 'size'}）→ ${dst}`);
+      return { action: 'restored' };
     } catch (error) {
       // 复制失败不阻断启动（naive 不可用时 sing-box 会自报 cronet 错误），但必须告警而非静默吞掉：
       // 否则 dst 缺库会被 getCronetLibStatus 判为 'copy-failed'，需要这条日志定位 EACCES/磁盘满/AV 锁等真因。
       const msg = error instanceof Error ? error.message : String(error);
-      this.log('warn', `libcronet 拷贝失败（naive 暂不可用）：${src} → ${dst}：${msg}`);
+      this.log('warn', `libcronet 自愈失败（naive 暂不可用）：${src} → ${dst}：${msg}`);
+      return { action: 'failed', reason: msg };
+    }
+  }
+
+  /**
+   * 判定是否需要从内置 bundle 重拷 libcronet：
+   * - dst 缺失 → true；
+   * - size(src)≠size(dst) → true（0 字节/截断/跨版本大小必变，命中绝大多数损坏，成本仅 2×stat）；
+   * - !strong → 热路径到此即止（零 hash 成本，正常启动每次只 stat）；
+   * - strong → 再比 sha256（冷路径强校验，仅启动失败重试时付费）。
+   */
+  private async cronetNeedsRestore(src: string, dst: string, strong: boolean): Promise<boolean> {
+    if (!(await this.fileExists(dst))) return true;
+    const [s, d] = [await fs.stat(src), await fs.stat(dst)];
+    if (s.size !== d.size) return true;
+    if (!strong) return false;
+    return sha256File(src) !== sha256File(dst);
+  }
+
+  /**
+   * 原子拷贝 src→dst：写 dst.tmp → chmod → rename。rename 同盘原子——避免 sing-box 启动时读到半写文件；
+   * tmp 失败/rename 被 AV 锁 → 抛给上层 catch 告警回落降级（不留半残破文件占着 dst 位）。
+   */
+  private async atomicCopy(src: string, dst: string): Promise<void> {
+    const tmp = `${dst}.tmp`;
+    try {
+      await fs.copyFile(src, tmp);
+      await fs.chmod(tmp, 0o755);
+      await fs.rename(tmp, dst);
+    } catch (e) {
+      // chmod/rename 失败（如 Windows AV 持 .tmp 扫描锁）→ 清理半残 .tmp 防跨重启累积，再抛给调用方降级。
+      await fs.unlink(tmp).catch(() => {});
+      throw e;
     }
   }
 
