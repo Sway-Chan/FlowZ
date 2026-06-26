@@ -40,6 +40,17 @@ const cfg = (servers: ServerConfig[], over: Partial<UserConfig> = {}): UserConfi
 const idMap = (servers: ServerConfig[]): Map<string, string> =>
   new Map(servers.map((s) => [s.id, s.name]));
 
+// CI 决定性（gate≠CI 的 host-OS 依赖）：WG/TS endpoint 的固定接口名（name / system_interface_name）**仅在非 macOS
+// 下发**（macOS utun 名动态、刻意不设，builder 平台门控本身正确）。Linux/Win CI 是非 darwin 故 name 断言过，macOS CI
+// 是 darwin 则 name=undefined → 断言挂。本文件无 darwin 专属断言，强制非 darwin 让接口名断言跨 CI host 确定。
+const __realPlatform = process.platform;
+beforeEach(() =>
+  Object.defineProperty(process, 'platform', { value: 'win32', configurable: true })
+);
+afterEach(() =>
+  Object.defineProperty(process, 'platform', { value: __realPlatform, configurable: true })
+);
+
 describe('buildOutbounds — 基础装配 + 载体', () => {
   it('单节点：节点出站 + proxy-selector(default=节点) + direct + block；载体空', () => {
     const servers = [vless('s1', '香港')];
@@ -187,7 +198,7 @@ describe('buildOutbounds — endpoint + 门控', () => {
     expect(ep!.peers![0].allowed_ips).toEqual(['10.8.0.0/24']);
   });
 
-  it('Phase2 WG reverseMesh=true → endpoint.system=true + allowed_ips 仅具体段', () => {
+  it('Phase2 WG reverseMesh=true(全隧道) → endpoint.system=true + 固定名 + allowed_ips 含 0/0', () => {
     const wgSys = {
       id: 'w1',
       name: 'WG-sys',
@@ -210,10 +221,44 @@ describe('buildOutbounds — endpoint + 门控', () => {
     );
     const ep = r.pendingEndpoints.find((e) => e.tag === 'WG-sys')!;
     expect(ep.system).toBe(true);
-    expect(ep.peers![0].allowed_ips).toEqual(['10.8.0.0/24']);
+    expect(ep.name).toBe('flowz-wg'); // 固定名供出口托管定位（sing-box 1.14 WG endpoint 字段=`name`）
+    // system WG 全隧道用裸 0/0（cryptokey 需要；预折半已证伪：sing-tun 落内核前把 0/1+128/1 合并回裸 0/0）→ 撞 en0
+    // default 的 EEXIST、被 setRoutes 善后删掉、停核 unsetRoutes 不回填 → 断网，由 ProxyManager 的「全局 default 存/
+    // 停核补回」安全网兜底。
+    expect(ep.peers![0].allowed_ips).toEqual(['10.8.0.0/24', '0.0.0.0/0', '::/0']);
   });
 
-  it('Phase2 Tailscale reverseMesh=true → endpoint.system_interface=true + exit_node 丢弃（结论A）', () => {
+  it('多个 System WG → 内核接口名唯一（首个 flowz-wg，其余 flowz-wg-N，防两张内核接口撞名致核 FATAL）', () => {
+    const mkWg = (id: string, name: string): ServerConfig =>
+      ({
+        id,
+        name,
+        protocol: 'wireguard',
+        address: `${id}.example.com`,
+        port: 51820,
+        wireguardSettings: {
+          privateKey: 'pk',
+          peerPublicKey: 'pub',
+          localAddress: ['10.0.0.2/32'],
+          reverseMesh: true,
+        },
+      }) as unknown as ServerConfig;
+    const a = mkWg('wa', 'WG-A');
+    const b = mkWg('wb', 'WG-B');
+    const r = buildOutbounds(
+      a,
+      cfg([a, b]),
+      idMap([a, b]),
+      deps({ systemInterfaceAvailable: true })
+    );
+    const epA = r.pendingEndpoints.find((e) => e.tag === 'WG-A')!;
+    const epB = r.pendingEndpoints.find((e) => e.tag === 'WG-B')!;
+    expect(epA.name).toBe('flowz-wg'); // 首个保留默认名（常见单节点不变）
+    expect(epB.name).toBe('flowz-wg-1'); // 次个唯一化
+    expect(epA.name).not.toBe(epB.name);
+  });
+
+  it('Phase2 Tailscale reverseMesh=true + exitNode → system_interface=true + 固定名 + exit_node 下发（出口路由由 MeshExitRouteManager 托管）', () => {
     const tsSys = {
       id: 't1',
       name: 'TS-sys',
@@ -234,7 +279,8 @@ describe('buildOutbounds — endpoint + 门控', () => {
     const ep = r.pendingEndpoints.find((e) => e.tag === 'TS-sys')!;
     expect(ep.type).toBe('tailscale');
     expect(ep.system_interface).toBe(true);
-    expect(ep.exit_node).toBeUndefined();
+    expect(ep.system_interface_name).toBe('flowz-ts'); // 固定名供出口托管定位
+    expect(ep.exit_node).toBe('exit-node-1'); // exit_node 下发;出口拆半默认路由由 MeshExitRouteManager 装到 flowz-ts
   });
 
   it('Phase2 Tailscale 非 system(缺省) + on + exitNode → 下发 exit_node、无 system_interface', () => {
@@ -255,7 +301,28 @@ describe('buildOutbounds — endpoint + 门控', () => {
     expect(ep.exit_node).toBe('exit-node-1');
   });
 
-  it('Phase2 B 门控：reverseMesh 节点 + 非提权(systemInterfaceAvailable 缺省 false) → 跳过不发射', () => {
+  // 旧配置防御：allowInternet=true（旧字段显式存）但 exitNode 空——新表单不再产此组合（allowInternet 由
+  // exitNode 派生），但存量配置可达。carriesFullTunnel=true，但 builder L653 `if (exitNode)` 守护 → 绝不下发
+  // 空 exit_node（'' 非法）；节点退化为黑洞但配置合法不崩。锁定此边界，防未来误改成 ep.exit_node=''。
+  it('旧配置 Tailscale allowInternet=true 但 exitNode 空 → 不下发 exit_node（不发空串、不崩）', () => {
+    const tsLegacy = {
+      id: 't1',
+      name: 'TS-legacy',
+      protocol: 'tailscale',
+      tailscaleSettings: { authKey: 'tskey-abc', allowInternet: true, exitNode: '' },
+    } as unknown as ServerConfig;
+    const r = buildOutbounds(
+      tsLegacy,
+      cfg([tsLegacy], { selectedServerId: 't1' }),
+      idMap([tsLegacy]),
+      deps()
+    );
+    const ep = r.pendingEndpoints.find((e) => e.tag === 'TS-legacy')!;
+    expect(ep.type).toBe('tailscale');
+    expect(ep.exit_node).toBeUndefined();
+  });
+
+  it('Phase2 非提权(systemInterfaceAvailable 缺省 false)：reverseMesh 节点**降级 gVisor 发射**(system:false)、仍可用', () => {
     const wgSys = {
       id: 'w1',
       name: 'WG-sys',
@@ -272,8 +339,12 @@ describe('buildOutbounds — endpoint + 门控', () => {
     } as unknown as ServerConfig;
     const node = vless('s1', '香港'); // 备一可用节点，避免「全部不可用」抛错
     const r = buildOutbounds(node, cfg([node, wgSys]), idMap([node, wgSys]), deps());
-    expect(r.pendingEndpoints.map((e) => e.tag)).not.toContain('WG-sys');
-    expect(r.outbounds.find((o) => o.tag === 'proxy-selector')!.outbounds).not.toContain('WG-sys');
+    // 非 TUN：不再跳过,降级 gVisor 发射 → 系统代理下该节点仍可用(与 UI 显示 gVisor 一致)。
+    const ep = r.pendingEndpoints.find((e) => e.tag === 'WG-sys');
+    expect(ep).toBeDefined();
+    expect(ep!.system).toBe(false); // system:true 仅 TUN+helper;非提权降级 gVisor
+    expect(ep!.name).toBeUndefined(); // gVisor 无内核接口名（WG endpoint 字段=`name`）
+    expect(r.outbounds.find((o) => o.tag === 'proxy-selector')!.outbounds).toContain('WG-sys');
   });
 
   it('gateInvalidNodes 命中 → 跳过该节点出站', () => {

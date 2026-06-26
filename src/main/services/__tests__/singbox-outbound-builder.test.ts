@@ -48,6 +48,14 @@ const wgServer = (over: Partial<ServerConfig> = {}): ServerConfig =>
     ...over,
   }) as unknown as ServerConfig;
 
+// CI 决定性（gate≠CI 的 host-OS 依赖）：WG `name` / TS `system_interface_name` 固定接口名**仅非 macOS 下发**（macOS
+// utun 名动态、刻意不设）。macOS CI 是 darwin 则 name=undefined → 断言挂。强制非 darwin 让接口名断言跨 host 确定。
+// 本文件内自设 platform 的用例（跨平台导入降级 ~L490 / shouldEmitTlsEngine 显式传 platform）各自 restore 到捕获的
+// orig，不受此 beforeEach 影响。
+const __realPlatform = process.platform;
+beforeEach(() => Object.defineProperty(process, 'platform', { value: 'win32', configurable: true }));
+afterEach(() => Object.defineProperty(process, 'platform', { value: __realPlatform, configurable: true }));
+
 describe('buildWireGuardEndpoint', () => {
   it('最小配置 → keepalive 兜 25s / allowed_ips 全量 / mtu 兜 1408 / system:false', () => {
     const ep = buildWireGuardEndpoint(wgServer(), 'WG');
@@ -130,7 +138,7 @@ describe('buildWireGuardEndpoint', () => {
     ).toThrow(/WireGuard/);
   });
 
-  it('Phase2 reverseMesh=true → system:true + allowed_ips 仅具体段（结论A：即便 allowInternet 缺省 on 也不注入 0/0）', () => {
+  it('Phase2 reverseMesh=true(全隧道) → system:true + 固定名 + allowed_ips 含 0/0（System 也保留,sing-box 装接口作用域路由）', () => {
     const ep = buildWireGuardEndpoint(
       wgServer({
         wireguardSettings: {
@@ -144,23 +152,26 @@ describe('buildWireGuardEndpoint', () => {
       'WGS'
     );
     expect(ep.system).toBe(true);
-    expect(ep.peers![0].allowed_ips).toEqual(['10.8.0.0/24']);
+    expect(ep.name).toBe('flowz-wg'); // sing-box 1.14 WG endpoint 内核接口名字段=`name`（非 interface_name）
+    // system WG 全隧道也用裸 0/0（cryptokey 需要；预折半已证伪：sing-tun 落内核前把 0/1+128/1 合并回裸 0/0）→ 撞
+    // en0 default EEXIST、被 setRoutes 善后删、停核不回填 → 断网，由 ProxyManager 的全局 default 安全网兜底。
+    expect(ep.peers![0].allowed_ips).toEqual(['10.8.0.0/24', '0.0.0.0/0', '::/0']);
   });
 
-  it('Phase2 reverseMesh=true + 无具体段 → 抛错（system specific-only 为空=FATAL）', () => {
-    expect(() =>
-      buildWireGuardEndpoint(
-        wgServer({
-          wireguardSettings: {
-            privateKey: 'pk',
-            peerPublicKey: 'pub',
-            localAddress: ['10.0.0.3/32'],
-            reverseMesh: true,
-          },
-        } as unknown as Partial<ServerConfig>),
-        'WGS2'
-      )
-    ).toThrow(/allowed/i);
+  it('Phase2 reverseMesh=true + 无具体段 + on → allowed_ips 仅 0/0（承载全隧道、可发射）', () => {
+    const ep = buildWireGuardEndpoint(
+      wgServer({
+        wireguardSettings: {
+          privateKey: 'pk',
+          peerPublicKey: 'pub',
+          localAddress: ['10.0.0.3/32'],
+          reverseMesh: true,
+        },
+      } as unknown as Partial<ServerConfig>),
+      'WGS2'
+    );
+    expect(ep.system).toBe(true);
+    expect(ep.peers![0].allowed_ips).toEqual(['0.0.0.0/0', '::/0']);
   });
 
   // #58：域名 server 的 WG endpoint 需 dial 级 domain_resolver（1.14 域名拨号无确定解析上游 → WARP 测速超时）。
