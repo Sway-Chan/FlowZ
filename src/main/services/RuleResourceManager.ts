@@ -2,7 +2,7 @@
  * 规则资源管理：下载/校验/清单维护 + 动态资源库刷新 + GitHub 加速。
  * .srs 普遍 <1MB → 下载到内存校验魔数后原子落盘。并发池 3，批末一次性保存配置（避免逐项 saveConfig 互相覆盖）。
  */
-import { net } from 'electron';
+import { net, type Session } from 'electron';
 import * as fs from 'fs/promises';
 import * as fssync from 'fs';
 import * as path from 'path';
@@ -37,6 +37,8 @@ import {
   findBuiltin,
 } from './builtin-geo-rulesets';
 import { enumerateResourceRefs, isResourceReferenced } from '../../shared/rule-resource-refs';
+import { UpdateNetwork } from './UpdateNetwork';
+import { resolveMainSessionViaProxy } from '../../shared/update-proxy';
 
 const IDLE_TIMEOUT_MS = 15_000;
 const OVERALL_TIMEOUT_MS = 120_000;
@@ -58,6 +60,47 @@ export class RuleResourceManager {
     private readonly broadcastConfigChanged: (config: UserConfig) => void,
     private readonly notifyCoreReload: (config: UserConfig) => void
   ) {}
+
+  // Phase 1（更新网络统一层 §8）：更新链路统一会话层 + 代理运行态读取器，构造后由 index.ts 注入。
+  // 未注入 → updateSession 返回 undefined（net.request 回落 default session，旧行为兜底）。
+  private updateNetwork: UpdateNetwork | null = null;
+  private proxyRunningProvider: (() => boolean) | null = null;
+  // Phase 2：update-in inbound 动态端口读取器（proxyManager.getUpdateInPort）。viaProxy 时 pin 此口（非 mixedPort）。
+  private updateInPortProvider: (() => number | null) | null = null;
+
+  /** Phase 1/2：注入更新链路统一会话层 + 代理运行态读取器 + update-in 端口读取器（index.ts 装配）。 */
+  setUpdateNetwork(
+    updateNetwork: UpdateNetwork,
+    proxyRunningProvider: () => boolean,
+    updateInPortProvider: () => number | null
+  ): void {
+    this.updateNetwork = updateNetwork;
+    this.proxyRunningProvider = proxyRunningProvider;
+    this.updateInPortProvider = updateInPortProvider;
+  }
+
+  /**
+   * Phase 1：资源下载统一会话。读 config(mainSessionViaProxy/mixedPort) + proxyRunning，经
+   * resolveMainSessionViaProxy 决定经代理（socks 入站）还是直连；未注入 → undefined（net.request 回落
+   * default session，旧行为兜底）。读 config 失败 → 直连兜底（绝不抛）。
+   */
+  private async updateSession(): Promise<Session | undefined> {
+    if (!this.updateNetwork) return undefined;
+    let viaProxy = false;
+    let updateInPort = 0;
+    try {
+      const cfg = await this.configManager.loadConfig();
+      const running = this.proxyRunningProvider ? this.proxyRunningProvider() : false;
+      viaProxy = resolveMainSessionViaProxy(running, cfg.mainSessionViaProxy);
+      updateInPort = this.updateInPortProvider?.() ?? 0;
+    } catch {
+      viaProxy = false; // 读 config 失败 → 直连兜底
+    }
+    // viaProxy 但 update-in 端口不可用（核未起/未分配）→ 直连兜底，不 pin 到无效端口
+    if (viaProxy && updateInPort <= 0) viaProxy = false;
+    // sessionFor 内部 setProxy 极罕见可能 reject；兜底 undefined 守住 fetchBuffer/fetchJson 的「永不 reject」契约。
+    return this.updateNetwork.sessionFor(viaProxy, updateInPort).catch(() => undefined);
+  }
 
   // 串行化所有 load-modify-save，防并发批次/删除/setGhProxy 在 load→save 窗口内交错丢写（review P2-1）
   private saveChain: Promise<unknown> = Promise.resolve();
@@ -533,10 +576,11 @@ export class RuleResourceManager {
     }
   }
 
-  private fetchBuffer(
+  private async fetchBuffer(
     url: string,
     onChunk?: (received: number, total: number | null) => void
   ): Promise<FetchResult> {
+    const sess = await this.updateSession();
     return new Promise((resolve) => {
       let settled = false;
       const done = (v: FetchResult) => {
@@ -549,7 +593,7 @@ export class RuleResourceManager {
       let received = 0;
       let total: number | null = null;
       const chunks: Buffer[] = [];
-      const req = net.request({ url, redirect: 'follow' });
+      const req = net.request({ url, redirect: 'follow', session: sess });
       req.setHeader('User-Agent', APP_USER_AGENT);
 
       let encoded = false; // 响应被压缩（content-encoding）→ data 为解压字节，content-length 是压缩长度，跳过比对
@@ -649,6 +693,38 @@ export class RuleResourceManager {
     }
   }
 
+  /**
+   * 图标库拉取（规则自定义图标选择器）：下沉主进程经 update-in 统一会话（Phase 1b——取代 renderer 直接
+   * fetch 走 default session；删 default session pin 后 manual 接管模式会退化直连）。两个图标库
+   * （QureColor + edc）各多 CDN 源逐个兜底（jsdelivr/fastly/raw），合并 icons；全失败返 [] 优雅降级
+   * （UI 回落手动输入图标 URL）。复用 fetchJson（带超时/OOM 防护 + update-in 会话）。
+   */
+  async fetchIconGalleries(): Promise<Array<{ name: string; url: string }>> {
+    const fetchWithFallback = async (urls: string[]): Promise<any> => {
+      for (const url of urls) {
+        try {
+          return await this.fetchJson(url);
+        } catch {
+          /* 当前源失败，尝试下一个 */
+        }
+      }
+      return null;
+    };
+    const [qure, edc] = await Promise.all([
+      fetchWithFallback([
+        'https://cdn.jsdelivr.net/gh/Koolson/Qure/Other/QureColor-All.json',
+        'https://fastly.jsdelivr.net/gh/Koolson/Qure/Other/QureColor-All.json',
+        'https://raw.githubusercontent.com/Koolson/Qure/master/Other/QureColor-All.json',
+      ]),
+      fetchWithFallback([
+        'https://cdn.jsdelivr.net/gh/erdongchanyo/icon@main/edc-filter-icon-gallery.json',
+        'https://fastly.jsdelivr.net/gh/erdongchanyo/icon@main/edc-filter-icon-gallery.json',
+        'https://raw.githubusercontent.com/erdongchanyo/icon/main/edc-filter-icon-gallery.json',
+      ]),
+    ]);
+    return [...(qure?.icons || []), ...(edc?.icons || [])];
+  }
+
   private async findCatalogItem(id: string): Promise<RuleResourceCatalogItem | undefined> {
     const builtin = findCatalogItem(id);
     if (builtin) return builtin;
@@ -699,9 +775,10 @@ export class RuleResourceManager {
     return items;
   }
 
-  private fetchJson(url: string): Promise<any> {
+  private async fetchJson(url: string): Promise<any> {
+    const sess = await this.updateSession();
     return new Promise((resolve, reject) => {
-      const req = net.request({ url, redirect: 'follow' });
+      const req = net.request({ url, redirect: 'follow', session: sess });
       req.setHeader('User-Agent', APP_USER_AGENT);
       req.setHeader('Accept', 'application/vnd.github+json');
       const chunks: Buffer[] = [];
