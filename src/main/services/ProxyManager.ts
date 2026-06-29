@@ -76,6 +76,7 @@ import {
   classifyReseedResult,
 } from '../../shared/core-build';
 import { retry } from '../utils/retry';
+import { writeFileAtomic } from '../utils/atomic-write';
 import { coreVersionAtLeast } from '../../shared/version';
 import { parseTailscaleAuthLine } from '../../shared/tailscale';
 import { safeHttpUrl } from '../../shared/url';
@@ -148,6 +149,16 @@ export function parseCheckEndpointIndex(stderr: string): number | null {
   if (!m) return null;
   const idx = Number(m[1]);
   return Number.isInteger(idx) && idx >= 0 ? idx : null;
+}
+
+/**
+ * 外化自定义规则的孤儿文件判定（单一真值，便于单测）。匹配：
+ *  - 裸 custom-rule-<id>.json（孤儿主目标：删规则/禁用/转 inline/改 id/direct 切换的遗留）；
+ *  - .json 后跟任意中间段的 .tmp 残留（writeFileAtomic 唯一后缀 .<pid>.<rand>.tmp 或裸 .tmp）。
+ * .tmp 段整体可选——勿丢裸 .json（曾因强制 .tmp$ 致裸 .json 孤儿永久残留）。
+ */
+export function isCustomRuleOrphanFile(name: string): boolean {
+  return /^custom-rule-.+\.json(?:(?:\.[^.]+)*\.tmp)?$/.test(name);
 }
 
 /**
@@ -1422,7 +1433,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     this.customRuleFilesDegraded = false;
     try {
       await fs.mkdir(dir, { recursive: true });
-      // 孤儿清扫（含 atomicWrite 可能残留的 .tmp）
+      // 孤儿清扫：裸 custom-rule-*.json（主目标：删规则/禁用/转 inline/改 id/direct 切换的遗留）
+      // + atomicWrite 残留的 .tmp。writeFileAtomic 用唯一后缀 .<pid>.<rand6hex>.tmp（架构 review：
+      // 原固定 .tmp 正则不匹配新后缀）——正则放宽匹配任意中间段的 .tmp，且把 .tmp 段整体设为**可选**
+      // 以保留裸 .json 清扫（否则强制 .tmp$ 会让删规则后的 .json 孤儿永久残留）。
       let existing: string[] = [];
       try {
         existing = await fs.readdir(dir);
@@ -1430,7 +1444,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         /* 目录刚建/读失败：无孤儿可清 */
       }
       for (const name of existing) {
-        if (/^custom-rule-.+\.json(\.tmp)?$/.test(name) && !expected.has(name)) {
+        // 孤儿判定抽到 isCustomRuleOrphanFile（单一真值，含裸 .json + .tmp 变体，见其说明）。
+        if (isCustomRuleOrphanFile(name) && !expected.has(name)) {
           await fs.unlink(path.join(dir, name)).catch(() => {});
         }
       }
@@ -1485,9 +1500,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
   /** 原子写：临时文件 + rename（与 RuleResourceManager 同形；rename-over 触发 sing-box fswatch 热重载）。 */
   private async atomicWrite(filePath: string, content: string): Promise<void> {
-    const tmp = `${filePath}.tmp`;
-    await fs.writeFile(tmp, content, 'utf-8');
-    await fs.rename(tmp, filePath);
+    // 架构 review：改用 utils/writeFileAtomic（唯一后缀 .tmp 防多 writer 撞车），消除本处复刻的固定
+    // `${filePath}.tmp`——正是 util 已修掉的形态（多 writer 写同一 .tmp 致字节交错损坏正本）。
+    await writeFileAtomic(filePath, content);
   }
 
   /**
