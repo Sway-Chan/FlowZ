@@ -6,7 +6,14 @@
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { randomBytes } from 'crypto';
-import type { UserConfig, Rule, RuleCondition, LogLevel, Protocol } from '../../shared/types';
+import type {
+  UserConfig,
+  Rule,
+  RuleCondition,
+  LogLevel,
+  Protocol,
+  ProxyModeType,
+} from '../../shared/types';
 import type { LogManager } from './LogManager';
 import { getConfigPath } from '../utils/paths';
 import { writeFileAtomic } from '../utils/atomic-write';
@@ -519,11 +526,22 @@ export class ConfigManager implements IConfigManager {
       throw new Error('proxyMode must be global, smart, or direct');
     }
 
-    // 验证 proxyModeType（不区分大小写）
+    // 验证 proxyModeType（不区分大小写），并回写到**权威 camelCase 规范值**。validateConfig 是
+    // loadConfig/saveConfig 的必经校验，回写后磁盘值恒为规范形 → 全栈精确比较（=== 'systemProxy' /
+    // === 'tun' / === 'manual'）可信，消除大小写漂移致日志静默丢失/幽灵文件风险。
+    // 关键：必须归一到 camelCase 'systemProxy'（ProxyModeType 联合类型与 ProxyManager 谓词均为
+    // camelCase），不能盲 toLowerCase——后者把 'systemProxy' 变 'systemproxy'，使 ProxyManager.ts
+    // 的 === 'systemProxy' 恒 false、系统代理分支永不命中（系统代理从不设置 → 流量直连泄漏）。
+    const CANONICAL_MODE_TYPE: Record<string, ProxyModeType> = {
+      systemproxy: 'systemProxy',
+      tun: 'tun',
+      manual: 'manual',
+    };
     const modeTypeLower = config.proxyModeType?.toLowerCase();
-    if (!modeTypeLower || !['systemproxy', 'tun', 'manual'].includes(modeTypeLower)) {
+    if (!modeTypeLower || !(modeTypeLower in CANONICAL_MODE_TYPE)) {
       throw new Error('proxyModeType must be systemProxy, tun, or manual');
     }
+    config.proxyModeType = CANONICAL_MODE_TYPE[modeTypeLower];
 
     // subscriptionProxyPolicy（三态可选）sanitize（不 throw，与 dnsTimeoutMs/CIDR 同标准防整配置回落）：
     // 非 'follow'|'proxy'|'direct' 的脏值（手改 / 损坏备份跨设备导入，见 config-portability）→ 删除该字段，落回默认 follow。
