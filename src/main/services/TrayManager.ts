@@ -8,10 +8,11 @@ import {
   shell,
 } from 'electron';
 import { LogManager } from './LogManager';
+import { releaseWindowMemory } from './window-memory';
 import { ServerConfig, ProxyMode, ProxyModeType, SubscriptionConfig } from '../../shared/types';
 import { groupServersBySubscription } from '../../shared/server-grouping';
 import { sortServersByLatency } from '../../shared/server-latency-sort';
-import { mt, setMainLanguage } from '../i18n';
+import { mt } from '../i18n';
 import { DIRECT_SERVER_ID, isDirectSelection } from '../../shared/direct-selection';
 import { IPC_CHANNELS } from '../../shared/ipc-channels';
 
@@ -102,8 +103,8 @@ export class TrayManager implements ITrayManager {
   private selectedServerId: string | null = null;
   private proxyMode: ProxyMode = 'smart';
   private proxyModeType: ProxyModeType = 'systemProxy';
-  // 语言：托盘文案经 mt() 走主进程 i18n 中央语言持有点（index.ts 启动按系统偏好初始化 + APP_SET_LANGUAGE 同步），
-  // 故本类不再自持 currentLanguage——setLanguage 只负责同步持有点并触发重渲染。
+  // 语言：托盘文案经 mt() 走主进程 i18n 中央语言持有点（据 config.language 单一真值源，启动 + config-change
+  // 由 index.ts 重设并重渲染菜单），故本类不自持语言、也不再暴露 setLanguage。
 
   // 回调函数
   private onStartProxy?: () => void;
@@ -267,15 +268,6 @@ export class TrayManager implements ITrayManager {
       proxyMode: this.proxyMode,
       proxyModeType: this.proxyModeType,
     });
-  }
-
-  /**
-   * 设置应用语言（由主进程根据渲染进程 IPC 调用）
-   */
-  setLanguage(lang: string): void {
-    setMainLanguage(lang); // 同步主进程 i18n 持有点（mt() 据此取文案）
-    // 重新渲染菜单以应用新语言
-    this.updateTrayMenu(this.isProxyRunning);
   }
 
   /**
@@ -571,23 +563,16 @@ export class TrayManager implements ITrayManager {
     if (this.onLightweightMode) {
       this.onLightweightMode();
     } else if (this.mainWindow && !this.mainWindow.isDestroyed()) {
-      // 销毁窗口，释放整个 Chromium 渲染进程（最大内存释放）
-      this.mainWindow.destroy();
-      this.logManager.addLog('info', 'Main window destroyed for lightweight mode', 'TrayManager');
-
-      // 窗口销毁后执行主进程内存清理：
-      // 1. 清空日志缓冲区（释放 5-10MB 内存中积累的日志对象）
-      // 2. 触发 V8 GC（回收孤立的闭包、IPC handler 引用、缓存 config 对象等，约 15-25MB）
-      // 延迟 500ms 等待窗口销毁事件完全传播
-      setTimeout(() => {
-        // 清空内存日志缓冲区（只清内存，不删磁盘日志文件）
-        this.logManager.clearLogs();
-
-        // 手动触发 V8 GC（需要启动时已调用 v8.setFlagsFromString('--expose-gc')）
-        if (typeof (global as any).gc === 'function') {
-          (global as any).gc();
-        }
-      }, 500);
+      // 兜底分支（生产环境恒不可达，onLightweightMode 由 tray-actions.ts 恒注入）：不经
+      // index.ts 的 markLightweightModeTransition 标记，minimizeToTray=false 时销毁窗口会
+      // 被 window-all-closed 误判成用户关闭而连带退出 app。可接受——真正接线的路径（上面
+      // onLightweightMode 分支）已正确处理，这里只是防未接线时至少还能释放内存。
+      releaseWindowMemory({
+        window: this.mainWindow,
+        logManager: this.logManager,
+        clearLogsAndGc: true,
+        reason: 'lightweight-mode',
+      });
     }
   }
 

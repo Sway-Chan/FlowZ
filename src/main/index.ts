@@ -5,6 +5,8 @@ import { ConfigManager } from './services/ConfigManager';
 import { ProtocolParser } from './services/ProtocolParser';
 import { LogManager } from './services/LogManager';
 import { TrayManager } from './services/TrayManager';
+import { releaseWindowMemory } from './services/window-memory';
+import { shouldQuitOnAllWindowsClosed } from './window-close-policy';
 import { ProxyManager } from './services/ProxyManager';
 import { DiagnosticService } from './services/DiagnosticService';
 import { createSystemProxyManager, SystemProxyBase } from './services/SystemProxyManager';
@@ -67,7 +69,7 @@ import { initUserDataPath } from './utils/paths';
 import { IPC_CHANNELS } from '../shared/ipc-channels';
 import { LOGIN_ITEMS_SETTINGS_URL } from '../shared/constants';
 import { effectiveLogLevel } from '../shared/log-level';
-import { resolveAutoLanguage } from '../shared/language';
+import { resolveAutoLanguage, resolveEffectiveLanguage } from '../shared/language';
 
 // ── 启动计时探针（真机量化用，纯日志、零行为改动）─────────────────────────────
 // 从「本模块加载」到「窗口首次可见」的各阶段 ms，window-shown 时一行汇总到 app.log（[startup-timing]）。
@@ -162,7 +164,8 @@ let isDragging = false;
  * UI 广播活跃谓词（T1/T2/T4 统一门控，issue #225）：窗口可见 **且** 非拖动中 才推 UI 更新。
  * - 日志批 flush（registerLogHandlers）按此门控：不活跃只暂存不推。
  * - 流量/连接 relay（StatsWorkerHost）按此门控：不活跃只更新缓存不 sendToAll，活跃恢复时补推一帧最新。
- * 隐藏（macOS hide / minimizeToTray / 轻量销毁）= 无 UI 消费者；拖动中 = 让主线程只处理窗口移动重绘。
+ * 不活跃 = 窗口已销毁（关窗释放内存 / 轻量模式）或 macOS Cmd+H 系统级隐藏；拖动中 = 让主线程只处理
+ * 窗口移动重绘。
  */
 function isUiBroadcastActive(): boolean {
   return !!mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() && !isDragging;
@@ -259,7 +262,7 @@ let ipInfoService: IpInfoService | null = null;
 let ruleResourceManager: RuleResourceManager | null = null;
 let ruleResourceScheduler: RuleResourceScheduler | null = null;
 let helperManager: IPrivilegedHelper | null = null;
-let currentLanguage = 'zh-CN'; // 渲染端 APP_SET_LANGUAGE 同步的最近语言；经 setMainLanguage 喂主进程 i18n（mt() 据此取文案）。空值由 handler 的 lang||currentLanguage 兜底保留旧值（不传空给 setMainLanguage）
+// 界面语言不再由渲染端经 IPC 反向告知——主进程直接读 config.language 单一真值源（启动 + config-change）。
 // 渲染端 APP_SET_NODE_SORT_BY_LATENCY 同步的「按延迟排序」开关最近值；持有于此以便 trayManager 在渲染端 mount 推送
 // 早于 tray 创建的极端时序下、于 tray 创建后补应用（否则 push 被 trayManager?.短路丢弃 → 托盘整会话停在默认序）。
 let currentNodeSortByLatency = false;
@@ -495,9 +498,9 @@ function restoreDockPresence(): void {
   }, 50);
 }
 
-// 任一窗口关闭后重评估「无可见窗口 → 菜单栏-only」：覆盖更新进度窗关闭、主窗轻量 destroy 等
-// 主窗已隐藏的边缘（hideDockIfMenubarOnly 自带 anyVisible 守卫 → 仅真无可见窗口才摘，主窗仍开则 no-op）。
-// 模块级注册（早于首个窗口创建）→ 含启动期主窗。主窗红灯关走 'hide'（非 'closed'），不经此、不重复。
+// 任一窗口关闭后重评估「无可见窗口 → 菜单栏-only」：覆盖更新进度窗关闭、主窗关闭/轻量 destroy 等
+// 全部路径（hideDockIfMenubarOnly 自带 anyVisible 守卫 + isQuitting/dockHidden 幂等，重复调用安全）。
+// 模块级注册（早于首个窗口创建）→ 含启动期主窗。
 if (process.platform === 'darwin') {
   app.on('browser-window-created', (_e, win) => {
     win.on('closed', () => {
@@ -617,8 +620,11 @@ async function createWindow(forceShow = false) {
       devTools: isDevelopment, // 仅在开发环境启用开发者工具，生产环境禁用（除非特殊需求）
       // OS 偏好语言注入 preload（同步、无 IPC 时序问题）：供 i18n「自动跟随系统」解析。
       //   app.getLocale() 恒返 app bundle locale=en（与系统脱钩，代码多处实证），故必须用 getPreferredSystemLanguages。
+      // 界面语言选择注入 preload（config.language 单一真值源）：供 i18n 初始化直接用，取代旧 localStorage 真值源。
+      //   每个 additionalArguments 项作为独立 argv 项传递，'auto'/语言码均为安全 ASCII，无需转义。
       additionalArguments: [
         `--flowz-sys-langs=${JSON.stringify(getPreferredSystemLanguagesSafe())}`,
+        `--flowz-lang-choice=${cfg.language ?? ''}`,
       ],
     },
     // macOS：集成式窗口（红绿灯内嵌 + sidebar 半透材质）
@@ -729,10 +735,13 @@ async function createWindow(forceShow = false) {
   // 注册窗口到 IPC 事件发送器，以便接收广播事件
   ipcEventEmitter.registerWindow(mainWindow);
 
-  // 更新托盘管理器的窗口引用
+  // 刷新持有窗口引用的各服务（关窗默认销毁重建后，构造时只捕获一次的引用会永久指向已销毁窗口，
+  // 致 ProxyManager 的事件广播 / UpdateService 的更新对话框此后静默失效——见 ProxyManager.setMainWindow 的注释）。
   if (trayManager) {
     trayManager.setMainWindow(mainWindow);
   }
+  proxyManager?.setMainWindow(mainWindow);
+  updateService?.setMainWindow(mainWindow);
 
   startupMark('windowCreated');
 
@@ -805,8 +814,9 @@ async function createWindow(forceShow = false) {
     logManager.addLog('error', `Window failed to load: ${errorDescription} (${errorCode})`, 'Main');
   });
 
-  // macOS：隐藏到托盘时摘 Dock 图标（仅驻留菜单栏，不占 Dock / Cmd-Tab），重新显示时恢复。
-  // 经 activation policy 状态机（见 hideDockIfMenubarOnly/restoreDockPresence），覆盖所有显隐路径。
+  // macOS：Cmd+H（app.hide()）系统级隐藏时摘 Dock 图标（仅驻留菜单栏，不占 Dock / Cmd-Tab），重新显示时
+  // 恢复。关闭窗口现在统一走 destroy（不再 hide），由模块级 browser-window-created 的 'closed' 监听器摘
+  // Dock 图标，不经本分支。经 activation policy 状态机（见 hideDockIfMenubarOnly/restoreDockPresence）。
   if (process.platform === 'darwin') {
     mainWindow.on('hide', () => {
       // 经 accessory + app.hide() 摘 Dock 图标（机制与 macOS 限制见 hideDockIfMenubarOnly）。
@@ -818,42 +828,26 @@ async function createWindow(forceShow = false) {
     });
   }
 
-  // 处理窗口关闭事件
-  // 注意：必须同步调用 preventDefault()，否则窗口会直接销毁。
-  // 任何 await 操作都应该在此之后。
+  // 处理窗口关闭事件：统一销毁渲染进程释放内存（不再区分平台/minimizeToTray 去 hide 保活——隐藏态
+  // 长期占满渲染进程内存正是 issue #242 的放大器之一，关窗是明确的"暂时不需要看"信号，没有理由继续
+  // 保活）。是否常驻托盘 vs 彻底退出，在销毁的这一刻就算好存进 pendingQuitOnAllClosed，供 window-all-closed
+  // 消费（而非等它触发时才判断——那时可能已经隔了很久、配置或托盘状态都可能变过）。
   mainWindow.on('close', (event) => {
     const window = mainWindow;
     if (!window || window.isDestroyed()) return;
 
-    // 退出管线（Cmd+Q/Dock/托盘退出 → app.quit() → before-quit 置 isQuitting）：放行销毁，
+    // 退出管线（Cmd+Q/Dock/托盘退出 → app.quit() → before-quit 置 isQuitting）：放行默认销毁，
     // 不再 preventDefault→hide，否则 macOS 上 quit 会被吞成"隐藏"、will-quit 清理永不执行（根因 A）。
     if (isQuitting) return;
 
-    // 默认先阻止关闭
     event.preventDefault();
-
-    // 异步获取配置并决定是隐藏还是真正销毁
-    configManager
-      .loadConfig()
-      .then((config) => {
-        if (window.isDestroyed()) return;
-
-        // macOS：关窗按钮恒隐藏（mac 惯例——红灯关窗不退应用），保留渲染态、避免重建开销与状态错乱
-        // （焦点/激活项/currentView 不丢）。其余平台按 minimizeToTray 决定隐藏或销毁。
-        if (process.platform === 'darwin' || config.minimizeToTray) {
-          window.hide();
-          logManager.addLog('info', 'Window hidden to tray', 'Main');
-        } else {
-          // 允许窗口销毁，不再 preventDefault
-          // 既然已经调用过 preventDefault，我们需要手动调用 destroy
-          logManager.addLog('info', 'Window destroying (minimizeToTray off)', 'Main');
-          window.destroy();
-        }
-      })
-      .catch((err) => {
-        console.error('Failed to load config during window close:', err);
-        if (!window.isDestroyed()) window.destroy();
-      });
+    const minimizeToTray = configManager.get<boolean>('minimizeToTray') ?? true;
+    pendingQuitOnAllClosed = shouldQuitOnAllWindowsClosed(
+      process.platform,
+      minimizeToTray,
+      !!trayManager?.hasTray()
+    );
+    releaseWindowMemory({ window, logManager, reason: 'close' });
   });
 
   mainWindow.on('closed', () => {
@@ -861,6 +855,8 @@ async function createWindow(forceShow = false) {
     if (trayManager) {
       trayManager.setMainWindow(null);
     }
+    proxyManager?.setMainWindow(null);
+    updateService?.setMainWindow(null);
     // 轻量 destroy 的 Dock 摘除由模块级 browser-window-created → 'closed' 钩子统一处理（不在此重复）。
     logManager.addLog('info', 'Main window closed', 'Main');
   });
@@ -1046,13 +1042,18 @@ if (gotTheLock) {
 
     // Windows toast 前置：设 AppUserModelID（与 electron-builder appId 一致），提升 portable 版通知可靠性（无 NSIS 注册时）。
     if (process.platform === 'win32') app.setAppUserModelId('com.flowz.app');
-    // 主进程 i18n 初值按系统偏好（渲染端 APP_SET_LANGUAGE 同步到达前的桌面通知语言；与 TrayManager 初值口径一致）。
+    // 主进程 i18n 初值先按系统偏好兜底（config 加载完成前的极短窗口，覆盖任何早于配置读取的 mt() 调用）。
     setMainLanguage(resolveAutoLanguage(getPreferredSystemLanguagesSafe()));
     // 桌面通知总开关初始同步（运行期变更由 config-change-handler 同步）。await 确保 enabled 在后续启动步骤
     // （含 proxy 自动连接，error 通知的唯一来源）前就绪——此刻 proxy 未启动，error 不会触发，无竞态；读配置毫秒级。
+    // 同一次 loadConfig 顺带据 config.language 单一真值源精化界面语言（auto→系统解析；存量缺键退回系统，
+    // 与上面兜底一致，待渲染端从 localStorage 迁移回填 config 后下次启动即精确）——主进程不再靠渲染端 IPC 告知语言。
     await configManager
       .loadConfig()
-      .then((c) => setDesktopNotificationsEnabled(c.desktopNotifications))
+      .then((c) => {
+        setMainLanguage(resolveEffectiveLanguage(c.language, getPreferredSystemLanguagesSafe()));
+        setDesktopNotificationsEnabled(c.desktopNotifications);
+      })
       .catch(() => {});
 
     // 启动期系统代理 marker 恢复：上次会话崩溃/强杀/断电导致 disableProxy 未执行时 marker 残留，
@@ -1140,9 +1141,25 @@ if (gotTheLock) {
       );
     }
 
-    await ensureWindow(); // 走串行化入口（forceShow=false 尊重 silentStart），与 activate/托盘/second-instance 共享创建
+    // 静默启动（config.silentStart / --hidden / macOS wasOpenedAsHidden）不创建渲染进程：窗口在首次唤出
+    // （托盘/Dock/second-instance → showWindow）时懒创建，避免整个 Chromium 渲染进程从开机起空占内存
+    // （等价于「开机即进轻量模式」，与关窗释放后的 tray-resident 态同构）。此时 mainWindow 保持 null——启动
+    // 后续代码已容忍该态（proxyManager 构造 mainWindow||undefined、升级检查 setTimeout 兜底、各 getMainWindow
+    // getter 懒取）。configManager.get 读 1120 行已加载的内存缓存（同步、不重复读盘）。
+    const startsHidden =
+      configManager.get<boolean>('silentStart') === true ||
+      process.argv.includes('--hidden') ||
+      (process.platform === 'darwin' && app.getLoginItemSettings().wasOpenedAsHidden);
+    if (startsHidden) {
+      logManager.addLog('info', 'Silent start: deferring window creation to first show', 'Main');
+      // macOS：无窗口时主动进入菜单栏-only（原静默分支在 presentWindow 内做，现无窗口 → 在此做）；
+      // 首次唤出 showWindow 会 restoreDockPresence 复原。
+      if (process.platform === 'darwin') hideDockIfMenubarOnly();
+    } else {
+      await ensureWindow(); // 走串行化入口，与 activate/托盘/second-instance 共享创建
+    }
 
-    // 初始化 ProxyManager（需要在窗口创建后）
+    // 初始化 ProxyManager（懒创建静默启动窗口时 mainWindow 为 null → undefined，首次建窗经 setMainWindow 刷新）
     proxyManager = new ProxyManager(logManager, mainWindow || undefined);
     // 隐私联动：隐私模式开 → sing-box 日志级别抬到 ≥warn（源头不记访问域名/SNI 到 singbox.log）
     proxyManager.setPrivacyProvider(getPrivacyMode);
@@ -1531,9 +1548,8 @@ if (gotTheLock) {
     const config = await configManager.loadConfig();
     await autoStartManager.setAutoStart(config.autoStart ?? false);
 
-    // 注册更新处理器
+    // 注册更新处理器（窗口引用已由 createWindow() 内的刷新逻辑设置，此处无需重复）
     setUpdateService(updateService);
-    updateService.setMainWindow(mainWindow);
     // 设置更新前的清理回调，确保在安装更新前停止代理进程
     // 更新流程用非终态的 runCleanup（不消耗退出管线的一次性清理 promise）：安装失败 app 续命后，
     // 后续真正退出仍能完整拆除代理；安装成功则 app.exit 直接退，runCleanup 已先行清理。
@@ -1557,15 +1573,8 @@ if (gotTheLock) {
       updateTrayMenuState(isRunning, hasError);
     });
 
-    // 监听渲染进程语言同步（架构 review：改走 registerIpcHandler 统一 ApiResponse 契约 + 进注册表，
-    // 原裸 ipcMain.handle 是 19 个 handler 中唯一例外，绕过 wrapper 且无返回值）
-    registerIpcHandler<string, void>(IPC_CHANNELS.APP_SET_LANGUAGE, (_event, lang: string) => {
-      currentLanguage = lang || currentLanguage;
-      setMainLanguage(currentLanguage); // 主进程 i18n（桌面通知等）同步语言
-      if (trayManager) {
-        trayManager.setLanguage(lang);
-      }
-    });
+    // 界面语言不再经渲染端 IPC 反向同步：改走 config.language 单一真值源——渲染端改语言写 config，
+    // config-change-handler 据 config.language 重设主进程 i18n 并重渲染托盘（见 applyLanguageFromConfig 注入）。
 
     // 节点列表「按延迟排序」开关同步：渲染端 App.tsx 在 mount（cold-start 一次同步）+ 每次切换时推送，
     // 使托盘节点列表与下拉同序（幂等，TrayManager.setSortByLatency 同态 no-op 不重建菜单）。
@@ -1609,6 +1618,16 @@ if (gotTheLock) {
         showWindow,
         updateTrayMenuState,
         setPrivacyMode,
+        // 轻量模式恒不因 minimizeToTray 退出（代理不中断是其硬性契约）——等价于按 minimizeToTray=true
+        // 算 shouldQuitOnAllWindowsClosed，但 hasTray 兜底仍要判：托盘图标创建失败时，轻量模式销毁窗口
+        // 后台也会变成无窗口+无图标的僵尸，那种情形下仍需退出（10 分钟空闲自动触发时尤其够不着托盘菜单）。
+        markLightweightModeTransition: () => {
+          pendingQuitOnAllClosed = shouldQuitOnAllWindowsClosed(
+            process.platform,
+            true,
+            !!trayManager?.hasTray()
+          );
+        },
       })
     );
     trayManager.createTray();
@@ -1641,6 +1660,17 @@ if (gotTheLock) {
       getCoreUpdateScheduler: () => coreUpdateScheduler,
       updateTrayMenuState,
       getPrivacyMode,
+      // 语言解析需系统偏好（auto→系统），故在 index.ts 内注入；config-change-handler 本身不依赖 electron。
+      // 读 configManager 缓存而非事件 payload：saveConfig 先更新 currentConfig 再 emit CONFIG_CHANGED（见
+      // config-handlers），故缓存恒是最新值；且不受 payload 形状影响（未来某发射点漏带 language、或恢复缺该键的
+      // 旧备份，都不会把主进程语言静默重置成系统语言）——与「config.language 单一真值源」主旨一致。
+      applyLanguageFromConfig: () =>
+        setMainLanguage(
+          resolveEffectiveLanguage(
+            configManager.get<string>('language'),
+            getPreferredSystemLanguagesSafe()
+          )
+        ),
     });
 
     // 关机/重启早期钩子：powerMonitor 'shutdown' **仅 macOS/Linux 触发**（Electron 文档），Windows 不发。
@@ -1668,6 +1698,14 @@ if (gotTheLock) {
 // 退出意图标记：before-quit 早于逐窗口 close 触发，置位后 close 处理器放行销毁（见 createWindow），
 // 使 app.quit() 不被 close 的 preventDefault 吞成"隐藏"、will-quit 清理得以执行（根因 A 修复，跨平台）。
 let isQuitting = false;
+// 常驻托盘 vs 彻底退出的待决意图：主窗口每次被销毁（关窗 或 轻量模式）时就地算好、存在这里；
+// window-all-closed 只消费这个最近一次算好的值，不在自己触发的那一刻重新判断。
+// 根因：window-all-closed 只反映"窗口计数归零"，不反映"是哪次销毁导致的"——若还开着更新进度窗/
+// sing-box 面板等独立窗口，主窗口销毁后计数不会立刻归零，事件会推迟到那些窗口之后也关闭才触发；
+// 若在那一刻才重新判断，判断的其实是"最新配置"而非"当初销毁主窗口时的意图"，且曾用一次性 flag
+// 做过这件事，结果 flag 在"计数暂未归零"期间一直脏着，被后续一次完全无关的关窗事件误读。
+// 提前在销毁的当下算好并存下来，无论 window-all-closed 隔多久之后才真正触发都不会跑偏。
+let pendingQuitOnAllClosed = false;
 // 清理 memoized promise：多入口（will-quit / SIGTERM / 托盘 app.quit）共享同一次清理。
 // 用 promise 而非 boolean：并发的第二入口 await 同一进行中的清理，避免 process.exit 拦腰截断它。
 let cleanupPromise: Promise<void> | null = null;
@@ -1677,12 +1715,14 @@ app.on('before-quit', () => {
 
 app.on('window-all-closed', () => {
   if (!gotTheLock) return;
-  // 在 macOS 上，即使所有窗口关闭，应用也应该继续运行（托盘模式）
-  // 在其他平台上，如果启用了托盘，也应该继续运行
-  // 判「图标真实存在」而非对象引用：createTray 失败被静默吞时 trayManager 非 null 但无图标 →
-  // 无窗口 + 无图标仍驻留 = 不可达僵尸。hasTray() 兜住此情形。
-  if (process.platform !== 'darwin' && !trayManager?.hasTray()) {
+  // 只消费 pendingQuitOnAllClosed（主窗口销毁那一刻已经算好，见 close 处理器 / markLightweightModeTransition），
+  // 不在这里重新判断——本事件何时触发只取决于"最后一个窗口"何时关闭（可能是更新进度窗/sing-box 面板
+  // 这类独立窗口，跟主窗口销毁不同时），用当下配置重新算的话，判断的就不是当初销毁主窗口时的真实意图。
+  if (pendingQuitOnAllClosed) {
+    logManager.addLog('info', 'All windows closed, quitting', 'Main');
     app.quit();
+  } else {
+    logManager.addLog('info', 'All windows closed, staying resident in tray', 'Main');
   }
 });
 
