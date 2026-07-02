@@ -69,9 +69,14 @@ export class ResourceManager {
       }
     }
 
-    // Linux 模式特殊处理：优先使用 userData 下的核心，以便支持 setcap 和规避 AppImage EROFS
+    // Linux：helper 模式优先 root 受管核（安装播种 / install-core 写入，root-only 不可篡改）——存在且可执行即用，
+    // 与 macOS 受保护目录优先同构。无受管核（未装 helper / setcap 兜底）→ userData 可写核（支持 setcap + 规避 AppImage EROFS）。
     if (this.platform === 'linux') {
       const fs = require('fs');
+      // helper 模式：root 受管核优先（共用 linuxManagedCoreUsable 谓词，与 ensureWritableCore force 刷新腿同源）。
+      if (this.linuxManagedCoreUsable()) {
+        return path.join(this.getLinuxManagedCoreDir(), filename);
+      }
       const linuxCorePath = path.join(app.getPath('userData'), 'core_update', filename);
       if (fs.existsSync(linuxCorePath)) {
         return linuxCorePath;
@@ -144,10 +149,41 @@ export class ResourceManager {
     return path.join(this.getPlatformResourceDir(), 'com.flowz.helper.exe');
   }
 
+  /**
+   * 获取随包内置的 Linux 提权 helper 二进制路径（与 sing-box 同目录，安装期的**复制源**）。
+   * 生产：<resources>/linux/flowz-helper-linux；开发：resources/linux[-${arch}]/flowz-helper-linux。仅 Linux 有意义。
+   * 安装时由 LinuxServiceHelper 复制到 /opt/FlowZ/flowz-helper 并注册为 systemd system service。
+   */
+  getLinuxHelperPath(): string {
+    return path.join(this.getPlatformResourceDir(), 'flowz-helper-linux');
+  }
+
   /** macOS 内核持久化的受保护目录（root-only 写，App 升级不覆盖；B 块）。helper 安装时经 --coredir 锁定它，
    *  install-core 只写此目录。仅 macOS 有意义。 */
   getProtectedCoreDir(): string {
     return '/Library/Application Support/FlowZ/core';
+  }
+
+  /** Linux root-owned 受管核目录（root:root 0755，普通用户改不动；LinuxServiceHelper 安装时播种、install-core 写入）。
+   *  helper 只跑此目录内的 sing-box（路径锁），getSingBoxPath 在此目录有可执行核时优先返回它。**须与 LinuxServiceHelper
+   *  的 CORE_DIR 常量字面一致**。仅 Linux 有意义。 */
+  getLinuxManagedCoreDir(): string {
+    return '/usr/local/lib/flowz/core';
+  }
+
+  /** Linux root 受管核是否在位且可执行——getSingBoxPath 读路径与 ensureWritableCore force 刷新腿共用同一谓词，
+   *  杜绝「读受管核、却刷 userData」的写读错位。 */
+  private linuxManagedCoreUsable(): boolean {
+    try {
+      const fsSync = require('fs') as typeof import('fs');
+      fsSync.accessSync(
+        path.join(this.getLinuxManagedCoreDir(), 'sing-box'),
+        fsSync.constants.X_OK
+      );
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /** 始终指向随 App 出厂的 bundle 内核（B 块 App 升级仲裁 / 受保护目录种子用，绕过受保护目录优先逻辑）。 */
@@ -351,7 +387,8 @@ export class ResourceManager {
 
   /**
    * 确保「现役核」就位并返回其路径——平台感知的随包核播种入口（§5 两平台统一调用 ensureWritableCore(true)）：
-   *  - linux：用户目录可写核（解决 AppImage EROFS + setcap），force 时随包核覆盖刷新；
+   *  - linux：helper 模式经 install-core 刷新 root 受管核（force + 注入 installCore + 受管核在位）+ 维护 userData
+   *    兜底核（setcap/系统代理回退用）；返回现役核（受管核优先，探测/校验/实跑同源）。无 helper → userData 可写核（AppImage EROFS + setcap）；
    *  - darwin：受保护目录 root-only，force 时经已装 helper install-core 重播种随包核（免密码）——复制到干净临时
    *    目录再装（避免带入同目录 helper/LICENSE），macOS 无 libcronet 静态编入只播 sing-box。需注入 deps.installCore
    *    （由 ProxyManager 传 HelperManager.installCore，保持本模块零 HelperManager 依赖）；缺注入 / 非 force → no-op
@@ -388,6 +425,28 @@ export class ResourceManager {
       return this.getSingBoxPath();
     }
 
+    // Linux root 受管核刷新（镜像 darwin 受保护目录腿）：仅 force（§5 决策已定）+ 注入 installCore + 受管核在位
+    // （helper 模式读路径优先它）时，把随包核 + libcronet 放进干净临时 seedDir，经 helper install-core（sha256 校验、
+    // 免密、原子 rename）写入 root 受管目录。失败仅告警不抛——返回值仍解析到受管核，§5 诚实校验会探测到旧版本、由版本
+    // 闸门兜底（绝不谎报成功）。helper 未装/受管核不在位 → 跳过，走下方 userData 兜底核（setcap 路径零回归）。
+    if (this.platform === 'linux' && force && deps?.installCore && this.linuxManagedCoreUsable()) {
+      let seedDir: string | null = null;
+      try {
+        const os = require('os') as typeof import('os');
+        seedDir = await fs.mkdtemp(path.join(os.tmpdir(), 'flowz-core-reseed-'));
+        const seedBin = path.join(seedDir, 'sing-box');
+        await fs.copyFile(this.getBundledSingBoxPath(), seedBin);
+        await fs.chmod(seedBin, 0o755);
+        await this.ensureCronetBeside(seedDir); // naive purego 同目录加载，libcronet.so 随核配套
+        const r = await deps.installCore(seedDir);
+        if (!r.ok) this.log('warn', `受管核重播种失败: ${r.error ?? ''}`);
+      } catch (e) {
+        this.log('warn', `受管核刷新失败: ${(e as Error)?.message ?? e}`);
+      } finally {
+        if (seedDir) await fs.rm(seedDir, { recursive: true, force: true }).catch(() => {});
+      }
+    }
+
     const filename = this.platform === 'win32' ? 'sing-box.exe' : 'sing-box';
     const userDataPath = app.getPath('userData');
     const updateDir = path.join(userDataPath, 'core_update');
@@ -398,7 +457,8 @@ export class ResourceManager {
     if (!force && (await this.fileExists(targetPath))) {
       // 已有可写核心：仍需确保 libcronet 在旁（naive 出站靠 purego 同目录/系统库路径加载）
       await this.ensureCronetBeside(updateDir);
-      return targetPath;
+      // Linux 现役核对齐：helper 模式返回受管核（探测/校验/实跑同源），无 helper 返回 userData 核（等价旧值）。
+      return this.platform === 'linux' ? this.getSingBoxPath() : targetPath;
     }
 
     // 创建目录
@@ -419,7 +479,8 @@ export class ResourceManager {
     // naive 节点需要 libcronet 与 sing-box 同目录（purego 加载），随核心一并放过去
     await this.ensureCronetBeside(updateDir);
 
-    return targetPath;
+    // Linux 现役核对齐：helper 模式返回受管核（上方 force 腿已刷新），无 helper 返回刚写的 userData 核（等价旧 targetPath）。
+    return this.platform === 'linux' ? this.getSingBoxPath() : targetPath;
   }
 
   /** 各平台 NaiveProxy 核心库文件名（purego 期望的名字） */

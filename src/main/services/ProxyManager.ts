@@ -562,7 +562,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 先保存当前配置（needsRootPrivilege 等方法需要用到）
     this.currentConfig = config;
 
-    // Linux 下确保核心在用户目录且可执行，以便支持 setcap 和规避 AppImage EROFS
+    // Linux：解析现役核（helper 模式=root 受管核，setcap 兜底=userData 可写核）并维护 userData 兜底核。每次 start
+    // 重解析（对齐 darwin/win HIGH-1）：探测/校验/实跑对准同一核。ensureWritableCore 内按平台维护 + 返回现役核。
     if (process.platform === 'linux') {
       try {
         this.singboxPath = await resourceManager.ensureWritableCore();
@@ -613,10 +614,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         );
         let reseedError = '';
         try {
-          // §5 两平台统一经 ensureWritableCore(true)：linux force 覆盖可写核；darwin 经注入的 helper installCore
-          // 重播种随包核到受保护目录（root-only，helper 上方 maybePromptHelperGate 已引导在位）。临时目录复制 +
-          // installCore 编排已下沉 ResourceManager（平台感知，免 ProxyManager 内联）。修：app 更新后受保护目录旧核不自愈。
-          // darwin helperManager 恒为 HelperManager（win 才注入 WindowsServiceHelper）；installCore 是具体方法非接口成员，故 cast。
+          // §5 两平台统一经 ensureWritableCore(true)：darwin 经 helper installCore 重播种随包核到受保护目录；
+          // **linux helper 模式同构** —— 经注入的 LinuxServiceHelper.installCore 免密刷新 root 受管核（受管核不在位/
+          // 无 helper 则退化为刷 userData 兜底核，setcap 路径零回归）。临时目录复制 + installCore 编排下沉 ResourceManager。
+          // 修：app 更新后 macOS 受保护目录 / Linux 受管核旧核不自愈。
+          // darwin helperManager 恒为 HelperManager；linux 为注入的 LinuxServiceHelper（installCore 同签名，duck-typing）；故 cast。
           if (process.platform === 'darwin') this.helperManager ??= new HelperManager();
           this.singboxPath = await resourceManager.ensureWritableCore(true, {
             installCore: (seedDir) => (this.helperManager as HelperManager).installCore(seedDir),
@@ -3339,6 +3341,13 @@ done
   }
 
   /**
+   * 检查是否需要 Linux TUN 提权（仅 Linux TUN 模式）。就绪的 systemd helper 可零提权驱动；否则回退 setcap+pkexec。
+   */
+  private needsLinuxTun(): boolean {
+    return process.platform === 'linux' && this.needsRootPrivilege();
+  }
+
+  /**
    * Linux TUN：确保打包核心具备 TUN 所需 capabilities，并安装一条「仅当前用户改 systemd-resolved
    * 链路 DNS」的 polkit 规则——否则 sing-box(auto_route) 经 resolve1 D-Bus 设 DNS 时，polkit 按 uid
    * （非 root）逐条弹 4 次密码框（issue #33）。一次 pkexec 同做 setcap + 写规则；幂等：caps 已具备且
@@ -3732,6 +3741,21 @@ exit 0
       throw new Error(
         '提权助手不可用，已跳过非交互（崩溃自动重启）的管理员权限授权——请手动重启代理以经引导安装/修复 helper'
       );
+    }
+
+    // Linux TUN 模式 + systemd helper 就绪 → 零提权路径（socket 驱动，避免每次 pkexec setcap）。就绪即经 helper 起核；
+    // 启动失败 → 回退下方 ensureLinuxTunCapabilities（setcap+pkexec）兜底，不在 helper 路径死循环。未装 helper →
+    // isReady=false → 直接落 fallback，零回归（镜像上方 macOS/Windows helper 分支）。
+    if (this.needsLinuxTun() && this.helperManager && (await this.helperManager.isReady())) {
+      try {
+        return await this.startViaHelper(startGen);
+      } catch (e) {
+        if (e instanceof CoreStartRetryError || e instanceof CoreStartSupersededError) throw e;
+        this.logToManager(
+          'warn',
+          `helper 启动失败，回退 setcap 路径: ${e instanceof Error ? e.message : String(e)}`
+        );
+      }
     }
 
     // Linux TUN：在 spawn 前确保核心具备 capabilities + 安装 polkit 规则（首次弹 1 次密码，之后启停零
@@ -4273,6 +4297,42 @@ exit 0
         return;
       }
       return this.stopSingBoxOnWindows(opts);
+    }
+
+    // Linux TUN 模式：经 systemd helper 启动的 sing-box（startViaHelper 设 singboxPid+startedViaHelper 但不设
+    // singboxProcess）→ 经 helper.stopCore() 停（零提权）。root helper 能停自己拉起的 child。helper 停未生效 → 直接
+    // 终止 pid（核以登录用户跑，app 同 uid 可 kill，无需提权）。setcap 直起路径 startedViaHelper=false → 落下方通用
+    // singboxProcess 分支，零回归。镜像 macOS/Windows helper-stop 分支。
+    if (
+      this.singboxPid &&
+      process.platform === 'linux' &&
+      this.startedViaHelper &&
+      this.helperManager
+    ) {
+      const pidToKill = this.singboxPid;
+      this.logToManager('info', `正在经提权 helper 停止 sing-box (PID: ${pidToKill})（免提权）...`);
+      if (this.isProcessAlive(pidToKill)) {
+        await this.helperManager.stopCore();
+        await this.waitForProcessExit(pidToKill, opts?.quitting ? 3000 : 8000);
+      }
+      if (this.isProcessAlive(pidToKill)) {
+        // helper 停未生效（极少）→ 同 uid 直接 TERM→KILL 兜底（核以登录用户跑，无需提权）。
+        this.logToManager('warn', 'helper 停止未生效，回退同 uid 直接终止');
+        try {
+          process.kill(pidToKill, 'SIGTERM');
+        } catch {
+          /* 已退出 */
+        }
+        await this.waitForProcessExit(pidToKill, 3000);
+        try {
+          if (this.isProcessAlive(pidToKill)) process.kill(pidToKill, 'SIGKILL');
+        } catch {
+          /* 已退出 */
+        }
+      }
+      this.logToManager('info', 'sing-box 已停止（helper 路径）');
+      this.finishStop();
+      return;
     }
 
     if (!this.singboxProcess) {
