@@ -54,7 +54,8 @@ export interface ServerActionsContext {
   onDelete: (serverId: string) => void;
 }
 
-/** 无分享链接的协议（ProtocolParser.generateUrl 无对应分支）：隐藏/排除复制按钮，避免 per-server 抛错刷屏。 */
+/** 无分享链接的协议（ProtocolParser.generateUrl 无对应分支）：隐藏/排除复制按钮，避免 per-server 抛错刷屏。
+ *  snell 已按事实形态（sub-store 等）支持 parse/generate，不在此列。 */
 export const NO_SHARE_LINK_PROTOCOLS = new Set(['ssh', 'wireguard', 'tailscale', 'custom']);
 export const hasShareLink = (protocol: string | undefined): boolean =>
   !NO_SHARE_LINK_PROTOCOLS.has(protocol?.toLowerCase() || '');
