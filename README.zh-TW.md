@@ -22,7 +22,7 @@
 
 - **一次授權，永久零提權** — macOS root daemon / Windows 系統服務，安裝一次後 TUN 啟停 · 切換節點 · 退出全程免授權。
 - **改規則不斷流** — 編輯已啟用規則的比對值，經 local rule-set 熱重載**即時生效、連線零中斷**；只有結構變更才重啟（去抖合併、只重啟一次）。
-- **任意協定，核心即權威** — 貼上 sing-box outbound JSON（如 **Snell**）即可使用，儲存時即時探測目前核心的相容性；官方核心不支援的協定可**手動換用第三方 fork 核心**，FlowZ 會自動辨識 fork 並停用線上更新以保護它。
+- **任意協定，核心即權威** — 貼上 sing-box outbound JSON即可使用，儲存時即時探測目前核心的相容性；官方核心不支援的協定可**手動換用第三方 fork 核心**，FlowZ 會自動辨識 fork 並停用線上更新以保護它。
 - **組網開箱即用** — WireGuard / **WARP（一鍵匿名註冊）** / **Tailscale（瀏覽器互動登入）** 作為一等節點，可選取 · 分流 · 熱切。
 - **退出零殘留** — 跨平台清理 sing-box 程序 / 虛擬網卡 / 系統代理，當機 · 登出 · 關機都有兜底。
 - **sing-box 1.14 原生管理面** — 內建 1.14 核心，原生 gRPC 管理 API + 可選官方 dashboard 面板。
@@ -32,9 +32,9 @@
 ## ✨ 功能特性
 
 **協定**
-- 代理：VLESS / VMess / Trojan / Shadowsocks / Hysteria2 / TUIC / AnyTLS / **NaiveProxy** / SOCKS / HTTP / SSH
+- 代理：VLESS / VMess / Trojan / Shadowsocks / **Snell** / Hysteria2 / TUIC / AnyTLS / **NaiveProxy** / SOCKS / HTTP / SSH
 - 組網：**WireGuard** / **Cloudflare WARP** / **Tailscale**
-- **自訂協定 + 換核擴充**：貼上 sing-box outbound JSON（如 **Snell**），儲存時以「核心即權威」即時探測相容性；官方核心不支援的協定可手動替換為支援它的第三方 fork 核心（FlowZ 會自動辨識 fork、停用線上更新以防覆蓋）
+- **自訂協定 + 換核擴充**：貼上 sing-box outbound JSON，儲存時以「核心即權威」即時探測相容性；官方核心不支援的協定可手動替換為支援它的第三方 fork 核心（FlowZ 會自動辨識 fork、停用線上更新以防覆蓋）
 
 **核心**
 - sing-box 1.14 統一核心，隨套件內建（Windows / macOS arm64+x64 / Linux）

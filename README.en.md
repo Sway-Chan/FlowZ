@@ -22,7 +22,7 @@ Built around: **simple setup · clear rules · uninterrupted switching · author
 
 - **Authorize once, never again** — a macOS root daemon / Windows system service is installed a single time; afterwards starting/stopping TUN, switching nodes, and quitting are all prompt-free.
 - **Edit rules without dropping connections** — changing the match values of an already-enabled rule takes effect **instantly with zero interruption** via local rule-set hot-reload; only structural changes restart the core (debounced, restarted only once).
-- **Any protocol, the core is the source of truth** — paste a sing-box outbound JSON (e.g. **Snell**) and it just works; compatibility is probed against the running core on save. For protocols the official core doesn't support, you can **manually swap in a third-party fork core** — FlowZ detects the fork and disables online updates to protect it.
+- **Any protocol, the core is the source of truth** — paste a sing-box outbound JSON and it just works; compatibility is probed against the running core on save. For protocols the official core doesn't support, you can **manually swap in a third-party fork core** — FlowZ detects the fork and disables online updates to protect it.
 - **Mesh out of the box** — WireGuard / **WARP (one-click anonymous registration)** / **Tailscale (interactive browser login)** are first-class nodes you can select, route, and hot-switch.
 - **No leftovers on exit** — cross-platform cleanup of the sing-box process / virtual adapter / system proxy, with fallbacks for crash, logout, and shutdown.
 - **sing-box 1.14 native management** — bundled 1.14 core, native gRPC management API plus an optional official dashboard panel.
@@ -32,9 +32,9 @@ Built around: **simple setup · clear rules · uninterrupted switching · author
 ## ✨ Features
 
 **Protocols**
-- Proxy: VLESS / VMess / Trojan / Shadowsocks / Hysteria2 / TUIC / AnyTLS / **NaiveProxy** / SOCKS / HTTP / SSH
+- Proxy: VLESS / VMess / Trojan / Shadowsocks / **Snell** / Hysteria2 / TUIC / AnyTLS / **NaiveProxy** / SOCKS / HTTP / SSH
 - Mesh: **WireGuard** / **Cloudflare WARP** / **Tailscale**
-- **Custom protocol + core swap**: paste a sing-box outbound JSON (e.g. **Snell**); on save, "the core is the source of truth" probes live compatibility. For protocols the official core lacks, manually replace it with a third-party fork core that supports them (FlowZ auto-detects forks and disables online updates to avoid overwriting them).
+- **Custom protocol + core swap**: paste a sing-box outbound JSON; on save, "the core is the source of truth" probes live compatibility. For protocols the official core lacks, manually replace it with a third-party fork core that supports them (FlowZ auto-detects forks and disables online updates to avoid overwriting them).
 
 **Core**
 - sing-box 1.14 unified core, bundled per-platform (Windows / macOS arm64+x64 / Linux)

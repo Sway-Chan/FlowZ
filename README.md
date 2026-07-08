@@ -22,7 +22,7 @@
 
 - **一次授权，永久零提权** — macOS root daemon / Windows 系统服务，装一次后 TUN 启停 · 切节点 · 退出全程免授权。
 - **改规则不断流** — 编辑已启用规则的匹配值经 local rule-set 热重载**即时生效、连接零中断**；只有结构变更才重启（去抖合并、只重启一次）。
-- **任意协议，内核即权威** — 粘贴 sing-box outbound JSON（如 **Snell**）即用，保存时实时探测当前内核兼容性；官方核不支持的协议可**手动换用第三方 fork 内核**，FlowZ 自动识别 fork 并停用在线更新以保护它。
+- **任意协议，内核即权威** — 粘贴 sing-box outbound JSON即用，保存时实时探测当前内核兼容性；官方核不支持的协议可**手动换用第三方 fork 内核**，FlowZ 自动识别 fork 并停用在线更新以保护它。
 - **组网开箱即用** — WireGuard / **WARP（一键匿名注册）** / **Tailscale（浏览器交互登录）** 作为一等节点，可选中 · 分流 · 热切。
 - **退出零残留** — 跨平台清理 sing-box 进程 / 虚拟网卡 / 系统代理，崩溃 · 注销 · 关机都兜底。
 - **sing-box 1.14 原生管理面** — 内置 1.14 内核，原生 gRPC 管理 API + 可选官方 dashboard 面板。
@@ -32,9 +32,9 @@
 ## ✨ 功能特性
 
 **协议**
-- 代理：VLESS / VMess / Trojan / Shadowsocks / Hysteria2 / TUIC / AnyTLS / **NaiveProxy** / SOCKS / HTTP / SSH
+- 代理：VLESS / VMess / Trojan / Shadowsocks / **Snell** / Hysteria2 / TUIC / AnyTLS / **NaiveProxy** / SOCKS / HTTP / SSH
 - 组网：**WireGuard** / **Cloudflare WARP** / **Tailscale**
-- **自定义协议 + 换核扩展**：粘贴 sing-box outbound JSON（如 **Snell**），保存时「内核即权威」实时探测兼容性；官方核不支持的协议可手动替换为支持它的第三方 fork 内核（FlowZ 自动识别 fork、停用在线更新以防覆盖）
+- **自定义协议 + 换核扩展**：粘贴 sing-box outbound JSON，保存时「内核即权威」实时探测兼容性；官方核不支持的协议可手动替换为支持它的第三方 fork 内核（FlowZ 自动识别 fork、停用在线更新以防覆盖）
 
 **核心**
 - sing-box 1.14 统一内核，随包内置（Windows / macOS arm64+x64 / Linux）
