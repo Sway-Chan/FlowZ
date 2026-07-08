@@ -12,7 +12,14 @@ import {
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
-import { Loader2, Link as LinkIcon, Edit, Activity, AlertTriangle } from 'lucide-react';
+import {
+  Loader2,
+  Link as LinkIcon,
+  Edit,
+  Activity,
+  AlertTriangle,
+  ChevronDown,
+} from 'lucide-react';
 import type { SubscriptionConfig } from '@/bridge/types';
 import {
   SUBSCRIPTION_ERROR_I18N_KEY,
@@ -51,6 +58,9 @@ export function SubscriptionDialog({
   const [updateViaProxy, setUpdateViaProxy] = useState(false); // per-sub 经代理更新（默认关）
   const [appVersion, setAppVersion] = useState('');
   const [isSaving, setIsSaving] = useState(false);
+  // 字段级校验错误内联展示（§6：可归位到字段的错误不走 toast 通知流，就地红框+红字）。
+  const [nameError, setNameError] = useState('');
+  const [urlError, setUrlError] = useState('');
 
   // 取 app 版本以拼出默认 UA placeholder（FlowZ/<版本>），与主进程 defaultSubscriptionUserAgent() 保持一致。
   useEffect(() => {
@@ -69,6 +79,8 @@ export function SubscriptionDialog({
 
   useEffect(() => {
     if (open) {
+      setNameError('');
+      setUrlError('');
       if (subscription) {
         setName(subscription.name);
         setUrl(subscription.url);
@@ -86,14 +98,16 @@ export function SubscriptionDialog({
   }, [open, subscription]);
 
   const handleSave = async () => {
+    let hasError = false;
     if (!name.trim()) {
-      toast.error(t('sub.requireName'));
-      return;
+      setNameError(t('sub.requireName'));
+      hasError = true;
     }
     if (!url.trim()) {
-      toast.error(t('sub.requireUrl'));
-      return;
+      setUrlError(t('sub.requireUrl'));
+      hasError = true;
     }
+    if (hasError) return;
 
     try {
       setIsSaving(true);
@@ -153,8 +167,14 @@ export function SubscriptionDialog({
               id="sub-name"
               placeholder={t('sub.namePlaceholder')}
               value={name}
-              onChange={(e) => setName(e.target.value)}
+              onChange={(e) => {
+                setName(e.target.value);
+                if (nameError) setNameError('');
+              }}
+              aria-invalid={!!nameError}
+              className={nameError ? 'border-destructive focus-visible:ring-destructive' : ''}
             />
+            {nameError && <p className="text-sm text-destructive">{nameError}</p>}
           </div>
           <div className="space-y-2">
             <Label htmlFor="sub-url">{t('sub.urlLabel')}</Label>
@@ -162,8 +182,14 @@ export function SubscriptionDialog({
               id="sub-url"
               placeholder="https://example.com/api/v1/client/subscribe?token=xxx"
               value={url}
-              onChange={(e) => setUrl(e.target.value)}
+              onChange={(e) => {
+                setUrl(e.target.value);
+                if (urlError) setUrlError('');
+              }}
+              aria-invalid={!!urlError}
+              className={urlError ? 'border-destructive focus-visible:ring-destructive' : ''}
             />
+            {urlError && <p className="text-sm text-destructive">{urlError}</p>}
           </div>
 
           <div className="space-y-2">
@@ -210,51 +236,62 @@ export function SubscriptionDialog({
             </div>
           )}
 
-          <div className="flex items-center justify-between rounded-lg border p-3 shadow-sm">
-            <div className="space-y-0.5">
-              <Label htmlFor="sub-auto-update">{t('sub.autoUpdate')}</Label>
-              <div className="text-[0.8rem] text-muted-foreground">{t('sub.autoUpdateDesc')}</div>
-            </div>
-            <Switch id="sub-auto-update" checked={autoUpdate} onCheckedChange={setAutoUpdate} />
-          </div>
-          {/* 开启自动更新即提示重启代价（订阅刷新带来节点变动会重启代理、短暂断流） */}
-          {autoUpdate && (
-            <p className="flex items-start gap-1.5 px-1 text-[0.8rem] text-warning">
-              <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
-              <span>{t('sub.autoUpdateRestartHint')}</span>
-            </p>
-          )}
+          {/* 高级设置（默认折叠，用户反馈）：自动更新 + 经代理更新。 */}
+          <details className="group rounded-lg border shadow-sm">
+            <summary className="flex cursor-pointer select-none items-center justify-between px-3 py-2.5 text-sm font-medium [&::-webkit-details-marker]:hidden">
+              <span>{t('sub.advancedSection', '高级')}</span>
+              <ChevronDown className="h-4 w-4 text-muted-foreground transition-transform group-open:rotate-180" />
+            </summary>
+            <div className="flex flex-col gap-3 border-t p-3">
+              <div className="flex items-center justify-between rounded-lg bg-muted/40 p-3">
+                <div className="space-y-0.5">
+                  <Label htmlFor="sub-auto-update">{t('sub.autoUpdate')}</Label>
+                  <div className="text-[0.8rem] text-muted-foreground">
+                    {t('sub.autoUpdateDesc')}
+                  </div>
+                </div>
+                <Switch id="sub-auto-update" checked={autoUpdate} onCheckedChange={setAutoUpdate} />
+              </div>
+              {/* 开启自动更新即提示重启代价（订阅刷新带来节点变动会重启代理、短暂断流） */}
+              {autoUpdate && (
+                <p className="flex items-start gap-1.5 px-1 text-[0.8rem] text-warning">
+                  <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
+                  <span>{t('sub.autoUpdateRestartHint')}</span>
+                </p>
+              )}
 
-          {/* 经代理更新（per-sub）：仅全局策略为「跟随订阅设置」(follow) 时可设；'proxy'/'direct' 被全局覆盖、置灰 */}
-          <div className="flex items-center justify-between rounded-lg border p-3 shadow-sm">
-            <div className="space-y-0.5">
-              <div className="flex items-center gap-1.5">
-                <Label htmlFor="sub-via-proxy">{t('sub.updateViaProxy', '经代理更新')}</Label>
-                <InfoTooltip
-                  content={t(
-                    'sub.updateViaProxyDescFull',
-                    '开启后该订阅经运行中的代理拉取（订阅地址被直连封锁时用）；代理未运行时本轮跳过、就绪后自动补更。仅当「更新与测速」的全局「订阅更新经代理」为「跟随订阅设置」时本开关生效。'
-                  )}
+              {/* 经代理更新（per-sub）：仅全局策略为「跟随订阅设置」(follow) 时可设；'proxy'/'direct' 被全局覆盖、置灰 */}
+              <div className="flex items-center justify-between rounded-lg bg-muted/40 p-3">
+                <div className="space-y-0.5">
+                  <div className="flex items-center gap-1.5">
+                    <Label htmlFor="sub-via-proxy">{t('sub.updateViaProxy', '经代理更新')}</Label>
+                    <InfoTooltip
+                      content={t(
+                        'sub.updateViaProxyDescFull',
+                        '开启后该订阅经运行中的代理拉取（订阅地址被直连封锁时用）；代理未运行时本轮跳过、就绪后自动补更。仅当「更新与测速」的全局「订阅更新经代理」为「跟随订阅设置」时本开关生效。'
+                      )}
+                    />
+                  </div>
+                  <div className="text-[0.8rem] text-muted-foreground">
+                    {subscriptionProxyPolicy === 'proxy'
+                      ? t('sub.updateViaProxyOverrideProxy', '已由全局策略覆盖：全部订阅经代理')
+                      : subscriptionProxyPolicy === 'direct'
+                        ? t('sub.updateViaProxyOverrideDirect', '已由全局策略覆盖：全部订阅直连')
+                        : t(
+                            'sub.updateViaProxyDesc',
+                            '该订阅经运行中的代理拉取（代理未运行则就绪后补更）'
+                          )}
+                  </div>
+                </div>
+                <Switch
+                  id="sub-via-proxy"
+                  checked={updateViaProxy}
+                  onCheckedChange={setUpdateViaProxy}
+                  disabled={subscriptionProxyPolicy !== 'follow'}
                 />
               </div>
-              <div className="text-[0.8rem] text-muted-foreground">
-                {subscriptionProxyPolicy === 'proxy'
-                  ? t('sub.updateViaProxyOverrideProxy', '已由全局策略覆盖：全部订阅经代理')
-                  : subscriptionProxyPolicy === 'direct'
-                    ? t('sub.updateViaProxyOverrideDirect', '已由全局策略覆盖：全部订阅直连')
-                    : t(
-                        'sub.updateViaProxyDesc',
-                        '该订阅经运行中的代理拉取（代理未运行则就绪后补更）'
-                      )}
-              </div>
             </div>
-            <Switch
-              id="sub-via-proxy"
-              checked={updateViaProxy}
-              onCheckedChange={setUpdateViaProxy}
-              disabled={subscriptionProxyPolicy !== 'follow'}
-            />
-          </div>
+          </details>
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)} disabled={isSaving}>

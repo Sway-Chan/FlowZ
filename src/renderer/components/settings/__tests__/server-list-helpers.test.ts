@@ -2,7 +2,14 @@
  * tailscaleNeedsLogin 角标判定单测（Phase 1：真实登录态驱动，非静态 !authKey）。
  * 三档：有 authKey / 无 authKey 但已登录(loggedIn) / 都无；外加非 Tailscale 节点恒 false。
  */
-import { tailscaleNeedsLogin, tailscaleLoginUiState, sortServers } from '../server-list-helpers';
+import {
+  tailscaleNeedsLogin,
+  tailscaleLoggingIn,
+  tailscaleLoginUiState,
+  sortServers,
+  meshIsExitCapable,
+  meshInternetOff,
+} from '../server-list-helpers';
 
 // 仅取 tailscaleNeedsLogin 用到的字段，避免引 @/bridge/types（jest 无 @ 别名）。
 const ts = (over: Record<string, unknown> = {}) =>
@@ -38,6 +45,39 @@ describe('tailscaleNeedsLogin', () => {
   });
 });
 
+describe('统一节点卡 · TS 登录三态→角标映射（批3b：退役单例卡后 ServerCard 承载状态显示）', () => {
+  // 复刻 ServerCard 的角标优先级：loggingIn 优先，needs-login 仅在 !loggingIn 时显示。
+  // 三态 = 交互登录型（无 authKey）的 needs-login / logging-in / connected → 卡片有效角标。
+  const badge = (hasAuthUrl: boolean, loggedIn: boolean): 'logging-in' | 'needs-login' | 'none' => {
+    const s = ts();
+    if (tailscaleLoggingIn(s, hasAuthUrl, loggedIn)) return 'logging-in';
+    if (tailscaleNeedsLogin(s, loggedIn)) return 'needs-login';
+    return 'none';
+  };
+
+  it('needs-login（未登录 · 无 authUrl）→ 卡片显「Log in」角标', () => {
+    expect(badge(false, false)).toBe('needs-login');
+  });
+
+  it('logging-in（未登录 · 有 authUrl）→ 卡片显「登录中」角标（优先于 needs-login）', () => {
+    expect(badge(true, false)).toBe('logging-in');
+    // 优先级证据：此态下 needsLogin 谓词本身仍为真，但 loggingIn 抢先。
+    expect(tailscaleNeedsLogin(ts(), false)).toBe(true);
+    expect(tailscaleLoggingIn(ts(), true, false)).toBe(true);
+  });
+
+  it('connected（loggedIn=true）→ 常规卡，无登录角标（不论 authUrl 残留）', () => {
+    expect(badge(false, true)).toBe('none');
+    expect(badge(true, true)).toBe('none');
+  });
+
+  it('authKey 静态形态（key-ready）→ 无登录角标（既不 needs-login 也不 logging-in）', () => {
+    const keyed = ts({ tailscaleSettings: { authKey: 'tskey-x' } });
+    expect(tailscaleNeedsLogin(keyed, false)).toBe(false);
+    expect(tailscaleLoggingIn(keyed, true, false)).toBe(false);
+  });
+});
+
 describe('tailscaleLoginUiState（表单登录区三态）', () => {
   it('新建态（无 id）→ none，与 loggedIn/authKey 无关', () => {
     expect(tailscaleLoginUiState(false, false, false)).toBe('none');
@@ -56,6 +96,44 @@ describe('tailscaleLoginUiState（表单登录区三态）', () => {
 
   it('有 id、未登录、已填 authKey（pre-auth）→ none（不显交互登录区）', () => {
     expect(tailscaleLoginUiState(true, false, true)).toBe('none');
+  });
+});
+
+describe('meshIsExitCapable（组网节点「出口」能力 chip 判定）', () => {
+  const node = (over: Record<string, unknown> = {}) =>
+    ({ id: 'n1', name: 'm', protocol: 'wireguard', ...over }) as any;
+
+  it('WireGuard 默认（未显式关外网）→ 可作出口（true）', () => {
+    expect(meshIsExitCapable(node())).toBe(true);
+    expect(meshIsExitCapable(node({ wireguardSettings: { allowInternet: true } }))).toBe(true);
+  });
+
+  it('WireGuard 显式关外网（allowInternet=false）→ 仅内网、不可作出口（false）', () => {
+    expect(meshIsExitCapable(node({ wireguardSettings: { allowInternet: false } }))).toBe(false);
+  });
+
+  it('Tailscale 配了出口设备（exitNode）→ 可作出口（true）；未配 → false', () => {
+    expect(
+      meshIsExitCapable(node({ protocol: 'tailscale', tailscaleSettings: { exitNode: 'peer-1' } }))
+    ).toBe(true);
+    expect(meshIsExitCapable(node({ protocol: 'tailscale', tailscaleSettings: {} }))).toBe(false);
+    expect(
+      meshIsExitCapable(node({ protocol: 'tailscale', tailscaleSettings: { exitNode: '  ' } }))
+    ).toBe(false);
+  });
+
+  it('非组网协议（vless/trojan）→ 恒 false（出口能力由协议隐含，不标注）', () => {
+    expect(meshIsExitCapable(node({ protocol: 'vless' }))).toBe(false);
+    expect(meshIsExitCapable(node({ protocol: 'trojan' }))).toBe(false);
+  });
+
+  it('与 meshInternetOff 对 endpoint 节点互斥（恰一为真）', () => {
+    const full = node({ wireguardSettings: { allowInternet: true } });
+    const lanOnly = node({ wireguardSettings: { allowInternet: false } });
+    expect(meshIsExitCapable(full)).toBe(true);
+    expect(meshInternetOff(full)).toBe(false);
+    expect(meshIsExitCapable(lanOnly)).toBe(false);
+    expect(meshInternetOff(lanOnly)).toBe(true);
   });
 });
 

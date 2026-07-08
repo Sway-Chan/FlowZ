@@ -140,7 +140,8 @@ export interface RuleResourceListItem extends RuleResource {
  * label：route=已就绪文案（备注/首条件摘要）；app=内置 labelKey(i18n key) 或自定义 name（由 appBuiltin 决定渲染端是否 i18n）。
  */
 export interface RuleResourceRef {
-  kind: 'route' | 'app';
+  // system = 智能分流 geo 基线层对内置默认(geosite-cn/geoip-cn/geolocation-!cn)的隐式引用（纳入 referencedBy 计数）
+  kind: 'route' | 'app' | 'system';
   id: string;
   label: string;
   appBuiltin?: boolean;
@@ -211,4 +212,14 @@ export interface CustomAppPreset {
   iconUrl?: string;
   geositeTags: string[];
   geoipTags?: string[];
+  /**
+   * 进程名（真·应用分流，与内置预设 processNames 同源消费点 ProxyManager.effectiveAppRules）。
+   * 由 getAppPreset 透传给配置生成：命中即按进程名路由，比 geo 域名匹配更精准（macOS/Windows/Linux TUN 模式）。
+   */
+  processNames?: string[];
+  /**
+   * 分类归属（纯 UI：应用卡按分类分组展示，可为内置 5 类之一或用户自建分类名）。
+   * 配置生成不消费 category（后端只读 geositeTags/geoipTags/processNames），故仅影响卡片分组呈现。
+   */
+  category?: string;
 }

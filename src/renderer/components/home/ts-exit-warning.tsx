@@ -1,5 +1,5 @@
 /**
- * 首页「Tailscale 出口名不副实」行内警示（§H）。挂在 ConnectionStatusCard「当前服务器」下拉正下方：选中 TS 当出口
+ * 首页「Tailscale 出口名不副实」行内警示（§H）。挂在 ConnectionControlCard（原 ConnectionStatusCard）「出口节点」下拉正下方：选中 TS 当出口
  * 但出不了公网（未选出口设备 / 出口设备离线）时给一行 warning 注脚 +「选择出口设备」链接直达 TS 设置。
  * 判定单一真值 = deriveTsExitWarning。none → 渲染 null。纯 renderer 视图态、零 IPC/config-gen/重启。取代旧 §G nudge。
  */
@@ -42,7 +42,15 @@ export function TsExitWarning() {
       <p className="min-w-0 text-xs text-muted-foreground">
         {warning === 'no-exit-device'
           ? t('home.tsExitNoDeviceWarn', '已设为出口，但未选择出口设备，公网流量仍走直连。')
-          : t('home.tsExitDeviceOfflineWarn', '出口设备当前离线，公网可能无法经 Tailscale 出网。')}
+          : warning === 'exit-device-not-advertised'
+            ? t(
+                'home.tsExitNotAdvertisedWarn',
+                '所选出口设备未广告为出口节点，公网无法经其出网，请换一台已广告出口的设备。'
+              )
+            : t(
+                'home.tsExitDeviceOfflineWarn',
+                '出口设备当前离线，公网可能无法经 Tailscale 出网。'
+              )}
         <button
           type="button"
           onClick={goPickExitNode}

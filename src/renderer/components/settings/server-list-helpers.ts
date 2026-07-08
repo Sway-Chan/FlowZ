@@ -3,6 +3,7 @@
  * 全部不依赖组件 state/props，供主组件 + ServerCard/ServerRow/ServerActions 子组件共用，逐字保留原行为。
  */
 import type { ServerConfig } from '@/bridge/types';
+import { latencyTone, LATENCY_TONE_TEXT_CLASS, type LatencyTone } from '../ui/node-picker-logic';
 import {
   isAccountBasedProtocol,
   isEndpointProtocol,
@@ -105,6 +106,20 @@ export const getTransportLabel = (server: ServerConfigWithId): string => {
 export const isWarpNode = (s: ServerConfigWithId): boolean => isWarpServer(s);
 
 /**
+ * 节点类型 pill 显示标签（单一真值，ServerRow / ServerCard 共用，复用 server-picker-items 的「WARP 优先」模式）：
+ *   - WARP：语义独立，显 'WARP' 而非底层 wireguard —— 消 line 95「WIREGUARD」+ 独立 WARP 徽章的双标识残留。
+ *   - 组网协议：用短名 WG / TS —— 全大写 WIREGUARD/TAILSCALE(9 字符) 在弹性行里易触发行溢出被 .nd-rows overflow:hidden 截断。
+ *   - 其余：保持大写协议名，与既有 pill 视觉一致（WG/TS/WARP 本就全大写、不破坏风格）。
+ */
+export const nodeTypeLabel = (s: ServerConfigWithId): string => {
+  if (isWarpServer(s)) return 'WARP';
+  const p = s.protocol?.toLowerCase();
+  if (p === 'wireguard') return 'WG';
+  if (p === 'tailscale') return 'TS';
+  return (s.protocol || '').toUpperCase();
+};
+
+/**
  * Tailscale 节点是否「需登录」（Phase 1：真实登录态驱动，非静态 !authKey）。
  * 真实登录态 = authKey || loggedIn（主进程 state 目录真值，经 store.tailscaleLoginStates 透传）。
  * loggedIn 缺省 false（store 未刷新到该节点时按「需登录」保守显示，刷新后即收敛）。
@@ -151,6 +166,12 @@ export const tailscaleLoginUiState = (
 export const meshInternetOff = (s: ServerConfigWithId): boolean =>
   isEndpointProtocol(s.protocol) && !meshNodeCarriesFullTunnel(s);
 
+/** 组网节点承载全隧道默认出口 → 可作全局出口（meshInternetOff 的正向补集），列表用 teal「出口」chip 正向标注。
+ *  「出口能力」与「当前选中(current ring)」是正交两层：能力 chip 说明「能否作出口」，ring 说明「此刻是否选它」。
+ *  仅对 endpoint 协议(WG/WARP/Tailscale)成立；代理节点恒 false（其出口能力由协议本身隐含，不需标注）。 */
+export const meshIsExitCapable = (s: ServerConfigWithId): boolean =>
+  isEndpointProtocol(s.protocol) && meshNodeCarriesFullTunnel(s);
+
 // 账号制协议（Tailscale）无 server address/port；自定义协议 server/port 在 JSON 内（缺则显类型）——
 // 卡片副标题不展示 `undefined:undefined`。
 export const endpointLabel = (server: ServerConfigWithId): string => {
@@ -162,21 +183,20 @@ export const endpointLabel = (server: ServerConfigWithId): string => {
   return `${server.address}:${server.port}`;
 };
 
-export const getLatencyColor = (latency: number | undefined) => {
-  if (latency === undefined) return 'text-muted-foreground';
-  if (latency === -1) return 'text-destructive';
-  if (latency < 100) return 'text-success';
-  if (latency < 300) return 'text-warning';
-  return 'text-destructive';
+// 延迟色档与 .npick 共用单一真值：阈值判定委托 latencyTone，文字色映射复用 LATENCY_TONE_TEXT_CLASS，
+// 背景色映射为本地色档表（仅此处消费）——杜绝阈值/映射双写漂移。
+const LATENCY_TONE_BG_CLASS: Record<LatencyTone, string> = {
+  good: 'bg-success/10',
+  medium: 'bg-warning/10',
+  bad: 'bg-destructive/10',
+  idle: '',
 };
 
-export const getLatencyBg = (latency: number | undefined) => {
-  if (latency === undefined) return '';
-  if (latency === -1) return 'bg-destructive/10';
-  if (latency < 100) return 'bg-success/10';
-  if (latency < 300) return 'bg-warning/10';
-  return 'bg-destructive/10';
-};
+export const getLatencyColor = (latency: number | undefined) =>
+  LATENCY_TONE_TEXT_CLASS[latencyTone(latency)];
+
+export const getLatencyBg = (latency: number | undefined) =>
+  LATENCY_TONE_BG_CLASS[latencyTone(latency)];
 
 export const getProtocolBadgeVariant = (protocol: string) => {
   const colors: Record<string, string> = {
@@ -195,4 +215,30 @@ export const getProtocolBadgeVariant = (protocol: string) => {
     custom: 'bg-badge-slate/15 text-badge-slate border-badge-slate/30',
   };
   return colors[protocol.toLowerCase()] || 'bg-muted text-muted-foreground';
+};
+
+// ══════════════════ Conduit nodes-page（.nd-*）展示辅助 ══════════════════
+
+/** ISO 3166-1 alpha-2 国家码 → 区域指示符 emoji 旗帜（hk → 🇭🇰）。非法/空输入 → 空串。 */
+export const countryCodeToFlag = (code: string | null): string => {
+  if (!code || code.length !== 2) return '';
+  const cc = code.toUpperCase();
+  return String.fromCodePoint(0x1f1e6 + cc.charCodeAt(0) - 65, 0x1f1e6 + cc.charCodeAt(1) - 65);
+};
+
+/** 节点名 → 旗帜 emoji（.nd-flag 水印用）；识别不到国家 → 空串（省略水印）。复用 getCountryCode 单一真值。 */
+export const flagEmoji = (name: string): string => countryCodeToFlag(getCountryCode(name));
+
+/** 延迟数值 → .nd-lat 语义档类名（ok/warn/err）；无测速结果 / idle → ''。
+ *  阈值判定委托 latencyTone（与 getLatencyColor / .npick 同一单一真值，杜绝阈值双写漂移）。 */
+export const latToneClass = (latency: number | undefined): '' | 'ok' | 'warn' | 'err' => {
+  const tone = latencyTone(latency);
+  return tone === 'good' ? 'ok' : tone === 'medium' ? 'warn' : tone === 'bad' ? 'err' : '';
+};
+
+/** .nd-xfer 传输/加密紧凑摘要（如 "ws · tls" / "reality" / ss method）。空串则调用方省略该角标。 */
+export const transferSummary = (server: ServerConfigWithId): string => {
+  const p = server.protocol?.toLowerCase();
+  if (p === 'shadowsocks') return server.shadowsocksSettings?.method || '';
+  return [getTransportLabel(server), server.security].filter(Boolean).join(' · ');
 };

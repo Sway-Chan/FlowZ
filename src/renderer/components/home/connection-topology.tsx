@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Network } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useAppStore } from '@/store/app-store';
@@ -25,9 +24,10 @@ export function ConnectionTopology() {
   // F17：仅订阅 running 布尔（primitive），避免每 2s 轮询整体替换 connectionStatus 触发本组件空转重渲染
   const proxyRunning = useAppStore((s) => s.connectionStatus?.proxyCore?.running ?? false);
 
-  // Responsive Container Logic
+  // Responsive Container Logic：hero 随窗口宽/高自适应——实测容器尺寸喂布局（高度回退 FIXED_HEIGHT 防首帧塌陷）。
   const containerRef = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(800); // Default start width
+  const [height, setHeight] = useState(FIXED_HEIGHT);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -35,9 +35,8 @@ export function ConnectionTopology() {
     const resizeObserver = new ResizeObserver((entries) => {
       for (const entry of entries) {
         if (entry.contentBoxSize) {
-          // Provide a slight debounce or just set it? React 18 handles batching well.
-          // We need the width of the container content
           setWidth(entry.contentRect.width);
+          if (entry.contentRect.height > 0) setHeight(entry.contentRect.height);
         }
       }
     });
@@ -58,8 +57,8 @@ export function ConnectionTopology() {
   );
 
   const { nodes, links } = useMemo(
-    () => computeTopologyLayout(aggregate, width, t),
-    [aggregate, width, t]
+    () => computeTopologyLayout(aggregate, width, t, height),
+    [aggregate, width, height, t]
   );
 
   // --- Interaction Logic ---
@@ -286,18 +285,16 @@ export function ConnectionTopology() {
   };
 
   return (
-    <Card className="col-span-1">
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2">
-          <Network className="h-5 w-5" />
-          {t('home.connectionTopology')}
-        </CardTitle>
-      </CardHeader>
-      <CardContent className="overflow-hidden">
+    <div className="card topo-card">
+      <div className="field-lbl" style={{ marginBottom: 8 }}>
+        {t('home.connectionTopology')} <small>{t('home.topologyHint')}</small>
+      </div>
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         <div
           ref={containerRef}
-          style={{ width: '100%', height: `${FIXED_HEIGHT}px` }}
-          className="relative cursor-default"
+          // hero flex-1 填满 topo-card（conduit .topo-card{flex:1} flex-col）；下限 300px 防挤扁。
+          // 用 flex-1 而非 h-full：h-full(height:100%) 在 flex 父级下不稳解析、会塌成内容高（同 logs 修复根因）。
+          className="relative min-h-[300px] w-full flex-1 cursor-default"
           onMouseMove={handleMouseMove}
           onMouseLeave={handleMouseLeave}
         >
@@ -385,7 +382,7 @@ export function ConnectionTopology() {
           <svg
             width="100%"
             height="100%"
-            viewBox={`0 0 ${width} ${FIXED_HEIGHT}`}
+            viewBox={`0 0 ${width} ${height}`}
             className="overflow-visible font-sans"
           >
             <defs>
@@ -477,7 +474,7 @@ export function ConnectionTopology() {
             ))}
           </svg>
         </div>
-      </CardContent>
-    </Card>
+      </div>
+    </div>
   );
 }

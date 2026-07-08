@@ -18,6 +18,7 @@ import type { ServerConfig, SubscriptionConfig } from '@/bridge/types';
 import type { SubscriptionErrorKind } from '@shared/subscription-preview';
 import { buildSavedServers, buildClonedServer, type NewServerData } from './server-mutations';
 import { tailscaleSlotTaken } from '../../shared/endpoint-routes';
+import { isWarpServer, warpSlotTaken } from '../../shared/warp';
 
 // saveSubscription 的可判定返回：ok=false 让对话框保留不关、留住用户输入（原全吞错致失败仍关窗丢输入）。
 // 成功携带 sub，供调用方（server-page）setTabOverride 切到该订阅分组。
@@ -70,7 +71,7 @@ export function useServerActions() {
     if (!config) return;
     try {
       await saveConfig({ ...config, selectedServerId: serverId });
-      toast.success(t('servers.selectSuccess'));
+      // 选节点不弹「已选择」成功 toast（用户反馈：卡片即时高亮「当前」ring 即为反馈、无需提醒；同首页选节点/接管方式 toast 移除理由）。
     } catch (error) {
       toast.error(t('servers.selectFail'), {
         description: error instanceof Error ? error.message : t('servers.selectFailDesc'),
@@ -91,6 +92,13 @@ export function useServerActions() {
         tailscaleSlotTaken(servers, editingServer?.id)
       ) {
         toast.error(t('servers.tailscaleSingleOnly'));
+        return undefined;
+      }
+      // WARP 单例硬闸门：新增（非编辑）一个 WARP 节点但已存在另一个 WARP → 拦下不写。
+      // 手输 / 本地导入 / 克隆均经 saveServer 收口，防「接入区 UI 单例」被旁路造出第二个 WARP。
+      // editingId 排除自身——编辑现有 WARP 放行。
+      if (isWarpServer(serverData) && warpSlotTaken(servers, editingServer?.id)) {
+        toast.error(t('servers.warpSingleOnly'));
         return undefined;
       }
       const now = new Date().toISOString();
@@ -119,6 +127,11 @@ export function useServerActions() {
     // Tailscale 单节点硬限：克隆恒产出新增第二节点，克隆 TS 必撞限（含克隆源自身）→ 拦下，否则克隆绕过闸门。
     if (server.protocol?.toLowerCase() === 'tailscale' && tailscaleSlotTaken(servers)) {
       toast.error(t('servers.tailscaleSingleOnly'));
+      return;
+    }
+    // WARP 单例硬限：克隆 WARP 恒产出第二个 WARP（含克隆源自身在列表内）→ 拦下，否则克隆绕过单例闸门。
+    if (isWarpServer(server) && warpSlotTaken(servers)) {
+      toast.error(t('servers.warpSingleOnly'));
       return;
     }
     try {

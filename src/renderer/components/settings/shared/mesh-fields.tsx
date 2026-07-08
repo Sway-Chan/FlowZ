@@ -12,7 +12,7 @@ import { useRef } from 'react';
 import type { Control, FieldValues, FieldPath } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
 import { useAppStore } from '@/store/app-store';
-import { FormControl, FormField, FormItem, FormLabel, FormDescription } from '@/components/ui/form';
+import { FormField } from '@/components/ui/form';
 import {
   Select,
   SelectContent,
@@ -44,7 +44,7 @@ export function AccessModeField<TFieldValues extends FieldValues>({
   // 内部转发即可。故 Windows 一律置灰显示 gVisor（与非 TUN 同样不写回 reverseMesh，存储意图保留）。
   const isWindows = !meshSystemSupportedOnPlatform(window.electron?.platform);
   const systemSelectable = tunMode && !isWindows;
-  // 同 ExitNodeField：受控 value 编程式变更（form.reset 把 reverseMesh 设为 true→value='system'）时，Radix
+  // 同原 ExitNodeField（迁 npick 前）：受控 value 编程式变更（form.reset 把 reverseMesh 设为 true→value='system'）时，Radix
   // 隐藏原生 select 会触发一次伪 onValueChange(回退到首项 'userspace')，把刚 reset 的 System 静默打回 gVisor
   // （真机实证：保存 System 后重开/保存又恢复 gVisor）。用户真正打开过下拉才允许写回。
   const interacted = useRef(false);
@@ -57,34 +57,30 @@ export function AccessModeField<TFieldValues extends FieldValues>({
         // 非 TUN 或 Windows：强制显示 gVisor（有效态），不动存储值；否则按实际 reverseMesh 显示。
         const shownSystem = systemSelectable && isSystem;
         return (
-          <FormItem className="space-y-1.5">
-            <FormLabel className="!mt-0 font-normal">
-              {t('servers.accessMode', 'Access mode')}
-            </FormLabel>
-            <FormControl>
-              <Select
-                value={shownSystem ? 'system' : 'userspace'}
-                disabled={!systemSelectable}
-                onOpenChange={(open) => {
-                  if (open) interacted.current = true;
-                }}
-                onValueChange={(v) => {
-                  if (!interacted.current) return; // 挂载/reset 期伪回调 → 忽略，不打回 gVisor
-                  field.onChange(v === 'system');
-                }}
-              >
-                <SelectTrigger className="w-full sm:w-64">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="userspace">
-                    {t('servers.accessModeUserspace', 'gVisor')}
-                  </SelectItem>
-                  <SelectItem value="system">{t('servers.accessModeSystem', 'System')}</SelectItem>
-                </SelectContent>
-              </Select>
-            </FormControl>
-            <FormDescription>
+          <div className="nd-fld">
+            <span className="nd-fld-lbl">{t('servers.accessMode', 'Access mode')}</span>
+            <Select
+              value={shownSystem ? 'system' : 'userspace'}
+              disabled={!systemSelectable}
+              onOpenChange={(open) => {
+                if (open) interacted.current = true;
+              }}
+              onValueChange={(v) => {
+                if (!interacted.current) return; // 挂载/reset 期伪回调 → 忽略，不打回 gVisor
+                field.onChange(v === 'system');
+              }}
+            >
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="userspace">
+                  {t('servers.accessModeUserspace', 'gVisor')}
+                </SelectItem>
+                <SelectItem value="system">{t('servers.accessModeSystem', 'System')}</SelectItem>
+              </SelectContent>
+            </Select>
+            <div className="nd-swrow-d">
               {isWindows
                 ? t(
                     'servers.accessModeWindowsGvisorOnly',
@@ -104,8 +100,8 @@ export function AccessModeField<TFieldValues extends FieldValues>({
                         'servers.accessModeUserspaceDesc',
                         'gVisor userspace netstack — no privileges; outbound / access only.'
                       )}
-            </FormDescription>
-          </FormItem>
+            </div>
+          </div>
         );
       }}
     />

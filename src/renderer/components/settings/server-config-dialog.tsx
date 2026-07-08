@@ -1,12 +1,7 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useMemo } from 'react';
 import { toast } from 'sonner';
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
+import { X } from 'lucide-react';
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog';
 import {
   Select,
   SelectContent,
@@ -15,7 +10,6 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { Input } from '@/components/ui/input';
-import { Label } from '@/components/ui/label';
 import { VlessForm } from './vless-form';
 import { TrojanForm } from './trojan-form';
 import { Hysteria2Form } from './hysteria2-form';
@@ -32,15 +26,75 @@ import { WireGuardForm } from './wireguard-form';
 import { TailscaleForm } from './tailscale-form';
 import { CustomForm } from './custom-form';
 import { WarpPanel } from './warp-panel';
-import { ServerSelectGroups } from './server-select-groups';
 import { FormSection } from './shared/form-layout';
 import { getSortedProtocolOptions } from './shared/protocol-options';
-import { ENDPOINT_PROTOCOLS, isEndpointProtocol } from '../../../shared/endpoint-routes';
+import { isEndpointProtocol } from '../../../shared/endpoint-routes';
 import { isWarpServer } from '../../../shared/warp';
+import { NodePicker } from '@/components/ui/node-picker';
+import { buildServerPickerModel, isPickerCandidate } from '@/components/ui/server-picker-items';
+import { useAppStore } from '@/store/app-store';
 import type { ServerConfig, ProtocolType } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
 type ServerConfigWithId = ServerConfig;
+
+// detour「直连（无链）」哨兵：不与任何节点 uuid 撞；选中即 detour=undefined。
+const DETOUR_DIRECT = 'direct';
+
+/**
+ * 前置代理(detour)节点选择（`.npick`）—— 直连哨兵置顶 + 按订阅/自建分组 + 延迟徽标；排除自身(excludeId)与
+ * 组网协议(WireGuard/Tailscale 不作前置代理目标)。独立子组件隔离 latencyMap 订阅，测速期只重渲本下拉、不牵动整弹窗。
+ * 取代原 ServerSelectGroups（radix Select 内嵌手风琴）：NodePicker 一步选、口径与首页/规则/首页出口统一。
+ */
+function DetourPicker({
+  servers,
+  excludeId,
+  value,
+  onSelect,
+}: {
+  servers: ServerConfig[];
+  excludeId?: string;
+  value?: string;
+  onSelect: (id: string) => void;
+}) {
+  const { t } = useTranslation();
+  const subscriptions = useAppStore((s) => s.config?.subscriptions || []);
+  const latencyMap = useAppStore((s) => s.latencyMap);
+
+  // 排除自身 + 组网协议（endpoint 不作前置代理目标）；直连哨兵置顶。共享映射与首页/规则/应用分流口径统一。
+  // memo 对齐 rule-dialog / app-rules-card：测速广播只重渲本下拉、输入不变不空跑。
+  const { items, groups: pickerGroups } = useMemo(
+    () =>
+      buildServerPickerModel({
+        servers,
+        subscriptions,
+        latencyMap,
+        meshLabel: t('servers.meshNodes', '组网'),
+        manualLabel: t('servers.manualNodes', '自建节点'),
+        sentinel: {
+          id: DETOUR_DIRECT,
+          name: t('servers.directConnection', 'Direct (No Chain)'),
+          role: 'direct',
+        },
+        excludeId,
+        excludeEndpoint: true,
+        withAddress: true,
+      }),
+    [servers, subscriptions, latencyMap, excludeId, t]
+  );
+
+  return (
+    <NodePicker
+      items={items}
+      groups={pickerGroups}
+      value={value ?? DETOUR_DIRECT}
+      onSelect={onSelect}
+      placeholder={t('servers.directConnection', 'Direct (No Chain)')}
+      searchPlaceholder={t('common.search', '搜索')}
+      ariaLabel={t('servers.detour', 'Proxy Chain (Detour)')}
+    />
+  );
+}
 
 interface ServerConfigDialogProps {
   open: boolean;
@@ -114,9 +168,16 @@ export function ServerConfigDialog({
     }
     setNameError('');
 
+    // 悬挂 detour 防回写：detour state 在 open 时由 server.detour 灌入，但目标节点可能已被删除（或因组网协议被
+    // excludeEndpoint 过滤出候选）。此时 DetourPicker 触发器显「直连」占位（findItem 落空），但 state 仍持旧 id——
+    // 若原样保存会把用户以为已直连的悬挂 id 再写回 config。故用与 DetourPicker 同一候选谓词（isPickerCandidate，
+    // excludeId=自身 + excludeEndpoint）校验：不在有效候选则视为直连（undefined），杜绝 UI 显示与持久化不一致。
+    const detourValid =
+      !!detour && servers.some((s) => s.id === detour && isPickerCandidate(s, server?.id, true));
+
     const serverConfig = {
       name: serverName.trim(),
-      detour: detour || undefined,
+      detour: detourValid ? detour : undefined,
       ...protocolConfig,
     };
 
@@ -146,94 +207,129 @@ export function ServerConfigDialog({
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="w-[92vw] max-w-3xl max-h-[90vh] overflow-y-auto">
-        <DialogHeader>
-          <DialogTitle>
+      <DialogContent className="[&>button]:hidden flex max-h-[90vh] w-[min(452px,94vw)] max-w-none flex-col gap-0 overflow-hidden rounded-[12px] border-line bg-surface p-0">
+        {/* a11y：radix 需 Title/Description；视觉标题另在 `.nd-dlg-h`，此处仅供辅助技术。 */}
+        <DialogTitle className="sr-only">
+          {isEditing
+            ? t('servers.editServer', 'Edit Server Config')
+            : t('servers.addServerConfig', 'Add Server Config')}
+        </DialogTitle>
+        <DialogDescription className="sr-only">
+          {isEditing
+            ? t(
+                'servers.editServerDesc',
+                'Modify server configuration. Proxy will not restart automatically after saving.'
+              )
+            : t(
+                'servers.addServerDesc',
+                'Add a new proxy server. Supports VLESS, Trojan, Hysteria2, Shadowsocks, AnyTLS.'
+              )}
+        </DialogDescription>
+
+        <div className="nd-dlg-h">
+          <span className="nd-dlg-title">
             {isEditing
               ? t('servers.editServer', 'Edit Server Config')
               : t('servers.addServerConfig', 'Add Server Config')}
-          </DialogTitle>
-          <DialogDescription>
-            {isEditing
-              ? t(
-                  'servers.editServerDesc',
-                  'Modify server configuration. Proxy will not restart automatically after saving.'
-                )
-              : t(
-                  'servers.addServerDesc',
-                  'Add a new proxy server. Supports VLESS, Trojan, Hysteria2, Shadowsocks, AnyTLS.'
-                )}
-          </DialogDescription>
-        </DialogHeader>
+          </span>
+          <button
+            type="button"
+            className="nd-dlg-x"
+            aria-label={t('common.cancel', 'Cancel')}
+            onClick={() => onOpenChange(false)}
+          >
+            <X />
+          </button>
+        </div>
 
-        {isEditing && server?.subscriptionId && (
-          <div className="rounded-md border border-amber-300/50 bg-amber-50 px-3 py-2 text-xs text-amber-700 dark:border-amber-400/30 dark:bg-amber-950/40 dark:text-amber-400">
-            {t(
-              'servers.subNodeEditHint',
-              'This node belongs to a subscription; edits are overwritten on the next update. For lasting changes, use "Clone to Manual Nodes".'
+        <div className="nd-dlg-body">
+          {isEditing && server?.subscriptionId && (
+            <div className="nd-amber">
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="1.9"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              >
+                <circle cx="12" cy="12" r="9" />
+                <path d="M12 8v4M12 16h.01" />
+              </svg>
+              <span>
+                {t(
+                  'servers.subNodeEditHint',
+                  'This node belongs to a subscription; edits are overwritten on the next update. For lasting changes, use "Clone to Manual Nodes".'
+                )}
+              </span>
+            </div>
+          )}
+
+          {/* 协议：组网节点编辑锁协议（disabled 禁打开 + 改值）；WARP 显示「Cloudflare WARP」，其余走 SelectValue。 */}
+          <div className="nd-fld">
+            <span className="nd-fld-lbl">
+              {t('servers.protocol')}
+              {!isMeshEdit && (
+                <small className="font-medium text-fg-faint">
+                  {t('servers.selectProtocol', 'Select your proxy server protocol')}
+                </small>
+              )}
+            </span>
+            <Select
+              value={selectedProtocol}
+              onValueChange={handleProtocolChange}
+              disabled={isMeshEdit}
+            >
+              <SelectTrigger>
+                {isMeshEdit ? <span>{meshLockedLabel}</span> : <SelectValue />}
+              </SelectTrigger>
+              <SelectContent>
+                {/* 组网协议（WireGuard/WARP/Tailscale）始终不进可选下拉——新增走组网 tab 顶部「接入组网」区；编辑
+                    组网节点时协议被锁定，故下拉永不含 wireguard/tailscale，代理节点编辑时也无法被改成组网协议。 */}
+                {getSortedProtocolOptions(t, i18n.language, (v) => v !== 'wireguard').map((p) => (
+                  <SelectItem key={p.value} value={p.value}>
+                    {p.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            {isMeshEdit && (
+              <div className="nd-swrow-d">
+                {t(
+                  'servers.protocolLockedOnEdit',
+                  'Protocol cannot be changed when editing — delete and re-add to switch.'
+                )}
+              </div>
             )}
           </div>
-        )}
 
-        <div className="space-y-6">
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-            <div className="space-y-2">
-              <Label htmlFor="serverName">{t('servers.remarks')}</Label>
-              <Input
-                id="serverName"
-                placeholder={t('servers.remarksPlaceholder')}
-                value={serverName}
-                onChange={(e) => {
-                  setServerName(e.target.value);
-                  if (nameError) setNameError('');
-                }}
-                className={nameError ? 'border-destructive focus-visible:ring-destructive' : ''}
-              />
-              {nameError ? (
-                <p className="text-sm text-destructive">{nameError}</p>
-              ) : isDuplicateName ? (
-                <p className="text-sm text-amber-600 dark:text-amber-500">
-                  {t('servers.nameDuplicate', 'A node with this name already exists')}
-                </p>
-              ) : (
-                <p className="text-sm text-muted-foreground">{t('servers.remarksDesc')}</p>
-              )}
-            </div>
-
-            <div className="space-y-2">
-              <Label>{t('servers.protocol')}</Label>
-              {/* 组网节点编辑锁协议：disabled 禁打开 + 改值；WARP 显示「Cloudflare WARP」，其余走 SelectValue 显真实协议。 */}
-              <Select
-                value={selectedProtocol}
-                onValueChange={handleProtocolChange}
-                disabled={isMeshEdit}
-              >
-                <SelectTrigger>
-                  {isMeshEdit ? <span>{meshLockedLabel}</span> : <SelectValue />}
-                </SelectTrigger>
-                <SelectContent>
-                  {/* 组网协议（WireGuard/WARP/Tailscale）始终不进可选下拉——新增走组网 tab 顶部「接入组网」区；编辑
-                      组网节点时协议被锁定（disabled + 上方 span 显示标签），故下拉永不含 wireguard/tailscale，代理节点
-                      编辑时也无法被改成组网协议（组网↔代理隔离，用户要求）。 */}
-                  {getSortedProtocolOptions(t, i18n.language, (v) => v !== 'wireguard').map((p) => (
-                    <SelectItem key={p.value} value={p.value}>
-                      {p.label}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <p className="text-sm text-muted-foreground">
-                {isMeshEdit
-                  ? t(
-                      'servers.protocolLockedOnEdit',
-                      'Protocol cannot be changed when editing — delete and re-add to switch.'
-                    )
-                  : t('servers.selectProtocol', 'Select your proxy server protocol')}
-              </p>
-            </div>
+          {/* 备注名（必填，内联校验；重名给琥珀软提示不拦保存） */}
+          <div className="nd-fld">
+            <span className="nd-fld-lbl">
+              {t('servers.remarks')} <span className="nd-req">*</span>
+            </span>
+            <Input
+              id="serverName"
+              placeholder={t('servers.remarksPlaceholder')}
+              value={serverName}
+              onChange={(e) => {
+                setServerName(e.target.value);
+                if (nameError) setNameError('');
+              }}
+              className={
+                nameError ? 'border-destructive focus-visible:ring-destructive' : undefined
+              }
+            />
+            {nameError ? (
+              <div className="fld-err">{nameError}</div>
+            ) : isDuplicateName ? (
+              <div className="nd-swrow-d text-amber-600 dark:text-amber-500">
+                {t('servers.nameDuplicate', 'A node with this name already exists')}
+              </div>
+            ) : null}
           </div>
 
-          <div className="border-t pt-6">
+          <div className="contents">
             {selectedProtocol === 'warp' && (
               <WarpPanel onSubmit={handleSave} nameMissing={!serverName.trim()} />
             )}
@@ -410,31 +506,18 @@ export function ServerConfigDialog({
             collapsible
             defaultOpen={!!server?.detour}
           >
-            <Select
-              value={detour || 'direct'}
-              onValueChange={(v) => setDetour(v === 'direct' ? undefined : v)}
-            >
-              <SelectTrigger>
-                <SelectValue placeholder={t('servers.directConnection', 'Direct (No Chain)')} />
-              </SelectTrigger>
-              <SelectContent>
-                <SelectItem value="direct">
-                  {t('servers.directConnection', 'Direct (No Chain)')}
-                </SelectItem>
-                <ServerSelectGroups
-                  servers={servers}
-                  excludeId={server?.id}
-                  excludeProtocols={ENDPOINT_PROTOCOLS}
-                  selectedId={detour}
-                />
-              </SelectContent>
-            </Select>
-            <p className="text-sm text-muted-foreground">
+            <DetourPicker
+              servers={servers}
+              excludeId={server?.id}
+              value={detour}
+              onSelect={(id) => setDetour(id === DETOUR_DIRECT ? undefined : id)}
+            />
+            <div className="nd-swrow-d">
               {t(
                 'servers.detourDesc',
                 'Connect to this node through another proxy server (proxy chain)'
               )}
-            </p>
+            </div>
           </FormSection>
         </div>
       </DialogContent>

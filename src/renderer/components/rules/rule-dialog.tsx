@@ -1,15 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { toast } from 'sonner';
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from '@/components/ui/dialog';
-import { Textarea } from '@/components/ui/textarea';
-import { Input } from '@/components/ui/input';
+import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog';
 import {
   Select,
   SelectContent,
@@ -19,12 +10,9 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { Switch } from '@/components/ui/switch';
-import { Button } from '@/components/ui/button';
-import { SegmentedControl } from '@/components/ui/segmented-control';
-import { SettingsRow } from '@/components/settings/settings-row';
 import { Loader2, ListPlus, Plus, X } from 'lucide-react';
-import { ServerSelectGroups } from '@/components/settings/server-select-groups';
+import { NodePicker } from '@/components/ui/node-picker';
+import { buildServerPickerModel } from '@/components/ui/server-picker-items';
 import { useAppStore } from '@/store/app-store';
 import type { Rule, RuleType, RuleAction, RuleCondition } from '../../../shared/types';
 import {
@@ -51,10 +39,19 @@ import {
   SHORT_VALUE_TYPES,
   GEO_SUGGEST,
   PROCESS_TYPES,
-  BYPASS_FAKEIP_TYPES,
 } from './rule-type-meta';
 import { ProcessPickerDialog } from './process-picker-dialog';
 import { ResourcePicker } from './resource-picker';
+import {
+  collectRuleFormErrors,
+  hasRuleFormErrors,
+  deriveTargetServerId,
+  isBypassApplicable,
+  deriveBypassFakeIp,
+  showsTargetNode,
+  FOLLOW_GLOBAL_NODE_ID,
+  type RuleFormErrors,
+} from './rule-dialog-logic';
 
 interface RuleDialogProps {
   open: boolean;
@@ -71,6 +68,8 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
   const updateCustomRule = useAppStore((state) => state.updateCustomRule);
   const servers = useAppStore((state) => state.config?.servers || []);
   const selectedServerId = useAppStore((state) => state.config?.selectedServerId ?? null);
+  const subscriptions = useAppStore((state) => state.config?.subscriptions || []);
+  const latencyMap = useAppStore((state) => state.latencyMap);
   const customRules = useAppStore((state) => state.config?.customRules);
   const appRules = useAppStore((state) => state.config?.appRules);
   // 组网(WG/Tailscale)force-route 段：供 ipCidr 值「与组网重叠」内联提醒（优先级重排后自定义规则会覆盖组网路由）。
@@ -98,9 +97,12 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
   const [action, setAction] = useState<RuleAction>('proxy');
   const [enabled, setEnabled] = useState(true);
   const [bypassFakeIP, setBypassFakeIP] = useState(false);
-  const [targetServerId, setTargetServerId] = useState('default');
+  // 悬挂 targetServerId（指向已删节点）→ NodePicker findItem 落空显 placeholder（跟随全局文案），属既有边界，保留。
+  const [targetServerId, setTargetServerId] = useState(FOLLOW_GLOBAL_NODE_ID);
   const [remarks, setRemarks] = useState('');
   const [submitting, setSubmitting] = useState(false);
+  // 已尝试提交：为 true 后才计算并内联展示字段级错误（避免打开即报错，与 spec §6「提交时校验」一致）。
+  const [submitAttempted, setSubmitAttempted] = useState(false);
   // 进程选择器/聚焦态按「类型」定位（多块共存）：pickerType 标记哪个块的选择器打开，focusedType 标记哪个块输入中。
   const [pickerType, setPickerType] = useState<RuleType | null>(null);
   const [focusedType, setFocusedType] = useState<RuleType | null>(null);
@@ -109,6 +111,7 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
     if (!open) return;
     setFocusedType(null);
     setPickerType(null);
+    setSubmitAttempted(false);
     if (mode === 'edit' && rule) {
       // 多条件优先；无 conditions 退化为单条件 [{type,values}]。去重类型（桶按类型键）、合并同类型值，保序。
       const conds: RuleCondition[] =
@@ -133,7 +136,7 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
       setAction(rule.action);
       setEnabled(rule.enabled);
       setBypassFakeIP(rule.bypassFakeIP ?? false);
-      setTargetServerId(rule.targetServerId || 'default');
+      setTargetServerId(rule.targetServerId || FOLLOW_GLOBAL_NODE_ID);
       setRemarks(rule.remarks || '');
     } else {
       setConditionTypes([DEFAULT_TYPE]);
@@ -142,7 +145,7 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
       setAction('proxy');
       setEnabled(true);
       setBypassFakeIP(false);
-      setTargetServerId('default');
+      setTargetServerId(FOLLOW_GLOBAL_NODE_ID);
       setRemarks('');
     }
   }, [open, mode, rule]);
@@ -159,7 +162,30 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
   const nextAddableType = findAddableRuleType(usedTypes, platform);
   const canAddCondition = nextAddableType !== undefined;
   // bypassFakeIP 是规则级设置：只要任一条件是域名类即可用（生成期对域名类条件取真实 DNS）。
-  const bypassApplicable = conditionTypes.some((ct) => BYPASS_FAKEIP_TYPES.includes(ct));
+  const bypassApplicable = isBypassApplicable(conditionTypes);
+
+  // 字段级错误：仅在尝试提交后计算（随修改实时刷新，用户改好即消），内联展示、不 toast（spec §6）。
+  const formErrors: RuleFormErrors = useMemo(
+    () =>
+      submitAttempted
+        ? collectRuleFormErrors(conditionTypes, valuesByType, remarks)
+        : { conditions: {} },
+    [submitAttempted, conditionTypes, valuesByType, remarks]
+  );
+
+  // 目标节点选择器（`.npick`）数据：跟随全局哨兵置顶 + 按订阅/自建分组，显延迟徽标（不随全局排序开关重排）。
+  const { items: targetItems, groups: targetGroups } = useMemo(
+    () =>
+      buildServerPickerModel({
+        servers,
+        subscriptions,
+        latencyMap,
+        meshLabel: t('servers.meshNodes', '组网'),
+        manualLabel: t('servers.manualNodes', '自建节点'),
+        sentinel: { id: FOLLOW_GLOBAL_NODE_ID, name: t('rules.defaultNodeTip'), role: 'follow' },
+      }),
+    [servers, subscriptions, latencyMap, t]
+  );
 
   const valuesOf = (ct: RuleType) => valuesByType[ct] ?? '';
   const setValuesOf = (ct: RuleType, text: string) =>
@@ -223,39 +249,19 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
   };
 
   const onSubmit = async () => {
-    // 收集每个条件块（按 conditionTypes 顺序）的非空值
-    const conds: RuleCondition[] = [];
-    for (const ct of conditionTypes) {
-      const values = parseLines(valuesOf(ct));
-      if (values.length === 0) {
-        toast.error(
-          t('rules.errorEmptyCondition', { type: t(`rules.types.${ct}.name`, RULE_TYPE_NAME[ct]) })
-        );
-        return;
-      }
-      const invalid = values.filter((v) => !validateRuleValue(ct, v));
-      if (invalid.length > 0) {
-        toast.error(t('rules.invalidValue'), {
-          description: `${invalid.slice(0, 3).join(', ')}${invalid.length > 3 ? ' …' : ''}`,
-        });
-        return;
-      }
-      conds.push({ type: ct, values });
-    }
-    if (conds.length === 0) {
-      toast.error(t('rules.errorEmpty'));
-      return;
-    }
-    // 备注名强制必填（列表只显示备注名，空备注会让规则不可辨识）
-    if (!remarks.trim()) {
-      toast.error(t('rules.errorRemarksRequired', '请填写备注名'));
-      return;
-    }
+    // 提交 gate 与内联展示共用 collectRuleFormErrors：字段级错误就地红字提示，不 toast（spec §6）。
+    setSubmitAttempted(true);
+    const errors = collectRuleFormErrors(conditionTypes, valuesByType, remarks);
+    if (hasRuleFormErrors(errors)) return;
+    // 全部条件已校验通过：按 conditionTypes 顺序收集非空值。
+    const conds: RuleCondition[] = conditionTypes.map((ct) => ({
+      type: ct,
+      values: parseLines(valuesOf(ct)),
+    }));
 
-    const tid = targetServerId === 'default' ? undefined : targetServerId;
-    // L2：持久化对齐 UI 的 checked（globalFakeIpEnabled && bypassFakeIP）——全局 FakeIP 关时该字段天然 no-op，
-    // 避免 UI 显 unchecked 却写入无效的 bypassFakeIP:true（数据卫生）。
-    const bypass = bypassApplicable ? globalFakeIpEnabled && bypassFakeIP : undefined;
+    const tid = deriveTargetServerId(targetServerId);
+    // L2：持久化对齐 UI 的 checked——全局 FakeIP 关时该字段天然 no-op，避免写入无效 bypassFakeIP:true（数据卫生）。
+    const bypass = deriveBypassFakeIp(bypassApplicable, globalFakeIpEnabled, bypassFakeIP);
     // 单条件 → 退化为 type/values（不写 conditions/combineMode，与历史规则逐字节等价）；
     // 多条件 → 首条件镜像到 type/values（回滚兼容），并写 conditions + combineMode。
     const first = conds[0];
@@ -296,7 +302,7 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
     }
   };
 
-  // 单个条件块的「匹配值」编辑器（ruleSet→资源选择器；其余→Textarea + 常用标签 / 进程选择器）。
+  // 单个条件块的「匹配值」编辑器（ruleSet→资源选择器；其余→textarea + 常用标签 / 进程选择器）。
   const renderValueEditor = (ct: RuleType) => {
     if (ct === 'ruleSet') {
       return (
@@ -313,51 +319,64 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
     const meshOverlap = ct === 'ipCidr' ? parsed.filter((c) => cidrOverlapsAny(c, meshCidrs)) : [];
     return (
       <>
-        <Textarea
+        {PROCESS_TYPES.includes(ct) && (
+          <button type="button" className="btn ghost sm" onClick={() => setPickerType(ct)}>
+            <ListPlus size={14} />
+            {t('rules.pickProcess')}
+          </button>
+        )}
+        <textarea
+          className="rl-ta mono"
+          style={{
+            minHeight: SHORT_VALUE_TYPES.includes(ct) ? 60 : undefined,
+            borderColor: invalid.length > 0 ? 'hsl(var(--err))' : undefined,
+          }}
+          spellCheck={false}
           value={text}
           onChange={(e) => setValuesOf(ct, e.target.value)}
           onFocus={() => setFocusedType(ct)}
           onBlur={() => setFocusedType((prev) => (prev === ct ? null : prev))}
           placeholder={t(`rules.types.${ct}.placeholder`, RULE_TYPE_PLACEHOLDER[ct])}
-          className={`${SHORT_VALUE_TYPES.includes(ct) ? 'min-h-[60px]' : 'min-h-[100px]'} font-mono text-sm ${
-            invalid.length > 0 ? 'border-destructive/60 focus-visible:ring-destructive/40' : ''
-          }`}
         />
-        <p className="text-xs text-muted-foreground">
+        <div className="rl-cc-hint">
           {t(`rules.typeHints.${ct}`, RULE_TYPE_HINT[ct])}
           {PROCESS_TYPES.includes(ct) && ` · ${t('rules.processHint')}`}
-        </p>
+        </div>
         {invalid.length > 0 && (
-          <p className="text-xs text-destructive">
+          <div className="rl-cc-hint" style={{ color: 'hsl(var(--err))' }}>
             {t('rules.invalidInline', {
               values: `${invalid.slice(0, 3).join(', ')}${invalid.length > 3 ? ' …' : ''}`,
             })}
-          </p>
+          </div>
         )}
         {meshOverlap.length > 0 && (
-          <p className="text-xs text-amber-600 dark:text-amber-400">
+          <div className="rl-cc-hint" style={{ color: 'hsl(var(--warn))' }}>
             {t('rules.meshOverlapHint', {
               values: `${meshOverlap.slice(0, 3).join(', ')}${meshOverlap.length > 3 ? ' …' : ''}`,
               defaultValue:
                 '网段 {{values}} 与组网(WG/Tailscale)路由段重叠：本规则优先级更高、将覆盖组网路由，该段可能不走组网节点。如非有意请调整。',
             })}
-          </p>
+          </div>
         )}
         {GEO_SUGGEST[ct] && (
-          <div className="flex flex-wrap gap-1.5 pt-1">
-            <span className="text-xs text-muted-foreground">{t('rules.commonTags')}</span>
+          <div
+            style={{
+              display: 'flex',
+              flexWrap: 'wrap',
+              gap: 6,
+              alignItems: 'center',
+              paddingTop: 2,
+            }}
+          >
+            <span className="rl-cc-hint">{t('rules.commonTags')}</span>
             {GEO_SUGGEST[ct]!.map((tag) => {
               const active = parsed.includes(tag);
               return (
                 <button
                   key={tag}
                   type="button"
+                  className={active ? 'rl-step on' : 'rl-step'}
                   onClick={() => toggleValue(ct, tag)}
-                  className={`rounded-md border px-2 py-0.5 text-xs ${
-                    active
-                      ? 'border-primary bg-primary/10 text-primary'
-                      : 'bg-muted hover:bg-muted/70'
-                  }`}
                 >
                   {tag}
                 </button>
@@ -373,37 +392,84 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-[560px] max-h-[95vh] overflow-y-auto">
-        <DialogHeader>
-          <DialogTitle>{mode === 'add' ? t('rules.addRule') : t('rules.editRule')}</DialogTitle>
-          <DialogDescription>{t('rules.ruleDialogDesc')}</DialogDescription>
-        </DialogHeader>
+      <DialogContent className="flex max-h-[92vh] max-w-[480px] flex-col gap-0 overflow-hidden p-0">
+        {/* 头部 */}
+        <div className="rl-dlg-h">
+          <div>
+            <DialogTitle className="rl-dlg-title">
+              {mode === 'add' ? t('rules.addRule') : t('rules.editRule')}
+            </DialogTitle>
+            <DialogDescription className="rl-dlg-desc">
+              {/* 恒显用途描述，不回显规则名——名称由下方「备注名」字段承载，副标题回显=重复（用户反馈）。 */}
+              {t('rules.ruleDialogDesc')}
+            </DialogDescription>
+          </div>
+        </div>
 
-        <div className="min-w-0 space-y-5">
+        {/* 主体（可滚动） */}
+        <div className="rl-dlg-body min-h-0 flex-1 overflow-y-auto">
+          {/* 备注名（顶部，必填） */}
+          <div className="rl-zone">
+            <label className="field">
+              <div className="field-lbl">
+                {t('rules.remarksLabel')} <small style={{ color: 'hsl(var(--err))' }}>*</small>
+              </div>
+              <input
+                className={`input${formErrors.remarksRequired ? ' err' : ''}`}
+                type="text"
+                value={remarks}
+                onChange={(e) => setRemarks(e.target.value)}
+                placeholder={t('rules.remarksPlaceholder')}
+                maxLength={100}
+              />
+            </label>
+            {formErrors.remarksRequired && (
+              <div className="rl-cc-hint" style={{ color: 'hsl(var(--err))' }}>
+                {t('rules.errorRemarksRequired', '请填写备注名')}
+              </div>
+            )}
+          </div>
+
           {/* 匹配条件（1..N）：每块 = 类型 Select + 值编辑器 + 删除 */}
-          <div className="space-y-2">
-            <div className="flex items-center justify-between">
-              <label className="text-sm font-medium">{t('rules.matchConditions')}</label>
+          <div className="rl-zone">
+            <div className="rl-zone-h">
+              <div className="rl-zone-lbl">
+                {t('rules.matchConditions')}
+                <span className="rl-zone-cnt">
+                  {t('rules.conditionCount', {
+                    count: conditionTypes.length,
+                    defaultValue: '{{count}} 条',
+                  })}
+                </span>
+              </div>
               {multiCondition && (
-                <SegmentedControl<'and' | 'or'>
-                  value={combineMode}
-                  onChange={setCombineMode}
-                  options={[
-                    { value: 'or', label: t('rules.combineOr') },
-                    { value: 'and', label: t('rules.combineAnd') },
-                  ]}
-                />
+                <div className="seg2 rl-combine">
+                  <button
+                    type="button"
+                    className={combineMode === 'or' ? 'on' : ''}
+                    onClick={() => setCombineMode('or')}
+                  >
+                    {t('rules.combineOr')}
+                  </button>
+                  <button
+                    type="button"
+                    className={combineMode === 'and' ? 'on' : ''}
+                    onClick={() => setCombineMode('and')}
+                  >
+                    {t('rules.combineAnd')}
+                  </button>
+                </div>
               )}
             </div>
 
             {conditionTypes.map((ct, index) => (
-              <div key={ct} className="rounded-lg border p-3 space-y-2">
-                <div className="flex items-center gap-2">
+              <div key={ct} className="rl-cond-card">
+                <div className="rl-cc-top">
                   <Select
                     value={ct}
                     onValueChange={(v) => changeConditionType(index, v as RuleType)}
                   >
-                    <SelectTrigger className="flex-1">
+                    <SelectTrigger className="rl-select rl-cond-type">
                       <SelectValue />
                     </SelectTrigger>
                     <SelectContent>
@@ -432,134 +498,154 @@ export function RuleDialog({ open, onOpenChange, mode, rule }: RuleDialogProps) 
                       })}
                     </SelectContent>
                   </Select>
-                  {PROCESS_TYPES.includes(ct) && (
-                    <Button
-                      type="button"
-                      variant="outline"
-                      size="sm"
-                      className="h-9 shrink-0"
-                      onClick={() => setPickerType(ct)}
-                    >
-                      <ListPlus className="me-1 h-3.5 w-3.5" />
-                      {t('rules.pickProcess')}
-                    </Button>
-                  )}
                   {multiCondition && (
-                    <Button
+                    <button
                       type="button"
-                      variant="ghost"
-                      size="icon"
-                      className="h-9 w-9 shrink-0 text-muted-foreground"
+                      className="rl-cond-rm"
                       onClick={() => removeCondition(ct)}
                       aria-label={t('rules.removeCondition')}
                     >
-                      <X className="h-4 w-4" />
-                    </Button>
+                      <X size={15} />
+                    </button>
                   )}
                 </div>
-                <p className="text-xs text-muted-foreground">
-                  {t(`rules.types.${ct}.desc`, RULE_TYPE_DESC[ct])}
-                </p>
-                {renderValueEditor(ct)}
+                <div className="rl-cc-desc">{t(`rules.types.${ct}.desc`, RULE_TYPE_DESC[ct])}</div>
+                <div className="rl-cc-val">
+                  {renderValueEditor(ct)}
+                  {/* 提交后内联错误：空条件（非法值由 renderValueEditor 内实时红字，此处只兜底 ruleSet 等无实时校验的空/非法） */}
+                  {formErrors.conditions[ct] === 'empty' && (
+                    <div className="rl-cc-hint" style={{ color: 'hsl(var(--err))' }}>
+                      {t('rules.errorEmptyConditionInline', '请填写该条件的匹配值')}
+                    </div>
+                  )}
+                  {formErrors.conditions[ct] === 'invalid' && ct === 'ruleSet' && (
+                    <div className="rl-cc-hint" style={{ color: 'hsl(var(--err))' }}>
+                      {t('rules.errorInvalidConditionInline', '该条件含无效值，请检查')}
+                    </div>
+                  )}
+                </div>
               </div>
             ))}
 
             {canAddCondition && (
-              <Button
-                type="button"
-                variant="outline"
-                size="sm"
-                className="w-full"
-                onClick={addCondition}
-              >
-                <Plus className="me-1 h-3.5 w-3.5" />
+              <button type="button" className="rl-cond-add rl-cond-add-full" onClick={addCondition}>
+                <Plus size={15} />
                 {t('rules.addCondition')}
-              </Button>
+              </button>
             )}
           </div>
 
-          {/* 备注（必填：规则列表只显示备注名） */}
-          <div className="space-y-2">
-            <label className="text-sm font-medium">
-              {t('rules.remarksLabel')}
-              <span className="ms-0.5 text-destructive">*</span>
-            </label>
-            <Input
-              value={remarks}
-              onChange={(e) => setRemarks(e.target.value)}
-              placeholder={t('rules.remarksPlaceholder')}
-              maxLength={100}
-            />
-          </div>
-
-          {/* 策略 */}
-          <div className="space-y-2">
-            <label className="text-sm font-medium">{t('rules.policy')}</label>
-            <SegmentedControl<RuleAction>
-              value={action}
-              onChange={setAction}
-              options={[
-                { value: 'proxy', label: t('rules.policyProxy') },
-                { value: 'direct', label: t('rules.policyDirect') },
-                { value: 'block', label: t('rules.policyBlock') },
-              ]}
-            />
-          </div>
-
-          {/* 目标节点（仅代理） */}
-          {action === 'proxy' && (
-            <div className="space-y-2">
-              <label className="text-sm font-medium">{t('rules.targetNode')}</label>
-              <Select value={targetServerId} onValueChange={setTargetServerId}>
-                <SelectTrigger>
-                  <SelectValue placeholder={t('rules.defaultNodeTip')} />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="default">{t('rules.defaultNodeTip')}</SelectItem>
-                  <ServerSelectGroups servers={servers} selectedId={targetServerId} showLatency />
-                </SelectContent>
-              </Select>
+          {/* 策略区（策略 seg + 目标节点 + 启用规则 / bypassFakeIP） */}
+          <div className="rl-zone">
+            <div className="rl-zone-h">
+              <div className="rl-zone-lbl">{t('rules.policy')}</div>
             </div>
-          )}
-
-          {/* 开关区 */}
-          <div className="rounded-lg border divide-y divide-border/60 px-3">
-            <SettingsRow label={t('rules.enableRule')} description={t('rules.enableRuleTip')}>
-              <Switch checked={enabled} onCheckedChange={setEnabled} />
-            </SettingsRow>
-            {bypassApplicable && (
-              <SettingsRow
-                label={t('rules.bypassFakeIp')}
-                description={
-                  globalFakeIpEnabled
-                    ? t('rules.bypassFakeIpTip')
-                    : t('rules.bypassFakeIpDisabledTip')
-                }
+            <div className="seg2 rl-strat">
+              <button
+                type="button"
+                data-strat="proxy"
+                className={action === 'proxy' ? 'on' : ''}
+                onClick={() => setAction('proxy')}
               >
-                <Switch
-                  checked={globalFakeIpEnabled && bypassFakeIP}
-                  disabled={!globalFakeIpEnabled}
-                  onCheckedChange={setBypassFakeIP}
+                {t('rules.policyProxy')}
+              </button>
+              <button
+                type="button"
+                data-strat="direct"
+                className={action === 'direct' ? 'on' : ''}
+                onClick={() => setAction('direct')}
+              >
+                {t('rules.policyDirect')}
+              </button>
+              <button
+                type="button"
+                data-strat="block"
+                className={action === 'block' ? 'on' : ''}
+                onClick={() => setAction('block')}
+              >
+                {t('rules.policyBlock')}
+              </button>
+            </div>
+
+            {/* 目标节点（仅代理）：一步选下拉（`.npick`），跟随全局哨兵置顶 + 分组 + 延迟徽标。
+                「是否展示目标节点」单一真值取自 showsTargetNode（与写入 gate 同源）。 */}
+            {showsTargetNode(action) && (
+              <div className="field rl-target">
+                <div className="field-lbl">{t('rules.targetNode')}</div>
+                <NodePicker
+                  items={targetItems}
+                  groups={targetGroups}
+                  value={targetServerId}
+                  onSelect={setTargetServerId}
+                  placeholder={t('rules.defaultNodeTip')}
+                  searchPlaceholder={t('common.search', '搜索')}
+                  ariaLabel={t('rules.targetNode')}
                 />
-              </SettingsRow>
+              </div>
             )}
+
+            {/* 开关区：启用规则 + bypassFakeIP（域名类条件才显） */}
+            <div className="rl-optcard">
+              <label className="rl-optrow">
+                <div>
+                  <div className="rl-row-t">{t('rules.enableRule')}</div>
+                  <div className="rl-row-d">{t('rules.enableRuleTip')}</div>
+                </div>
+                <button
+                  type="button"
+                  role="switch"
+                  aria-checked={enabled}
+                  aria-label={t('rules.enableRule')}
+                  className={`swt${enabled ? ' on' : ''}`}
+                  onClick={() => setEnabled((v) => !v)}
+                />
+              </label>
+              {bypassApplicable && (
+                <>
+                  <div className="rl-optrow-hair" />
+                  <label className={`rl-optrow rl-bypass${globalFakeIpEnabled ? '' : ' disabled'}`}>
+                    <div>
+                      <div className="rl-row-t">
+                        {t('rules.bypassFakeIp')}{' '}
+                        <span className="rl-tag">{t('rules.realDns')}</span>
+                      </div>
+                      <div className="rl-row-d">
+                        {globalFakeIpEnabled
+                          ? t('rules.bypassFakeIpTip')
+                          : t('rules.bypassFakeIpDisabledTip')}
+                      </div>
+                    </div>
+                    <button
+                      type="button"
+                      role="switch"
+                      aria-checked={globalFakeIpEnabled && bypassFakeIP}
+                      aria-label={t('rules.bypassFakeIp')}
+                      disabled={!globalFakeIpEnabled}
+                      className={`swt${globalFakeIpEnabled && bypassFakeIP ? ' on' : ''}`}
+                      onClick={() => setBypassFakeIP((v) => !v)}
+                    />
+                  </label>
+                </>
+              )}
+            </div>
           </div>
         </div>
 
-        <DialogFooter>
-          <Button
+        {/* 底部操作 */}
+        <div className="rl-dlg-foot">
+          <button
             type="button"
-            variant="outline"
+            className="btn ghost"
             onClick={() => onOpenChange(false)}
             disabled={submitting}
           >
             {t('servers.cancel')}
-          </Button>
-          <Button type="button" onClick={onSubmit} disabled={submitting}>
-            {submitting && <Loader2 className="me-2 h-4 w-4 animate-spin" />}
+          </button>
+          <button type="button" className="btn flow" onClick={onSubmit} disabled={submitting}>
+            {submitting && <Loader2 className="animate-spin" size={15} />}
             {mode === 'add' ? t('rules.add') : t('rules.save')}
-          </Button>
-        </DialogFooter>
+          </button>
+        </div>
 
         <ProcessPickerDialog
           open={pickerType !== null}
