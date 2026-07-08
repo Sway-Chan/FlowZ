@@ -33,7 +33,11 @@
     "backgroundDisabledDesc": "系统设置中本应用的「允许在后台」已被关闭，提权助手无法运行，TUN 启停将退回每次弹管理员授权框。请点击下方「打开系统设置」，在「登录项与扩展」中重新开启 FlowZ 的「允许在后台」。开启后本页状态会在几秒内自动恢复。",
     "disabledOpenSettings": "打开系统设置",
     "backgroundRestored": "「允许在后台」已恢复，提权助手可用",
-    "descFull": "安装后 TUN 模式启停代理、切换节点不再反复弹出管理员授权框（仅安装时需授权一次）。"
+    "descFull": "安装后 TUN 模式启停代理、切换节点不再反复弹出管理员授权框（仅安装时需授权一次）。",
+    "upgradeTitle": "提权助手有新版本",
+    "upgradeDesc": "新版修复了跨提权态的文件属主冲突（会导致 Tailscale / 启动异常）。建议升级，仅需授权一次。",
+    "upgradeAction": "升级",
+    "upgradeDismiss": "不再提示"
   },
   "proxy": {
     "systemProxyResidualTitle": "系统代理可能干扰 TUN",
@@ -60,7 +64,8 @@
     "noResults": "无匹配",
     "apply": "应用",
     "remove": "移除",
-    "copy": "复制"
+    "copy": "复制",
+    "all": "全部"
   },
   "sidebar": {
     "home": "主页",
@@ -253,7 +258,9 @@
     "summaryCount": "共 {{n}} 项",
     "summaryMissing": "{{n}} 项缺失",
     "tableUsage": "占用",
-    "urlRequired": "必填"
+    "urlRequired": "必填",
+    "refKindSystem": "系统",
+    "smartBaselineRef": "智能分流基线"
   },
   "home": {
     "topologyHint": "右键域名可一键加规则",
@@ -359,7 +366,9 @@
     "tsExitNotAdvertisedWarn": "所选出口设备未广告为出口节点，公网无法经其出网，请换一台已广告出口的设备。",
     "tsExitPickDevice": "选择出口设备",
     "exitNode": "出口节点",
-    "reprobeExit": "重新检测出口"
+    "reprobeExit": "重新检测出口",
+    "exitDetecting": "检测中…",
+    "exitTimeout": "检测超时"
   },
   "settings": {
     "nav": {
@@ -616,10 +625,8 @@
       "tlsFragmentDesc": "切分 TLS ClientHello 规避 SNI 明文 DPI（非加密、不保证绕过）。",
       "tlsFragmentDescFull": "对所有 TLS 节点切分 ClientHello，规避基于 SNI 明文关键词的 DPI 探测。非加密、不保证绕过（区别于 ECH/Reality）。默认关；个别网络下可能轻微增加握手延迟。",
       "logLevel": "日志级别",
-      "logLevelDesc": "日志详细程度；级别越高越省盘越隐私，可排查信息越少。",
       "logLevelDescFull": "日志级别（同时作用于 sing-box 连接日志与应用日志 app.log）。info/debug 记录访问域名/SNI，warn 及以上不记录——级别越高越隐私、越省磁盘，但可排查的信息越少；排查问题时建议设回 info。保存即时生效（代理运行中会自动重启核心）。",
       "disableLogFile": "关闭日志写盘",
-      "disableLogFileDesc": "完全禁用 sing-box 日志（隐私 / 省盘）。",
       "subAutoUpdate": "订阅自动更新",
       "autoUpdateSub": "自动更新订阅",
       "autoUpdateSubDesc": "启动时补更陈旧订阅，运行期按周期自动更新。",
@@ -720,7 +727,6 @@
       "autoSwitchNodeDesc": "当当前代理连接失败时，自动切换到可用节点",
       "subIntervalRange": "更新间隔需为 1–168 小时",
       "fakeIpFilterEditHint": "每行一个域名；可增删，恢复默认回到内置清单。",
-      "bypassLANEditHint": "路由规则优先级高于此：需让某段走代理，可以从列表删除或者去「路由规则」加自定义规则即可覆盖。",
       "bypassLANEditHintWinTun": "Windows TUN 下此清单为内核级排除：自定义规则无法覆盖。需让某段走代理请从此清单移除该段（组网路由段已自动放行进 TUN）。",
       "fakeIpDescFull": "开启：节点收到域名、首连更快，TUN 推荐。关闭：节点收到真实 IP，部分严格机场可能拒连、海外首连变慢。",
       "resolveNodeDomainsAheadDescFull": "开启后连接前用多个 DoH 上游并发预解析节点域名取最快结果，避免单点 DNS 被限速/劫持导致整条代理连不上；关闭则退回单一上游解析（无并发容错）。SNI 仍用原域名，解析失败自动回退域名。建议开启。",
@@ -1632,7 +1638,8 @@
     "conditionCount": "{{count}} 条",
     "disabledBadge": "已禁用",
     "orderDraftUnsaved": "未保存的排序草稿",
-    "viewDensity": "视图密度"
+    "viewDensity": "视图密度",
+    "categoryFilter": "分类筛选"
   },
   "sub": {
     "requireName": "请输入订阅名称",
@@ -1685,7 +1692,8 @@
       "emptyDetail": "拉取成功但没有可用节点",
       "unknownTitle": "添加失败",
       "unknownDetail": "无法验证订阅，请稍后重试或联系机场"
-    }
+    },
+    "advancedSection": "高级"
   },
   "localImport": {
     "title": "手动导入",

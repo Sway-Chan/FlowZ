@@ -30,19 +30,23 @@ export function ConnectionTopology() {
   const [height, setHeight] = useState(FIXED_HEIGHT);
 
   useEffect(() => {
-    if (!containerRef.current) return;
-
-    const resizeObserver = new ResizeObserver((entries) => {
-      for (const entry of entries) {
-        if (entry.contentBoxSize) {
-          setWidth(entry.contentRect.width);
-          if (entry.contentRect.height > 0) setHeight(entry.contentRect.height);
-        }
-      }
-    });
-
-    resizeObserver.observe(containerRef.current);
-    return () => resizeObserver.disconnect();
+    const el = containerRef.current;
+    if (!el) return;
+    // 直接量 getBoundingClientRect（比 RO entry.contentRect 稳）；RO 观容器 + window resize 双兜底。
+    // 修真机「拖窗放大跟涨、缩小不回缩」：单靠 RO 在某些缩小路径未回调，viewBox 卡死旧宽 → 图不随窗回缩。
+    const measure = () => {
+      const r = el.getBoundingClientRect();
+      if (r.width > 0) setWidth(r.width);
+      if (r.height > 0) setHeight(r.height);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(el);
+    window.addEventListener('resize', measure);
+    return () => {
+      ro.disconnect();
+      window.removeEventListener('resize', measure);
+    };
   }, []);
 
   // batch3 §3.7：拓扑订阅 'aggregate' topic——挂载即拿初始帧（= 原 CONNECTIONS_AGGREGATE_GET 回填），之后增量 push
@@ -294,7 +298,9 @@ export function ConnectionTopology() {
           ref={containerRef}
           // hero flex-1 填满 topo-card（conduit .topo-card{flex:1} flex-col）；下限 300px 防挤扁。
           // 用 flex-1 而非 h-full：h-full(height:100%) 在 flex 父级下不稳解析、会塌成内容高（同 logs 修复根因）。
-          className="relative min-h-[300px] w-full min-w-0 flex-1 cursor-default overflow-hidden"
+          // [contain:size]：内容不参与自身尺寸——否则 svg viewBox 纵横比把上次高度变成内容地板，intrinsic 经
+          // flex-basis:0 链传进 .container(min-h-full auto 高)，缩窗时 RO 永远量不到更小值（高度棘轮，Fable 定位）。
+          className="relative min-h-[300px] w-full min-w-0 flex-1 cursor-default overflow-hidden [contain:size]"
           onMouseMove={handleMouseMove}
           onMouseLeave={handleMouseLeave}
         >
