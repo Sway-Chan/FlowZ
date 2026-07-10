@@ -907,6 +907,12 @@ export class ConfigManager implements IConfigManager {
       config.rememberWindowSize = true;
     }
 
+    // 默认启用（与 DEFAULT_CONFIG 一致）：未显式设置过的配置（含旧配置缺该键）切换节点默认断开旧连接；
+    // 显式设为 false 的用户配置不受影响（非 undefined）。
+    if (config.interruptConnectionsOnSwitch === undefined) {
+      config.interruptConnectionsOnSwitch = true;
+    }
+
     // bypassProcesses 是可选字段，兼容旧配置
     if (config.bypassProcesses === undefined) {
       config.bypassProcesses = [];
@@ -1131,6 +1137,7 @@ export class ConfigManager implements IConfigManager {
       subscriptionProxyPolicy: 'follow', // 默认跟随各订阅自身设定（per-sub updateViaProxy 默认关=直连）
       mainSessionViaProxy: true, // 更新检查/规则资源默认走代理（运行时）
       rememberWindowSize: true, // 默认启用记忆窗口大小（用户调整后下次沿用；已显式关闭的用户配置不受影响）
+      interruptConnectionsOnSwitch: true, // 切换节点默认断开旧连接（精准断连 pair 模型，避免误杀规则固定节点；已显式关闭的用户配置不受影响）
       enableIPv6: false, // 默认不启用 IPv6 解析（防假死兜底）
       autoPrivacyMode: false, // 默认不启用隐私模式
       privacyPassword: '', // 默认隐私模式密码为空

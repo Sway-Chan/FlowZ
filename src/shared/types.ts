@@ -428,7 +428,7 @@ export interface UserConfig {
   autoPrivacyMode?: boolean; // 自动进入隐私模式
   privacyPassword?: string; // 隐私模式解锁密码
   autoSwitchNode?: boolean; // 节点故障时自动切换到可用节点
-  interruptConnectionsOnSwitch?: boolean; // 切换节点时中断现有连接、强制在新节点重建（默认 false=优雅切换，现有连接保留至自然关闭）
+  interruptConnectionsOnSwitch?: boolean; // 切换节点时中断现有连接、强制在新节点重建（默认 true=切换即断旧连接；显式 false=优雅切换，现有连接保留至自然关闭）
   // 组网登录期出口让位（默认开=undefined||true）：当选中出口为 Tailscale 且其隧道尚未 Running 时，默认路由临时让位
   // 直连（hotSwitchSelector→direct，零重启），使浏览器授权页/引导期控制平面流量不被导向「尚未连上的 TS 出口」而死锁；
   // 隧道 Running 后自动切回 TS 出口。关闭=false：宁可授权失败也不在引导期直连（无泄漏窗口）。见 shared/mesh-login-fallback。
