@@ -1,6 +1,7 @@
 import type { ServerConfig, Protocol, UserConfig } from './types';
 import { dedupe, dedupeTrim } from './collections';
 import { isWarpServer } from './warp';
+import { isDirectSelection } from './direct-selection';
 
 /** sing-box endpoint 协议（顶层 endpoints[]、非 outbound）：WireGuard / Tailscale。单一真值，杜绝多处枚举漂移。 */
 export const ENDPOINT_PROTOCOLS: readonly Protocol[] = ['wireguard', 'tailscale'];
@@ -140,6 +141,38 @@ export function collectRuleTargetedServerIds(
 }
 
 /**
+ * issue #176 P2-A：「被引用节点」id 集——其定义变化会影响运行核实际行为、故必须随之重启（或订阅自动刷新须 apply）。
+ *   = {选中节点} ∪ {所有启用规则(custom/app)目标}，按 detour（前置代理链）传递闭包展开
+ *   ＋ 保守纳入全部 endpoint 协议节点（WireGuard/Tailscale 可能 force-route 子网/mesh，独立于选中即承载流量）。
+ * 其余「纯代理」节点仅作 selector 惰性成员、不承载任何流量，增删改不改变运行核行为 → 不在此集 → 可免重启。
+ * 安全方向：**过度纳入只会多一次重启、绝不错跳**（漏纳入才会错误免重启致运行核用旧前置参数 → 流量错误/泄漏）。
+ *   故 endpoint 一律纳入、detour 取全闭包、direct 哨兵剔除、悬空 detour 忽略。
+ * 注：custom-endpoint（`customSettings.isEndpoint`）不被 isEndpointProtocol 纳入，但其 `endpointForcedRouteCidrs`
+ *   恒返 []（不 force-route）→ 不会独立于选中承载流量 → 按普通未引用节点处理即安全，无需进引用集。
+ * 单一真值：ProxyManager（canSkip/getPendingNodeChanges）与 SubscriptionScheduler（自动刷新被引用节点变更判定）共用。
+ */
+export function referencedServerIds(c: UserConfig): Set<string> {
+  const byId = new Map(c.servers.map((s) => [s.id, s]));
+  const R = new Set<string>();
+  const stack: string[] = [];
+  const seed = (id?: string | null): void => {
+    if (id && !isDirectSelection(id)) stack.push(id);
+  };
+  seed(c.selectedServerId);
+  for (const r of c.customRules || []) if (r.enabled) seed(r.targetServerId);
+  for (const a of c.appRules || []) if (a.enabled) seed(a.targetServerId);
+  for (const s of c.servers) if (isEndpointProtocol(s.protocol)) stack.push(s.id); // 保守纳入全部 endpoint
+  while (stack.length) {
+    const id = stack.pop() as string;
+    if (R.has(id)) continue; // 成环/重复保护
+    R.add(id);
+    const s = byId.get(id);
+    if (s?.detour && byId.has(s.detour)) stack.push(s.detour); // detour 前置链传递闭包
+  }
+  return R;
+}
+
+/**
  * 本轮「实际会发射 force-route」的组网节点（与块 0c `shouldForceRouteSubnets` 同口径）：alwaysRouteSubnets ON、
  * 或被选中、或被规则显式指向。供「自定义规则与组网段重叠」warn / 「网段被覆盖」shadow 角标与**发射端同口径**，
  * 杜绝对「仅出网且未 engaged」节点虚报覆盖/被覆盖（非组网协议恒保留，对 cidr/shadow 计算无副作用）。
@@ -193,13 +226,30 @@ export function meshSystemSupportedOnPlatform(
   return (platform || '').toLowerCase() !== 'win32';
 }
 
+/** 测速可行性能力位（path-aware）：主核 probe 池是否可用（=代理运行且池就绪）。 */
+export interface SpeedTestCaps {
+  mainCorePool?: boolean;
+}
+
 /**
- * 节点是否参与测速。不可测=tailscale / 自定义 endpoint / reverseMesh(system 内核接口)。
- * 与 ProxyManager.buildSpeedTestOutbound 的 null 分支同口径(单一真值);WireGuard 仍可测。
+ * 节点是否参与测速（path-aware，§16.1）。
+ *  - TS-exit（exitNode 非空 && 非 reverseMesh）：**仅主核池路径**可测（caps.mainCorePool）——主核 tsnet 认证态活着、
+ *    TS tag 已是 probe-selector 成员；临时核路径建不出第二 tsnet 实例，维持排除。
+ *  - TS-mesh-only（无 exitNode）：meshAllowsInternet=false → 公网黑洞必假超时 → 恒排除。
+ *  - reverseMesh(system 内核接口)：非选中时 dial 走 OS default = 测出直连假好值 → 恒排除。
+ *  - custom endpoint：raw-JSON 无 gate 真值 → 恒排除。
+ * 缺省 caps（不传/临时核口径）：TS 一律不可测——与 ProxyManager.buildSpeedTestOutbound 的 null 分支同口径。
+ * WireGuard（非 reverseMesh）仍可测。
  */
-export function isSpeedTestable(server: ServerConfig): boolean {
+export function isSpeedTestable(server: ServerConfig, caps?: SpeedTestCaps): boolean {
   const p = server.protocol?.toLowerCase();
-  if (p === 'tailscale') return false;
+  if (p === 'tailscale') {
+    return (
+      caps?.mainCorePool === true &&
+      meshAllowsInternet(server) && // ⟺ !!exitNode（本文件 :92）
+      !meshUsesSystemInterface(server) // reverseMesh 排除（假好值）
+    );
+  }
   if (meshUsesSystemInterface(server)) return false;
   if (p === 'custom' && server.customSettings?.isEndpoint) return false;
   return true;

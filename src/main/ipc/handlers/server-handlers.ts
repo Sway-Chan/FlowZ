@@ -9,6 +9,9 @@ import { randomUUID } from 'crypto';
 import { IPC_CHANNELS } from '../../../shared/ipc-channels';
 import type { ServerConfig } from '../../../shared/types';
 import { registerIpcHandler } from '../ipc-handler';
+import { mainEventEmitter, MAIN_EVENTS } from '../main-events';
+import { ipcEventEmitter } from '../ipc-events';
+import { DIRECT_SERVER_ID } from '../../../shared/direct-selection';
 import { ProtocolParser } from '../../services/ProtocolParser';
 import { ConfigManager } from '../../services/ConfigManager';
 import { WarpService, type WarpWireGuardDraft } from '../../services/WarpService';
@@ -112,9 +115,17 @@ export function registerServerHandlers(
   );
 
   // 删除服务器
-  registerIpcHandler<{ serverId: string }, void>(
+  // D4/F-1（flowz-node-change-restart）：删除**恒双播** event:configChanged（renderer 差集刷新）+ MAIN_EVENTS.CONFIG_CHANGED
+  //   （主进程 switchMode）。重启与否**单一真值**归 switchMode.canSkipRestartForAddedUnreferenced（refOld∪refNext 含 detour
+  //   闭包 + endpoint 保守集）：删被引用节点（含 detour 前置/未选中 endpoint）恒重启、删纯未引用节点 canSkip③ defer 不重启。
+  //   原 handler 用 `wasSelected‖ruleTargeted` 残缺复刻判据、漏 detour/endpoint → 删它们不重启、活流量继续经已删节点（缺口）。
+  //   删选中时 selectedServerId 置**渲染端传入的兜底节点**（pickFallbackExit），而非 null（避免 0 节点重启 throw）。
+  registerIpcHandler<{ serverId: string; fallbackSelectedId?: string | null }, void>(
     IPC_CHANNELS.SERVER_DELETE,
-    async (_event: IpcMainInvokeEvent, args: { serverId: string }) => {
+    async (
+      _event: IpcMainInvokeEvent,
+      args: { serverId: string; fallbackSelectedId?: string | null }
+    ) => {
       const config = await configManager.loadConfig();
       const index = config.servers.findIndex((s) => s.id === args.serverId);
 
@@ -125,22 +136,34 @@ export function registerServerHandlers(
       const removed = config.servers[index];
       config.servers.splice(index, 1);
 
-      // 如果删除的是当前选中的服务器，清除选中状态
-      if (config.selectedServerId === args.serverId) {
-        config.selectedServerId = null;
+      const wasSelected = config.selectedServerId === args.serverId;
+
+      // 删当前选中 → 兜底出口（渲染端最快剩余节点）；无剩余(null/undefined) → DIRECT_SERVER_ID 哨兵（干净直连，
+      // proxy-selector default='direct'）。**不可置 null**：null 非哨兵 → 0 节点时 buildOutbounds `nodeTags.length===0
+      // && !isDirect` throw「没有可用节点」→ 重启失败（设计 D4：0 剩余→direct）。
+      if (wasSelected) {
+        config.selectedServerId = args.fallbackSelectedId ?? DIRECT_SERVER_ID;
       }
 
       await configManager.saveConfig(config);
       await runServerRemovalSideEffects(removed);
+
+      // F-1：恒双播（对齐 CONFIG_SAVE）。重启分类归 switchMode canSkip；渲染端差集/store 即时刷新（原删除零 sendToAll →
+      // 徽标要等下个无关触发点才冒出、观感随机）。未引用删除仍 defer 不重启（不多重启）。
+      ipcEventEmitter.sendToAll('event:configChanged', { newValue: config });
+      mainEventEmitter.emit(MAIN_EVENTS.CONFIG_CHANGED, config);
     }
   );
 
   // 批量删除服务器：一次 loadConfig → 过滤掉全部 ids → 命中选中清 selectedServerId → 一次 saveConfig，
   // 再逐个跑删除副作用。单次配置写避免「N 个并发单删各读旧配置、末次写覆盖前面」的竞态（净删 1 个）。
   // 不存在的 id 静默跳过（幂等）。返回实际删除数。
-  registerIpcHandler<{ serverIds: string[] }, number>(
+  registerIpcHandler<{ serverIds: string[]; fallbackSelectedId?: string | null }, number>(
     IPC_CHANNELS.SERVER_DELETE_BATCH,
-    async (_event: IpcMainInvokeEvent, args: { serverIds: string[] }) => {
+    async (
+      _event: IpcMainInvokeEvent,
+      args: { serverIds: string[]; fallbackSelectedId?: string | null }
+    ) => {
       const idSet = new Set(args.serverIds);
       const config = await configManager.loadConfig();
       const removed = config.servers.filter((s) => idSet.has(s.id));
@@ -148,16 +171,23 @@ export function registerServerHandlers(
 
       config.servers = config.servers.filter((s) => !idSet.has(s.id));
 
-      // 选中节点在删除集合内（'__direct__' 哨兵不是真实 id，不会命中）→ 清除选中，
-      // 否则 ConfigManager.validateConfig 会因 selectedServerId 指向不存在节点而抛错。
-      if (config.selectedServerId && idSet.has(config.selectedServerId)) {
-        config.selectedServerId = null;
+      // F-1：删除集合是否含选中节点 → 决定兜底出口（重启分类归 switchMode canSkip，不再在此复刻规则目标判据）。
+      const selectedDeleted = !!config.selectedServerId && idSet.has(config.selectedServerId);
+
+      // 选中节点在删除集合内（'__direct__' 哨兵不是真实 id，不会命中）→ 置兜底节点（渲染端最快剩余节点）；
+      // 无剩余 → DIRECT_SERVER_ID（同单删：null 会致 0 节点重启 throw）。
+      if (selectedDeleted) {
+        config.selectedServerId = args.fallbackSelectedId ?? DIRECT_SERVER_ID;
       }
 
       await configManager.saveConfig(config);
       for (const r of removed) {
         await runServerRemovalSideEffects(r);
       }
+
+      // F-1：恒双播（同单删；重启分类归 switchMode canSkip，含 detour 闭包/endpoint 保守集）。
+      ipcEventEmitter.sendToAll('event:configChanged', { newValue: config });
+      mainEventEmitter.emit(MAIN_EVENTS.CONFIG_CHANGED, config);
       return removed.length;
     }
   );

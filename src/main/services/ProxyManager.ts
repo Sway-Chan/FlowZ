@@ -21,6 +21,7 @@ import type {
   HelperStatus,
   InvalidNodeInfo,
   ProxyExitBlock,
+  PendingNodeChanges,
 } from '../../shared/types';
 import { ProxyErrorCode } from '../../shared/types';
 import { deriveTsExitWarning } from '../../shared/tailscale-exit-warning';
@@ -72,8 +73,10 @@ import {
   meshAlwaysRoutesSubnets,
   endpointForcedRouteCidrs,
   meshSystemSupportedOnPlatform,
+  referencedServerIds,
 } from '../../shared/endpoint-routes';
 import { resolveStartRetryBudget } from '../../shared/start-retry-policy';
+import { PROBE_POOL_SIZE, type MainCoreProbe } from '../../shared/speed-test';
 import { meshLoginFallbackShouldEngage } from '../../shared/mesh-login-fallback';
 import {
   classifyCoreBuild,
@@ -223,6 +226,7 @@ export interface IProxyManager {
       | 'stopped'
       | 'error'
       | 'node-hot-switched'
+      | 'unlock-invalidate'
       | 'api-client-ready'
       | 'tailscale-selected-running',
     listener: (...args: any[]) => void
@@ -233,6 +237,7 @@ export interface IProxyManager {
       | 'stopped'
       | 'error'
       | 'node-hot-switched'
+      | 'unlock-invalidate'
       | 'api-client-ready'
       | 'tailscale-selected-running',
     listener: (...args: any[]) => void
@@ -319,6 +324,14 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     markProxyBlocked: (reason: ProxyExitBlock) => void;
     refreshProxy: () => Promise<unknown>;
   };
+  // 出口无效态跨态回调（index 经 setOnTsExitBlockFlip 注入）：翻转对账跨态时通知解锁检测失效——翻 blocked 清陈旧
+  // 绿点（渲染端复位 idle）、翻 none 触发有效出口重检。可选，未注入优雅跳过（?.）。
+  private onTsExitBlockFlip?: () => void;
+  // R2 TS 出口恢复腿单飞 + 合并待跑：恢复是**边沿触发**（仅 blocked→none 跨态调，非每帧 level），被丢的边沿不会
+  // 次帧重触发（同态帧 cur===prev 早退）→ 不能像 loginFallback 那样靠次帧自愈。故在飞期间的 flip 记 pending，
+  // 收尾若仍处 none 补跑一次（合并 re-advertise flap 密集边沿，不漏最后一次真恢复）。
+  private tsExitRecovering = false;
+  private tsExitRecoverPending = false;
   // 缺陷1 登录期出口让位：选中出口为账号制 TS 且隧道未就绪时，默认路由临时 hotSwitch→direct（零重启），
   // 隧道 Running 后切回。engaged=当前是否处于让位态；serverId=让位所服务的选中出口 id（用户中途切换出口时据此
   // 判 stale 复位）。仅运行期内存态，随停核/新会话复位。见 shared/mesh-login-fallback + engageLoginFallback。
@@ -349,6 +362,20 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   // start/stop 接管生命周期（如退避窗口内用户手动 start，它会 reset autoRestartAborted=false 绕过 M3 检查）→
   // 本次自动重启静默让位，杜绝「自动腿 + 手动腿」双启动流并发互相杀进程/撞 9090/误清对方系统代理（M-2′）。
   private lifecycleGeneration = 0;
+
+  /**
+   * §15.11 测速 × 核生命周期竞态硬化：暴露既有生命周期世代 token（start/stop 各 ++，restart=×2）供 SpeedTestService
+   * 拉取——测速起测时快照 gen0，逐波/每 report 前比对，超代（核 start/stop/restart/config-regen 中途跃迁）即 abort，
+   * 保留已测、绝不给未测节点写假 -1（拉模型，对齐 IpInfoService.probeGeneration 先例）。零语义改动，纯暴露读值。
+   */
+  getLifecycleGeneration(): number {
+    return this.lifecycleGeneration;
+  }
+  // S1（§13.2）：per-start selector-settled 门。startInternal 重置为新 pending deferred；reassertSelectorSelection
+  // 完成（成功/放弃）/ 无管理 API / stop 各 resolve。whenSelectorSettled 供出口首探等待——保「探测=用户选中节点的
+  // 出口」，消除「核起→reassert 完成」窗口内经陈旧 selector（cache_file 携带的上一会话选择）从上一节点探测出错误
+  // 出口 IP（P18 陈旧出口 IP 尾巴）。null=无在跑 start（未 start / 已 settle 清空）→ waiter 即时放行。
+  private selectorSettled: { promise: Promise<void>; resolve: () => void } | null = null;
   // 在途自动重启腿的世代快照（isRestarting 置位时记，finally 清 -1）。供 handleProcessExit 判断「在途腿是否已被
   // supersede（注定让位）」→ 若是且此刻又崩溃，置 crashWhileSuperseded 让那条腿醒来补发一次重启，否则崩溃信号
   // 被 isRestarting dedup 吞掉、接管会话死后无人恢复（M-2′-G1）。
@@ -377,6 +404,17 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   // currentConfig）。与崩溃轴（isRestarting/lifecycleGeneration）、换核轴（coreSwapInProgress）正交、互不干扰。
   private lifecycleDepth = 0;
   private restartPending = false;
+  // H-1（§16.3.4b force-restart）：待决强制重启的目标配置。去抖重启读它优先于 currentConfig——因 restart 的 in-flight
+  // start 腿会在 startInternal 头 `this.currentConfig = config`（旧 cfg）覆盖掉 force-restart 刚设的新 cfg，若 drain 读
+  // currentConfig 会重启回旧 cfg、丢新节点、复现死循环。仅 force-restart 路径写；去抖 timer 消费即清；switchMode 结构性
+  // 重启（更新的完整 config）清它以超代（newer 胜）。null=普通去抖重启，读 currentConfig 原语义。
+  private pendingForceRestartConfig: UserConfig | null = null;
+  // 丢失更新修复（bug#5）：lifecycle 在飞（depth>0，如删选中节点触发的重启 stop→spawn 空窗）时到达的 switchMode 配置
+  // 变更不丢弃、暂存于此；endLifecycleOp 回 depth 0（kind≠stop）时重放一次 switchMode 对账。窗口内多次变更 last-wins
+  // （每次 payload 都是 ConfigManager 全量最新）。与 pendingForceRestartConfig 正交：force 由去抖 timer 消费、本字段由
+  // drain 重放 switchMode；相撞时 switchMode 最终重启腿会清 force（newer 胜）。根因：restart 空窗 singboxPid=null，旧
+  // switchMode「未运行」早退把变更静默丢给盘、对运行核永久丢失 → 核起于陈旧 fallback 快照（出口≠UI 选中）。
+  private pendingSwitchConfig: UserConfig | null = null;
   // issue #176：最近一次 start() 是否因被接管而「静默让位」（未真正起核）。startInternal 入口复位 false，start() 的
   // supersede 吞掉分支同步置 true。供 attemptAutoRestart 在 await start() 后判别——让位时跳过「自动重启成功」日志与
   // EVENT_PROXY_STARTED（否则发出与「已让位」矛盾、pid/startTime 陈旧的多余 started 事件）。
@@ -388,6 +426,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   // 置 true → 热路径(switchMode no-op 分支)改走重启重落盘，防「写文件但无人消费」导致值陈旧。
   private customRuleFilesDegraded = false;
   private currentConfig: UserConfig | null = null;
+  // 待应用差集基准（§2 待应用差集模型）：运行核实际起于的 servers 指纹快照（id→fingerprint）。仅在 startInternal
+  //   实际(重)启核时刷新——defer/no-op 分支的 currentConfig 赋值**不刷**（那不是运行核真值）。ConfigManager 最新
+  //   servers 与它的差集 = 待应用变更（added/modified/removed）；modified 集 = dirty（防热切到旧参数节点）。null=核未起。
+  private runningServersFingerprint: Map<string, string> | null = null;
   // 启动时生成的「节点 id → selector 成员 tag」映射，用于 clash_api 热切换时定位目标 tag
   private currentIdToTagMap: Map<string, string> | null = null;
   // 启动时生成的「规则 key → { selectorTag, memberTag }」映射，用于「改规则目标节点」clash_api 热切换
@@ -419,6 +461,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   // 真实直连出口 IP 与代理出口 IP（inbound 规则在 route.rules 头部短路，不受分流策略影响）。
   private probeDirectPort: number | null = null;
   private probeProxyPort: number | null = null;
+  // §15 主核测速探测池端口（每次 start 与探针同批分配，allocateProbePorts 3+K）：K 个 probe-in-k http 入站的
+  // listen_port。非空 → generateSingBoxConfig 向 inbounds/outbounds/route/dns 注入探测池，测速走主核（同核单会话，
+  // 消除 WG/WARP 双会话超时）；分配失败/未 start → []（不注入，测速回退临时核 testServersViaProxy）。
+  private probePoolPorts: number[] = [];
   // 更新链路统一 inbound `update-in`（socks）的动态端口（每次 start 与探针同批分配）：FlowZ 应用更新检查/下载
   // + 规则资源下载 + 订阅流量 pin 到此口（核心链路待后续接入），route 头部钉死按 proxyMode 决策（global/smart→
   // 经代理 userExitTag，off-mesh 回退 direct；direct→direct）。归属 100% 确定（只有 FlowZ 主动往此口发）→
@@ -441,6 +487,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   // connected 由 getStatus().running 实时判，故停代理不清缓存（保留「上次已知」供下拉，仅标陈旧）；删/改名节点的
   // 幽灵条目由 getTailscaleStatusSnapshot 读路径按当前 config 过滤（Map 本身不剪枝，按节点数有界）。
   private tailscaleStatusCache = new Map<string, TailscaleStatusEvent>();
+  // M-4：每条 TS 状态末帧写入时的 lifecycleGeneration。测速 gate（tsNodeReady）只信**本代**帧——核 restart 后
+  // （force-restart 主流程）新核 tsnet 拉起前，缓存里旧核末帧仍是 'Running'，若放行会对未就绪 TS 写假 -1（违反诚实性）。
+  private tailscaleStatusGen = new Map<string, number>();
   private lastLogMessage: string = '';
   private lastLogCount: number = 0;
   private lastLogTime: number = 0;
@@ -609,6 +658,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 复位自动重启取消标记：必须在上面的内部 stop() 之后（stop 会置 true）——真正开始一次启动即清掉，
     // 否则 start 的内部 stop poison 该标记会让此后所有崩溃自动重启被误拦（M3 回归防护）。
     this.autoRestartAborted = false;
+    // S1：本次 start 的 selector-settled 门重置为新 pending（须在内部 stop() 之后——内部 stop 会 resolve 上一个 deferred）。
+    // 出口首探（index.ts 'started' handler）经 whenSelectorSettled 等它 resolve 才发，防落在 reassert 前的陈旧 selector 窗口。
+    this.resetSelectorSettled();
 
     // 用户态启动（手动/托盘/IPC/去抖重启，恒 interactive!==false）即重置重启计数；自动重启腿恒 interactive:false
     // 不重置（计数需跨自动重启累积到上限）。按用户意图判而非 isRestarting——退避窗口内用户手动 start 时
@@ -619,6 +671,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
 
     // 先保存当前配置（needsRootPrivilege 等方法需要用到）
     this.currentConfig = config;
+    // §2 待应用差集基准：快照运行核实际起于的 servers 指纹。**仅此起核路径刷新**（switchMode 的 defer/no-op 分支不刷，
+    //   见 :420 字段注释）→ 后续 config 编辑相对此快照算差集（added 待入池 / modified 待生效+dirty / removed 待移出）。
+    this.runningServersFingerprint = this.computeServersFingerprint(config.servers);
 
     // Linux：解析现役核（helper 模式=root 受管核，setcap 兜底=userData 可写核）并维护 userData 兜底核。每次 start
     // 重解析（对齐 darwin/win HIGH-1）：探测/校验/实跑对准同一核。ensureWritableCore 内按平台维护 + 返回现役核。
@@ -871,6 +926,13 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
                     ib.listen_port = this.probeProxyPort;
                   } else if (ib.tag === 'update-in' && this.updateInPort) {
                     ib.listen_port = this.updateInPort;
+                  } else if (ib.tag?.startsWith('probe-in-')) {
+                    // §15 探测池：把重分配后的池端口回填到对应 probe-in-k 入站（allocateProbePorts 已刷新
+                    // this.probePoolPorts；不回填则 sing-box 仍 bind 旧冲突端口）。索引越界（池置空）时跳过。
+                    const k = Number(ib.tag.slice('probe-in-'.length));
+                    if (Number.isInteger(k) && this.probePoolPorts[k]) {
+                      ib.listen_port = this.probePoolPorts[k];
+                    }
                   }
                 }
                 await this.writeSingBoxConfig(singboxConfig);
@@ -1052,13 +1114,22 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       // 世代 token 守卫，被 stop/重启接管即放弃）。flush 绝不丢：reassert 成功或异常 finally 都会安排。
       // 缺陷1 登录期出口让位【预置】折入 reassert stage1（据 state 目录判未登录则直接 PUT direct 并 markEngaged，
       // 消除「核起→首帧」黑洞窗口）——不在此单独置 flag，避免 flag 与 selector 脱节（flag 只在 PUT 成功后置）。
-      void this.reassertSelectorSelection(config).finally(() =>
-        this.scheduleConnectionFlush(config)
-      );
+      void this.reassertSelectorSelection(config).finally(() => {
+        // S1：reassert 完成（selector 已校正回 config.selectedServerId 或放弃）→ 放行出口首探（whenSelectorSettled）。
+        this.markSelectorSettled('reassert 完成');
+        // F-C 解锁污染根治（契约收口）：reassert 可能实际翻转 selector（cache_file 复活旧选择 → 校正回 config 选中，
+        // 含 rule-sel）。该翻转不经 switchMode、原**不在 unlock invalidate 契约内** → boot 窗口内起跑的解锁轮会经错出口
+        // 探测、结果被当新鲜 commit 污染 store/cache（epoch 守卫失明）。此处补入契约：epoch 作废 boot 窗口轮，GAP-1
+        // self-run 在校正后出口重跑。同值 no-op reassert 多 emit 一次 → 与 'started' 的 invalidate 经 self-run 防抖合并，无害。
+        this.emit('unlock-invalidate');
+        this.scheduleConnectionFlush(config);
+      });
     } else {
       // 无管理 API（版本 <1.14）：无 reassert 可链，直接安排 flush（与原行为一致）。
       // P2a：启用代理 / 切接管模式后延迟一次连接 flush（见 scheduleConnectionFlush）——RST 泄漏成真实 IP 的旧连接
       // 逼其重连重解析（经 FakeIP 走代理），不重启内核；node 热切换不经 startInternal、由 interrupt 开关另管。
+      // S1：无管理 API（<1.14）无 reassert 可等 → 立即放行出口首探（selector default 即用户意图，无缓存携带窗口）。
+      this.markSelectorSettled('无管理 API');
       this.scheduleConnectionFlush(config);
     }
   }
@@ -1079,7 +1150,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       // 不要把它 revert 回启动时的旧节点。
       const targetId = this.currentConfig?.selectedServerId ?? config.selectedServerId;
       const tag = this.currentIdToTagMap?.get(targetId as string);
-      if (!tag) break;
+      if (!tag) {
+        // bug#5：选中节点不在本次起核的 tag 映射（config 被并发推进）→ 原静默 break 会让 selector 无声停在 cache_file
+        // 旧选择（症状放大器）。A/C 落地后由 settle 对账重启收敛，此处保留观测日志。
+        this.logToManager(
+          'warn',
+          `selector 校正放弃：选中节点 ${String(targetId)} 不在运行核 tag 映射，待启动后对账收敛`
+        );
+        break;
+      }
       const client = this.tailscaleApiClient;
       if (!client) break; // 管理 API 客户端未创建（核未起/无管理 API）→ 放弃，cache/default 兜底
       // 缺陷1 登录期出口让位预置：选中 TS 未登录（据 state 目录判 tunnelReady）→ reassert 直接 PUT 'direct' 而非
@@ -1134,6 +1213,41 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       if (!appRule.enabled || appRule.action !== 'proxy' || !appRule.targetServerId) continue;
       put(`app:${appRule.appId}`, appRule.targetServerId);
     }
+  }
+
+  /** S1：重置 selector-settled 门为新 pending deferred（每次 startInternal 调用，令本次 start 的 waiter 等本次校正）。 */
+  private resetSelectorSettled(): void {
+    let resolve!: () => void;
+    const promise = new Promise<void>((r) => {
+      resolve = r;
+    });
+    this.selectorSettled = { promise, resolve };
+  }
+
+  /** S1：标记 selector 已校正/放行出口首探（reassert 完成或放弃、无管理 API、stop 均调；幂等——已决议再 resolve 无害）。 */
+  private markSelectorSettled(reason: string): void {
+    if (!this.selectorSettled) return;
+    this.selectorSettled.resolve();
+    this.logToManager('debug', `selector-settled 放行出口首探（${reason}）`);
+  }
+
+  /**
+   * S1（§13.2）：等本次 start 的 selector 校正（reassertSelectorSelection）完成后再放行出口首探——保证「探测=用户
+   * 选中节点的出口」，消除「核起→reassert 完成」窗口内经陈旧 selector 从上一节点探测、拿到上一节点出口 IP（P18）。
+   * race 超时**恒 resolve 不 reject**——reassert 失败/慢时降级为今日行为（探测如实反映当前 selector 出口；reassert
+   * 失败本已 warn 可观测，诚实边界）。无在跑 deferred（未 start / 已 settle 清空）→ 即时返回，零成本。
+   */
+  async whenSelectorSettled(timeoutMs: number): Promise<void> {
+    const d = this.selectorSettled;
+    if (!d) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([
+      d.promise,
+      new Promise<void>((r) => {
+        timer = setTimeout(r, timeoutMs);
+      }),
+    ]);
+    if (timer) clearTimeout(timer);
   }
 
   /**
@@ -1275,8 +1389,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       // 进程已停 → 清掉旧的 id→tag 映射，防止对一个已不存在的 selector 误发 clash_api 切换
       this.currentIdToTagMap = null;
       this.currentRuleTargetMap = null;
+      this.runningServersFingerprint = null; // §2：核停→无运行核基准→待应用差集回空（computePendingDiff 返空）
     } finally {
       this.stopping = false;
+      // S1：停止时放行任何在等 selector-settled 的 waiter（本次 start 的 reassert 可能未完成即被停）——防 whenSelectorSettled
+      // 悬挂到超时。下次 start 的 resetSelectorSettled 会另建新 deferred，故此处 resolve 不影响后续。
+      this.markSelectorSettled('stop');
     }
     // macOS 停核断网安全网（补回腿）：放在最后——sing-box 已完全退出（sing-tun unsetRoutes 已跑），此刻若检测全局
     // default 缺失即补回起核前快照的网关。best-effort、绝不抛，不扰动上方已调试好的拆除时序。非 macOS no-op。
@@ -1417,12 +1535,31 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     if (this.lifecycleDepth > 0) return;
     if (kind === 'stop') {
       this.restartPending = false;
+      this.pendingForceRestartConfig = null; // H-1：停止终态丢弃待决 force-restart（停止优先，勿停后又被拉起）
+      this.pendingSwitchConfig = null; // bug#5：停止终态丢弃暂存变更（已落盘，下次 start 读盘应用，勿重放拉起核）
       return;
+    }
+    // bug#5：先重放窗口内暂存的 switchMode 变更（其内部自行分流热切/no-op/defer/重启；走重启为去抖，与下方
+    // restartPending 的去抖天然合并为一次）。depth 已回 0 → 重放的 switchMode 不再命中暂存分支、正常执行。失败仅记日志。
+    const pendingSwitch = this.pendingSwitchConfig;
+    this.pendingSwitchConfig = null;
+    if (pendingSwitch) {
+      void this.switchMode(pendingSwitch).catch((e) =>
+        this.logToManager(
+          'warn',
+          `生命周期后配置重放失败: ${e instanceof Error ? e.message : String(e)}`
+        )
+      );
     }
     if (this.restartPending) {
       this.restartPending = false;
       this.scheduleDebouncedRestart();
     }
+  }
+
+  /** bug#5：是否有 start/stop/restart 在飞——CONFIG_CHANGED 处理器据此不把重启 stop→spawn 空窗误判为「未运行」而丢变更。 */
+  isLifecycleBusy(): boolean {
+    return this.lifecycleDepth > 0;
   }
 
   /**
@@ -1437,15 +1574,18 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     if (this.restartDebounceTimer) clearTimeout(this.restartDebounceTimer);
     this.restartDebounceTimer = setTimeout(() => {
       this.restartDebounceTimer = null;
-      // 窗口内可能已被 stop()/quit 清掉：仅在仍运行时重启
-      if (!this.singboxProcess && !this.singboxPid) return;
-      const cfg = this.currentConfig;
-      if (!cfg) return;
-      // issue #176 单飞：有 start/stop/restart 在飞 → 不并发，置待决，由 endLifecycleOp 在 depth 归 0 时排空。
+      // issue #176 单飞 + H-1：有 start/stop/restart 在飞 → 不并发，置待决，由 endLifecycleOp 在 depth 归 0 时排空。
+      // **必须先于句柄判空**——restart 的 stop→start 空窗内句柄暂空但 depth>0，若先判句柄会误丢本次去抖重启。
       if (this.lifecycleDepth > 0) {
         this.restartPending = true;
         return;
       }
+      // 窗口内可能已被 stop()/quit 清掉（且无在飞操作）：仅在仍运行时重启
+      if (!this.singboxProcess && !this.singboxPid) return;
+      // H-1：force-restart 专用配置优先（in-flight start 腿覆盖 currentConfig 时它未被覆盖）；用后即清，普通去抖读 currentConfig。
+      const cfg = this.pendingForceRestartConfig ?? this.currentConfig;
+      this.pendingForceRestartConfig = null;
+      if (!cfg) return;
       // helper gate abort / 其它错误内部消化（终态=停止），防 timer 回调 unhandled rejection
       void this.restart(cfg).catch((e) => {
         this.logToManager('warn', `去抖重启结束: ${e instanceof Error ? e.message : String(e)}`);
@@ -1575,14 +1715,61 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   }
 
   /**
+   * §16.3.4b：手动订阅更新（用户主动、节点集变化 contentChanged）强制核去抖重启，把新增/改址节点纳入主核（及测速池）。
+   * **绕过 switchMode 的 norm no-op / hotSwitch / P2-A(canSkipRestartForAddedUnreferenced) 全部免重启闸**——sing-box
+   * 不热加载 outbound/endpoint 结构，让新节点入池的唯一手段是整核重启；P2-A 是自动路径减重启 optimization（非 correctness
+   * guard），手动路径「刷新=立即测未选中新节点」诉求必须绕过它。仅手动订阅路径调用（自动 Scheduler 恒不重启，§16.3.4b③ 不变量）。
+   * 代理未运行 → 仅更新缓存（下次 start 从磁盘纳入新节点）；换核窗口 → 仅更新缓存（不撞半替换核，随下次重启生效）。
+   * currentConfig 先赋值 → scheduleDebouncedRestart 在 trailing 读到新 servers；restart=stop+start 全量重生成（含新节点
+   * outbound/nodeTags/池成员/currentIdToTagMap），无半状态风险。
+   */
+  applyConfigForcingRestart(newConfig: UserConfig): void {
+    this.currentConfig = newConfig;
+    if (this.coreSwapInProgress) return; // 换核窗口：缓存已更新、随下次重启生效，不撞半替换核
+    // H-1：restart 的 stop→start 空窗内句柄（singboxProcess/singboxPid）暂空——若以句柄判空早退，本次强制重启会被
+    // 静默丢弃，且用户按 UI 指引重试订阅刷新时遇 304/contentChanged=false → 不再触发 force-restart → 死循环。故有
+    // lifecycle 操作在飞（depth>0）时置 restartPending，由 endLifecycleOp 在 depth 归 0 时排空一次。**且写 pending 专用
+    // 配置字段**——in-flight start 腿会覆盖 currentConfig，drain 须读 pendingForceRestartConfig 才能重启到本 cfg（否则
+    // 重启回旧 cfg、复现死循环，复审 H-1 残留 race）。
+    if (this.lifecycleDepth > 0) {
+      this.pendingForceRestartConfig = newConfig;
+      this.restartPending = true;
+      return;
+    }
+    if (!this.singboxProcess && !this.singboxPid) return; // 真未运行（无在飞操作）：下次 start 从磁盘纳入新节点
+    this.pendingForceRestartConfig = newConfig; // depth 0 运行中：直接去抖重启，drain 亦读专用字段绕开潜在覆盖
+    this.scheduleDebouncedRestart();
+  }
+
+  /**
    * 切换代理模式
    * 检测模式变化，如果代理正在运行则重启
    */
   async switchMode(newConfig: UserConfig): Promise<void> {
     // core-swap 手动轴门控：内核替换窗口中拒绝切模式/切节点——防 clash_api 打到半替换核、防重启式切换撞核。
     this.rejectIfCoreSwapInProgress('切换代理模式');
+    // 丢失更新修复（bug#5）：start/stop/restart 在飞时**绝不能**走下面「未运行」早退丢弃——restart 的 stop→spawn
+    // 空窗句柄为 null，早退会让变更对核永久丢失（且 startInternal 头会覆写 currentConfig）。暂存，settle 后由
+    // endLifecycleOp 重放对账（H-1 pendingForceRestartConfig 同型）。**必须先于句柄判空**。
+    if (this.lifecycleDepth > 0) {
+      this.pendingSwitchConfig = newConfig;
+      return;
+    }
     // 代理未运行：只更新配置（下次 start 时按新配置生成）
     if (!this.singboxProcess && !this.singboxPid) {
+      this.currentConfig = newConfig;
+      return;
+    }
+
+    // bug#5 review#1：newConfig 与 currentConfig **逐字节全等**（无任何变化）→ 仅更新引用即返回，不进 planHotSwitch /
+    // degraded 桥 / 重启。否则 C 的 started-对账在 config 未变时会走到 no-op 腿的 `if(customRuleFilesDegraded)
+    // scheduleDebouncedRestart`：外化文件持续写失败（磁盘满/EIO）时每次 start 自触发重启→再写失败→无限重启循环
+    // （原桥仅真实 CONFIG_CHANGED 触发、有界）；瞬时写失败也会多付一次无谓重启。全等用 stableStringify（键序不敏感）；
+    // 仅选中/规则/参数等真实差异才继续走热切/重启（degraded 桥仍在真实变更时按需重试写文件，语义不变）。
+    if (
+      this.currentConfig &&
+      this.stableStringify(newConfig) === this.stableStringify(this.currentConfig)
+    ) {
       this.currentConfig = newConfig;
       return;
     }
@@ -1607,6 +1794,10 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         //   补一次文件对账防值静默丢失（通常零 diff、幂等）。降级态文件无消费者 → 改走重启重落盘（与 no-op 分支对称）。
         if (this.customRuleFilesDegraded) this.scheduleDebouncedRestart();
         else await this.syncCustomRuleFiles(newConfig);
+        // 解锁检测失效（M1）：任何热切换（global/rules/both）都可能改变解锁出口——切全局节点变全局出口；
+        // 改规则目标节点变某服务（如 netflix.com）的分流出口。二者都须使 unlock 缓存失效重测。与 node-hot-switched
+        // 分开发独立事件：unlock-invalidate 仅触发解锁失效，**不触发 IpInfo 重测**（纯规则变更全局出口 IP 未变）。
+        this.emit('unlock-invalidate');
         // 全局节点热切换出口（覆盖渲染端/托盘/自动换节点三条切节点路径）→ 通知重测代理出口 IP。
         // 纯规则目标热切换（kind=rules）不切换全局出口 IP，不发 node-hot-switched（避免无谓重测）。
         // 注意：所有切节点路径必须经 switchMode，否则代理 IP 会陈旧至手动刷新。
@@ -1635,6 +1826,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 且节点未变、且无规则 targetServerId 变化）→ 既无需热切换也无需重启：直接更新缓存。避免纯切「更新检查
     // 走代理」开关触发 ~1.2s 断流。注意 planHotSwitch=none 已排除规则 targetServerId 变化（那会进 rules/both）。
     if (
+      !plan.mustRestart && // §2 F1：规则目标变更无法热切 → 不落 no-op（否则 targetServerId 出 norm 被误吞），走最终重启腿
       this.currentConfig &&
       this.currentConfig.selectedServerId === newConfig.selectedServerId &&
       this.configGenerationNorm(this.currentConfig) === this.configGenerationNorm(newConfig)
@@ -1657,6 +1849,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     //   可致错误直连）→ 必须重启。故只放行「纯新增未引用节点」。externalized 规则值若同窗口变了，与 no-op 分支同款经
     //   syncCustomRuleFiles 热重载（不重启）/降级则重启。
     if (
+      !plan.mustRestart && // §2 F1：规则目标变更无法热切 → 不落 canSkip defer，走最终重启腿
+      !newConfig.restartOnNodeChange && // §2 开关 ON=节点变更即刻重启：不落 defer，走最终重启腿（auto-apply 语义）
       this.currentConfig &&
       this.canSkipRestartForAddedUnreferenced(this.currentConfig, newConfig)
     ) {
@@ -1675,6 +1869,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 再调度 trailing 重启（~1.5s 内连改多条只重启一次，消除「连改 5 条规则=5 次断流」）。
     this.logToManager('info', '配置已更改，调度去抖重启以应用...');
     this.currentConfig = newConfig;
+    // H-1：结构性重启用更新的完整 config → 超代任何待决 force-restart 快照（newer 胜，避免旧 force cfg 反 shadow 本次变更）。
+    this.pendingForceRestartConfig = null;
     this.scheduleDebouncedRestart();
   }
 
@@ -1705,6 +1901,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   private planHotSwitch(newConfig: UserConfig): {
     kind: 'none' | 'global' | 'rules' | 'both';
     puts: { selectorTag: string; memberTag: string; oldMemberTag?: string }[];
+    // §2 P2-B（review F1）：kind='none' 但**规则目标变更无法热切**（目标 dirty/不在 selector）→ 必须重启（否则规则走旧
+    //   目标、且 targetServerId 出 norm 使 no-op 腿误吞 → 静默不生效不自愈）。仅此路径置 true；其余 none 落 canSkip 正常分流。
+    mustRestart?: boolean;
   } {
     const old = this.currentConfig;
     if (!old) return { kind: 'none', puts: [] };
@@ -1722,6 +1921,11 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       const toDirect = isDirectSelection(newConfig.selectedServerId);
       // 目标节点必须已存在于运行中的 selector（= 启动时 servers），否则 PUT 指向不存在的成员；direct 豁免（恒为成员）
       if (!toDirect && !old.servers.some((s) => s.id === newConfig.selectedServerId)) {
+        return { kind: 'none', puts: [] };
+      }
+      // §2 P2-B dirty 闸门：目标节点已编辑未生效（config 参数 ≠ 运行核快照）→ 热切到它会 PUT 到运行核里的**旧参数**
+      //   成员、流量走旧参数且不自愈 → 退回重启（重启即对齐新参数）。direct 哨兵无参数、不受影响。
+      if (!toDirect && this.isServerDirty(newConfig.selectedServerId, newConfig)) {
         return { kind: 'none', puts: [] };
       }
       // ICMP 规则已恒走 direct（route-builder，静态不依赖选中节点）→ ICMP 不再是热切换边界。但选中节点的【其它】
@@ -1763,7 +1967,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     // 规则目标变化：diff customRules + appRules 的 targetServerId，对每条变化的规则从 currentRuleTargetMap
     // 查 selectorTag、从 newConfig 的 idToTagMap（= 启动时映射，结构等价所以不变）解析新 memberTag。
     const rulePuts = this.planRuleHotSwitch(old, newConfig);
-    if (rulePuts === null) return { kind: 'none', puts: [] }; // 任一规则目标节点不在 selector → 整体退回重启
+    // 任一规则目标节点不在 selector（新节点未入核）或 dirty（已编辑未生效）→ 无法热切 → 必须重启（mustRestart 防被
+    // no-op/canSkip 腿吞：targetServerId 出 norm，no-op 看不到规则目标变更，会误判无变化 defer，review F1）。
+    if (rulePuts === null) return { kind: 'none', puts: [], mustRestart: true };
     puts.push(...rulePuts);
 
     if (puts.length === 0) return { kind: 'none', puts: [] };
@@ -1865,6 +2071,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       // 新目标有→解析节点 tag；无（节点切回默认/跟全局）→ proxy-selector（rule-sel 嵌套 default）
       const memberTag = newTarget ? idToTag.get(newTarget) : 'proxy-selector';
       if (newTarget && !memberTag) return false; // 新目标节点不在 selector → 退回重启
+      // §2 P2-B dirty 闸门：规则新目标节点已编辑未生效（config 参数≠运行核快照）→ 退回重启（防规则热切到旧参数成员）
+      if (newTarget && this.isServerDirty(newTarget, newConfig)) return false;
       // 旧成员 tag（供精准断连 pair）：旧目标节点 tag，无旧目标（跟全局）→ proxy-selector（rule-sel 嵌套 default）。
       // 必须从 oldTarget 现算，禁用 currentRuleTargetMap.memberTag（那是生成时 default，首次规则热切后即陈旧）。
       const oldMemberTag = oldTarget
@@ -1939,6 +2147,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       // 登录期出口让位开关：运行期由 ProxyManager live 读（shouldEngageLoginFallback），不喂 generateSingBoxConfig
       // → 切它走 hotSwitchSelector 零重启，绝不触发整核重启断流。关开关的 disengage 由 switchMode 无重启腿处理（见 reconcileLoginFallback）。
       meshLoginFallbackDirect: null,
+      // §2 待应用差集：restartOnNodeChange 纯调度偏好（switchMode 用它决定节点变更 defer 还是即刻重启），不影响
+      // sing-box 生成 → 排除出 norm，否则切此开关本身 norm 翻转 → 无谓重启断流（同 meshLoginFallbackDirect 处置）。
+      restartOnNodeChange: null,
       // 界面语言纯 UI 偏好，不影响 sing-box 生成 → 运行中切语言（写 config.language 触发 CONFIG_CHANGED→switchMode）
       // 不应重启内核断流。不排除的话每次切语言都会 norm 翻转 → 去抖重启 sing-box（旧 APP_SET_LANGUAGE 路径不写 config、零断流）。
       language: null,
@@ -2010,78 +2221,97 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       servers: [...c.servers]
         .filter((s) => !serverIds || serverIds.has(s.id)) // P2-A：传 serverIds 时仅保留被引用节点
         .sort((a, b) => a.id.localeCompare(b.id))
-        .map((s) => {
-          const copy: Record<string, unknown> = { ...s };
-          delete copy.updatedAt;
-          delete copy.createdAt;
-          return copy;
-        }),
+        // Nit F3：复用 serverFingerprint 作节点序列化单一真值（剔时间戳、键序无关），避免此处第 5 处内联副本
+        // 与 canSkip③/dirty/待应用差集漂移。norm 仅自比较、不持久化 → 表示从内联对象改为指纹串安全。
+        .map((s) => this.serverFingerprint(s)),
     });
   }
 
-  /**
-   * issue #176 P2-A：「被引用节点」id 集——其定义变化会影响运行核实际行为、故必须随之重启。
-   *   = {选中节点} ∪ {所有启用规则(custom/app)目标}，按 detour（前置代理链）传递闭包展开
-   *   ＋ 保守纳入全部 endpoint 协议节点（WireGuard/Tailscale 可能 force-route 子网/mesh，独立于选中即承载流量）。
-   * 其余「纯代理」节点仅作 selector 惰性成员、不承载任何流量，增删改不改变运行核行为 → 不在此集 → 可免重启。
-   * 安全方向：**过度纳入只会多一次重启、绝不错跳**（漏纳入才会错误免重启致运行核用旧前置参数 → 流量错误/泄漏）。
-   *   故 endpoint 一律纳入、detour 取全闭包、direct 哨兵剔除、悬空 detour 忽略。
-   * 注：custom-endpoint（`customSettings.isEndpoint`）不被 isEndpointProtocol 纳入，但其 `endpointForcedRouteCidrs`
-   *   恒返 []（不 force-route）→ 不会独立于选中承载流量 → 按普通未引用节点处理即安全（新增它经 additions-only
-   *   模型放行、其 route/DNS 条目缺失无害），无需进引用集。
-   */
-  private referencedServerIds(c: UserConfig): Set<string> {
-    const byId = new Map(c.servers.map((s) => [s.id, s]));
-    const R = new Set<string>();
-    const stack: string[] = [];
-    const seed = (id?: string | null): void => {
-      if (id && !isDirectSelection(id)) stack.push(id);
-    };
-    seed(c.selectedServerId);
-    for (const r of c.customRules || []) if (r.enabled) seed(r.targetServerId);
-    for (const a of c.appRules || []) if (a.enabled) seed(a.targetServerId);
-    for (const s of c.servers) if (isEndpointProtocol(s.protocol)) stack.push(s.id); // 保守纳入全部 endpoint
-    while (stack.length) {
-      const id = stack.pop() as string;
-      if (R.has(id)) continue; // 成环/重复保护
-      R.add(id);
-      const s = byId.get(id);
-      if (s?.detour && byId.has(s.detour)) stack.push(s.detour); // detour 前置链传递闭包
-    }
-    return R;
+  /** 节点生成指纹（剔时间戳、键序无关）：canSkip③、runningServersFingerprint 快照、待应用差集、dirty 判定**共用单一
+   *  真值**——防「差集/UI 显示 vs switchMode 重启决策」用不同指纹而撕裂（§2 Fable R1）。 */
+  private serverFingerprint(s: ServerConfig): string {
+    const c: Record<string, unknown> = { ...s };
+    delete c.updatedAt;
+    delete c.createdAt;
+    return this.stableStringify(c);
+  }
+
+  /** 从 servers 算 id→指纹 Map；startInternal 实际起核时快照为 runningServersFingerprint（待应用差集基准）。 */
+  private computeServersFingerprint(servers: ServerConfig[]): Map<string, string> {
+    return new Map(servers.map((s) => [s.id, this.serverFingerprint(s)]));
   }
 
   /**
-   * issue #176 P2-A：判 next 相对 old 是否「仅新增了未被引用的纯代理节点」——是则可免整核重启（订阅刷新加新节点）。
-   * 非对称安全模型：新增未引用节点 → 其 route 排除/DNS rule1（route-builder/dns-builder 遍历**全部**节点的 address+
-   *   serverName）条目缺失**无害**（节点未承载流量、被选中才连它→届时退回重启补全）；删除/改址/改任一旧节点 →
-   *   运行核**残留陈旧**条目（旧址被复用为真实代理目标时可致错误直连）→ 必须重启。
+   * 待应用差集（§2 待应用差集模型）：config.servers 相对**运行核快照** runningServersFingerprint 的差集。
+   * added=id 不在快照（新增未入核，徽标「待入池」）；modified=指纹不等（已编辑未生效，徽标「待生效」+dirty）；
+   * removed=快照有而 config 无（已删未从核移出）。核未起（快照 null）→ 空差集（无「运行核」概念，动作条隐藏）。
+   */
+  getPendingNodeChanges(config: UserConfig): PendingNodeChanges {
+    const snap = this.runningServersFingerprint;
+    // F-3：死核快照 guard——崩溃终态（cleanup 不清快照）/spawn 前起败会留非空快照，核未运行时差集必须为空
+    // （动作条「核未运行→不渲染」不变量的单点收口；pull 模型恒经此处）。
+    if (!snap || !this.getStatus().running) return { added: [], modified: [] };
+    // 差集只报「可 defer（未引用）」变更。被引用节点（选中/规则目标/detour 链/endpoint）的增/改会即刻去抖重启
+    // （canSkip③/④返 false），仅在 ~1.5s 去抖窗口内因快照尚旧而瞬态出现在差集里——那不是真「待应用」（它正在重启）。
+    // 按引用集过滤 added/modified，消动作条/徽标在自动重启窗口的误报闪动（review Low-1；差集语义收敛为「仅 deferrable」）。
+    // F-2：**removed 不进差集**——删被引用节点恒即刻重启（F-1 恒 emit → canSkip③ 拦）仅瞬态；删未引用节点的核内
+    // orphan 是惰性 selector 成员：无 UI 锚点、不可被选、「应用」无可观测收益（不影响活流量/选路），下次自然重启清。
+    // 全代码库无逻辑消费 removed 计数（仅显示消费）→ 显它是负价值 cosmetic（侵蚀徽标可信度），类型级删除。
+    const ref = referencedServerIds(config);
+    const added: string[] = [];
+    const modified: string[] = [];
+    for (const s of config.servers) {
+      if (ref.has(s.id)) continue; // 被引用节点变更即刻重启，不入待应用差集
+      const fp = snap.get(s.id);
+      if (fp === undefined) added.push(s.id);
+      else if (fp !== this.serverFingerprint(s)) modified.push(s.id);
+    }
+    return { added, modified };
+  }
+
+  /**
+   * 节点是否 dirty：config 里的参数 ≠ 运行核快照（=已编辑未生效）。planHotSwitch 禁热切到 dirty 节点——否则 PUT
+   * 到运行核里的旧参数成员、流量走旧参数且不自愈（§2 P2-B 唯一新增风险的堵法）。不在快照（新增未入核）返 false——
+   * 那由 planHotSwitch「目标不在运行 selector」既有判据挡（退回重启）。
+   */
+  private isServerDirty(id: string, config: UserConfig): boolean {
+    const snap = this.runningServersFingerprint;
+    if (!snap) return false;
+    const fp = snap.get(id);
+    if (fp === undefined) return false;
+    const s = config.servers.find((x) => x.id === id);
+    return !!s && fp !== this.serverFingerprint(s);
+  }
+
+  /**
+   * issue #176 P2-A + §2 P2-B：判 next 相对 old 是否「仅变更了**不影响活流量**的节点」——是则免整核重启（defer）。
+   * 覆盖：新增未引用节点（P2-A，订阅刷新）+ 编辑/删除未引用节点（P2-B）。
+   * 非对称安全模型：未引用节点（非选中/非规则目标/非 endpoint/不在 detour 链）仅作 selector 惰性成员、不承载流量，
+   *   增/改/删对运行核行为无影响 → 可 defer（被选中才连它 → 届时 planHotSwitch dirty 闸门退回重启补全陈旧条目）；
+   *   被引用节点 改/删 → 运行核残留陈旧条目或用旧参数承载流量 → 必须重启。
    * 全部满足才放行（缺一即重启）：
-   *   ① selectedServerId 未变；② 所有非 servers 的生成相关字段未变（servers 过滤到空集后归一键相等）；
-   *   ③ 旧节点全部原样保留在 next（无删除、无任一旧节点 address/参数改动——含选中/规则目标/detour/endpoint）；
-   *   ④ 新增节点（next\old）全部未被引用（非选中/非规则目标/不在 detour 链/非 endpoint）。
+   *   ① selectedServerId 未变；② 非 servers 生成字段全等（混入 DNS/mode 变更即重启=正交守卫）；
+   *   ③ 所有**被引用**（refOld∪refNext）旧节点原样保留（无删除、无改动）；④ 新增节点全部未被引用。
    */
   private canSkipRestartForAddedUnreferenced(old: UserConfig, next: UserConfig): boolean {
     if (old.selectedServerId !== next.selectedServerId) return false; // ①
     const EMPTY: ReadonlySet<string> = new Set();
-    // ② 非 servers 字段逐字节一致（servers 投影到空 → 仅比对路由/规则/DNS/端口/模式 等非节点字段）
+    // ② 非 servers 字段逐字节一致（servers 投影到空 → 仅比对路由/规则/DNS/端口/模式 等非节点字段；混入 DNS/mode
+    //   变更即重启=正交守卫，节点 defer 绝不吞其它字段的重启）
     if (this.configGenerationNorm(old, EMPTY) !== this.configGenerationNorm(next, EMPTY))
       return false;
-    const fingerprint = (s: ServerConfig): string => {
-      const c: Record<string, unknown> = { ...s };
-      delete c.updatedAt; // 时间戳不影响生成
-      delete c.createdAt;
-      return this.stableStringify(c);
-    };
     const oldById = new Map(old.servers.map((s) => [s.id, s]));
     const newById = new Map(next.servers.map((s) => [s.id, s]));
-    // ③ 旧节点全部原样保留（无删除、无改动；含 address/serverName 与全部协议参数）
+    const refOld = referencedServerIds(old);
+    const refNext = referencedServerIds(next);
+    // ③ P2-B：**被引用**（旧或新）的旧节点必须原样保留——删/改被引用节点影响活流量→重启；**未引用**旧节点的删/改
+    //   放行（defer）。未引用节点仅作 selector 惰性成员不承载流量；被选中才连它 → 届时 planHotSwitch dirty 闸门退回重启补全。
     for (const s of old.servers) {
+      if (!refOld.has(s.id) && !refNext.has(s.id)) continue; // 未引用 → 删/改放行
       const n = newById.get(s.id);
-      if (!n || fingerprint(n) !== fingerprint(s)) return false;
+      if (!n || this.serverFingerprint(n) !== this.serverFingerprint(s)) return false;
     }
     // ④ 新增节点全部未被引用
-    const refNext = this.referencedServerIds(next);
     for (const s of next.servers) {
       if (!oldById.has(s.id) && refNext.has(s.id)) return false;
     }
@@ -2273,12 +2503,25 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     return null;
   }
 
+  /**
+   * 登录让位是否生效（供出口伴测守卫 G4）：TS NeedsLogin 期默认路由被临时 hotSwitch→direct，此时探针 proxy-selector
+   * 实指直连路径——出口延迟伴测若在此期间量测，会把「直连耗时」误记到选中的 TS 节点头上，故须拦截不写。
+   */
+  isLoginFallbackEngaged(): boolean {
+    return this.bootstrapFallbackEngaged;
+  }
+
   /** 注入 IpInfoService 引用（index 启动接线）：供 TS 出口无效翻转对账即时通知出口探测层。 */
   setIpInfoService(svc: {
     markProxyBlocked: (reason: ProxyExitBlock) => void;
     refreshProxy: () => Promise<unknown>;
   }): void {
     this.ipInfoService = svc;
+  }
+
+  /** 注入 TS 出口无效态跨态回调（index 启动接线）：翻转对账跨态时通知解锁检测失效（G-flip）。 */
+  setOnTsExitBlockFlip(cb: () => void): void {
+    this.onTsExitBlockFlip = cb;
   }
 
   /**
@@ -2296,7 +2539,91 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     if (cur) {
       this.ipInfoService?.markProxyBlocked(cur);
     } else {
-      void this.ipInfoService?.refreshProxy();
+      // R2 恢复腿：出口恢复有效（re-advertise / 切走）→ 热重设 exit_node（补 sing-box watchState 不随 netmap 重试的缺口）
+      // + reassert System 路由 + 重探。串行单飞、fire-and-forget。切走出口的场景被 reapply 守卫天然跳过、仍走重探。
+      void this.recoverTsExit();
+    }
+    // G-flip：跨态即令解锁检测失效——翻 blocked 清陈旧绿点（渲染端 onInvalidated → 复位 idle，R-gate 拦重跑）；
+    // 翻 none 触发自动重检（有效出口恢复，与 refreshProxy→伴测同节奏）。原因变更（blocked→blocked'）亦通知，无害。
+    this.onTsExitBlockFlip?.();
+  }
+
+  /**
+   * R2 出口恢复腿（blocked→none 触发，串行单飞）：re-advertise 后运行中的 sing-box 不随 netmap 重解析 exit_node
+   * （上游 watchState 缺陷），只重探不够 → 依次 ①热重设 exit_node（gRPC EditPrefs 幂等，强制核重解析）②reassert
+   * System 出口路由（补 resolveIface 18s 超时缺口）③refreshProxy 重探（成功链式触发伴测 + G-flip2 解锁重检）。
+   * 全程 fire-and-forget、绝不抛（恢复属增益路径，异常不污染 STATUS 帧处理）。
+   */
+  private async recoverTsExit(): Promise<void> {
+    // 在飞 → 记 pending（不丢边沿）：收尾若仍 none 补跑一次，避免在飞窗（reassert 轮询最长 ~18s）内的
+    // none→blocked→none flap 被单飞丢弃后卡「检测超时」直到下个真边沿/手动重探。
+    if (this.tsExitRecovering) {
+      this.tsExitRecoverPending = true;
+      return;
+    }
+    this.tsExitRecovering = true;
+    try {
+      do {
+        this.tsExitRecoverPending = false;
+        await this.reapplyTsExitNode(); // 无论成败继续（切走出口时守卫内跳过）
+        const config = this.currentConfig;
+        if (config) await this.meshExitRoute.reassert(config, !!config.enableIPv6);
+        await this.ipInfoService?.refreshProxy();
+        // 补跑门：在飞期间又发生过 flip 且当前仍为有效出口（none）→ 再跑一轮（否则丢的边沿不自愈）。
+      } while (this.tsExitRecoverPending && this.selectedTsExitBlock() === null);
+    } catch (e) {
+      this.logToManager(
+        'warn',
+        `TS 出口恢复腿异常: ${e instanceof Error ? e.message : e}`,
+        'sing-box'
+      );
+    } finally {
+      this.tsExitRecovering = false;
+      this.tsExitRecoverPending = false;
+    }
+  }
+
+  /**
+   * R1 热重设选中 TS 出口的 exit_node（gRPC SetTailscaleExitNode → EditPrefs{ExitNodeID}，幂等，免整重启核）。
+   * 守卫：running + 管理 API 就绪 + 选中为 TS + 配了 exitNode + peers 里能以 ip/hostName 双匹配解到 stableID。
+   * 任一不满足（如切走出口、无 stableID）→ 跳过返 false。同值 EditPrefs 为核侧 no-op、对「本就已生效」零副作用。
+   */
+  private async reapplyTsExitNode(): Promise<boolean> {
+    const config = this.currentConfig;
+    if (!config || !this.getStatus().running) return false;
+    const client = this.tailscaleApiClient;
+    if (!client) return false;
+    const selId = config.selectedServerId;
+    const server = selId ? config.servers?.find((s) => s.id === selId) : undefined;
+    if (!server || (server.protocol || '').toLowerCase() !== 'tailscale') return false;
+    const exitNode = server.tailscaleSettings?.exitNode?.trim();
+    if (!exitNode) return false; // 未配出口（切走/仅内网）→ 无可重设
+    const peers = this.tailscaleStatusCache.get(server.id)?.peers ?? [];
+    const peer = peers.find((p) => p.ip === exitNode || p.hostName === exitNode);
+    const stableID = peer?.stableID;
+    if (!stableID) {
+      this.logToManager(
+        'debug',
+        `热重设 exit_node 跳过：peers 未解到 stableID（exitNode=${exitNode}）`,
+        'sing-box'
+      );
+      return false;
+    }
+    try {
+      await client.setTailscaleExitNode(server.name, stableID);
+      this.logToManager(
+        'info',
+        `已热重设 TS exit_node → ${peer?.hostName || exitNode}（stableID=${stableID}）`,
+        'sing-box'
+      );
+      return true;
+    } catch (e) {
+      this.logToManager(
+        'warn',
+        `热重设 exit_node 失败: ${e instanceof Error ? e.message : e}`,
+        'sing-box'
+      );
+      return false;
     }
   }
 
@@ -2317,6 +2644,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
         engaged: true,
         serverName: name,
       });
+      // F-C-b：登录让位 engage（selector 节点→direct，不经 switchMode）= 契约外出口翻转 → 入 unlock invalidate 契约。
+      this.emit('unlock-invalidate');
     }
   }
 
@@ -2383,6 +2712,8 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
           engaged: false,
           serverName: name,
         });
+        // F-C-b：登录让位 disengage（selector direct→节点，同选中出口切回）= 契约外出口翻转 → 入 unlock invalidate 契约。
+        this.emit('unlock-invalidate');
       } else {
         // 切走出口：selector 已由 planHotSwitch/config default PUT 到新目标，仅清 flag + 撤 UI（不 PUT，避免打架）。
         this.bootstrapFallbackEngaged = false;
@@ -2709,8 +3040,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     const servers: net.Server[] = [];
     const ports: number[] = [];
     try {
-      // 3 个本地回环端口：probe-direct / probe-proxy / update-in（更新链路统一 inbound，Phase 2）
-      for (let i = 0; i < 3; i++) {
+      // 3 个固定回环端口（probe-direct / probe-proxy / update-in）+ K 个 §15 主核测速探测池端口（probe-in-0..K-1）。
+      // 一批分配，任一冲突整批失败降级（探针/池同置空）——池是叠加能力，失败回退临时核，不阻断代理启动。
+      for (let i = 0; i < 3 + PROBE_POOL_SIZE; i++) {
         let port = 0;
         // 至多 5 次重绑避开排除端口（ephemeral 段与常用端口几乎不撞，循环仅作保险）
         for (let attempt = 0; attempt < 5; attempt++) {
@@ -2735,10 +3067,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
       this.probeDirectPort = ports[0];
       this.probeProxyPort = ports[1];
       this.updateInPort = ports[2];
+      this.probePoolPorts = ports.slice(3); // K 个池端口（PROBE_POOL_SIZE=0 时为空，池不注入）
     } catch {
       this.probeDirectPort = null;
       this.probeProxyPort = null;
       this.updateInPort = null;
+      this.probePoolPorts = [];
     } finally {
       await Promise.all(
         servers.map((srv) => new Promise<void>((resolve) => srv.close(() => resolve())))
@@ -3004,6 +3338,49 @@ done
     return null;
   }
 
+  /**
+   * §15 主核测速探测池句柄（SpeedTestService 消费）：主核运行 + 池就绪 → 测速走主核（同核单会话，结构性消除
+   * WG/WARP 双会话超时）；否则回退临时核 testServersViaProxy。selectSlot 复用现成管理 API gRPC selectOutbound
+   * （与 proxy-selector 热切同原语），tagOf 复用 currentIdToTagMap（= 主 proxy-selector 成员 tag）。全 call-time 取值。
+   */
+  getSpeedTestMainCoreProbe(): MainCoreProbe {
+    const poolPorts = this.probePoolPorts;
+    return {
+      poolPorts,
+      // 池端口已分配（3+K 成功）→ 本轮 generateSingBoxConfig 已注入池（池 deps 读同一 this.probePoolPorts）。
+      available: () => poolPorts.length > 0,
+      // 主核进程存活 + 管理 API 客户端就绪（可 selectOutbound 热切 probe-selector-k）。
+      isRunning: () => this.getStatus().running && !!this.tailscaleApiClient,
+      selectSlot: (k: number, tag: string): Promise<void> => {
+        const client = this.tailscaleApiClient;
+        if (!client) return Promise.reject(new Error('管理 API 客户端未就绪'));
+        return client.selectOutbound(`probe-selector-${k}`, tag);
+      },
+      tagOf: (id: string): string => this.currentIdToTagMap?.get(id) ?? id,
+      // §16.3.3：非成员=订阅新增/改址未重启入池（currentIdToTagMap 无此 id）→ 预筛缺席防 select-failed 假 -1。
+      hasTag: (id: string): boolean => this.currentIdToTagMap?.has(id) ?? false,
+      // §16.1.3 层3：TS 节点登录就绪 = 主核 STATUS 末帧 backendState==='Running' 且 key 未过期。无帧=false。
+      // M-4：且必须是**本代**帧（tailscaleStatusGen===lifecycleGeneration）——核 restart 后新核首帧到达前，旧核
+      // 陈旧 'Running' 帧不放行（否则对未就绪 TS 写假 -1，违反诚实性）。跨代帧视为「未知→不就绪→缺席」。
+      tsNodeReady: (id: string): boolean => {
+        const st = this.tailscaleStatusCache.get(id);
+        return (
+          !!st &&
+          st.backendState === 'Running' &&
+          !st.expired &&
+          this.tailscaleStatusGen.get(id) === this.lifecycleGeneration
+        );
+      },
+      // §2（review F-B）：直接比**传入待测节点**的指纹 vs 运行核启动快照——待测列表来自 ConfigManager 最新 config，
+      // 故避开 currentConfig 在「订阅 OFF 自动刷新（不经 switchMode）」路径的滞后（那会漏判 dirty、仍测旧参数出口失真）。
+      // 快照无此 id（新增未入核）→ false（那由 hasTag/notInPool 既有判据挡）。
+      isDirty: (server: ServerConfig): boolean => {
+        const fp = this.runningServersFingerprint?.get(server.id);
+        return fp !== undefined && fp !== this.serverFingerprint(server);
+      },
+    };
+  }
+
   /** 当前 update-in inbound 端口（更新链路 pin 目标）；代理未启动或分配失败时返回 null。供 UpdateNetwork 取数。 */
   getUpdateInPort(): number | null {
     return this.updateInPort;
@@ -3100,6 +3477,8 @@ done
       // meshSystemSupportedOnPlatform（理由见其注释：tsnet 自装 exit 0/0 抢 DNS、无 ifscope 隔离）。
       systemInterfaceAvailable:
         cfg.proxyModeType === 'tun' && meshSystemSupportedOnPlatform(process.platform),
+      // §15 主核测速探测池：注入 K 个 probe-selector-k（成员=全量 nodeTags）。空=不注入。
+      probePoolPorts: this.probePoolPorts,
     });
     this.pendingEndpoints = outboundsResult.pendingEndpoints;
     this.pendingRuleSelectors = outboundsResult.pendingRuleSelectors;
@@ -3114,12 +3493,19 @@ done
         (level, message) => this.logToManager(level, message),
         this.raceServerPort,
         // 根治 §3.5：传本轮发射的 endpoint，供 tailnet 按名解析 gate 确认目标 TS endpoint 已发射（防悬空引用 FATAL）。
-        this.pendingEndpoints
+        this.pendingEndpoints,
+        // §15 主核测速探测池：注入 K 个 dns-probe-exit-k server + inbound 键控 rule。空=不注入。
+        this.probePoolPorts,
+        // V37 出口伴测 / 出口 IP 探测（§17.5）：注入 dns-probe-exit-proxy(223.5.5.5 DoH:443) + probe-proxy-in inbound rule
+        // ——治 WG/WARP 伴测无值，且 China-reachable+DoH/TCP 全栈通（不踩 TS-exit UDP 弱腿、不踩大陆出口 dns.google 超时）。
+        this.probeProxyPort
       ),
       inbounds: buildInbounds(config, resolvedIps, {
         probeDirectPort: this.probeDirectPort,
         probeProxyPort: this.probeProxyPort,
         updateInPort: this.updateInPort,
+        // §15 主核测速探测池：注入 K 个 probe-in-k http 入站。空=不注入。
+        probePoolPorts: this.probePoolPorts,
         log: (level, message) => this.logToManager(level, message),
       }),
       outbounds: outboundsResult.outbounds,
@@ -3127,6 +3513,8 @@ done
         probeDirectPort: this.probeDirectPort,
         probeProxyPort: this.probeProxyPort,
         updateInPort: this.updateInPort,
+        // §15 主核测速探测池：钉死 K 条 probe-in-k → probe-selector-k 路由。空=不注入。
+        probePoolPorts: this.probePoolPorts,
         lanResolverForDns: this.lanResolverForDns,
         pendingEndpoints: this.pendingEndpoints,
         log: (level, message) => this.logToManager(level, message),
@@ -3140,6 +3528,11 @@ done
         cache_file: {
           enabled: true,
           path: cachePath,
+          // R2（§14.4）：一次性 bump cache_id 命名空间——store_dns 把 P6 修复前的投毒 DNS 条目持久化（+ optimistic
+          // 续命），旧 cache.db 里的 face:b00c decoy 会跨核重启命中。新 cache_id='flowz-dns-v2' 令冷启动走新命名空间，
+          // 旧投毒条目成不可达垃圾（bbolt 文件不缩，~2MB 可接受）。cache_id 对 store_dns bucket 的命名空间语义须真机
+          // 实证（§14.7 W1）；若不生效降级为发版引导手动 rm cache.db。
+          cache_id: 'flowz-dns-v2',
           store_fakeip: true,
           store_dns: true,
         },
@@ -5108,6 +5501,8 @@ exit 0
     this.probeDirectPort = null;
     this.probeProxyPort = null;
     this.updateInPort = null;
+    // §15 主核测速探测池：核已停 → 池失效，测速回退临时核（getSpeedTestMainCoreProbe.available()=false）。
+    this.probePoolPorts = [];
     // Tailscale 登录 URL 去重集随核会话收尾清空（绑定核会话而非整进程）：下个核会话若再触发交互登录，
     // 同一 URL 应重新弹「需登录」提示。tailscaleAuthPolling 有自身 delete 收尾，不在此动（勿破在飞登录）。
     this.tailscaleAuthSeen.clear();
@@ -6649,6 +7044,7 @@ exit 0
     };
     // L2：缓存末帧供 TAILSCALE_GET_STATUS 主动拉 + 渲染端重挂兜底（治本陈旧）。
     this.tailscaleStatusCache.set(serverId, payload);
+    this.tailscaleStatusGen.set(serverId, this.lifecycleGeneration); // M-4：标记本帧所属核代
     this.sendEventToRenderer(IPC_CHANNELS.EVENT_TAILSCALE_STATUS, payload);
   }
 

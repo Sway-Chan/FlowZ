@@ -10,6 +10,7 @@ import type {
   HelperStatus,
   IpInfoSnapshot,
   InvalidNodeInfo,
+  PendingNodeChanges,
 } from '../../shared/types';
 import type { UpdateInfo } from '../../shared/types/update';
 import type { TailscaleStatusPeer } from '../../shared/tailscale-status';
@@ -20,6 +21,13 @@ import {
   loadTailscaleLoginStatesFromCache,
   useTailscaleLoginCacheStore,
 } from './use-tailscale-login-cache-store';
+import { pickFallbackExit } from '../../shared/direct-selection';
+import {
+  SERVICE_IDS,
+  type UnlockResult,
+  type UnlockSnapshot,
+  type UnlockEgress,
+} from '../../shared/unlock-detection';
 
 // 兼容旧的类型定义
 type ProxyMode = UserConfig['proxyMode'];
@@ -34,6 +42,27 @@ export interface AvailableCoreUpdate {
   /** 是否跨当前 minor 带（如 1.13.x→1.14.x）；true 时 UI 用警告色 + 风险文案。 */
   crossBand?: boolean;
 }
+
+/**
+ * 解锁检测显示态（issue 2）：提到 store 使其跨首页组件卸载存活——切导航离开首页 → UnlockInline 卸载但检测态留存，
+ * 切回时直接展示、不从头重跑。progress/complete/invalidated 由 use-native-events 持久订阅写入（无论首页是否挂载均累积）；
+ * 检测的发起唯一驱动 = 主进程 backend self-run（GAP-1），渲染端纯展示、不再自触发。
+ */
+export interface UnlockDisplayState {
+  results: Record<string, UnlockResult>;
+  running: boolean;
+  checkedAt: number | null;
+  egress: UnlockEgress | null;
+  /**
+   * 上次真发起一轮检测的完成时刻（renderer 打戳，含真检测 + notReady——两者后端都置 lastRunAt、force 15s 下限生效）。
+   * 手动刷新冷却由此**派生**（不再手动 startCooldown）：统一 auto（backend self-run）+ manual 两条完成路径都镜像后端 force-min，
+   * 消除「auto 路径完成后 15s 内点刷新→假重检闪烁」。blockedReason（M-gate 毫秒响应）不打戳、停代理清 null → 冷却自动灭。
+   */
+  lastRunAt: number | null;
+}
+
+const allCheckingResults = (): Record<string, UnlockResult> =>
+  Object.fromEntries(SERVICE_IDS.map((id) => [id, { status: 'checking' as const }]));
 
 // loadConfig 单飞：防 configChanged 风暴 / 启动期重复拉取（替代原 isLoading 重入守卫）
 let loadConfigInflight: Promise<void> | null = null;
@@ -93,6 +122,19 @@ interface AppState {
   latencyMap: Record<string, number>;
   // 每节点最近测速时间戳（serverId → epoch ms），与 latencyMap 并行；供延迟徽标「会话内」陈旧标识
   latencyTestedAt: Record<string, number>;
+  // 本会话是否发起过全量测速（会话内存态，不持久化）：控制不可测节点徽标——未点过测速显「—」（同未测），
+  // 点过全量测速后才显「不支持测速」（解释「为什么它没值」）。单节点 ⚡ 测速不置位（保持同步口径）。
+  speedTestAttempted: boolean;
+  // §16.3.3：上次测速中「非主核池成员」而缺席的节点 id（订阅新增/改址未重启入池）。徽标据此对无值节点显
+  // tooltip「刷新订阅后纳入测速」（区别于恒不可测的「不支持测速」）。会话内存态；拿到真值即从集合移除（已入池）。
+  speedTestNotInPool: Set<string>;
+
+  // §2 待应用差集：节点集相对运行核启动快照的增(待入池)/改(待生效)/删。pull 模型——configChanged/proxyStarted/
+  // proxyStopped 后 refreshPendingChanges 拉取。动作条汇总 + 徽标数据源。核未运行 → 全空（动作条隐藏）。
+  pendingChanges: PendingNodeChanges;
+
+  // issue 2：解锁检测显示态提到 store（跨首页组件卸载存活，切页回来不重跑）。见 UnlockDisplayState。
+  unlock: UnlockDisplayState;
 
   // 启动前配置校验 gate 剔除的非法节点（serverId → 信息）：节点列表据此标灰 + tooltip（不禁用点击）。
   // 仅会话内存，由 EVENT_PROXY_INVALID_NODES 事件覆盖（空数组=清空）。
@@ -138,8 +180,20 @@ interface AppState {
   setCurrentView: (view: string) => void;
   setServerPageAction: (action: 'add-server' | 'add-sub' | 'ts-settings' | null) => void;
   setSettingsSection: (section: string) => void;
-  /** 应用一批测速结果（serverId→latency）：合并 latencyMap + 为这些节点打 latencyTestedAt 时间戳（单一结果应用路径，会话内存态）。 */
-  applyLatencyResults: (results: Record<string, number>) => void;
+  /** 应用一批测速结果（serverId→latency）：合并 latencyMap + 打 latencyTestedAt 时间戳（单一结果应用路径，会话内存态）。
+   *  notInPool（§16.3.3）：本次「非池成员」缺席节点 id → 加入 speedTestNotInPool；拿到真值的节点从该集合移除（已入池）。 */
+  applyLatencyResults: (results: Record<string, number>, notInPool?: string[]) => void;
+  /** 标记本会话已发起全量测速（全量测速起跑时调；不可测节点徽标据此从「—」转「不支持测速」）。 */
+  markSpeedTestAttempted: () => void;
+  // issue 2 解锁检测显示态 actions：
+  /** 发起/失效一轮检测：results 置 allChecking + running=true（切页不丢的「检测中」态；egress/checkedAt 清空待新值）。 */
+  beginUnlockCheck: () => void;
+  /** 单服务 settle 增量点亮（EVENT_UNLOCK_PROGRESS 持久订阅写入，无论首页是否挂载均累积）。 */
+  setUnlockProgress: (serviceId: string, result: UnlockResult) => void;
+  /** 应用一轮完整终态（run() 返回 / EVENT_UNLOCK_UPDATED）：notReady/blocked → idle，否则 results/checkedAt/egress，running=false。 */
+  applyUnlockSnapshot: (snap: UnlockSnapshot) => void;
+  /** 复位为 idle（停代理 / 选中出口无效）。 */
+  resetUnlock: () => void;
   setPrivacyMode: (value: boolean) => void;
   setAvailableAppUpdate: (info: UpdateInfo | null) => void;
   setAvailableCoreUpdate: (info: AvailableCoreUpdate | null) => void;
@@ -153,6 +207,9 @@ interface AppState {
   saveConfig: (config: UserConfig) => Promise<void>;
   updateProxyMode: (mode: ProxyMode) => Promise<void>;
   setConfigValue: (key: keyof UserConfig, value: any) => Promise<void>;
+
+  // §2 待应用差集：拉取节点差集入 store（configChanged/proxyStarted/proxyStopped 后 + 挂载时调）。失败静默（保留旧值）。
+  refreshPendingChanges: () => Promise<void>;
 
   // Status Actions
   refreshConnectionStatus: () => Promise<void>;
@@ -174,8 +231,9 @@ interface AppState {
   setTailscalePeers: (serverId: string, peers: TailscaleStatusPeer[]) => void;
 
   // Server Management Actions
-  deleteServer: (serverId: string) => Promise<void>;
-  deleteServers: (serverIds: string[]) => Promise<number>;
+  // 返回删选中节点的兜底出口（undefined=非删选中；null=无剩余→direct；string=兜底节点 id），供调用点 toast「已切换到 X」。
+  deleteServer: (serverId: string) => Promise<string | null | undefined>;
+  deleteServers: (serverIds: string[]) => Promise<{ count: number; fallback: string | null | undefined }>;
 
   // Custom Rules Actions
   addCustomRule: (rule: Rule) => Promise<void>;
@@ -204,6 +262,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   ipInfo: null,
   latencyMap: {},
   latencyTestedAt: {},
+  speedTestAttempted: false,
+  speedTestNotInPool: new Set<string>(),
+  pendingChanges: { added: [], modified: [] },
+  unlock: { results: {}, running: false, checkedAt: null, egress: null, lastRunAt: null },
   invalidNodes: {},
   // 启动秒显：从 localStorage 缓存派生登录态初值（代理关时不再 spawn 瞬态核探针，见 use-tailscale-login-cache-store）。
   tailscaleLoginStates: loadTailscaleLoginStatesFromCache(),
@@ -228,12 +290,20 @@ export const useAppStore = create<AppState>((set, get) => ({
     })),
   setServerPageAction: (action) => set({ serverPageAction: action }),
   setSettingsSection: (section) => set({ settingsSection: section }),
-  applyLatencyResults: (results) =>
+  markSpeedTestAttempted: () => set({ speedTestAttempted: true }),
+  applyLatencyResults: (results, notInPool = []) =>
     set((state) => {
       const now = Date.now();
       const latencyTestedAt = { ...state.latencyTestedAt };
       for (const id of Object.keys(results)) latencyTestedAt[id] = now;
-      return { latencyMap: { ...state.latencyMap, ...results }, latencyTestedAt };
+      // §16.3.3：更新「非池成员」集——本次缺席的加入，拿到真值的移除（已入池）。仅在有增删时新建 Set（避免无谓重渲染）。
+      let speedTestNotInPool = state.speedTestNotInPool;
+      if (notInPool.length > 0 || Object.keys(results).some((id) => speedTestNotInPool.has(id))) {
+        speedTestNotInPool = new Set(state.speedTestNotInPool);
+        for (const id of notInPool) speedTestNotInPool.add(id);
+        for (const id of Object.keys(results)) speedTestNotInPool.delete(id);
+      }
+      return { latencyMap: { ...state.latencyMap, ...results }, latencyTestedAt, speedTestNotInPool };
     }),
   setAvailableAppUpdate: (info) => set({ availableAppUpdate: info }),
   setAvailableCoreUpdate: (info) => set({ availableCoreUpdate: info }),
@@ -426,6 +496,66 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
+  // §2 待应用差集：拉取入 store。失败静默保留旧值（差集是提示性 UI，拉失败不该清空误报「无待应用」）。
+  refreshPendingChanges: async () => {
+    try {
+      const pc = await api.proxy.getPendingChanges();
+      set({ pendingChanges: pc });
+    } catch {
+      /* 拉取失败保留旧值 */
+    }
+  },
+
+  // issue 2 解锁检测显示态（lastRunAt 承载「上次完成时刻」供冷却派生；beginUnlockCheck/setUnlockProgress 保留旧 lastRunAt）：
+  beginUnlockCheck: () =>
+    set((s) => ({
+      unlock: {
+        results: allCheckingResults(),
+        running: true,
+        checkedAt: null,
+        egress: null,
+        lastRunAt: s.unlock.lastRunAt,
+      },
+    })),
+  setUnlockProgress: (serviceId, result) =>
+    set((s) => ({
+      unlock: { ...s.unlock, results: { ...s.unlock.results, [serviceId]: result } },
+    })),
+  applyUnlockSnapshot: (snap) => {
+    // review#5：陈旧轮 no-op 快照（空 results + 无 checkedAt/notReady/blockedReason）——本轮在飞期间被 invalidate、
+    // 新一轮已 beginUnlockCheck 接管显示 → 不覆盖（否则会把新一轮「检测中」清成空 idle）。
+    if (
+      !snap.checkedAt &&
+      !snap.notReady &&
+      !snap.blockedReason &&
+      Object.keys(snap.results).length === 0
+    ) {
+      return;
+    }
+    if (snap.blockedReason) {
+      // gating 短路（proxy-not-running / exit-invalid）→ idle，不打 lastRunAt（M-gate 毫秒响应，允许反复点，无冷却）。
+      set({ unlock: { results: {}, running: false, checkedAt: null, egress: null, lastRunAt: null } });
+    } else if (snap.notReady) {
+      // 就绪门未过 → idle 但后端已置 lastRunAt（force 15s 下限生效）→ 打戳，冷却据此镜像。
+      set({
+        unlock: { results: {}, running: false, checkedAt: null, egress: null, lastRunAt: Date.now() },
+      });
+    } else {
+      // 真检测落定 → results/checkedAt/egress + 打 lastRunAt（冷却镜像后端 force-min）。
+      set({
+        unlock: {
+          results: snap.results,
+          running: false,
+          checkedAt: snap.checkedAt,
+          egress: snap.egress,
+          lastRunAt: Date.now(),
+        },
+      });
+    }
+  },
+  resetUnlock: () =>
+    set({ unlock: { results: {}, running: false, checkedAt: null, egress: null, lastRunAt: null } }),
+
   // Status Actions
   refreshConnectionStatus: async () => {
     try {
@@ -454,11 +584,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
-  // 手动重探出口 IP（force，绕 TTL）：状态栏检测超时/失败的刷新按钮触发；结果 set 回 ipInfo（EVENT 亦兜底推送）。
+  // 手动重探出口 IP（force+visible，绕 TTL）：可见流程「检测中…→新IP/检测超时/出口无效」，解锁刷新钮 + 状态栏
+  // 刷新钮共用。中间态与终值均由 EVENT_IP_INFO_UPDATED 事件链写入 store（use-native-events，App 根常驻订阅）；
+  // 【不回写 invoke 返回值】——终值可能晚于并发 markProxyConnecting（切节点清值广播、且不推 updatedAt 单调 guard
+  // 挡不住）抵达，set 会用陈旧快照冲掉「检测中」态。await 仅用于两入口按钮的 reprobing spinner 生命周期。
   reprobeExitIp: async () => {
     try {
-      const snap = await api.ipInfo.get(true);
-      set({ ipInfo: snap });
+      await api.ipInfo.get(true, true);
     } catch (error) {
       console.error('Failed to reprobe exit IP:', error);
     }
@@ -559,7 +691,18 @@ export const useAppStore = create<AppState>((set, get) => ({
   // Server Management Actions
   deleteServer: async (serverId) => {
     try {
-      await api.server.delete(serverId);
+      // D4：删的是当前选中节点 → 算兜底出口（最快剩余节点，latency 在渲染端会话态）传后端，
+      // 后端据此置 selectedServerId 并 emit 触发重启，把已删节点移出运行核（避免流量仍走已删出口）。
+      const st = get();
+      const cfg = st.config;
+      const fallback =
+        cfg && cfg.selectedServerId === serverId
+          ? pickFallbackExit(
+              cfg.servers.filter((s) => s.id !== serverId).map((s) => s.id),
+              st.latencyMap
+            )
+          : undefined;
+      await api.server.delete(serverId, fallback);
       // 清该节点 Tailscale 登录态缓存（仅 TS 节点有此缓存，非 TS 为 no-op）：免删-增循环陈旧缓存累积，
       // 也免导入/恢复复用旧 uuid 时陈旧 true 让 state 兜底跳过、误显「已登录」。
       useTailscaleLoginCacheStore.getState().removeCached(serverId);
@@ -568,6 +711,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       invalidateLoadConfig();
       // Reload config to get updated server list（Tailscale 登录态由 api STATUS 流实时驱动，无需在此刷新）。
       await get().loadConfig();
+      // 返回兜底出口（供调用点 toast「已切换到 X」）：undefined=非删选中；null=删选中但无剩余→direct；string=兜底节点 id。
+      return fallback;
     } catch (error) {
       console.error('[Store] Exception deleting server:', error);
       throw error; // 调用点 catch + toast
@@ -576,14 +721,26 @@ export const useAppStore = create<AppState>((set, get) => ({
 
   deleteServers: async (serverIds) => {
     try {
-      const count = await api.server.deleteBatch(serverIds);
+      // D4：删除集合含当前选中节点 → 兜底最快剩余节点（排除全部待删）传后端触发重启（同 deleteServer）。
+      const st = get();
+      const cfg = st.config;
+      const delSet = new Set(serverIds);
+      const fallback =
+        cfg && cfg.selectedServerId && delSet.has(cfg.selectedServerId)
+          ? pickFallbackExit(
+              cfg.servers.filter((s) => !delSet.has(s.id)).map((s) => s.id),
+              st.latencyMap
+            )
+          : undefined;
+      const count = await api.server.deleteBatch(serverIds, fallback);
       // 同 deleteServer：批量清各节点 Tailscale 登录态缓存（非 TS 为 no-op）。
       const cache = useTailscaleLoginCacheStore.getState();
       for (const id of serverIds) cache.removeCached(id);
       // 代际护栏：同 deleteServer，作废在飞旧 load，防批量删后旧快照复活已删节点。
       invalidateLoadConfig();
       await get().loadConfig();
-      return count;
+      // fallback 同 deleteServer 语义（供调用点分流 toast「已切换 X/直连」）；count 保留供其它调用方。
+      return { count, fallback };
     } catch (error) {
       console.error('[Store] Exception batch-deleting servers:', error);
       throw error; // 调用点 catch + toast

@@ -4,6 +4,7 @@
 
 import { useEffect } from 'react';
 import { api } from '../ipc';
+import { unlockApi } from '../ipc/api-client';
 import { useStatsTopic } from './use-stats-topic';
 import { useAppStore } from '../store/app-store';
 import { useTailscaleLoginCacheStore } from '../store/use-tailscale-login-cache-store';
@@ -19,6 +20,11 @@ import type {
   InvalidNodeInfo,
 } from '../../shared/types';
 import type { TailscaleStatusEvent } from '../../shared/tailscale-status';
+import type {
+  UnlockProgress,
+  UnlockSnapshot,
+  UnlockInvalidatedPayload,
+} from '../../shared/unlock-detection';
 
 // 定义事件数据类型
 interface NativeEventData {
@@ -62,6 +68,10 @@ interface NativeEventData {
   helperUpgradeable: { version: string };
   // 缺陷1 登录期出口让位：选中 TS 出口未就绪→默认路由让位直连（engaged=true）/隧道 Running 后切回（engaged=false）。
   meshLoginFallback: { engaged: boolean; serverName?: string };
+  // issue 2 解锁检测持久订阅（写 store，跨首页卸载存活）：progress 逐个点亮 / updated 完整终态 / invalidated 失效复位。
+  unlockProgress: UnlockProgress;
+  unlockUpdated: UnlockSnapshot;
+  unlockInvalidated: UnlockInvalidatedPayload;
 }
 
 type NativeEventListener<K extends keyof NativeEventData> = (data: NativeEventData[K]) => void;
@@ -120,6 +130,15 @@ export function useNativeEvent<K extends keyof NativeEventData>(
       case 'meshLoginFallback':
         unsubscribe = api.proxy.onMeshLoginFallback(callback as any);
         break;
+      case 'unlockProgress':
+        unsubscribe = unlockApi.onProgress(callback as any);
+        break;
+      case 'unlockUpdated':
+        unsubscribe = unlockApi.onUpdated(callback as any);
+        break;
+      case 'unlockInvalidated':
+        unsubscribe = unlockApi.onInvalidated(callback as any);
+        break;
       default:
         console.warn(`Unknown event: ${eventName}`);
     }
@@ -140,11 +159,17 @@ export function useNativeEvent<K extends keyof NativeEventData>(
 function handleProcessStarted(_data: NativeEventData['processStarted']) {
   // Refresh connection status when process starts
   useAppStore.getState().refreshConnectionStatus();
+  // §2 待应用差集：起核后运行核快照刷新 → 差集应清零（原待应用变更已入核）。
+  useAppStore.getState().refreshPendingChanges();
 }
 
 function handleProcessStopped(_data: NativeEventData['processStopped']) {
   // Refresh connection status when process stops
   useAppStore.getState().refreshConnectionStatus();
+  // §2 待应用差集：停核后无运行核快照 → 差集应清空（动作条隐藏）。
+  useAppStore.getState().refreshPendingChanges();
+  // issue 2：停核 → 解锁检测态复位 idle（即使首页未挂载也持久生效，切回不残留旧节点绿点）。
+  useAppStore.getState().resetUnlock();
 }
 
 function handleProcessError(data: NativeEventData['processError']) {
@@ -189,6 +214,8 @@ function handleConfigChanged(data: NativeEventData['configChanged']) {
     // 如果没有新配置数据，则重新加载；loadConfig 自带单飞，无需再用全局 isLoading 守卫
     useAppStore.getState().loadConfig();
   }
+  // §2 待应用差集：节点集/参数变更（含增删改、订阅刷新、defer 生效）→ 重算差集，动作条/徽标即时反映。
+  useAppStore.getState().refreshPendingChanges();
 }
 
 // batch3 §3.7：stats 帧改经 useStatsTopic('stats') 订阅（取代旧全局 api.stats.onUpdated）。payload 即最新
@@ -292,7 +319,20 @@ function handleTailscaleStatus(data: NativeEventData['tailscaleStatus']) {
   // 「需登录」角标；tailscaleIPs（self.tailscaleIPs）入 store 供节点卡「组网信息」popover 展示内网 IP。
   // backendState 仅本地驱动登录 toast（不入 store）；authURL 除驱动 toast 外，NeedsLogin 时【入 store】（缺陷4，下方），
   // 是主核 always-emit 路径取消后恢复登录 URL 的可靠来源。
-  useAppStore.getState().setTailscaleLoginState(data.serverId, data.loggedIn);
+  // W1 登录判决门（§12.1）：仅 definitive 帧写登录态。启动早期过渡帧（NoState/Stopped 等 backendState 未达
+  // Running/Starting）被主进程 emitTailscaleStatus 折叠成 loggedIn=false——那是「后端尚未启完」而非「凭据无效」，
+  // 若无条件覆写会把缓存里的 true 翻 false → 徽标闪「未登录」+ 写穿 localStorage 毒化缓存（P5 根因）。过渡态对凭据
+  // 没有判决 → 跳过（不动登录态/缓存）；definitive-in（loggedIn=true，主进程已算 Running/Starting && !expired）与
+  // definitive-out（NeedsLogin/NeedsMachineAuth/expired）才写。不触碰主进程 tailscaleStatusCache.loggedIn（§9 M-gate
+  // 依赖它做 exit-block gating，过渡帧折叠 false 在主进程侧保守安全，原样保留）。真 NeedsLogin/expired 照常即时判决。
+  const definitiveOut =
+    data.backendState === 'NeedsLogin' ||
+    data.backendState === 'NeedsMachineAuth' ||
+    data.expired === true;
+  const definitiveIn = data.loggedIn === true;
+  if (definitiveIn || definitiveOut) {
+    useAppStore.getState().setTailscaleLoginState(data.serverId, definitiveIn);
+  }
   // 内网 IP（self.tailscaleIPs）入 store，组网卡 popover 据此显示。
   useAppStore.getState().setTailscaleIps(data.serverId, data.tailscaleIPs || []);
   // L4：对端列表入 store，供出口节点下拉 + 组网信息 popover（peers 已排除 self，由 userGroups 摊平）。
@@ -348,6 +388,22 @@ function handleSpeedTestResult(data: NativeEventData['speedTestResult']) {
   // 修：原 per-node 监听写在 use-speed-test 的 handler 作用域内（仅 UI 测速期间临时订阅），托盘测速结果无人接、
   // 切走服务器页期间的流式结果也丢失。提到此顶层持久 hook 后两入口统一捕获、跨页不丢。
   useAppStore.getState().applyLatencyResults({ [data.serverId]: data.latency });
+}
+
+// issue 2 解锁检测：持久订阅写 store（跨首页组件卸载存活）。检测的发起唯一驱动 = 主进程 backend self-run（GAP-1），
+// 此处纯消费事件、不发起。切导航离开首页时后台自跑的 progress/终态照样落 store，切回直接展示、不重跑。
+function handleUnlockProgress(data: NativeEventData['unlockProgress']) {
+  useAppStore.getState().setUnlockProgress(data.serviceId, data.result);
+}
+function handleUnlockUpdated(data: NativeEventData['unlockUpdated']) {
+  useAppStore.getState().applyUnlockSnapshot(data);
+}
+function handleUnlockInvalidated(data: NativeEventData['unlockInvalidated']) {
+  // 失效（切节点/起停/G-flip/G-flip2）：据**主进程带来的核真态**判分支（review#1/#3：渲染端 connectionStatus/
+  // proxyBlocked 在 invalidate 抵达时常陈旧——invalidate 先于 EVENT_PROXY_STARTED / IP_INFO_UPDATED）。
+  // 核在跑且出口有效 → 显「检测中」（后台 self-run 1.5s 后跑，结果经 EVENT_UNLOCK_UPDATED 回填）；否则 → idle。
+  if (data.running && !data.exitBlocked) useAppStore.getState().beginUnlockCheck();
+  else useAppStore.getState().resetUnlock();
 }
 
 // #40：非官方核 ≤ 随包基线 → 兼容风险警告 toast（每会话一次，避免每次启动唠叨；同 systemProxyResidual 模式）。
@@ -436,6 +492,15 @@ export function useNativeEventListeners() {
   useNativeEvent('coreBaselineWarning', handleCoreBaselineWarning);
   useNativeEvent('helperUpgradeable', handleHelperUpgradeable);
   useNativeEvent('meshLoginFallback', handleMeshLoginFallback);
+  // issue 2 解锁检测持久订阅（跨首页卸载存活；发起由 backend self-run 驱动，此处纯消费）。
+  useNativeEvent('unlockProgress', handleUnlockProgress);
+  useNativeEvent('unlockUpdated', handleUnlockUpdated);
+  useNativeEvent('unlockInvalidated', handleUnlockInvalidated);
+
+  // §2 待应用差集：挂载即拉一次（事件驱动的三触发点之外的冷启动水合；核未运行返空、无害）。
+  useEffect(() => {
+    void useAppStore.getState().refreshPendingChanges();
+  }, []);
 
   // L2 治本：挂载即主动拉一次 Tailscale 状态末帧 → 填 store（self IP + peers），不干等下一帧推送。
   // 根治「状态流 push-only-on-change、无心跳、渲染端错过那一帧即永久陈旧」（内网IP「尚未分配」/peers 拿不到）。
@@ -451,6 +516,26 @@ export function useNativeEventListeners() {
         for (const st of snap.statuses) {
           store.setTailscaleIps(st.serverId, st.tailscaleIPs || []);
           store.setTailscalePeers(st.serverId, st.peers || []);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // G-peek：窗口内存回收重建后 renderer store 全空 → 状态栏丢「出口无效/IP」显示直到下次主进程广播。挂载时若
+  // store.ipInfo 为空，纯读（peek，零探测）水合一次。**不**用 get(false)：proxyBlocked/error 终态 TTL 仅 10s，
+  // 过期即触发真探测——正是无效出口下要消灭的挂载触发面。普通 hide→show 不 remount、store 保留，本 effect 不空跑。
+  useEffect(() => {
+    if (useAppStore.getState().ipInfo) return; // 已有快照（普通挂载）→ 不覆盖
+    let cancelled = false;
+    void api.ipInfo
+      .peek()
+      .then((snap) => {
+        if (cancelled || useAppStore.getState().ipInfo) return; // 期间已被事件填充 → 不覆盖
+        if (snap && (snap.direct || snap.proxy || snap.updatedAt)) {
+          useAppStore.setState({ ipInfo: snap });
         }
       })
       .catch(() => {});

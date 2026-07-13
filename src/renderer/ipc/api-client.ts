@@ -26,11 +26,18 @@ import type {
   RuleResourceCatalogResult,
   InvalidNodeInfo,
   ImportParseResult,
+  PendingNodeChanges,
 } from '../../shared/types';
+import type {
+  UnlockSnapshot,
+  UnlockProgress,
+  UnlockInvalidatedPayload,
+} from '../../shared/unlock-detection';
 import type { SubscriptionPreviewResult } from '../../shared/subscription-preview';
 import type { WarpWireGuardDraft } from '../../shared/warp';
 import type { BackupCategory } from '../../shared/backup-categories';
 import type { TailscaleStatusEvent, TailscaleStatusSnapshot } from '../../shared/tailscale-status';
+import type { SpeedTestInvokeResult } from '../../shared/speed-test';
 
 /**
  * 代理控制 API
@@ -80,6 +87,21 @@ export const proxyApi = {
    */
   async disableSystemProxy(): Promise<{ ok: boolean }> {
     return ipcClient.invoke(IPC_CHANNELS.SYSTEM_PROXY_DISABLE);
+  },
+
+  /**
+   * §2 待应用差集（pull）：拉取节点集相对运行核快照的增/改/删差集。核未运行 → 全空。
+   * 调用时机：configChanged / proxyStarted / proxyStopped 事件后。
+   */
+  async getPendingChanges(): Promise<PendingNodeChanges> {
+    return ipcClient.invoke(IPC_CHANNELS.PROXY_GET_PENDING_CHANGES);
+  },
+
+  /**
+   * §2 动作条「立即应用」：把最新 config force-restart 入核（应用全部待应用变更）。
+   */
+  async applyPendingChanges(): Promise<{ ok: boolean }> {
+    return ipcClient.invoke(IPC_CHANNELS.PROXY_APPLY_PENDING_CHANGES);
   },
 
   /**
@@ -304,17 +326,19 @@ export const serverApi = {
   },
 
   /**
-   * 删除服务器
+   * 删除服务器。fallbackSelectedId：删的是当前选中节点时的兜底出口（最快剩余节点，渲染端算 pickFallbackExit）；
+   * 后端据此把 selectedServerId 置兜底节点并 emit 触发重启（D4）。删非选中节点省略即可。
    */
-  async delete(serverId: string): Promise<void> {
-    return ipcClient.invoke(IPC_CHANNELS.SERVER_DELETE, { serverId });
+  async delete(serverId: string, fallbackSelectedId?: string | null): Promise<void> {
+    return ipcClient.invoke(IPC_CHANNELS.SERVER_DELETE, { serverId, fallbackSelectedId });
   },
 
   /**
    * 批量删除服务器（一次配置写，避免并发单删竞态）。返回实际删除数。
+   * fallbackSelectedId：删除集合含当前选中节点时的兜底出口（同 delete）。
    */
-  async deleteBatch(serverIds: string[]): Promise<number> {
-    return ipcClient.invoke(IPC_CHANNELS.SERVER_DELETE_BATCH, { serverIds });
+  async deleteBatch(serverIds: string[], fallbackSelectedId?: string | null): Promise<number> {
+    return ipcClient.invoke(IPC_CHANNELS.SERVER_DELETE_BATCH, { serverIds, fallbackSelectedId });
   },
 
   /**
@@ -395,7 +419,7 @@ export const serverApi = {
   /**
    * 测试指定服务器延迟，不传则测试所有服务器
    */
-  async speedTest(serverIds?: string[]): Promise<Record<string, number>> {
+  async speedTest(serverIds?: string[]): Promise<SpeedTestInvokeResult> {
     return ipcClient.invoke(IPC_CHANNELS.SERVER_SPEED_TEST, { serverIds });
   },
 
@@ -581,14 +605,45 @@ export const ruleResourcesApi = {
  * 出口 IP 信息 API
  */
 export const ipInfoApi = {
-  /** 获取出口 IP 快照（force 强制重测） */
-  async get(force = false): Promise<IpInfoSnapshot> {
-    return ipcClient.invoke(IPC_CHANNELS.IP_INFO_GET, { force });
+  /** 获取出口 IP 快照。force=强制重测（绕 TTL）；visible=手动重探可见流程（清当前出口→检测中→结果/超时，仅与 force 搭配）。 */
+  async get(force = false, visible = false): Promise<IpInfoSnapshot> {
+    return ipcClient.invoke(IPC_CHANNELS.IP_INFO_GET, { force, visible });
+  },
+
+  /** 纯读当前快照（零探测）：窗口重建后 store 为空时水合状态栏，避免丢「出口无效/IP」显示。绝不触发探测（区别于 get）。 */
+  async peek(): Promise<IpInfoSnapshot> {
+    return ipcClient.invoke(IPC_CHANNELS.IP_INFO_GET, { peek: true });
   },
 
   /** 监听出口 IP 更新事件 */
   onUpdated(listener: (snap: IpInfoSnapshot) => void): () => void {
     return ipcClient.on(IPC_CHANNELS.EVENT_IP_INFO_UPDATED, listener);
+  },
+};
+
+/**
+ * 解锁检测 API（AI/流媒体，经当前代理出口）。照 ipInfoApi 范式（invoke + on），preload 零改。
+ */
+export const unlockApi = {
+  /** 跑一轮检测（force 绕 TTL，仍受 15s 硬下限约束）。返回完整快照。 */
+  async run(force = false): Promise<UnlockSnapshot> {
+    return ipcClient.invoke(IPC_CHANNELS.UNLOCK_RUN, { force });
+  },
+  /** 纯读最近快照（页面挂载水合，零网络）；无则 null。 */
+  async get(): Promise<UnlockSnapshot | null> {
+    return ipcClient.invoke(IPC_CHANNELS.UNLOCK_GET);
+  },
+  /** 单个服务 settle 逐个点亮。 */
+  onProgress(listener: (p: UnlockProgress) => void): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_UNLOCK_PROGRESS, listener);
+  },
+  /** 切节点/起停代理 → 缓存失效。载荷带主进程核真态（running/exitBlocked），渲染端据此判「检测中 vs idle」。 */
+  onInvalidated(listener: (p: UnlockInvalidatedPayload) => void): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_UNLOCK_INVALIDATED, listener);
+  },
+  /** 一轮检测完成的完整终态快照（issue 2：checkedAt/egress 跨组件卸载持有，切页回来不重跑）。 */
+  onUpdated(listener: (snap: UnlockSnapshot) => void): () => void {
+    return ipcClient.on(IPC_CHANNELS.EVENT_UNLOCK_UPDATED, listener);
   },
 };
 
@@ -879,6 +934,8 @@ export const subscriptionApi = {
     updatedServers: number;
     deletedServers: number;
     error?: string;
+    /** §16.3.4：304/无内容变化 → true（UI 弹「订阅无变化」toast）。 */
+    unchanged?: boolean;
   }> {
     return ipcClient.invoke(IPC_CHANNELS.SUBSCRIPTION_UPDATE_SERVERS, { subscriptionId });
   },
