@@ -11,7 +11,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { FormButtons } from './shared/form-buttons';
 import { EchField } from './shared/anti-censor-fields';
 import { AddressField, PortField } from './shared/basic-fields';
 import { TlsServerNameField, AllowInsecureField } from './shared/tls-fields';
@@ -27,14 +26,14 @@ const createHysteria2Schema = (t: any) =>
       port: z.number().min(1).max(65535),
       password: z.string().min(1, t('servers.passwordRequired')),
       // 带宽限制
-      upMbps: z.number().optional(),
-      downMbps: z.number().optional(),
+      upMbps: z.number().optional().or(z.literal('')),
+      downMbps: z.number().optional().or(z.literal('')),
       // 混淆设置
       obfsEnabled: z.boolean(),
       obfsType: z.enum(['salamander', 'gecko']),
       obfsPassword: z.string().optional(),
-      obfsMinPacketSize: z.number().optional(),
-      obfsMaxPacketSize: z.number().optional(),
+      obfsMinPacketSize: z.number().optional().or(z.literal('')),
+      obfsMaxPacketSize: z.number().optional().or(z.literal('')),
       // 拥塞控制
       bbrProfile: z.string().optional(),
       // TLS 设置
@@ -175,7 +174,15 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit(handleSubmit)} className="flex flex-col gap-[13px]">
+      <form
+        id="node-cfg-form"
+        onSubmit={form.handleSubmit(handleSubmit)}
+        onReset={(e) => {
+          e.preventDefault();
+          form.reset();
+        }}
+        className="flex flex-col gap-[13px]"
+      >
         <FieldGrid cols={2}>
           <AddressField control={form.control} t={t} />
           <PortField control={form.control} t={t} placeholder="443" />
@@ -216,7 +223,7 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
                     value={field.value ?? ''}
                     onChange={(e) => {
                       const val = e.target.value;
-                      field.onChange(val ? parseInt(val) : undefined);
+                      field.onChange(val ? parseInt(val) : ''); // '' 空哨兵：避免 Controller 编辑态回退旧值(#294 同类)
                     }}
                   />
                   <FormMessage className="fld-err" />
@@ -236,7 +243,7 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
                     value={field.value ?? ''}
                     onChange={(e) => {
                       const val = e.target.value;
-                      field.onChange(val ? parseInt(val) : undefined);
+                      field.onChange(val ? parseInt(val) : ''); // '' 空哨兵：避免 Controller 编辑态回退旧值(#294 同类)
                     }}
                   />
                   <FormMessage className="fld-err" />
@@ -313,7 +320,7 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
                                 value={field.value ?? ''}
                                 onChange={(e) => {
                                   const val = e.target.value;
-                                  field.onChange(val ? parseInt(val) : undefined);
+                                  field.onChange(val ? parseInt(val) : ''); // '' 空哨兵：避免 Controller 编辑态回退旧值(#294 同类)
                                 }}
                               />
                               <FormMessage className="fld-err" />
@@ -335,7 +342,7 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
                                 value={field.value ?? ''}
                                 onChange={(e) => {
                                   const val = e.target.value;
-                                  field.onChange(val ? parseInt(val) : undefined);
+                                  field.onChange(val ? parseInt(val) : ''); // '' 空哨兵：避免 Controller 编辑态回退旧值(#294 同类)
                                 }}
                               />
                               <FormMessage className="fld-err" />
@@ -408,8 +415,6 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
             />
           </FieldGrid>
         </FormSection>
-
-        <FormButtons isSubmitting={form.formState.isSubmitting} onReset={() => form.reset()} />
       </form>
     </Form>
   );

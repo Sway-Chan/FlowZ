@@ -10,7 +10,6 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { FormButtons } from './shared/form-buttons';
 import { MultiplexFields } from './shared/anti-censor-fields';
 import { AddressField, PortField } from './shared/basic-fields';
 import { TlsAdvancedFields } from './shared/tls-fields';
@@ -46,7 +45,7 @@ const createVmessSchema = (t: any) =>
         /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
         t('servers.uuidInvalid')
       ),
-    alterId: z.number().default(0),
+    alterId: z.number().default(0).or(z.literal('')), // '' = 清空态哨兵（提交归一为 0）
     vmessSecurity: z.string().default('auto'),
     network: z.enum(['Tcp', 'Ws', 'Grpc', 'Http', 'HttpUpgrade']),
     security: z.enum(['None', 'Tls']),
@@ -132,7 +131,7 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
       address: values.address,
       port: values.port,
       uuid: values.uuid,
-      alterId: values.alterId,
+      alterId: values.alterId === '' ? 0 : values.alterId,
       vmessSecurity: values.vmessSecurity,
       network,
       security,
@@ -163,7 +162,15 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit(handleSubmit)} className="flex flex-col gap-[13px]">
+      <form
+        id="node-cfg-form"
+        onSubmit={form.handleSubmit(handleSubmit)}
+        onReset={(e) => {
+          e.preventDefault();
+          form.reset();
+        }}
+        className="flex flex-col gap-[13px]"
+      >
         <FieldGrid cols={2}>
           <AddressField control={form.control} t={t} />
           <PortField control={form.control} t={t} placeholder="443" />
@@ -194,15 +201,15 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
                   {...field}
                   value={field.value ?? ''}
                   onChange={(e) => {
-                    // 空串 → undefined（zod `.default(0)` 回落 0，且允许退格删空重录）；不用 `parseInt || 0`
-                    // （把删空/半删压成 0、卡住无法清空）。异常值 → undefined。
+                    // 空串 → ''（**不是 undefined**）：RHF Controller 在 value===undefined 时回退 defaultValue(0)，
+                    // 清空后又填回旧值（issue #294 同类回归）。'' 不触发回退；提交时 ''→0 归一。不用 `parseInt || 0`。
                     const raw = e.target.value;
                     if (raw === '') {
-                      field.onChange(undefined);
+                      field.onChange('');
                       return;
                     }
                     const n = Number.parseInt(raw, 10);
-                    field.onChange(Number.isNaN(n) ? undefined : n);
+                    field.onChange(Number.isNaN(n) ? '' : n);
                   }}
                 />
                 <FormMessage className="fld-err" />
@@ -295,8 +302,6 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
 
           <MultiplexFields control={form.control} t={t} disabled={false} />
         </FormSection>
-
-        <FormButtons isSubmitting={form.formState.isSubmitting} onReset={() => form.reset()} />
       </form>
     </Form>
   );

@@ -12,7 +12,6 @@ import {
 } from '@/components/ui/select';
 import { Switch } from '@/components/ui/switch';
 import { Shield } from 'lucide-react';
-import { FormButtons } from './shared/form-buttons';
 import { MultiplexFields } from './shared/anti-censor-fields';
 import { AddressField, PortField } from './shared/basic-fields';
 import { FormSection, FieldGrid, FieldSpan } from './shared/form-layout';
@@ -39,7 +38,7 @@ const createSsSchema = (t: any) =>
     shadowTlsPassword: z.string().optional(),
     shadowTlsSni: z.string().optional(),
     shadowTlsFingerprint: z.string().optional(),
-    shadowTlsPort: z.number().optional(),
+    shadowTlsPort: z.number().optional().or(z.literal('')), // '' = 清空态哨兵（提交 `|| undefined` 归一）
     ...multiplexSchemaShape,
   });
 
@@ -141,7 +140,15 @@ export function SsForm({ serverConfig, onSubmit }: SsFormProps) {
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit(handleSubmit)} className="flex flex-col gap-[13px]">
+      <form
+        id="node-cfg-form"
+        onSubmit={form.handleSubmit(handleSubmit)}
+        onReset={(e) => {
+          e.preventDefault();
+          form.reset();
+        }}
+        className="flex flex-col gap-[13px]"
+      >
         <FieldGrid cols={2}>
           <FieldSpan>
             <FormField
@@ -310,8 +317,9 @@ export function SsForm({ serverConfig, onSubmit }: SsFormProps) {
                           {...field}
                           value={field.value ?? ''}
                           onChange={(e) => {
+                            // '' 空哨兵（非 undefined）：避免 RHF Controller 编辑态回退旧端口（issue #294 同类）。
                             const val = e.target.value;
-                            field.onChange(val ? parseInt(val) : undefined);
+                            field.onChange(val ? parseInt(val) : '');
                           }}
                         />
                         <FormMessage className="fld-err" />
@@ -350,8 +358,6 @@ export function SsForm({ serverConfig, onSubmit }: SsFormProps) {
 
           <MultiplexFields control={form.control} t={t} disabled={false} />
         </FormSection>
-
-        <FormButtons isSubmitting={form.formState.isSubmitting} onReset={() => form.reset()} />
       </form>
     </Form>
   );

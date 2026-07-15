@@ -3,7 +3,6 @@ import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import * as z from 'zod';
 import { Button } from '@/components/ui/button';
-import { FormButtons } from './shared/form-buttons';
 import { Form, FormField, FormMessage } from '@/components/ui/form';
 import { Input } from '@/components/ui/input';
 import { AddressField, PortField } from './shared/basic-fields';
@@ -39,7 +38,8 @@ const createWireGuardSchema = (t: any) =>
     alwaysRouteSubnets: z.boolean(),
     allowedIPs: z.string().optional(),
     persistentKeepalive: z.number().min(0).max(65535),
-    mtu: z.number().min(0).max(9000).optional(),
+    // 允许 ''（清空态）：清空数字输入用 '' 作空哨兵（避免 Controller 回退 defaultValue），提交时 `mtu || undefined` 归一。
+    mtu: z.number().min(0).max(9000).optional().or(z.literal('')),
     reserved: z.string().optional(),
   });
 
@@ -212,7 +212,15 @@ export function WireGuardForm({ serverConfig, onSubmit }: WireGuardFormProps) {
 
   return (
     <Form {...form}>
-      <form onSubmit={form.handleSubmit(handleSubmit)} className="flex flex-col gap-[13px]">
+      <form
+        id="node-cfg-form"
+        onSubmit={form.handleSubmit(handleSubmit)}
+        onReset={(e) => {
+          e.preventDefault();
+          form.reset();
+        }}
+        className="flex flex-col gap-[13px]"
+      >
         {/* 组网概要：降低 WG/组网概念门槛（与 Tailscale tsIntro 对齐） */}
         <p className="text-xs text-muted-foreground">
           {t('servers.wgIntro', 'WireGuard node: reach a peer LAN, or act as an internet exit.')}
@@ -430,15 +438,16 @@ export function WireGuardForm({ serverConfig, onSubmit }: WireGuardFormProps) {
                     {...field}
                     value={field.value ?? ''}
                     onChange={(e) => {
-                      // 空串（退格删空）→ undefined，允许清空重录；不用 Number(e.target.value)（`Number('')===0`
-                      // 会把删空卡成 0、无法清空）。非空按十进制解析，异常值 → undefined 不硬塞 0。
+                      // 空串（退格删空）→ ''（**不是 undefined**）：RHF Controller 在 value===undefined 时回退
+                      // defaultValue，把清空的字段自动填回旧值（issue #294 同类回归）。'' 是「已定义的空」不触发回退。
+                      // 不用 Number(e.target.value)（`Number('')===0` 卡成 0）。异常值 → '' 不硬塞 0。
                       const raw = e.target.value;
                       if (raw === '') {
-                        field.onChange(undefined);
+                        field.onChange('');
                         return;
                       }
                       const n = Number.parseInt(raw, 10);
-                      field.onChange(Number.isNaN(n) ? undefined : n);
+                      field.onChange(Number.isNaN(n) ? '' : n);
                     }}
                   />
                   <FormMessage className="fld-err" />
@@ -458,15 +467,16 @@ export function WireGuardForm({ serverConfig, onSubmit }: WireGuardFormProps) {
                     {...field}
                     value={field.value ?? ''}
                     onChange={(e) => {
-                      // 空串（退格删空）→ undefined，允许清空重录；不用 Number(e.target.value)（`Number('')===0`
-                      // 会把删空卡成 0、无法清空）。非空按十进制解析，异常值 → undefined 不硬塞 0。
+                      // 空串（退格删空）→ ''（**不是 undefined**）：RHF Controller 在 value===undefined 时回退
+                      // defaultValue，把清空的字段自动填回旧值（issue #294 同类回归）。'' 是「已定义的空」不触发回退。
+                      // 不用 Number(e.target.value)（`Number('')===0` 卡成 0）。异常值 → '' 不硬塞 0。
                       const raw = e.target.value;
                       if (raw === '') {
-                        field.onChange(undefined);
+                        field.onChange('');
                         return;
                       }
                       const n = Number.parseInt(raw, 10);
-                      field.onChange(Number.isNaN(n) ? undefined : n);
+                      field.onChange(Number.isNaN(n) ? '' : n);
                     }}
                   />
                   <FormMessage className="fld-err" />
@@ -489,8 +499,6 @@ export function WireGuardForm({ serverConfig, onSubmit }: WireGuardFormProps) {
             />
           </FieldGrid>
         </FormSection>
-
-        <FormButtons isSubmitting={form.formState.isSubmitting} onReset={() => form.reset()} />
       </form>
     </Form>
   );
