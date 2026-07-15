@@ -389,7 +389,13 @@
       "autoConnectDesc": "Restore the last exit node and takeover mode, then connect",
       "behaviorSub": "Update prompts, window and privacy mask",
       "autoCheckUpdateDesc": "Notify on the About page when a new version is found",
-      "rememberWindowSizeDesc": "Restore the last window layout the next time you open it"
+      "rememberWindowSizeDesc": "Restore the last window layout the next time you open it",
+      "groupGraphics": "Graphics compatibility",
+      "graphicsSub": "Turn these off to recover from a blank window or display glitches",
+      "hardwareAcceleration": "Hardware acceleration",
+      "hardwareAccelerationDesc": "Turning this off switches to software rendering, which can fix a blank window, visual artifacts, or a repeatedly crashing GPU process on some devices. Restart FlowZ to take effect.",
+      "windowEffects": "Window effects",
+      "windowEffectsDesc": "Mica material on Windows, frosted glass on macOS. Turning this off uses a solid background, which can fix a blank window or compositing glitches. Restart FlowZ to take effect."
     },
     "coreVersion": {
       "changedTitle": "sing-box Core Updated",
