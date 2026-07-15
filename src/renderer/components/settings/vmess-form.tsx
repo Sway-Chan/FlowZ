@@ -86,12 +86,12 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
         port: serverConfig.port || 443,
         uuid: serverConfig.uuid || '',
         alterId: serverConfig.alterId ?? 0,
-        vmessSecurity: serverConfig.vmessSecurity || 'auto',
+        vmessSecurity: (serverConfig.vmessSecurity || 'auto').toLowerCase(),
         network: normalizeNetworkUpper(serverConfig.network),
         security: normalizeSecurity(serverConfig.security),
         tlsServerName: serverConfig.tlsSettings?.serverName || '',
         tlsAllowInsecure: serverConfig.tlsSettings?.allowInsecure || false,
-        tlsFingerprint: serverConfig.tlsSettings?.fingerprint || 'chrome',
+        tlsFingerprint: (serverConfig.tlsSettings?.fingerprint || 'chrome').toLowerCase(),
         tlsEngine: serverConfig.tlsSettings?.engine || 'go',
         ...readTransportDefaults(serverConfig),
         ...readEchDefault(serverConfig),
@@ -192,7 +192,18 @@ export function VmessForm({ serverConfig, onSubmit }: VmessFormProps) {
                   type="number"
                   placeholder="0"
                   {...field}
-                  onChange={(e) => field.onChange(parseInt(e.target.value) || 0)}
+                  value={field.value ?? ''}
+                  onChange={(e) => {
+                    // 空串 → undefined（zod `.default(0)` 回落 0，且允许退格删空重录）；不用 `parseInt || 0`
+                    // （把删空/半删压成 0、卡住无法清空）。异常值 → undefined。
+                    const raw = e.target.value;
+                    if (raw === '') {
+                      field.onChange(undefined);
+                      return;
+                    }
+                    const n = Number.parseInt(raw, 10);
+                    field.onChange(Number.isNaN(n) ? undefined : n);
+                  }}
                 />
                 <FormMessage className="fld-err" />
               </div>

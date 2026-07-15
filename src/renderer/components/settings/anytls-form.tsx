@@ -69,9 +69,12 @@ export function AnyTlsForm({ serverConfig, onSubmit }: AnyTlsFormProps) {
         address: serverConfig.address || '',
         port: serverConfig.port || 443,
         password: serverConfig.password || '',
-        security: (serverConfig.security === 'reality' ? 'reality' : 'tls') as 'tls' | 'reality',
+        // 大小写归一：存量/导入 security 可能是 'Reality'——严格 === 'reality' 会误折成 'tls'。
+        security: ((serverConfig.security || '').toLowerCase() === 'reality'
+          ? 'reality'
+          : 'tls') as 'tls' | 'reality',
         tlsServerName: serverConfig.tlsSettings?.serverName || '',
-        tlsFingerprint: serverConfig.tlsSettings?.fingerprint || 'chrome',
+        tlsFingerprint: (serverConfig.tlsSettings?.fingerprint || 'chrome').toLowerCase(),
         tlsEngine: serverConfig.tlsSettings?.engine || 'go',
         tlsAllowInsecure: serverConfig.tlsSettings?.allowInsecure || false,
         realityPublicKey: serverConfig.realitySettings?.publicKey || '',
