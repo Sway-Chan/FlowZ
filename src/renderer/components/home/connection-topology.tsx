@@ -1,19 +1,44 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Network } from 'lucide-react';
+import { Network, Search } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useAppStore } from '@/store/app-store';
 import { useStatsTopic } from '@/hooks/use-stats-topic';
 import { toast } from 'sonner';
 import type { Rule, RuleAction, ConnectionsAggregate } from '../../../shared/types';
 import { getRuleActionStyle } from '@/lib/rule-action-style';
-import { computeTopologyLayout, FIXED_HEIGHT, NODE_WIDTH, type Node } from './topology-layout';
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu';
+import {
+  collectLinkedIds,
+  computeTopologyLayout,
+  hitBox,
+  matchNodeIds,
+  FIXED_HEIGHT,
+  NODE_WIDTH,
+  type Node,
+} from './topology-layout';
 
 const EMPTY_AGGREGATE: ConnectionsAggregate = { total: 0, hosts: [], outbounds: [], at: 0 };
+
+/** 右键菜单三动作的 i18n key（与 RuleAction 同名，集中一处避免散落硬编码）。 */
+const RULE_ACTION_LABEL_KEY: Record<'proxy' | 'direct' | 'block', string> = {
+  proxy: 'home.ruleProxy',
+  direct: 'home.ruleDirect',
+  block: 'home.ruleBlock',
+};
 
 export function ConnectionTopology() {
   const [aggregate, setAggregate] = useState<ConnectionsAggregate>(EMPTY_AGGREGATE);
   const [loading, setLoading] = useState(true);
   const [hovered, setHovered] = useState<{ type: 'node' | 'link'; id: string } | null>(null);
+  const [search, setSearch] = useState('');
+  const tooltipRef = useRef<HTMLDivElement>(null);
+  // tooltip 实测尺寸：靠近视口边缘时翻到指针另一侧（首帧 0 → 落在指针右下，测得后即修正）
+  const [tooltipSize, setTooltipSize] = useState({ w: 0, h: 0 });
   const [mousePos, setMousePos] = useState({ x: 0, y: 0 });
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; domain: string } | null>(
     null
@@ -65,67 +90,69 @@ export function ConnectionTopology() {
     [aggregate, width, height, t]
   );
 
+  // 检索命中集：载荷恒为小聚合（≤Top-N host + 出口，issue #227），每帧 O(~20) 子串匹配，无需 debounce。
+  const searchMatches = useMemo(() => matchNodeIds(nodes, search), [nodes, search]);
+  const searching = search.trim().length > 0;
+
   const highlightedIds = useMemo(() => {
-    if (!hovered) return new Set<string>();
-
-    const set = new Set<string>();
-    set.add(hovered.id);
-
-    // 焦点节点：hover 节点本身即焦点；hover 连线则其两端节点皆为焦点。
+    // hover 与检索共用同一套链路高亮；hover 优先（指针离开即回落检索态）。
     let focusNodes: string[] = [];
-    if (hovered.type === 'node') {
-      focusNodes = [hovered.id];
-    } else {
-      const idx = parseInt(hovered.id.split('-')[1]);
-      const hLink = links[idx];
-      if (hLink) focusNodes = [hLink.source, hLink.target];
-    }
-
-    // 沿链路向上游(target→source)与下游(source→target)各做一次 BFS，收敛即停。
-    // 合计 O(L²)，覆盖经过焦点的完整链路（上游全部来源 + 下游全部去向）。
-    const upstreamNodes = new Set<string>(focusNodes);
-    let changed = true;
-    while (changed) {
-      changed = false;
-      links.forEach((l) => {
-        if (upstreamNodes.has(l.target) && !upstreamNodes.has(l.source)) {
-          upstreamNodes.add(l.source);
-          changed = true;
-        }
-      });
-    }
-
-    const downstreamNodes = new Set<string>(focusNodes);
-    changed = true;
-    while (changed) {
-      changed = false;
-      links.forEach((l) => {
-        if (downstreamNodes.has(l.source) && !downstreamNodes.has(l.target)) {
-          downstreamNodes.add(l.target);
-          changed = true;
-        }
-      });
-    }
-
-    // 焦点上下游所有节点高亮；两端都在集合内的连线即落在链路上，一并高亮。
-    const pathNodes = new Set([...upstreamNodes, ...downstreamNodes]);
-    pathNodes.forEach((id) => set.add(id));
-    links.forEach((l, i) => {
-      if (pathNodes.has(l.source) && pathNodes.has(l.target)) {
-        set.add(`link-${i}`);
+    if (hovered) {
+      if (hovered.type === 'node') {
+        focusNodes = [hovered.id];
+      } else {
+        const idx = parseInt(hovered.id.split('-')[1]);
+        const hLink = links[idx];
+        if (hLink) focusNodes = [hLink.source, hLink.target];
       }
-    });
+    } else if (searching) {
+      focusNodes = searchMatches;
+    }
+    return collectLinkedIds(links, focusNodes);
+  }, [hovered, searching, searchMatches, links]);
 
-    return set;
-  }, [hovered, links]);
+  // 检索中即使零命中也算激活态（全图淡出 + 空态提示），与"未检索"的全亮区分。
+  const dimming = hovered !== null || searching;
+
+  // tooltip 尺寸随内容变（域名长短/链路条目数），每次 hover 换目标后重测。
+  useEffect(() => {
+    if (!hovered || !tooltipRef.current) return;
+    const r = tooltipRef.current.getBoundingClientRect();
+    setTooltipSize((prev) =>
+      prev.w === r.width && prev.h === r.height ? prev : { w: r.width, h: r.height }
+    );
+  }, [hovered]);
+
+  // fixed 定位（原 absolute 挂 overflow-hidden 容器内会被裁）+ 约束在图容器内：
+  // 默认落指针右下，越界则翻到左/上侧，再 clamp 兜底——判据取容器边界而非视口，否则不裁但会溢出到卡片外。
+  const tooltipPos = useMemo(() => {
+    const OFFSET = 12;
+    const PAD = 8;
+    const b = containerRef.current?.getBoundingClientRect();
+    const minX = b ? b.left + PAD : PAD;
+    const maxX = (b ? b.right : window.innerWidth) - PAD;
+    const minY = b ? b.top + PAD : PAD;
+    const maxY = (b ? b.bottom : window.innerHeight) - PAD;
+
+    const flipX = mousePos.x + OFFSET + tooltipSize.w > maxX;
+    const flipY = mousePos.y + OFFSET + tooltipSize.h > maxY;
+    const left = flipX ? mousePos.x - OFFSET - tooltipSize.w : mousePos.x + OFFSET;
+    const top = flipY ? mousePos.y - OFFSET - tooltipSize.h : mousePos.y + OFFSET;
+
+    // clamp：翻转后仍越界（容器比 tooltip 还窄/矮）时贴边，绝不超出容器
+    return {
+      left: Math.min(Math.max(minX, left), Math.max(minX, maxX - tooltipSize.w)),
+      top: Math.min(Math.max(minY, top), Math.max(minY, maxY - tooltipSize.h)),
+    };
+  }, [mousePos, tooltipSize]);
 
   const getNodeOpacity = (nodeId: string) => {
-    if (!hovered) return 1;
+    if (!dimming) return 1;
     return highlightedIds.has(nodeId) ? 1 : 0.1;
   };
 
   const getLinkOpacity = (index: number) => {
-    if (!hovered) return 0.4;
+    if (!dimming) return 0.4;
     return highlightedIds.has(`link-${index}`) ? 0.8 : 0.05;
   };
 
@@ -202,11 +229,9 @@ export function ConnectionTopology() {
 
   const handleMouseMove = (e: React.MouseEvent) => {
     if (containerRef.current) {
-      const rect = containerRef.current.getBoundingClientRect();
-      setMousePos({
-        x: e.clientX - rect.left,
-        y: e.clientY - rect.top,
-      });
+      // 存视口坐标：tooltip 用 fixed 定位（原 absolute 挂在 overflow-hidden [contain:size] 容器内，
+      // 靠下/靠右 hover 时被卡片裁掉——与右键菜单同一个病）。
+      setMousePos({ x: e.clientX, y: e.clientY });
     }
   };
 
@@ -229,6 +254,9 @@ export function ConnectionTopology() {
     e.stopPropagation();
     if (!containerRef.current) return;
     const rect = containerRef.current.getBoundingClientRect();
+    // 清 hovered：菜单打开后指针不再移动，hover 高亮会冻结在右键那一瞬（issue #303 报告者截图即此态，
+    // 被误读为"渲染太淡"）。菜单期间维持全亮，关闭后由 mouseMove/mouseLeave 正常接管。
+    setHovered(null);
     setContextMenu({
       x: e.clientX - rect.left,
       y: e.clientY - rect.top,
@@ -281,8 +309,20 @@ export function ConnectionTopology() {
 
   return (
     <div className="card topo-card">
-      <div className="field-lbl" style={{ marginBottom: 8 }}>
-        {t('home.connectionTopology')} <small>{t('home.topologyHint')}</small>
+      <div className="field-lbl topo-head" style={{ marginBottom: 8 }}>
+        <span>
+          {t('home.connectionTopology')} <small>{t('home.topologyHint')}</small>
+        </span>
+        <label className="rl-search-box topo-search">
+          <Search size={15} />
+          <input
+            type="text"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder={t('home.searchTopology')}
+            aria-label={t('home.searchTopology')}
+          />
+        </label>
       </div>
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         <div
@@ -308,70 +348,63 @@ export function ConnectionTopology() {
             </div>
           )}
 
+          {/* 检索零命中：全图已淡出，须说明缘由——「其他」组的成员名在 main 侧聚合时即丢弃，检索不可达 */}
+          {nodes.length > 0 && searching && searchMatches.length === 0 && (
+            <div className="absolute inset-0 pointer-events-none flex items-center justify-center">
+              <span className="rounded-md bg-surface-2/90 px-3 py-1.5 text-xs text-muted-foreground">
+                {t('home.searchTopologyNoMatch')}
+              </span>
+            </div>
+          )}
+
           {hovered && !contextMenu && (
-            <div
-              className="absolute pointer-events-none"
-              style={{
-                left: mousePos.x + 10,
-                top: mousePos.y + 10,
-              }}
-            >
+            <div ref={tooltipRef} className="pointer-events-none fixed z-50" style={tooltipPos}>
               {getTooltipContent()}
             </div>
           )}
 
-          {contextMenu && (
-            <>
-              <div
-                className="fixed inset-0 z-40"
-                onClick={() => setContextMenu(null)}
-                onContextMenu={(e) => {
-                  e.preventDefault();
-                  setContextMenu(null);
-                }}
+          {/* 右键菜单（issue #303）：radix 受控 open + 0 尺寸虚拟锚点。
+              Content 走 Portal 挂 body → 逃出本容器的 overflow-hidden [contain:size]（原自绘 absolute 菜单被卡片裁切）；
+              avoidCollisions 默认开 → 靠近卡片/窗口下缘时自动向上翻转（原自绘定位零边界感知）。
+              ESC / 点击外部关闭 / 键盘导航由 radix 提供，无需自绘 overlay。 */}
+          <DropdownMenu
+            open={contextMenu !== null}
+            onOpenChange={(open) => {
+              if (!open) setContextMenu(null);
+            }}
+          >
+            <DropdownMenuTrigger asChild>
+              <span
+                aria-hidden
+                className="absolute h-0 w-0"
+                style={{ left: contextMenu?.x ?? 0, top: contextMenu?.y ?? 0 }}
               />
-              <div
-                className="absolute z-50 min-w-[180px] rounded-lg border border-border bg-popover shadow-lg text-popover-foreground text-sm overflow-hidden"
-                style={{ left: contextMenu.x, top: contextMenu.y }}
-              >
-                <div className="px-3 py-2 border-b border-border">
-                  <p className="font-medium truncate max-w-[160px]" title={contextMenu.domain}>
+            </DropdownMenuTrigger>
+            {contextMenu && (
+              <DropdownMenuContent align="start" collisionPadding={8} className="min-w-[180px] p-0">
+                <div className="border-b border-border px-3 py-2">
+                  <p className="max-w-[160px] truncate font-medium" title={contextMenu.domain}>
                     {contextMenu.domain}
                   </p>
                   <p className="text-xs text-muted-foreground">{t('home.addToRule')}</p>
                 </div>
                 <div className="py-1">
-                  <button
-                    className="w-full text-start px-3 py-2 hover:bg-accent flex items-center gap-2 transition-colors"
-                    onClick={() => addDomainRule(contextMenu.domain, 'proxy')}
-                  >
-                    <span
-                      className={`h-2 w-2 rounded-full inline-block ${getRuleActionStyle('proxy').dot}`}
-                    />
-                    {t('home.ruleProxy')}
-                  </button>
-                  <button
-                    className="w-full text-start px-3 py-2 hover:bg-accent flex items-center gap-2 transition-colors"
-                    onClick={() => addDomainRule(contextMenu.domain, 'direct')}
-                  >
-                    <span
-                      className={`h-2 w-2 rounded-full inline-block ${getRuleActionStyle('direct').dot}`}
-                    />
-                    {t('home.ruleDirect')}
-                  </button>
-                  <button
-                    className={`w-full text-start px-3 py-2 hover:bg-accent flex items-center gap-2 transition-colors ${getRuleActionStyle('block').text}`}
-                    onClick={() => addDomainRule(contextMenu.domain, 'block')}
-                  >
-                    <span
-                      className={`h-2 w-2 rounded-full inline-block ${getRuleActionStyle('block').dot}`}
-                    />
-                    {t('home.ruleBlock')}
-                  </button>
+                  {(['proxy', 'direct', 'block'] as const).map((action) => (
+                    <DropdownMenuItem
+                      key={action}
+                      className={`gap-2 px-3 py-2 ${action === 'block' ? getRuleActionStyle('block').text : ''}`}
+                      onSelect={() => addDomainRule(contextMenu.domain, action)}
+                    >
+                      <span
+                        className={`inline-block h-2 w-2 rounded-full ${getRuleActionStyle(action).dot}`}
+                      />
+                      {t(RULE_ACTION_LABEL_KEY[action])}
+                    </DropdownMenuItem>
+                  ))}
                 </div>
-              </div>
-            </>
-          )}
+              </DropdownMenuContent>
+            )}
+          </DropdownMenu>
 
           <svg
             width="100%"
@@ -454,12 +487,14 @@ export function ConnectionTopology() {
                 >
                   {node.value}
                 </text>
-                {/* Hit area for easier hover */}
+                {/* 命中区：连接数一多，条本身只剩几 px 高（scale 反比缩水），6×9px 的靶子右键根本戳不中。
+                    故命中区独立于条的视觉尺寸：纵向至少 HIT_MIN_HEIGHT 且不超过条+间距（绝不与相邻节点重叠），
+                    横向覆盖到标签文字（文字本身 pointer-events:none，否则点域名会穿透）。 */}
                 <rect
-                  x={-10}
-                  y={0}
-                  width={NODE_WIDTH + 20}
-                  height={node.height}
+                  x={hitBox(node).x}
+                  y={hitBox(node).y}
+                  width={hitBox(node).width}
+                  height={hitBox(node).height}
                   fill="transparent"
                 />
               </g>
