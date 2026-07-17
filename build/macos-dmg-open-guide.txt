@@ -1,0 +1,45 @@
+════════════════════════════════════════════════════════════
+  首次打开 FlowZ 提示「已损坏」？这是正常现象，按下面三步即可
+════════════════════════════════════════════════════════════
+
+若 macOS 提示：
+    「"FlowZ.app" 已损坏，无法打开。您应该将它移到废纸篓。」
+
+这是因为本应用未使用付费的 Apple 开发者签名（成本原因），
+并非文件损坏，也不是病毒。按以下步骤即可正常使用：
+
+  1. 先把 FlowZ 拖到左侧的「应用程序 (Applications)」文件夹
+
+  2. 打开「终端 (Terminal)」，粘贴并回车运行这一行命令：
+
+         xattr -cr /Applications/FlowZ.app
+
+  3. 之后正常双击打开 FlowZ 即可（此命令只需执行一次）
+
+  注意：对「已损坏」这个提示，「右键 →打开」是无效的，
+        必须用上面的终端命令清除隔离属性。
+
+
+────────────────────────────────────────────────────────────
+  Getting "damaged and can't be opened" on first launch?
+────────────────────────────────────────────────────────────
+
+If macOS says:
+    "FlowZ.app is damaged and can't be opened. You should move
+     it to the Trash."
+
+This is because the app is not signed with a paid Apple Developer
+certificate. It is NOT malware and the file is NOT corrupted.
+To use it:
+
+  1. Drag FlowZ into the Applications folder (on the left)
+
+  2. Open Terminal, then paste and run this single line:
+
+         xattr -cr /Applications/FlowZ.app
+
+  3. Double-click FlowZ to open it normally (run the command once)
+
+  Note: "Right-click → Open" does NOT work for the "damaged"
+        message — you must use the Terminal command above to
+        clear the quarantine attribute.
