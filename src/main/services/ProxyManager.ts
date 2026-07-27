@@ -101,6 +101,7 @@ import {
   getUserDataPath,
   getSingBoxConfigPath,
   getSingBoxLogPath,
+  getSingBoxStartupLogPath,
   getSingBoxPidPath,
   getCachePath,
   getCustomRulesDir,
@@ -4226,12 +4227,11 @@ done
       return;
     }
 
-    const userDataPath = getUserDataPath();
     const filesToFix = [
       getCachePath(),
       getSingBoxLogPath(),
       getSingBoxPidPath(),
-      path.join(userDataPath, 'singbox_startup.log'),
+      getSingBoxStartupLogPath(),
     ];
 
     const fsSync = require('fs');
@@ -4436,7 +4436,7 @@ exit 0
       throw new Error(`找不到 sing-box 可执行文件: ${this.singboxPath}`);
     }
     const pidFile = getSingBoxPidPath();
-    const startupLogFile = path.join(getUserDataPath(), 'singbox_startup.log');
+    const startupLogFile = getSingBoxStartupLogPath();
     const forward = !!this.currentConfig?.allowLan;
     this.logToManager(
       'info',
@@ -4732,7 +4732,7 @@ exit 0
           // macOS: osascript 一次授权 → 以 root 跑「看护脚本」托管 sing-box（停止/退出/崩溃回收无需再提权）。
           // 路径单引号包裹以容忍空格（与原实现一样不处理路径内引号——FlowZ 路径不含单/双引号）。
           const pidFile = getSingBoxPidPath();
-          const startupLogFile = path.join(getUserDataPath(), 'singbox_startup.log');
+          const startupLogFile = getSingBoxStartupLogPath();
           const stopFlag = this.getStopFlagPath();
           const fwd = this.currentConfig?.allowLan ? '1' : '0';
           const parentPid = process.pid; // Electron 主进程 PID：退出即让看护脚本联动停 sing-box，杜绝孤儿
@@ -4781,7 +4781,7 @@ exit 0
           // osascript 看护路径）。正常停止经 stopflag 零 UAC；GUI 崩溃/强杀由看护脚本按父 PID
           // 联动收割，杜绝提权孤儿。UAC 次数与旧实现一致（每次 TUN 启动仍 1 次）。
           const pidFile = getSingBoxPidPath();
-          const startupLogFile = path.join(getUserDataPath(), 'singbox_startup.log');
+          const startupLogFile = getSingBoxStartupLogPath();
           const stopFlag = this.getStopFlagPath();
           const parentPid = process.pid; // Electron 主进程 PID：父死即看护脚本收割 sing-box
           // 父进程名（无扩展名，对应 PS Get-Process 的 ProcessName）：配合 PID 校验防 PID 复用误判

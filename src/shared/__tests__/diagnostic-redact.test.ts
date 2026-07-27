@@ -213,6 +213,31 @@ describe('buildDiagnosticReport', () => {
     expect(md).toContain('(空)');
   });
 
+  it('有 startupLogTail 时渲染核 stdout/stderr 区块（issue #324 诊断盲区）', () => {
+    const md = buildDiagnosticReport({
+      ...base,
+      startupLogTail: 'FATAL[0000] start service: initialize inbound/tun[tun-in]: boom',
+    });
+    expect(md).toContain('## singbox_startup.log（近期 · 核 stdout/stderr）');
+    expect(md).toContain('initialize inbound/tun[tun-in]: boom');
+    // 排在 singbox.log 之后，保持「核自身日志 → 核 stdout/stderr」的阅读顺序
+    expect(md.indexOf('## singbox_startup.log')).toBeGreaterThan(md.indexOf('## singbox.log'));
+  });
+
+  it('无 startupLogTail 时不渲染该区块（老调用点不受影响）', () => {
+    expect(buildDiagnosticReport(base)).not.toContain('## singbox_startup.log');
+  });
+
+  it('startupLogTail 同样经节点标识符打码（红线：零明文节点身份）', () => {
+    const md = buildDiagnosticReport({
+      ...base,
+      startupLogTail: 'dial tcp: lookup node.example.com: no such host',
+      nodeIdentifiers: [{ value: 'node.example.com', placeholder: '<domain-1>' }],
+    });
+    expect(md).not.toContain('node.example.com');
+    expect(md).toContain('<domain-1>');
+  });
+
   it('有 hint 时输出提示行', () => {
     const md = buildDiagnosticReport({ ...base, hint: '建议开启诊断采集' });
     expect(md).toContain('建议开启诊断采集');

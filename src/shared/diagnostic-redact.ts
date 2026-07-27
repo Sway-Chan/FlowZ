@@ -342,6 +342,12 @@ export interface DiagnosticReportInput {
   rendererWatchdog?: { discardCount: number; warnCount: number; thresholdMb: number };
   appLogTail: string;
   singboxLogTail: string;
+  /**
+   * 提权/看护路径下核的 stdout+stderr（singbox_startup.log）。核在 logger 建起前失败、panic、被环境拦下，
+   * 只会写到这条流——singbox.log 里一个字都没有。issue #324 两轮诊断都定不了位正因该段缺失。
+   * 可选：未提供则不出该段（老调用点/单测不受影响）。
+   */
+  startupLogTail?: string;
   /** 节点标识符 → 占位符（P0.6）：构建末尾在全报告统一替换，打码节点身份（域名/IP/SNI/节点名），保留形态与跨段相关性。 */
   nodeIdentifiers?: readonly NodeIdentifier[];
   /** 当前级别不含连接明细（>info）且日志疑似有连接/DNS 错误 → 提示开启诊断采集复现。 */
@@ -494,6 +500,14 @@ export function buildDiagnosticReport(input: DiagnosticReportInput): string {
   lines.push('');
   lines.push(fence('text', input.singboxLogTail));
   lines.push('');
+
+  // 核的 stdout/stderr：与 singbox.log 互补（见 startupLogTail 字段注释）。放在其后，同样进 redactIdentifiers。
+  if (input.startupLogTail !== undefined) {
+    lines.push('## singbox_startup.log（近期 · 核 stdout/stderr）');
+    lines.push('');
+    lines.push(fence('text', input.startupLogTail));
+    lines.push('');
+  }
 
   // P0.6：末尾在全报告（配置块 + 日志 + 运行态）统一打码节点标识符，跨段占位一致便于关联诊断。
   const redacted = redactIdentifiers(lines.join('\n'), input.nodeIdentifiers ?? []);

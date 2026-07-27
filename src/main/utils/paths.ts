@@ -188,6 +188,16 @@ export function getSingBoxPidPath(): string {
   return path.join(getUserDataPath(), 'singbox.pid');
 }
 
+/**
+ * 提权/看护路径下 sing-box 的 stdout+stderr 落盘文件（mac osascript wrapper / Windows watchdog / Windows
+ * helper 服务均把核的两条流重定向到此）。与 singbox.log（核自身 logger 按 log.output 写）是**两份不同的东西**：
+ * 核在 logger 建起前挂掉、或 panic/运行时崩溃，只会出现在这里，singbox.log 里一个字都没有（issue #324 的
+ * 诊断盲区正是如此）。诊断报告与写侧共用本函数，杜绝两边路径漂移。
+ */
+export function getSingBoxStartupLogPath(): string {
+  return path.join(getUserDataPath(), 'singbox_startup.log');
+}
+
 export function getCachePath(): string {
   return path.join(getUserDataPath(), 'cache.db');
 }

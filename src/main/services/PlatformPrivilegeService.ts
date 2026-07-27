@@ -36,6 +36,7 @@ import {
   getUserDataPath,
   getCachePath,
   getSingBoxLogPath,
+  getSingBoxStartupLogPath,
   getSingBoxPidPath,
 } from '../utils/paths';
 import { system32, powershellPath } from '../utils/win-system32';
@@ -370,12 +371,11 @@ exit 0
       return;
     }
 
-    const userDataPath = getUserDataPath();
     const filesToFix = [
       getCachePath(),
       getSingBoxLogPath(),
       getSingBoxPidPath(),
-      path.join(userDataPath, 'singbox_startup.log'),
+      getSingBoxStartupLogPath(),
     ];
 
     const fsSync = require('fs');

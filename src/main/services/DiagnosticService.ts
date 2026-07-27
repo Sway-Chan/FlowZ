@@ -1,6 +1,7 @@
 /**
  * 把「运行态系统里已有的诊断事实」汇成单个脱敏 Markdown：环境快照 + 运行态 + 脱敏 UserConfig +
- * 脱敏「实际下发给内核的 sing-box 配置」（#57 类一眼可见 DNS/route 根因）+ app.log/singbox.log 近期 tail。
+ * 脱敏「实际下发给内核的 sing-box 配置」（#57 类一眼可见 DNS/route 根因）+ app.log / singbox.log /
+ * singbox_startup.log（提权路径下核的 stdout+stderr，#324 盲区）近期 tail。
  *
  * 设计取舍：单 Markdown 文件（非 zip）—— 一个文件更易上传、人可读、零新依赖（package.json 无 zip 库）。
  * 脱敏走单一真值 shared/diagnostic-redact，绝不漏密钥（公开 issue 附件零明文密钥，红线）。
@@ -26,7 +27,7 @@ import {
   sampleCoreProcess,
   serializeMemoryTimelineCsv,
 } from './process-sampler';
-import { getLogsPath, getSingBoxLogPath } from '../utils/paths';
+import { getLogsPath, getSingBoxLogPath, getSingBoxStartupLogPath } from '../utils/paths';
 import path from 'path';
 import type { LogManager } from './LogManager';
 import type { ProxyManager } from './ProxyManager';
@@ -88,9 +89,13 @@ export class DiagnosticService {
     // 落盘待写日志先 flush，确保 tail 含最新行
     await this.logManager.flush().catch(() => {});
 
-    const [appLogTail, singboxLogTail] = await Promise.all([
+    // startupLogTail = 提权/看护路径下核的 stdout+stderr。核在 logger 建起前挂掉或 panic 时，singbox.log 里
+    // 什么都没有、失败原因只在这条流里（issue #324：两轮诊断报告都因缺这段而定不了位）。恒纳入报告——
+    // 文件不存在时 readTail 给「(无日志文件)」占位，这本身也是信息（该机从未走过提权启动路径）。
+    const [appLogTail, singboxLogTail, startupLogTail] = await Promise.all([
       this.readTail(path.join(getLogsPath(), 'app.log'), LOG_TAIL_BYTES),
       this.readTail(getSingBoxLogPath(), LOG_TAIL_BYTES),
+      this.readTail(getSingBoxStartupLogPath(), LOG_TAIL_BYTES),
     ]);
 
     const coreVersion = await this.proxyManager.getCoreVersion().catch(() => 'unknown');
@@ -242,6 +247,7 @@ export class DiagnosticService {
       rendererWatchdog,
       appLogTail,
       singboxLogTail,
+      startupLogTail,
       // issue #147：节点 outbound.server 已恒为域名（不再烧 IP），无额外预解析 IP 需补脱敏 → 仅扫 config.servers。
       nodeIdentifiers: collectNodeIdentifiers(config),
       hint: wantDeeper
