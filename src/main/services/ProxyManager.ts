@@ -4728,7 +4728,15 @@ exit 0
         let command: string;
         let args: string[];
 
-        if (this.needsOsascript()) {
+        // 启动路径在 spawn 前固化成局部量：exit / setTimeout 回调必须按【本次 spawn 实际走的路径】判定，
+        // 不能在回调里现查 needsOsascript()/needsWindowsUAC()——二者读 this.currentConfig（**当前**模式）。
+        // 模式切换（系统代理→TUN）时旧核被 SIGTERM 停，其 exit 回调此刻已看到新模式 tun → 直起的 sing-box
+        // 被当成 UAC 包装进程判定，一次正常停核被误报成「UAC 授权失败，退出码: null」（issue #324 排查噪声，
+        // 用户/维护者据此误判成提权失败）。局部量随 attempt 走，杜绝该错配。
+        const launchViaOsascript = this.needsOsascript();
+        const launchViaWindowsUAC = !launchViaOsascript && this.needsWindowsUAC();
+
+        if (launchViaOsascript) {
           // macOS: osascript 一次授权 → 以 root 跑「看护脚本」托管 sing-box（停止/退出/崩溃回收无需再提权）。
           // 路径单引号包裹以容忍空格（与原实现一样不处理路径内引号——FlowZ 路径不含单/双引号）。
           const pidFile = getSingBoxPidPath();
@@ -4776,7 +4784,7 @@ exit 0
             'info',
             `TUN 模式需要管理员权限${this.currentConfig?.allowLan ? '及开启 IP 转发' : ''}，正在请求（仅此一次，后续启停免授权）...`
           );
-        } else if (this.needsWindowsUAC()) {
+        } else if (launchViaWindowsUAC) {
           // Windows TUN 模式：UAC 一次授权 → 以管理员跑「看护脚本」托管 sing-box（镜像 macOS
           // osascript 看护路径）。正常停止经 stopflag 零 UAC；GUI 崩溃/强杀由看护脚本按父 PID
           // 联动收割，杜绝提权孤儿。UAC 次数与旧实现一致（每次 TUN 启动仍 1 次）。
@@ -4895,7 +4903,7 @@ exit 0
 
         // macOS/Windows TUN 模式下，这个 PID 是 osascript/PowerShell 的 PID，不是 sing-box 的
         // 实际的 sing-box PID 会在 waitForPidFile 中从 PID 文件读取
-        if (this.needsOsascript() || this.needsWindowsUAC()) {
+        if (launchViaOsascript || launchViaWindowsUAC) {
           this.logToManager('info', `正在启动 sing-box（权限提升进程 PID: ${this.pid}）...`);
         } else {
           this.logToManager('info', `正在启动 sing-box 进程 (PID: ${this.pid})...`);
@@ -4939,7 +4947,9 @@ exit 0
           this.logToManager('info', `sing-box process exited with code ${code}, signal ${signal}`);
 
           // 对于 macOS TUN 模式，osascript 退出码为 0 表示成功启动了后台进程
-          if (this.needsOsascript()) {
+          // code === null（被信号杀，如 stop/模式切换的 SIGTERM）不是授权失败 → 交下方通用启动期退出判定，
+          // 别按「退出码」编造授权失败文案（退出码根本不存在）。
+          if (launchViaOsascript && code !== null) {
             if (code === 0) {
               // osascript 成功执行，sing-box 在后台运行
               // PID 文件读取由 setTimeout 中的 waitForPidFile 统一处理
@@ -4958,7 +4968,8 @@ exit 0
           }
 
           // 对于 Windows TUN 模式，PowerShell 退出码为 0 表示成功启动了 sing-box
-          if (this.needsWindowsUAC()) {
+          // 同 osascript 分支：code === null（信号杀）不判 UAC 失败。
+          if (launchViaWindowsUAC && code !== null) {
             if (code === 0) {
               // PowerShell 成功执行，sing-box 以管理员权限在后台运行
               // PID 文件读取由 setTimeout 中的 waitForPidFile 统一处理
@@ -5002,8 +5013,9 @@ exit 0
           if (startupResolved) return;
           // macOS TUN 模式或 Windows TUN 模式：检查 singboxPid（从 PID 文件读取）
           // 其他模式：检查 singboxProcess 和 pid
-          const isMacTunMode = this.needsOsascript();
-          const isWindowsTunMode = this.needsWindowsUAC();
+          // 同 exit 回调：按本次 spawn 的实际启动路径判定（局部量），不现查当前模式。
+          const isMacTunMode = launchViaOsascript;
+          const isWindowsTunMode = launchViaWindowsUAC;
 
           if (isMacTunMode || isWindowsTunMode) {
             // TUN 模式：等待 PID 文件被写入
