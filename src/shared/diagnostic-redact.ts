@@ -343,11 +343,16 @@ export interface DiagnosticReportInput {
   appLogTail: string;
   singboxLogTail: string;
   /**
-   * 提权/看护路径下核的 stdout+stderr（singbox_startup.log）。核在 logger 建起前失败、panic、被环境拦下，
-   * 只会写到这条流——singbox.log 里一个字都没有。issue #324 两轮诊断都定不了位正因该段缺失。
+   * 提权/看护路径下的核启动日志（singbox_startup.log）尾部。核在 logger 建起前失败、panic、被环境拦下，
+   * 错误只走 stderr——singbox.log 里一个字都没有。issue #324 两轮诊断都定不了位正因该段缺失。
+   * **内容按写侧而异**（见 main/utils/paths.ts getSingBoxStartupLogPath 的平台表）：mac wrapper / Windows
+   * helper 服务含核的 stdout+stderr；Windows UAC 看护脚本未重定向 → 只有看护脚本自述行。故本段标题不写死
+   * 「核 stdout/stderr」，由 startupLogSource 如实标注本机走的哪条写侧路径。
    * 可选：未提供则不出该段（老调用点/单测不受影响）。
    */
   startupLogTail?: string;
+  /** 本段内容的来源与元信息（写侧路径描述 + 文件大小/最后写入时刻）；缺省则段标题只写文件名。 */
+  startupLogSource?: string;
   /** 节点标识符 → 占位符（P0.6）：构建末尾在全报告统一替换，打码节点身份（域名/IP/SNI/节点名），保留形态与跨段相关性。 */
   nodeIdentifiers?: readonly NodeIdentifier[];
   /** 当前级别不含连接明细（>info）且日志疑似有连接/DNS 错误 → 提示开启诊断采集复现。 */
@@ -501,9 +506,12 @@ export function buildDiagnosticReport(input: DiagnosticReportInput): string {
   lines.push(fence('text', input.singboxLogTail));
   lines.push('');
 
-  // 核的 stdout/stderr：与 singbox.log 互补（见 startupLogTail 字段注释）。放在其后，同样进 redactIdentifiers。
+  // 核启动日志：与 singbox.log 互补（见 startupLogTail 字段注释）。放在其后，同样进 redactIdentifiers。
+  // 标题带来源描述 + 文件元信息：Windows helper 侧 O_APPEND 永不截断，仅凭 64KB tail 无法判断内容属于哪次
+  // 会话（sing-box 的 FATAL[0000] 是启动相对秒、非墙钟时间），故必须让读报告的人看见文件多大、何时最后写入。
   if (input.startupLogTail !== undefined) {
-    lines.push('## singbox_startup.log（近期 · 核 stdout/stderr）');
+    const src = input.startupLogSource ? ` · ${input.startupLogSource}` : '';
+    lines.push(`## singbox_startup.log（近期${src}）`);
     lines.push('');
     lines.push(fence('text', input.startupLogTail));
     lines.push('');

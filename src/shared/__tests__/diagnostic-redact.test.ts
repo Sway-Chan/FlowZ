@@ -213,19 +213,35 @@ describe('buildDiagnosticReport', () => {
     expect(md).toContain('(空)');
   });
 
-  it('有 startupLogTail 时渲染核 stdout/stderr 区块（issue #324 诊断盲区）', () => {
+  it('有 startupLogTail 时渲染核启动日志区块（issue #324 诊断盲区）', () => {
     const md = buildDiagnosticReport({
       ...base,
       startupLogTail: 'FATAL[0000] start service: initialize inbound/tun[tun-in]: boom',
     });
-    expect(md).toContain('## singbox_startup.log（近期 · 核 stdout/stderr）');
+    expect(md).toContain('## singbox_startup.log（近期）');
     expect(md).toContain('initialize inbound/tun[tun-in]: boom');
-    // 排在 singbox.log 之后，保持「核自身日志 → 核 stdout/stderr」的阅读顺序
+    // 排在 singbox.log 之后，保持「核自身日志 → 核启动日志」的阅读顺序
     expect(md.indexOf('## singbox_startup.log')).toBeGreaterThan(md.indexOf('## singbox.log'));
+  });
+
+  it('startupLogSource 如实进段标题（写侧不同 → 内容含义不同，不能一律写「核 stdout/stderr」）', () => {
+    const md = buildDiagnosticReport({
+      ...base,
+      startupLogTail: 'FlowZ watchdog starting...',
+      startupLogSource:
+        '写侧 UAC 看护脚本：**仅看护脚本自述行，不含核输出** · 0.01 MB · 最后写入 2026-07-24T14:38:50.000Z',
+    });
+    expect(md).toContain('## singbox_startup.log（近期 · 写侧 UAC 看护脚本');
+    expect(md).toContain('最后写入 2026-07-24T14:38:50.000Z');
   });
 
   it('无 startupLogTail 时不渲染该区块（老调用点不受影响）', () => {
     expect(buildDiagnosticReport(base)).not.toContain('## singbox_startup.log');
+  });
+
+  it('startupLogTail 为空串时仍渲染该区块（文件存在但空 ≠ 未提供）', () => {
+    const md = buildDiagnosticReport({ ...base, startupLogTail: '' });
+    expect(md).toContain('## singbox_startup.log（近期）');
   });
 
   it('startupLogTail 同样经节点标识符打码（红线：零明文节点身份）', () => {

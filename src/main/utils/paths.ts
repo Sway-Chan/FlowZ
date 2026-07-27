@@ -189,10 +189,17 @@ export function getSingBoxPidPath(): string {
 }
 
 /**
- * 提权/看护路径下 sing-box 的 stdout+stderr 落盘文件（mac osascript wrapper / Windows watchdog / Windows
- * helper 服务均把核的两条流重定向到此）。与 singbox.log（核自身 logger 按 log.output 写）是**两份不同的东西**：
- * 核在 logger 建起前挂掉、或 panic/运行时崩溃，只会出现在这里，singbox.log 里一个字都没有（issue #324 的
- * 诊断盲区正是如此）。诊断报告与写侧共用本函数，杜绝两边路径漂移。
+ * 提权/看护路径下的核启动日志。与 singbox.log（核自身 logger 按 log.output 写）是**两份不同的东西**：
+ * 核在 logger 建起前挂掉、或 panic/运行时崩溃，错误只走 stderr，singbox.log 里一个字都没有（issue #324 的
+ * 诊断盲区正是如此）。
+ *
+ * **各写侧内容不同，读报告时必须按平台区分**：
+ *   · mac osascript wrapper（ProxyManager.writeWrapperScript）：`> "$LOG" 2>&1` → 含核的 stdout+stderr，每次启动截断
+ *   · Windows helper 服务（helper-win/winproc.go startSingbox）：`c.Stdout/c.Stderr = lf` → 含核的两条流，**O_APPEND 永不截断**
+ *   · Windows UAC 看护脚本（PlatformPrivilegeService.writeWindowsWatchdogScript）：Start-Process **未重定向**
+ *     → **只有看护脚本自述行，不含核的任何输出**（未装 helper 的 Windows 用户在此仍是盲区，待补 -RedirectStandardError）
+ *
+ * 诊断报告与写侧共用本函数，杜绝两边路径漂移。
  */
 export function getSingBoxStartupLogPath(): string {
   return path.join(getUserDataPath(), 'singbox_startup.log');
