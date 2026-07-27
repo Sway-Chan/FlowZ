@@ -353,6 +353,13 @@ export interface DiagnosticReportInput {
   startupLogTail?: string;
   /** 本段内容的来源与元信息（写侧路径描述 + 文件大小/最后写入时刻）；缺省则段标题只写文件名。 */
   startupLogSource?: string;
+  /**
+   * Windows UAC 看护脚本自身的日志（`flowz-win-watchdog.log`）尾部。与核 stderr 分文件（Start-Process 的
+   * 重定向独占目标文件）。它记的是「谁停的核」——`sing-box exited by itself` / `Stopflag detected` /
+   * `Parent process gone`，是区分「核自杀」与「被外部杀」的判据，和 FATAL 文本互补。
+   * 仅 Windows UAC 路径有内容；其它平台/路径不提供，不出该段。
+   */
+  watchdogLogTail?: string;
   /** 节点标识符 → 占位符（P0.6）：构建末尾在全报告统一替换，打码节点身份（域名/IP/SNI/节点名），保留形态与跨段相关性。 */
   nodeIdentifiers?: readonly NodeIdentifier[];
   /** 当前级别不含连接明细（>info）且日志疑似有连接/DNS 错误 → 提示开启诊断采集复现。 */
@@ -514,6 +521,14 @@ export function buildDiagnosticReport(input: DiagnosticReportInput): string {
     lines.push(`## singbox_startup.log（近期${src}）`);
     lines.push('');
     lines.push(fence('text', input.startupLogTail));
+    lines.push('');
+  }
+
+  // Windows UAC 看护脚本自述日志：回答「谁停的核」，与上面的 FATAL 文本互补（见 watchdogLogTail 注释）。
+  if (input.watchdogLogTail !== undefined) {
+    lines.push('## flowz-win-watchdog.log（近期 · Windows UAC 看护脚本自述）');
+    lines.push('');
+    lines.push(fence('text', input.watchdogLogTail));
     lines.push('');
   }
 

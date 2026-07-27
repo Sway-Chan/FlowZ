@@ -29,7 +29,7 @@ import type { ILogManager } from './LogManager';
 import { HelperManager } from './HelperManager';
 import type { IPrivilegedHelper } from './IPrivilegedHelper';
 import { MeshExitRouteManager } from './mesh-exit-route-manager';
-import { PlatformPrivilegeService } from './PlatformPrivilegeService';
+import { PlatformPrivilegeService, windowsWatchdogScriptText } from './PlatformPrivilegeService';
 import { type ISystemProxyManager, SystemProxyBase } from './SystemProxyManager';
 import { type ISystemDnsManager } from './SystemDnsManager';
 import { DnsInterfaceWatcher, shouldReconcileDns } from './DnsInterfaceWatcher';
@@ -102,6 +102,7 @@ import {
   getSingBoxConfigPath,
   getSingBoxLogPath,
   getSingBoxStartupLogPath,
+  getWindowsWatchdogLogPath,
   getSingBoxPidPath,
   getCachePath,
   getCustomRulesDir,
@@ -4356,81 +4357,9 @@ rm -f "$STOPFLAG"
       this.privilegeService.writeWindowsWatchdogScript();
       return;
     }
-    const script = `# FlowZ elevated watchdog (run by UAC-elevated PowerShell via -File). Do not edit manually.
-param(
-  [Parameter(Mandatory = $true)][string]$SbPath,
-  [Parameter(Mandatory = $true)][string]$CfgPath,
-  [Parameter(Mandatory = $true)][string]$PidFile,
-  [Parameter(Mandatory = $true)][string]$StopFlag,
-  [Parameter(Mandatory = $true)][int]$ParentPid,
-  [Parameter(Mandatory = $true)][string]$ParentName,
-  [Parameter(Mandatory = $true)][string]$LogFile,
-  [string]$Forward = '0'
-)
-$ErrorActionPreference = 'Continue'
-function Log([string]$Msg) {
-  try { ((Get-Date -Format 'HH:mm:ss') + ' [watchdog] ' + $Msg) | Out-File -FilePath $LogFile -Append -Encoding UTF8 } catch {}
-}
-try { 'FlowZ watchdog starting...' | Out-File -FilePath $LogFile -Encoding UTF8 } catch {}
-if (-not (Test-Path -LiteralPath $SbPath)) { Log 'ERROR: sing-box not found'; exit 1 }
-if (-not (Test-Path -LiteralPath $CfgPath)) { Log 'ERROR: config not found'; exit 1 }
-
-# (a) sweep leftover sing-box started from OUR core path (reuses this elevation).
-try {
-  $orphans = @(Get-CimInstance Win32_Process -Filter "Name='sing-box.exe'" | Where-Object { $_.ExecutablePath -eq $SbPath })
-  foreach ($o in $orphans) {
-    Log ('Killing leftover sing-box PID ' + $o.ProcessId)
-    Stop-Process -Id $o.ProcessId -Force -ErrorAction SilentlyContinue
-  }
-  if ($orphans.Count -gt 0) { Start-Sleep -Milliseconds 500 }
-} catch { Log ('Orphan sweep failed: ' + $_.Exception.Message) }
-
-if ($Forward -eq '1') {
-  try {
-    Set-NetIPInterface -Forwarding Enabled
-    Set-NetIPInterface -AddressFamily IPv6 -Forwarding Enabled
-    Log 'IP forwarding enabled'
-  } catch { Log ('Enable IP forwarding failed: ' + $_.Exception.Message) }
-}
-
-# (b) start sing-box (already elevated, no inner RunAs); PID file protocol unchanged.
-# Config path is explicitly quoted: -ArgumentList does NOT auto-quote elements with spaces.
-try {
-  $proc = Start-Process -FilePath $SbPath -ArgumentList 'run', '-c', ('"' + $CfgPath + '"') -PassThru -WindowStyle Hidden
-} catch {
-  Log ('ERROR: failed to start sing-box: ' + $_.Exception.Message)
-  exit 1
-}
-if (-not ($proc -and $proc.Id)) { Log 'ERROR: Start-Process returned null'; exit 1 }
-$sbId = $proc.Id
-try {
-  $sbId | Out-File -FilePath $PidFile -Encoding ASCII -NoNewline
-} catch {
-  Log ('ERROR: failed to write PID file: ' + $_.Exception.Message)
-  Stop-Process -Id $sbId -Force -ErrorAction SilentlyContinue
-  exit 1
-}
-Log ('sing-box started, PID ' + $sbId)
-
-# (c) babysit: exit when core dies; kill core on stopflag or parent death (name check vs PID reuse).
-while ($true) {
-  $sb = Get-Process -Id $sbId -ErrorAction SilentlyContinue
-  if (-not $sb -or $sb.ProcessName -ne 'sing-box') { Log 'sing-box exited by itself'; break }
-  if (Test-Path -LiteralPath $StopFlag) { Log 'Stopflag detected'; break }
-  $parent = Get-Process -Id $ParentPid -ErrorAction SilentlyContinue
-  if (-not $parent -or $parent.ProcessName -ne $ParentName) { Log 'Parent process gone'; break }
-  Start-Sleep -Seconds 1
-}
-$sb = Get-Process -Id $sbId -ErrorAction SilentlyContinue
-if ($sb -and $sb.ProcessName -eq 'sing-box') {
-  Stop-Process -Id $sbId -Force -ErrorAction SilentlyContinue
-  Log 'sing-box stopped by watchdog'
-}
-Remove-Item -LiteralPath $StopFlag -Force -ErrorAction SilentlyContinue
-Log 'Watchdog exit'
-exit 0
-`;
-    require('fs').writeFileSync(this.getWindowsWatchdogScriptPath(), script);
+    // 脚本正文走 PlatformPrivilegeService 的导出纯函数（唯一真值），此处只负责落盘——两份脚本文本
+    // 各自维护必然漂移（参数链与 param 数量对不上 → 兜底路径在隐藏窗口里挂起）。
+    require('fs').writeFileSync(this.getWindowsWatchdogScriptPath(), windowsWatchdogScriptText());
   }
 
   /** 停止收尾：删 PID 文件 + 资源清理 + 通知前端。 */
@@ -4787,6 +4716,7 @@ exit 0
               configPath: this.configPath,
               pidFile,
               startupLogFile,
+              watchdogLog: getWindowsWatchdogLogPath(),
               stopFlag,
               wrapper: wd.path,
               watchdog: wd.path,
@@ -4836,6 +4766,7 @@ exit 0
               configPath: this.configPath,
               pidFile,
               startupLogFile,
+              watchdogLog: getWindowsWatchdogLogPath(),
               stopFlag,
               wrapper: wd.path,
               watchdog: wd.path,
@@ -4872,9 +4803,11 @@ exit 0
               `'${parentPid}'`,
               q(parentName),
               q(startupLogFile),
+              q(getWindowsWatchdogLogPath()),
               `'${fwd}'`,
             ].join(',');
-            const logFileEsc = startupLogFile.replace(/'/g, "''");
+            // ERROR 行写看护日志：startupLogFile 已归 sing-box stderr 独占（-RedirectStandardError）
+            const logFileEsc = getWindowsWatchdogLogPath().replace(/'/g, "''");
             const psScript = [
               "$ErrorActionPreference = 'Stop'",
               'try {',

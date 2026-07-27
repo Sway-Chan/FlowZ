@@ -22,7 +22,12 @@ jest.mock('electron', () => ({
 }));
 
 import { DiagnosticService } from '../DiagnosticService';
-import { getLogsPath, getSingBoxLogPath, getSingBoxStartupLogPath } from '../../utils/paths';
+import {
+  getLogsPath,
+  getSingBoxLogPath,
+  getSingBoxStartupLogPath,
+  getWindowsWatchdogLogPath,
+} from '../../utils/paths';
 
 afterAll(() => {
   try {
@@ -69,18 +74,39 @@ describe('DiagnosticService — 日志取数路径收口', () => {
     expect(md).toMatch(/## singbox_startup\.log[\s\S]*tail-of:singbox_startup\.log/);
   });
 
-  it('Windows 非 helper 路径的段标题如实标注「不含核输出」（#324 假阴性防线）', async () => {
+  it('Windows UAC 路径：startup 段标注核 stderr，并额外收看护脚本自述日志', async () => {
     const real = process.platform;
     Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
     try {
       const svc = makeSvc({ startedViaHelper: false });
-      jest.spyOn(svc, 'readTail').mockResolvedValue('FlowZ watchdog starting...');
+      const seen: string[] = [];
+      jest.spyOn(svc, 'readTail').mockImplementation(async (...args: unknown[]) => {
+        const p = args[0] as string;
+        seen.push(p);
+        return `tail-of:${path.basename(p)}`;
+      });
       const md = await svc.buildReport();
       expect(md).toContain('写侧 UAC 看护脚本');
-      expect(md).toContain('不含核输出');
+      expect(md).toContain('核 stderr');
+      // 看护自述日志是「谁停的核」的判据，与 FATAL 互补，Windows 上必须一并收
+      expect(seen).toContain(getWindowsWatchdogLogPath());
+      expect(md).toContain('## flowz-win-watchdog.log');
+      expect(md).toContain('tail-of:flowz-win-watchdog.log');
     } finally {
       Object.defineProperty(process, 'platform', { value: real, configurable: true });
     }
+  });
+
+  it('非 Windows 不出看护脚本日志段（避免恒定的「(无日志文件)」噪声）', async () => {
+    const svc = makeSvc({ startedViaHelper: true });
+    const seen: string[] = [];
+    jest.spyOn(svc, 'readTail').mockImplementation(async (...args: unknown[]) => {
+      seen.push(args[0] as string);
+      return 'x';
+    });
+    const md = await svc.buildReport();
+    expect(seen).not.toContain(getWindowsWatchdogLogPath());
+    expect(md).not.toContain('## flowz-win-watchdog.log');
   });
 
   it('helper 路径标注为含核 stdout+stderr 且只追加不截断', async () => {
