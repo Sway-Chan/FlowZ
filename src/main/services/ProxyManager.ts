@@ -101,6 +101,7 @@ import {
   getUserDataPath,
   getSingBoxConfigPath,
   getSingBoxLogPath,
+  getSingBoxStartupLogPath,
   getSingBoxPidPath,
   getCachePath,
   getCustomRulesDir,
@@ -396,6 +397,12 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     | null = null;
   // 本次 sing-box 是否经 helper 启动（决定停止走 helper socket 还是 osascript）。
   private startedViaHelper: boolean = false;
+  // 本次 sing-box 是否经「包装进程」启动（macOS osascript / Windows UAC PowerShell）——决定 this.pid 是包装
+  // 进程还是核本身，getStatus / 健康检查 / 内存采样据此取 activePid。**必须是启动派生态，不能现查
+  //   needsOsascript()/needsWindowsUAC()**：那两个谓词读 currentConfig（当前模式），系统代理→TUN 切换的去抖
+  //   窗口内会翻转，让仍在运行的直起核被按包装模式取 pid（singboxPid 恒 null）→ getStatus 假 running:false、
+  //   健康检查空转、内存帧丢核。与 startedViaHelper 同批复位/置位。
+  private startedViaWrapper: boolean = false;
   // 远程 geo rule_set URL 可达性缓存（应用分流/自定义 geo 规则的 remote rule_set 预检用）。
   // 仅缓存"确定结论"：2xx→可达(6h)，404/403/410→缺失(30min，留恢复窗口)；瞬时错误不缓存。见 isRemoteRuleSetReachable。
   private ruleSetReachCache = new Map<string, { reachable: boolean; at: number }>();
@@ -2774,14 +2781,28 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     this.sendEventToRenderer(IPC_CHANNELS.EVENT_MESH_LOGIN_FALLBACK, { engaged: false });
   }
 
+  /**
+   * 本次运行中的 sing-box 真实 PID（取不到返回 null）。getStatus / 健康检查 / 内存采样的**单一真值**。
+   *
+   * 判定依据是 startedViaWrapper（启动派生态），不是现查 needsOsascript()/needsWindowsUAC()：
+   *   · 包装进程模式（mac osascript / Win UAC）：this.pid 是包装进程的，核的真 PID 在 singboxPid；包装进程
+   *     PID 绝不能当核用（它常已退出，或复用给别的进程）→ singboxPid 为空即视为无核。
+   *   · 直起 / helper 模式（含 Linux TUN）：singboxPid 有值取它，否则回落 this.pid。
+   * 现查谓词会在「系统代理→TUN」的去抖重启窗口内翻转，让仍在运行的直起核被按包装模式取 pid（singboxPid
+   * 恒 null）→ getStatus 假 running:false、健康检查空转、内存帧丢核。三个消费点共用本方法，杜绝各自漂移。
+   */
+  private activeCorePid(): number | null {
+    return this.startedViaWrapper ? this.singboxPid : this.singboxPid || this.pid;
+  }
+
   getStatus(): ProxyStatus {
     // 判定依据：是否经「包装进程」启动（macOS osascript / Windows UAC）。
     //   · 包装进程模式：this.pid 是 osascript/PowerShell 的 PID，真实 sing-box PID 在 singboxPid。
     //   · 直接 spawn 模式（含 Linux TUN）：只有 this.pid，singboxPid 恒 null。
     // 旧逻辑按 `proxyModeType==='tun'` 取 singboxPid → Linux TUN 直接 spawn 时 activePid 恒 null →
     // getStatus 恒返回 running:false（issue #33「连接状态/按钮不同步」根因，且令健康检查失效）。
-    const wrapperMode = this.needsOsascript() || this.needsWindowsUAC();
-    const activePid = wrapperMode ? this.singboxPid : this.singboxPid || this.pid;
+    // 取 pid 收口到 activeCorePid()（读启动派生态，不现查当前模式）——见该方法说明。
+    const activePid = this.activeCorePid();
 
     // 验证进程是否真正存活
     const isRunning = activePid !== null && this.isProcessAlive(activePid);
@@ -4226,12 +4247,11 @@ done
       return;
     }
 
-    const userDataPath = getUserDataPath();
     const filesToFix = [
       getCachePath(),
       getSingBoxLogPath(),
       getSingBoxPidPath(),
-      path.join(userDataPath, 'singbox_startup.log'),
+      getSingBoxStartupLogPath(),
     ];
 
     const fsSync = require('fs');
@@ -4436,7 +4456,7 @@ exit 0
       throw new Error(`找不到 sing-box 可执行文件: ${this.singboxPath}`);
     }
     const pidFile = getSingBoxPidPath();
-    const startupLogFile = path.join(getUserDataPath(), 'singbox_startup.log');
+    const startupLogFile = getSingBoxStartupLogPath();
     const forward = !!this.currentConfig?.allowLan;
     this.logToManager(
       'info',
@@ -4625,6 +4645,9 @@ exit 0
     //   直起 UAC/osascript 路径保持 false）。修复 issue #159 就绪门控失败、重试腿回退直起时 startedViaHelper 残留 true
     //   → 后续 stop() 误走 helper 停核分支（停不动→回退提权 taskkill/osascript，降级但自愈）。每次启动腿都从干净态判定。
     this.startedViaHelper = false;
+    // 同上：包装进程标志也每腿复位，由下方实际启动路径置位（helper 路径保持 false——helper 起核时 singboxPid
+    // 即核本身，非包装进程）。
+    this.startedViaWrapper = false;
 
     // issue #159：起核前（win32&&TUN）等上一轮自家 wintun 适配器释放。置于本方法顶部（而非 startInternal）→ 每次
     //   runStartWithRetry 重启腿、以及下方 helper / UAC 两条启动支路都经此门控（不止首次），杜绝重试立刻再撞僵尸适配器。
@@ -4728,11 +4751,21 @@ exit 0
         let command: string;
         let args: string[];
 
-        if (this.needsOsascript()) {
+        // 启动路径在 spawn 前固化成局部量：exit / setTimeout 回调必须按【本次 spawn 实际走的路径】判定，
+        // 不能在回调里现查 needsOsascript()/needsWindowsUAC()——二者读 this.currentConfig（**当前**模式）。
+        // 模式切换（系统代理→TUN）时旧核被 SIGTERM 停，其 exit 回调此刻已看到新模式 tun → 直起的 sing-box
+        // 被当成 UAC 包装进程判定，一次正常停核被误报成「UAC 授权失败，退出码: null」（issue #324 排查噪声，
+        // 用户/维护者据此误判成提权失败）。局部量随 attempt 走，杜绝该错配。
+        const launchViaOsascript = this.needsOsascript();
+        const launchViaWindowsUAC = this.needsWindowsUAC();
+        // 同一快照下沉为实例态，供回调之外的消费点（getStatus / 健康检查 / 内存采样）判「this.pid 是不是核」。
+        this.startedViaWrapper = launchViaOsascript || launchViaWindowsUAC;
+
+        if (launchViaOsascript) {
           // macOS: osascript 一次授权 → 以 root 跑「看护脚本」托管 sing-box（停止/退出/崩溃回收无需再提权）。
           // 路径单引号包裹以容忍空格（与原实现一样不处理路径内引号——FlowZ 路径不含单/双引号）。
           const pidFile = getSingBoxPidPath();
-          const startupLogFile = path.join(getUserDataPath(), 'singbox_startup.log');
+          const startupLogFile = getSingBoxStartupLogPath();
           const stopFlag = this.getStopFlagPath();
           const fwd = this.currentConfig?.allowLan ? '1' : '0';
           const parentPid = process.pid; // Electron 主进程 PID：退出即让看护脚本联动停 sing-box，杜绝孤儿
@@ -4776,12 +4809,12 @@ exit 0
             'info',
             `TUN 模式需要管理员权限${this.currentConfig?.allowLan ? '及开启 IP 转发' : ''}，正在请求（仅此一次，后续启停免授权）...`
           );
-        } else if (this.needsWindowsUAC()) {
+        } else if (launchViaWindowsUAC) {
           // Windows TUN 模式：UAC 一次授权 → 以管理员跑「看护脚本」托管 sing-box（镜像 macOS
           // osascript 看护路径）。正常停止经 stopflag 零 UAC；GUI 崩溃/强杀由看护脚本按父 PID
           // 联动收割，杜绝提权孤儿。UAC 次数与旧实现一致（每次 TUN 启动仍 1 次）。
           const pidFile = getSingBoxPidPath();
-          const startupLogFile = path.join(getUserDataPath(), 'singbox_startup.log');
+          const startupLogFile = getSingBoxStartupLogPath();
           const stopFlag = this.getStopFlagPath();
           const parentPid = process.pid; // Electron 主进程 PID：父死即看护脚本收割 sing-box
           // 父进程名（无扩展名，对应 PS Get-Process 的 ProcessName）：配合 PID 校验防 PID 复用误判
@@ -4895,7 +4928,7 @@ exit 0
 
         // macOS/Windows TUN 模式下，这个 PID 是 osascript/PowerShell 的 PID，不是 sing-box 的
         // 实际的 sing-box PID 会在 waitForPidFile 中从 PID 文件读取
-        if (this.needsOsascript() || this.needsWindowsUAC()) {
+        if (launchViaOsascript || launchViaWindowsUAC) {
           this.logToManager('info', `正在启动 sing-box（权限提升进程 PID: ${this.pid}）...`);
         } else {
           this.logToManager('info', `正在启动 sing-box 进程 (PID: ${this.pid})...`);
@@ -4939,7 +4972,9 @@ exit 0
           this.logToManager('info', `sing-box process exited with code ${code}, signal ${signal}`);
 
           // 对于 macOS TUN 模式，osascript 退出码为 0 表示成功启动了后台进程
-          if (this.needsOsascript()) {
+          // code === null（被信号杀，如 stop/模式切换的 SIGTERM）不是授权失败 → 交下方通用启动期退出判定，
+          // 别按「退出码」编造授权失败文案（退出码根本不存在）。
+          if (launchViaOsascript && code !== null) {
             if (code === 0) {
               // osascript 成功执行，sing-box 在后台运行
               // PID 文件读取由 setTimeout 中的 waitForPidFile 统一处理
@@ -4958,7 +4993,8 @@ exit 0
           }
 
           // 对于 Windows TUN 模式，PowerShell 退出码为 0 表示成功启动了 sing-box
-          if (this.needsWindowsUAC()) {
+          // 同 osascript 分支：code === null（信号杀）不判 UAC 失败。
+          if (launchViaWindowsUAC && code !== null) {
             if (code === 0) {
               // PowerShell 成功执行，sing-box 以管理员权限在后台运行
               // PID 文件读取由 setTimeout 中的 waitForPidFile 统一处理
@@ -5002,8 +5038,9 @@ exit 0
           if (startupResolved) return;
           // macOS TUN 模式或 Windows TUN 模式：检查 singboxPid（从 PID 文件读取）
           // 其他模式：检查 singboxProcess 和 pid
-          const isMacTunMode = this.needsOsascript();
-          const isWindowsTunMode = this.needsWindowsUAC();
+          // 同 exit 回调：按本次 spawn 的实际启动路径判定（局部量），不现查当前模式。
+          const isMacTunMode = launchViaOsascript;
+          const isWindowsTunMode = launchViaWindowsUAC;
 
           if (isMacTunMode || isWindowsTunMode) {
             // TUN 模式：等待 PID 文件被写入
@@ -5844,8 +5881,7 @@ exit 0
         });
       }
       // 核不在 Electron 进程树：单独采 RSS。PID 取法与 getStatus 一致（wrapper=singboxPid，直启=pid）。
-      const wrapperMode = this.needsOsascript() || this.needsWindowsUAC();
-      const corePid = wrapperMode ? this.singboxPid : this.singboxPid || this.pid;
+      const corePid = this.activeCorePid();
       if (corePid) {
         const rssMb = await sampleProcessRssMb(corePid).catch(() => null);
         if (rssMb != null) procs.push({ label: 'sing-box', pid: corePid, rssMb });
@@ -5875,8 +5911,7 @@ exit 0
 
     // 判定依据与 getStatus 一致：经包装进程(osascript/UAC)启动才取 singboxPid，否则取 pid。
     // 修复 Linux TUN（直接 spawn，singboxPid 恒 null）下健康检查/自动重启完全失效（issue #33）。
-    const wrapperMode = this.needsOsascript() || this.needsWindowsUAC();
-    const activePid = wrapperMode ? this.singboxPid : this.singboxPid || this.pid;
+    const activePid = this.activeCorePid();
 
     if (!activePid) {
       return;

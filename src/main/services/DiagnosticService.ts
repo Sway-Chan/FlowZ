@@ -1,6 +1,7 @@
 /**
  * 把「运行态系统里已有的诊断事实」汇成单个脱敏 Markdown：环境快照 + 运行态 + 脱敏 UserConfig +
- * 脱敏「实际下发给内核的 sing-box 配置」（#57 类一眼可见 DNS/route 根因）+ app.log/singbox.log 近期 tail。
+ * 脱敏「实际下发给内核的 sing-box 配置」（#57 类一眼可见 DNS/route 根因）+ app.log / singbox.log /
+ * singbox_startup.log（提权路径下的核启动日志，#324 盲区；内容按写侧而异，见 describeStartupLog）近期 tail。
  *
  * 设计取舍：单 Markdown 文件（非 zip）—— 一个文件更易上传、人可读、零新依赖（package.json 无 zip 库）。
  * 脱敏走单一真值 shared/diagnostic-redact，绝不漏密钥（公开 issue 附件零明文密钥，红线）。
@@ -26,7 +27,7 @@ import {
   sampleCoreProcess,
   serializeMemoryTimelineCsv,
 } from './process-sampler';
-import { getLogsPath, getSingBoxLogPath } from '../utils/paths';
+import { getLogsPath, getSingBoxLogPath, getSingBoxStartupLogPath } from '../utils/paths';
 import path from 'path';
 import type { LogManager } from './LogManager';
 import type { ProxyManager } from './ProxyManager';
@@ -78,7 +79,39 @@ export class DiagnosticService {
         await fd.close();
       }
     } catch (e: any) {
-      return e?.code === 'ENOENT' ? '(无日志文件)' : `(读取失败: ${e?.message ?? e})`;
+      // 只回错误码，不回 e.message：Node 的 EACCES/EPERM message 内嵌完整路径（含 OS 用户名），而本报告是
+      // 给公开 issue 当附件用的，redactIdentifiers 只打码节点标识符、不碰路径。singbox_startup.log 在
+      // Windows helper 路径下由 SYSTEM 创建、fixFilePermissions 又只修 darwin，是三个 tail 里最可能踩到
+      // 非 ENOENT 失败的那个。
+      return e?.code === 'ENOENT' ? '(无日志文件)' : `(读取失败: ${e?.code ?? '未知错误'})`;
+    }
+  }
+
+  /**
+   * 描述 startup log 的**写侧**与文件元信息，供报告段标题如实标注。
+   *
+   * 为什么必须标：三个写侧写进去的东西根本不同（见 main/utils/paths.ts getSingBoxStartupLogPath），其中
+   * Windows UAC 看护脚本压根不重定向核的输出——若段标题一律写「核 stdout/stderr」，读报告的人会把「只有
+   * 看护脚本自述行、没有 FATAL」误读成「核什么都没打印」，与 issue #324 里那条假的「UAC 授权失败」是同一
+   * 类误导。另外 Windows helper 侧 O_APPEND 永不截断，必须给出文件大小与最后写入时刻，否则无法判断这
+   * 64KB tail 属于哪次会话（sing-box 的 FATAL[0000] 是启动相对秒，非墙钟时间）。
+   */
+  private async describeStartupLog(): Promise<string> {
+    // isStartedViaHelper 反映最近一次启动走的路径（代理已停时即上一次），是此处能拿到的最准信息。
+    const viaHelper = this.proxyManager.isStartedViaHelper();
+    const writer = viaHelper
+      ? '写侧 helper 服务：核 stdout+stderr，只追加不截断'
+      : process.platform === 'darwin'
+        ? '写侧 osascript wrapper：核 stdout+stderr，每次启动截断'
+        : process.platform === 'win32'
+          ? '写侧 UAC 看护脚本：**仅看护脚本自述行，不含核输出**'
+          : '非 helper 路径（直起）：核输出走 app.log 管道，本文件不被写入';
+    try {
+      const st = await fs.stat(getSingBoxStartupLogPath());
+      const mb = (st.size / (1024 * 1024)).toFixed(2);
+      return `${writer} · ${mb} MB · 最后写入 ${st.mtime.toISOString()}`;
+    } catch {
+      return writer; // 文件缺失/不可读：tail 那边已给占位，此处不重复报错
     }
   }
 
@@ -88,9 +121,14 @@ export class DiagnosticService {
     // 落盘待写日志先 flush，确保 tail 含最新行
     await this.logManager.flush().catch(() => {});
 
-    const [appLogTail, singboxLogTail] = await Promise.all([
+    // startupLogTail = 提权/看护路径下的核启动日志。核在 logger 建起前挂掉或 panic 时，singbox.log 里什么
+    // 都没有、失败原因只走 stderr（issue #324：两轮诊断报告都因缺这段而定不了位）。恒纳入报告——文件不存在
+    // 时 readTail 给「(无日志文件)」占位，这本身也是信息（该机从未走过提权启动路径）。
+    const [appLogTail, singboxLogTail, startupLogTail, startupLogSource] = await Promise.all([
       this.readTail(path.join(getLogsPath(), 'app.log'), LOG_TAIL_BYTES),
       this.readTail(getSingBoxLogPath(), LOG_TAIL_BYTES),
+      this.readTail(getSingBoxStartupLogPath(), LOG_TAIL_BYTES),
+      this.describeStartupLog(),
     ]);
 
     const coreVersion = await this.proxyManager.getCoreVersion().catch(() => 'unknown');
@@ -242,6 +280,8 @@ export class DiagnosticService {
       rendererWatchdog,
       appLogTail,
       singboxLogTail,
+      startupLogTail,
+      startupLogSource,
       // issue #147：节点 outbound.server 已恒为域名（不再烧 IP），无额外预解析 IP 需补脱敏 → 仅扫 config.servers。
       nodeIdentifiers: collectNodeIdentifiers(config),
       hint: wantDeeper
