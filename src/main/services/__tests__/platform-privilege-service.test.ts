@@ -32,6 +32,7 @@ import {
   PlatformPrivilegeService,
   PrivilegeContext,
   ElevatedLaunchPaths,
+  windowsWatchdogScriptText,
 } from '../PlatformPrivilegeService';
 import type { LogLevel } from '../../../shared/types';
 import { powershellPath } from '../../utils/win-system32';
@@ -96,6 +97,7 @@ function makePaths(): ElevatedLaunchPaths {
     configPath: '/app/config.json',
     pidFile: '/app/sb.pid',
     startupLogFile: '/app/startup.log',
+    watchdogLog: '/app/watchdog.log',
     stopFlag: '/app/stop.flag',
     wrapper: '/app/wrapper.sh',
     watchdog: 'C:\\app\\watchdog.ps1',
@@ -277,5 +279,79 @@ describe('PlatformPrivilegeService.generateWatchdogScript', () => {
     expect(script).toContain('$parent.ProcessName -ne $ParentName');
     // 强停兜底
     expect(script).toContain('Stop-Process -Id $sbId -Force');
+  });
+});
+
+// ============================================================================
+// 六、Windows 看护脚本正文 × 提权参数链（issue #324：核 stderr 必须落盘）
+// ============================================================================
+
+describe('windowsWatchdogScriptText — 核 stderr 落盘与文件分工', () => {
+  const script = windowsWatchdogScriptText();
+
+  it('脚本正文必须是纯 ASCII（PowerShell 5.1 按 ANSI 解码无 BOM 文件，非 ASCII 会破坏语法）', () => {
+    // 真机实测：脚本里放中文注释 → `fs.writeFileSync` 写出 UTF-8 无 BOM → PowerShell 5.1 按 GBK 解码，
+    // 多字节序列被拆出反引号/引号 → ParserError「表达式或语句中包含意外的标记」→ 看护脚本根本不启动，
+    // 核也就永远起不来。这条本地跑不出来（Linux/Node 读 UTF-8 一切正常），只有真机会暴露。
+    const offenders = [...script].filter((ch) => ch.charCodeAt(0) > 127);
+    expect(offenders).toEqual([]);
+  });
+
+  it('Start-Process 重定向 sing-box 的 stderr 到 $LogFile', () => {
+    // sing-box 启动失败的 FATAL 只走 stderr，不进 config 的 log.output（Windows 真机实测：log.output
+    // 文件里只有一行 "updated default interface"）。不重定向 = #324 的失败原因彻底丢失。
+    expect(script).toMatch(/Start-Process[^\n]*-RedirectStandardError \$LogFile/);
+  });
+
+  it('不重定向 stdout：PowerShell 禁止两者指向同一路径（真机实测抛错）', () => {
+    expect(script).not.toContain('-RedirectStandardOutput');
+  });
+
+  it('看护脚本自述行写 $WatchdogLog，不写 $LogFile（后者被重定向独占，真机实测写入报文件占用）', () => {
+    expect(script).toMatch(/param\([\s\S]*\$WatchdogLog[\s\S]*\)/);
+    expect(script).toMatch(/function Log[\s\S]*Out-File -FilePath \$WatchdogLog/);
+    // 起始行也落看护日志，不能再写 $LogFile
+    expect(script).toMatch(/'FlowZ watchdog starting\.\.\.' \| Out-File -FilePath \$WatchdogLog/);
+    expect(script).not.toMatch(/Out-File -FilePath \$LogFile/);
+  });
+
+  it('脚本 param 个数与提权参数链长度一致（缺参会让看护脚本在隐藏窗口里挂起）', () => {
+    setPlatform('win32');
+    const svc = makeSvc(true);
+    const { args } = svc.buildElevatedLaunchCommand(makePaths());
+    const psScript = args[4] as string;
+
+    // 脚本 param(...) 块里声明的参数个数
+    const paramBlock = script.slice(
+      script.indexOf('param('),
+      script.indexOf(')\n$ErrorActionPreference')
+    );
+    // 只数形如 `[string]$Xxx` 的形参名——裸 `\$[A-Za-z]\w*` 会把 `Mandatory = $true` 里的 $true 也算进去
+    const declared = (paramBlock.match(/\]\$[A-Za-z]\w*/g) ?? []).length;
+
+    // -ArgumentList 里 '-File' 之后的元素：第一个是脚本自身路径，其余是传给 param 的实参
+    // psScript 各行用 '; ' 拼接，-ArgumentList 链止于该行末尾的分号（fixture 路径不含分号）
+    const afterFile = psScript.slice(psScript.indexOf("'-File'") + "'-File'".length);
+    const argList = afterFile.slice(0, afterFile.indexOf(';'));
+    const passed = argList.split(',').filter((x) => x.trim().length > 0).length - 1;
+
+    expect(declared).toBeGreaterThan(0);
+    expect(passed).toBe(declared);
+  });
+
+  it('提权参数链把 watchdogLog 传进去（顺序：startupLogFile → watchdogLog → fwd）', () => {
+    setPlatform('win32');
+    const svc = makeSvc(true);
+    const paths = makePaths();
+    const { args } = svc.buildElevatedLaunchCommand(paths);
+    const psScript = args[4] as string;
+    expect(psScript).toContain(paths.watchdogLog);
+    expect(psScript.indexOf(paths.watchdogLog)).toBeGreaterThan(
+      psScript.indexOf(paths.startupLogFile)
+    );
+    // UAC 发起失败的 ERROR 行也落看护日志（不污染归 stderr 独占的 startupLogFile）
+    expect(psScript).toMatch(
+      /ERROR launching watchdog[\s\S]*Out-File -FilePath '[^']*watchdog\.log'/
+    );
   });
 });

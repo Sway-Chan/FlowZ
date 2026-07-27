@@ -205,6 +205,17 @@ export function getSingBoxStartupLogPath(): string {
   return path.join(getUserDataPath(), 'singbox_startup.log');
 }
 
+/**
+ * Windows UAC 看护脚本自身的日志（`flowz-win-watchdog.log`）。与 singbox_startup.log **必须分文件**：
+ * Start-Process 的 -RedirectStandardError 会独占打开目标文件（Windows 真机实测：重定向期间 PowerShell
+ * `Out-File -Append` 报「文件正由另一进程使用」），两者同文件会让看护脚本自述行全部写失败。
+ * 看护脚本自述行（"sing-box exited by itself" / "Stopflag detected" / "Parent process gone"）是区分
+ * 「核自杀 vs 被外部杀」的判据，与核 stderr 同等重要，故各写各的、诊断报告两段都收。
+ */
+export function getWindowsWatchdogLogPath(): string {
+  return path.join(getUserDataPath(), 'flowz-win-watchdog.log');
+}
+
 export function getCachePath(): string {
   return path.join(getUserDataPath(), 'cache.db');
 }

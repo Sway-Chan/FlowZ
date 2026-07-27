@@ -27,7 +27,12 @@ import {
   sampleCoreProcess,
   serializeMemoryTimelineCsv,
 } from './process-sampler';
-import { getLogsPath, getSingBoxLogPath, getSingBoxStartupLogPath } from '../utils/paths';
+import {
+  getLogsPath,
+  getSingBoxLogPath,
+  getSingBoxStartupLogPath,
+  getWindowsWatchdogLogPath,
+} from '../utils/paths';
 import path from 'path';
 import type { LogManager } from './LogManager';
 import type { ProxyManager } from './ProxyManager';
@@ -104,7 +109,7 @@ export class DiagnosticService {
       : process.platform === 'darwin'
         ? '写侧 osascript wrapper：核 stdout+stderr，每次启动截断'
         : process.platform === 'win32'
-          ? '写侧 UAC 看护脚本：**仅看护脚本自述行，不含核输出**'
+          ? '写侧 UAC 看护脚本：核 stderr（-RedirectStandardError），每次起核截断；看护脚本自述行见下一段'
           : '非 helper 路径（直起）：核输出走 app.log 管道，本文件不被写入';
     try {
       const st = await fs.stat(getSingBoxStartupLogPath());
@@ -124,12 +129,17 @@ export class DiagnosticService {
     // startupLogTail = 提权/看护路径下的核启动日志。核在 logger 建起前挂掉或 panic 时，singbox.log 里什么
     // 都没有、失败原因只走 stderr（issue #324：两轮诊断报告都因缺这段而定不了位）。恒纳入报告——文件不存在
     // 时 readTail 给「(无日志文件)」占位，这本身也是信息（该机从未走过提权启动路径）。
-    const [appLogTail, singboxLogTail, startupLogTail, startupLogSource] = await Promise.all([
-      this.readTail(path.join(getLogsPath(), 'app.log'), LOG_TAIL_BYTES),
-      this.readTail(getSingBoxLogPath(), LOG_TAIL_BYTES),
-      this.readTail(getSingBoxStartupLogPath(), LOG_TAIL_BYTES),
-      this.describeStartupLog(),
-    ]);
+    const [appLogTail, singboxLogTail, startupLogTail, startupLogSource, watchdogLogTail] =
+      await Promise.all([
+        this.readTail(path.join(getLogsPath(), 'app.log'), LOG_TAIL_BYTES),
+        this.readTail(getSingBoxLogPath(), LOG_TAIL_BYTES),
+        this.readTail(getSingBoxStartupLogPath(), LOG_TAIL_BYTES),
+        this.describeStartupLog(),
+        // 看护脚本自述日志只有 Windows UAC 路径会写；其它平台不出该段（避免恒定的「(无日志文件)」噪声）。
+        process.platform === 'win32'
+          ? this.readTail(getWindowsWatchdogLogPath(), LOG_TAIL_BYTES)
+          : Promise.resolve(undefined),
+      ]);
 
     const coreVersion = await this.proxyManager.getCoreVersion().catch(() => 'unknown');
     const status = this.proxyManager.getStatus();
@@ -282,6 +292,7 @@ export class DiagnosticService {
       singboxLogTail,
       startupLogTail,
       startupLogSource,
+      watchdogLogTail,
       // issue #147：节点 outbound.server 已恒为域名（不再烧 IP），无额外预解析 IP 需补脱敏 → 仅扫 config.servers。
       nodeIdentifiers: collectNodeIdentifiers(config),
       hint: wantDeeper

@@ -22,7 +22,12 @@ jest.mock('electron', () => ({
 }));
 
 import { DiagnosticService } from '../DiagnosticService';
-import { getLogsPath, getSingBoxLogPath, getSingBoxStartupLogPath } from '../../utils/paths';
+import {
+  getLogsPath,
+  getSingBoxLogPath,
+  getSingBoxStartupLogPath,
+  getWindowsWatchdogLogPath,
+} from '../../utils/paths';
 
 afterAll(() => {
   try {
@@ -47,17 +52,33 @@ function makeSvc(opts: { startedViaHelper?: boolean } = {}): any {
   return new DiagnosticService(configManager, logManager, proxyManager, systemProxyManager) as any;
 }
 
+/**
+ * 本文件的断言与 `process.platform` 强相关（Windows 会多收一段看护脚本日志），故每条用例都**显式 pin
+ * 平台**，绝不吃宿主平台的默认值——否则本地 Linux 全绿、Windows CI runner 上必挂（已实际踩过）。
+ */
+async function withPlatform<T>(platform: NodeJS.Platform, fn: () => Promise<T>): Promise<T> {
+  const real = process.platform;
+  Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+  try {
+    return await fn();
+  } finally {
+    Object.defineProperty(process, 'platform', { value: real, configurable: true });
+  }
+}
+
 describe('DiagnosticService — 日志取数路径收口', () => {
   it('三段日志各读各的文件，startup log 走 getSingBoxStartupLogPath()（不与 singbox.log 同源）', async () => {
-    const svc = makeSvc();
-    const seen: string[] = [];
-    jest.spyOn(svc, 'readTail').mockImplementation(async (...args: unknown[]) => {
-      const p = args[0] as string;
-      seen.push(p);
-      return `tail-of:${path.basename(p)}`;
+    // pin 非 Windows：Windows 会多收一段看护脚本日志，seen 就不是三条了
+    const { seen, md } = await withPlatform('linux', async () => {
+      const svc = makeSvc();
+      const seen: string[] = [];
+      jest.spyOn(svc, 'readTail').mockImplementation(async (...args: unknown[]) => {
+        const p = args[0] as string;
+        seen.push(p);
+        return `tail-of:${path.basename(p)}`;
+      });
+      return { seen, md: (await svc.buildReport()) as string };
     });
-
-    const md = await svc.buildReport();
 
     expect(seen).toHaveLength(3);
     expect(new Set(seen).size).toBe(3); // 三个互不相同 → 排除「两段读同一文件」的漂移
@@ -69,24 +90,45 @@ describe('DiagnosticService — 日志取数路径收口', () => {
     expect(md).toMatch(/## singbox_startup\.log[\s\S]*tail-of:singbox_startup\.log/);
   });
 
-  it('Windows 非 helper 路径的段标题如实标注「不含核输出」（#324 假阴性防线）', async () => {
-    const real = process.platform;
-    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
-    try {
+  it('Windows UAC 路径：startup 段标注核 stderr，并额外收看护脚本自述日志', async () => {
+    const { seen, md } = await withPlatform('win32', async () => {
       const svc = makeSvc({ startedViaHelper: false });
-      jest.spyOn(svc, 'readTail').mockResolvedValue('FlowZ watchdog starting...');
-      const md = await svc.buildReport();
-      expect(md).toContain('写侧 UAC 看护脚本');
-      expect(md).toContain('不含核输出');
-    } finally {
-      Object.defineProperty(process, 'platform', { value: real, configurable: true });
-    }
+      const seen: string[] = [];
+      jest.spyOn(svc, 'readTail').mockImplementation(async (...args: unknown[]) => {
+        const p = args[0] as string;
+        seen.push(p);
+        return `tail-of:${path.basename(p)}`;
+      });
+      return { seen, md: (await svc.buildReport()) as string };
+    });
+    expect(md).toContain('写侧 UAC 看护脚本');
+    expect(md).toContain('核 stderr');
+    // 看护自述日志是「谁停的核」的判据，与 FATAL 互补，Windows 上必须一并收
+    expect(seen).toContain(getWindowsWatchdogLogPath());
+    expect(md).toContain('## flowz-win-watchdog.log');
+    expect(md).toContain('tail-of:flowz-win-watchdog.log');
+  });
+
+  it('非 Windows 不出看护脚本日志段（避免恒定的「(无日志文件)」噪声）', async () => {
+    const { seen, md } = await withPlatform('linux', async () => {
+      const svc = makeSvc({ startedViaHelper: true });
+      const seen: string[] = [];
+      jest.spyOn(svc, 'readTail').mockImplementation(async (...args: unknown[]) => {
+        seen.push(args[0] as string);
+        return 'x';
+      });
+      return { seen, md: (await svc.buildReport()) as string };
+    });
+    expect(seen).not.toContain(getWindowsWatchdogLogPath());
+    expect(md).not.toContain('## flowz-win-watchdog.log');
   });
 
   it('helper 路径标注为含核 stdout+stderr 且只追加不截断', async () => {
-    const svc = makeSvc({ startedViaHelper: true });
-    jest.spyOn(svc, 'readTail').mockResolvedValue('FATAL[0000] boom');
-    const md = await svc.buildReport();
+    const md = await withPlatform('linux', async () => {
+      const svc = makeSvc({ startedViaHelper: true });
+      jest.spyOn(svc, 'readTail').mockResolvedValue('FATAL[0000] boom');
+      return (await svc.buildReport()) as string;
+    });
     expect(md).toContain('核 stdout+stderr');
     expect(md).toContain('只追加不截断');
   });
