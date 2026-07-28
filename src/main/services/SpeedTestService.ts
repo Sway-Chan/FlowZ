@@ -845,13 +845,38 @@ export class SpeedTestService {
           server_port: 53,
           detour: tag, // 查询穿本端点隧道 → AliDNS 按出口地理(ECS)返 IP
         });
-        // WG localAddress 含 v6 → prefer_ipv4（避免 v6 优先落不可达）；纯 v4 → ipv4_only（消 v6 解析噪声）。
+        // 族别偏好（语义不变，写法迁移）：WG localAddress 含 v6 → v4 优先但保留 v6（避免 v6 优先落不可达）；
+        // 纯 v4 → 只取 A（消 v6 解析噪声）。
+        //
+        // 迁移背景（sing-box 1.14.0，随包核 1.14.0-beta.2 本机 loopback 实测）：rule-action 上的 legacy
+        // `strategy` 已废弃、run 时 WARN、1.16.0 移除；更要命的是它与**同一份 dns 配置内**任何带
+        // `query_type`/`ip_version` 的规则（含引用带 query_type 的 rule-set）**互斥**——共存则 `sing-box run`
+        // 与 `check` 双双硬拒（`initialize dns router: Legacy strategy ... is deprecated` FATAL）。主配置
+        // （singbox-dns-builder）大量用 query_type，测速配置用 rule-action strategy，此前只是**恰好错开**。
+        // 新写法改用 query_type 规则项表达，两侧不再有 legacy strategy，该雷结构性拆除。
+        //
+        //  · 旧 `prefer_ipv4` → **不下发任何东西**：本配置无顶层 `dns.strategy`（见下方 `dns` 组装），内核默认
+        //    并发 A/AAAA 且把 v4 排在 v6 前（sortAddresses 对 AsIS 与 prefer_ipv4 同一分支）。实测两形态返回
+        //    的地址列表逐项同序。⚠️ 该等价性**依赖测速配置不带顶层 dns.strategy**，由 speed-test-endpoint-dns
+        //    单测「全仓禁 legacy rule-action strategy」一例锁死。
+        //  · 旧 `ipv4_only` → 给该 inbound 的 AAAA 查询前置一条 predefined 空 NOERROR：AAAA 就地返空、不出网，
+        //    结果集只剩 A。实测与 legacy ipv4_only 的出网查询与解析结果逐字节一致。
+        //
+        // 顺序有牙：抑制规则必须排在本节点 route 规则**之前**——DNS 规则先匹配先命中，route 规则是该 inbound 的
+        // catch-all，排它前面则 AAAA 先被 route 吃掉、抑制静默失效（实测反证）。
         const hasV6 = !!server.wireguardSettings?.localAddress?.some((a) => a.includes(':'));
+        if (!hasV6) {
+          dnsRules.push({
+            inbound: [inboundTag],
+            query_type: ['AAAA'],
+            action: 'predefined',
+            rcode: 'NOERROR', // 空答复：等价旧 ipv4_only 的「不要 v6」，且不触发拒绝日志噪声
+          });
+        }
         dnsRules.push({
           inbound: [inboundTag], // 端点入站的目标解析走穿隧道 DNS（按出口地理）
           action: 'route',
           server: exitDnsTag,
-          strategy: hasV6 ? 'prefer_ipv4' : 'ipv4_only',
           disable_cache: true, // 多端点并测出口 geo 答案各异，禁缓存防互污染（cache 按 question 全局共享）
         });
       } else {
@@ -868,6 +893,9 @@ export class SpeedTestService {
     //    ⚠️ 勿引入 sniff / outbound.domain_strategy / 针对目标的本地解析——会破坏此不变量。
     //  · 端点（WG/WARP…L3）：**必本地解析**目标（内核强制）。故上方用 inbound 键控 dns.rule 把端点的目标解析压到穿隧道
     //    223.5.5.5（AliDNS ECS 按出口地理返 IP、geo 正确、单形态覆盖境内外出口）；default_domain_resolver 仍解节点 server 地址。
+    // ⚠️ 恒不下发顶层 `dns.strategy`：端点族别偏好靠上方的 query_type 规则项表达，而「无顶层 strategy」
+    // 正是「省略 prefer_ipv4 == prefer_ipv4」这一等价性的前提（顶层若为 prefer_ipv6，端点解析会翻成 v6 优先，
+    // 实测确证）。要加顶层 strategy 必须同时重新推导端点规则，别只加一半。单测锁死本不变量。
     const dns: Record<string, unknown> = { servers: dnsServers };
     if (dnsRules.length > 0) dns.rules = dnsRules; // 仅有端点节点时下发；纯代理配置零变化
     const config: Record<string, unknown> = {
