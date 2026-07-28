@@ -5,7 +5,11 @@
  */
 
 import type { ServerConfig, UserConfig, InvalidNodeInfo } from '../../shared/types';
-import type { SingBoxOutbound, SingBoxEndpoint } from './singbox-config-types';
+import type {
+  SingBoxOutbound,
+  SingBoxEndpoint,
+  SingBoxDomainResolver,
+} from './singbox-config-types';
 import { resourceManager } from './ResourceManager';
 import {
   isEndpointProtocol,
@@ -24,7 +28,7 @@ import { tailscaleStateDir } from './tailscale-state';
 import {
   effectiveCustomRules,
   effectiveAppRules,
-  getNodeResolverTag,
+  getNodeDialDomainResolver,
   getDomesticResolverTag,
 } from './singbox-config-helpers';
 import { isDirectSelection, resolveGlobalExitTag } from '../../shared/direct-selection';
@@ -88,13 +92,16 @@ export function prunedSelectorDefault(
  * #58：peer.address 为【域名】时（如 WARP engage.cloudflareclient.com）必须给 endpoint 顶层 dial 级
  * domain_resolver，否则 sing-box 1.14 起域名无确定解析上游 → 拨号解析失败/超时（实测：WARP 测速超时，
  * Dalutone IP-server 正常）。与 buildProxyOutbound 的 outbound.domain_resolver 同口径。调用方传解析器
- * tag（config-gen：getNodeResolverTag(config,'dial')；测速：'dns-direct'）。
+ * tag（config-gen：getNodeDialDomainResolver(config)；测速：'dns-direct'）。
  * IP 字面量 server 不需 DNS 解析 → 不下发该字段（保持配置精简，且 IP 路径本就不受影响）。
+ *
+ * 形态由调用方决定（本函数保持纯透传）：字符串 = 仅指定 tag；结构化 = 附带 strategy 覆盖顶层
+ * dns.strategy，供关 IPv6 时解锁 AAAA-only 域名节点（见 getNodeDialDomainResolver）。
  */
 export function buildWireGuardEndpoint(
   server: ServerConfig,
   tag: string,
-  domainResolverTag?: string
+  domainResolverTag?: SingBoxDomainResolver
 ): SingBoxEndpoint {
   const s = server.wireguardSettings;
   if (!s || !s.privateKey || !s.peerPublicKey || !s.localAddress?.length) {
@@ -154,9 +161,13 @@ export function buildWireGuardEndpoint(
 export function buildProxyOutbound(
   server: ServerConfig,
   idToTagMap: Map<string, string>,
-  // #57：节点域名 dial 解析器 tag，由调用方传 getNodeResolverTag(config,'dial')。
-  // 缺省 dns-bootstrap（AliDNS IP-DoH）= 现状，兼容无 config 上下文的兜底调用。
-  nodeResolverTag: string = 'dns-bootstrap'
+  // #57：节点域名 dial 解析器，由调用方传 getNodeDialDomainResolver(config)。形态由调用方决定、本函数纯透传：
+  // 字符串 = 仅指定 tag；结构化 = 附带 strategy 覆盖顶层 dns.strategy（关 IPv6 时解锁 AAAA-only 域名节点）。
+  //
+  // **必填、刻意无默认值**：曾默认 'dns-bootstrap'（字符串形态＝未修复形态）。实测该默认值是静默后门——把
+  // buildOutbounds 里的第三参删掉后，全量 3451 测试零红：tsc/单测/snapshot/sing-box check 四层全哑，因为漏传
+  // 与「显式选择字符串形态」在类型上不可区分。改必填后，任何新增 call site 漏传 = 编译错误，被迫显式表态。
+  nodeResolverTag: SingBoxDomainResolver
 ): SingBoxOutbound {
   // sing-box 要求协议类型必须是小写
   const protocol = server.protocol.toLowerCase();
@@ -182,10 +193,11 @@ export function buildProxyOutbound(
     tag: idToTagMap.get(server.id) || `proxy-${server.id}`,
     // issue #147：server 恒用原域名——交内核 resolveDialer 运行时解析多 A → DialSerial 逐个 IP 重试（取代旧
     // resolve-ahead 烧单 IP，那会令 destination.IsDomain()=false、关闭内核多 IP 容错，见设计 §1.1）。
-    // 多上游 race / 抗单点由 domain_resolver 指向的本地 race server 承担（getNodeResolverTag）。
+    // 多上游 race / 抗单点由 domain_resolver 指向的本地 race server 承担（getNodeDialDomainResolver）。
     server: server.address,
     server_port: server.port,
-    // 代理节点域名经引导解析（默认 dns-bootstrap=AliDNS IP-DoH），免疫 UDP 53 限速/劫持，
+    // 代理节点域名经引导解析（缺省档 dns-bootstrap=AliDNS IP-DoH，由调用方的 getNodeDialDomainResolver 定档，
+    // 本参数无默认值），免疫 UDP 53 限速/劫持，
     // 避免节点解析失败导致全断流；同时防止 dns-local 死循环导致的连接挂起。
     // #57：节点域名解析器档位可改为 dns-node(DNSPod)/dns-local(系统 DNS)，dial 与 rule1 同档（统一 tag）。
     domain_resolver: nodeResolverTag,
@@ -837,10 +849,10 @@ export function buildOutbounds(
         }
         try {
           // #58：域名 server 的 WG endpoint 需 dial 级 domain_resolver（**仅用于 peer 地址解析**，与普通协议同档）。
-          // R4（§14.4，回退 E2）：peer 解析回 getNodeResolverTag(config,'dial')（race 多上游）。E2 曾改 dns-bootstrap 治
+          // R4（§14.4，回退 E2）：peer 解析回 getNodeDialDomainResolver(config)（race 多上游）。E2 曾改 dns-bootstrap 治
           // WARP 目的域名投毒——已证伪：endpoint domain_resolver 结构上只喂 peer 解析、碰不到目的域名 dial 解析（§14.3
           // 官方源码 endpoint.go L94-100 vs L229-247）。目的域名投毒的真修在 dns-builder 的 FakeIP 影子规则（R1，§14.4）。
-          const ep = buildWireGuardEndpoint(server, tag, getNodeResolverTag(config, 'dial'));
+          const ep = buildWireGuardEndpoint(server, tag, getNodeDialDomainResolver(config));
           if (downgradeMeshToGvisor) {
             ep.system = false; // 非 TUN：降级 userspace gVisor 栈（零提权可跑）
             delete ep.name; // gVisor 无内核接口名
@@ -911,7 +923,7 @@ export function buildOutbounds(
         continue;
       }
       try {
-        const ob = buildProxyOutbound(server, idToTagMap, getNodeResolverTag(config, 'dial'));
+        const ob = buildProxyOutbound(server, idToTagMap, getNodeDialDomainResolver(config));
         ob.tag = tag;
         if (server.detour && config.servers.some((s) => s.id === server.detour)) {
           // 环检测：沿 detour 链行进，若回到本节点即成环 → 不设 detour，避免 sing-box 报循环引用启动失败
@@ -1000,7 +1012,7 @@ export function buildOutbounds(
   } else if (selectedServer) {
     // Fallback if config is missing (shouldn't happen)
     outbounds.push(
-      buildProxyOutbound(selectedServer, idToTagMap, getNodeResolverTag(config, 'dial'))
+      buildProxyOutbound(selectedServer, idToTagMap, getNodeDialDomainResolver(config))
     );
   }
 

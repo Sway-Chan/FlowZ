@@ -703,6 +703,44 @@ export function NetworkSettings() {
             onChange={(c) => setBool('meshLoginFallbackDirect', c)}
           />
         </Srow>
+        <Srow
+          label={
+            <span style={{ color: 'hsl(var(--warn))' }}>{t('settings.general.enableIPv6')}</span>
+          }
+          desc={t('settings.network.enableIPv6Desc')}
+        >
+          <Swt checked={config.enableIPv6 === true} onChange={(c) => setBool('enableIPv6', c)} />
+        </Srow>
+        {/* 与上面的 enableIPv6 开关强耦合：拨开关的**同一视野**里就要看到后果提示与一键补救，故必须与开关相邻。
+            开关从「高级流量」折叠区上提时，本块一并上提——留在折叠区等于用户拨完开关看不到提示。 */}
+        {config.proxyModeType === 'tun' &&
+          config.enableIPv6 === true &&
+          config.dnsConfig?.enableFakeIp === false && (
+            <div
+              className="srow-warn"
+              style={{
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'space-between',
+                gap: 12,
+              }}
+            >
+              <span>
+                {t(
+                  'settings.network.ipv6NodeFakeIpHint',
+                  '若节点不支持 IPv6，部分网站可能无法访问；建议开启 FakeIP。'
+                )}
+              </span>
+              <button
+                type="button"
+                className="btn flow sm"
+                style={{ flex: 'none' }}
+                onClick={() => writeFakeIp(true)}
+              >
+                {t('settings.network.enableFakeIpAction', '开启 FakeIP')}
+              </button>
+            </div>
+          )}
         <Collapse summary={t('settings.network.advancedTraffic', '高级流量')}>
           <Srow
             label={
@@ -787,42 +825,6 @@ export function NetworkSettings() {
               onChange={(c) => setBool('tlsFragment', c)}
             />
           </Srow>
-          <Srow
-            label={
-              <span style={{ color: 'hsl(var(--warn))' }}>{t('settings.general.enableIPv6')}</span>
-            }
-            desc={t('settings.network.enableIPv6Desc')}
-          >
-            <Swt checked={config.enableIPv6 === true} onChange={(c) => setBool('enableIPv6', c)} />
-          </Srow>
-          {config.proxyModeType === 'tun' &&
-            config.enableIPv6 === true &&
-            config.dnsConfig?.enableFakeIp === false && (
-              <div
-                className="srow-warn"
-                style={{
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'space-between',
-                  gap: 12,
-                }}
-              >
-                <span>
-                  {t(
-                    'settings.network.ipv6NodeFakeIpHint',
-                    '若节点不支持 IPv6，部分网站可能无法访问；建议开启 FakeIP。'
-                  )}
-                </span>
-                <button
-                  type="button"
-                  className="btn flow sm"
-                  style={{ flex: 'none' }}
-                  onClick={() => writeFakeIp(true)}
-                >
-                  {t('settings.network.enableFakeIpAction', '开启 FakeIP')}
-                </button>
-              </div>
-            )}
         </Collapse>
       </div>
 

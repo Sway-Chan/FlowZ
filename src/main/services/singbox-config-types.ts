@@ -10,6 +10,24 @@ export interface SingBoxLogConfig {
   disabled?: boolean;
 }
 
+/**
+ * dial 级域名解析器（sing-box 1.14）。两种形态：
+ *  - 字符串：仅指定解析器 tag，解析策略回落顶层 `dns.strategy`。
+ *  - 对象：额外携带 `strategy`，**覆盖顶层策略**——用于把「节点域名的 dial 解析」与「目标域名解析」分离。
+ *    关 IPv6 时顶层为 `ipv4_only`（#57：抑制目标站点 AAAA，防双栈站 Happy Eyeballs 卡死），该策略会连带
+ *    使内核对节点域名也从不发 AAAA 查询 → AAAA-only 域名节点无地址可拨。对象形态让节点侧单独放宽。
+ *
+ * strategy 按内核支持集收窄为字面量联合：`sing-box check` 对**值**有牙（未知值 FATAL）但对对象内**键名**
+ * 无牙（typo 静默丢字段、修复静默失效，实测 exit=0）——收窄类型让 tsc 先于 check 拦住值笔误，键名笔误由
+ * 单测 `toEqual` 精确形状锁兜住。
+ */
+export type SingBoxDomainResolver =
+  | string
+  | {
+      server: string;
+      strategy?: 'prefer_ipv4' | 'prefer_ipv6' | 'ipv4_only' | 'ipv6_only';
+    };
+
 export interface SingBoxDnsServer {
   tag: string;
   type?: string;
@@ -18,7 +36,7 @@ export interface SingBoxDnsServer {
   /** DoH path, e.g. "/dns-query" */
   path?: string;
   /** Bootstrap resolver tag: required when server is a domain name (sing-box 1.12+ new format) */
-  domain_resolver?: string;
+  domain_resolver?: SingBoxDomainResolver;
   detour?: string;
   // Tailscale DNS server（1.14；P4b，sing-box check 实证 alpha.32）：type:"tailscale" 须引用一个
   // tailscale endpoint 的 tag（endpoint 必填，缺失则 FATAL）。accept_search_domain=短名/MagicDNS/split-DNS；
@@ -214,7 +232,7 @@ export interface SingBoxOutbound {
   server_ports?: string[];
   hop_interval?: string;
   // DNS resolver for outbound server domain
-  domain_resolver?: string;
+  domain_resolver?: SingBoxDomainResolver;
   // UDP over TCP (UoT)
   udp_over_tcp?: {
     enabled: boolean;
@@ -258,7 +276,7 @@ export interface SingBoxEndpoint {
   // Dial Fields（endpoint 顶层继承）：sing-box 1.14 起，server 用域名的 endpoint 需 dial 级 domain_resolver
   // （或 route.default_domain_resolver），否则域名解析无确定上游。WG peer.address 为域名时显式下发，
   // 与 buildProxyOutbound 的 outbound.domain_resolver 同口径（IP server 不需 DNS 解析，故不下发）。
-  domain_resolver?: string;
+  domain_resolver?: SingBoxDomainResolver;
   // WireGuard
   system?: boolean;
   mtu?: number;

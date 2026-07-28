@@ -17,7 +17,11 @@ import { parseDnsServerSpec, isIpv6Literal } from '../../shared/dns';
 import { ruleConditions } from '../../shared/rules';
 import { getAppPreset } from '../../shared/app-rules-preset';
 import { BUILTIN_GEO_RULESETS } from './builtin-geo-rulesets';
-import type { SingBoxConfig, SingBoxRouteRule } from './singbox-config-types';
+import type {
+  SingBoxConfig,
+  SingBoxRouteRule,
+  SingBoxDomainResolver,
+} from './singbox-config-types';
 
 /**
  * 内置出站/inbound 保留 tag：节点显示名撞这些会致 sing-box tag 冲突 FATAL，故去重时预占。
@@ -179,6 +183,29 @@ export function getNodeResolverTag(
   }
   // 'ali' / 自定义（自定义 server 见 Task#5）/ 缺省：忠实保留两路径各自基线解析器，逐字节回现状。
   return ctx === 'dial' ? 'dns-bootstrap' : 'dns-domestic';
+}
+
+/**
+ * 节点域名 **dial 侧** domain_resolver 的下发形态（单一真值：outbound / WG endpoint 共用）。
+ *
+ * 为什么需要它：顶层 `dns.strategy` 在关 IPv6 时为 `ipv4_only`（#57，抑制**目标站点** AAAA，防「双栈站 +
+ * 节点无 v6」时浏览器试 v6 失败又不回落 v4）。但该策略同时让内核对**节点域名**也从不发出 AAAA 查询
+ * → AAAA-only 域名节点解析不到地址、整个代理不可用。两者严重度不同量级，且在 sing-box 1.14 里是可分离
+ * 的两个解析面：per-outbound 的结构化 `domain_resolver.strategy` 覆盖顶层 strategy（loopback 实证：结构化
+ * 形态下内核发出 AAAA 并成功 v6 拨号；字符串形态下只发 A）。故关 IPv6 时给节点侧单独放宽，顶层一字不动。
+ *
+ * 形态选择：
+ *  - `enableIPv6=true`：顶层已是 `prefer_ipv4`，结构化属冗余 → 保持字符串，该分支 config 字节零变化。
+ *  - `enableIPv6=false`：`{ server, strategy:'prefer_ipv4' }`。取 `prefer_ipv4` 而非 `prefer_ipv6`——双栈节点
+ *    仍优先拨 v4（现行为零变化），只为 AAAA-only 节点解锁 v6；省略 strategy 则回落顶层 `ipv4_only`＝没修。
+ *
+ * 注：dial 侧不经 DNS rules，rule 级 strategy 对拨号解析无效（已实证），故此形态是唯一生效路径。
+ */
+export function getNodeDialDomainResolver(
+  config: UserConfig | null | undefined
+): SingBoxDomainResolver {
+  const tag = getNodeResolverTag(config, 'dial');
+  return config?.enableIPv6 ? tag : { server: tag, strategy: 'prefer_ipv4' };
 }
 
 /**

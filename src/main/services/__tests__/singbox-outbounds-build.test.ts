@@ -68,6 +68,25 @@ describe('buildOutbounds — 基础装配 + 载体', () => {
     expect(r.pendingRuleSelectors).toEqual([]);
   });
 
+  // IPv6-only 域名节点修复的**装配面**断言（proxy call site）：单函数单测只证 builder 透传，
+  // 「buildOutbounds 里的 buildProxyOutbound call site 被改回 getNodeResolverTag(config,'dial')」只有这里能抓。
+  // toEqual 锁精确形状——sing-box check 对对象内键名 typo 无牙（实测 `stratgy:` exit=0）。
+  it('节点出站 domain_resolver：关 IPv6（缺省）→ 结构化放宽；开 IPv6 → 字符串 tag', () => {
+    const servers = [vless('s1', '香港')];
+    const off = buildOutbounds(servers[0], cfg(servers), idMap(servers), deps());
+    expect(off.outbounds.find((o) => o.tag === '香港')!.domain_resolver).toEqual({
+      server: 'dns-node-race',
+      strategy: 'prefer_ipv4',
+    });
+    const on = buildOutbounds(
+      servers[0],
+      cfg(servers, { enableIPv6: true } as Partial<UserConfig>),
+      idMap(servers),
+      deps()
+    );
+    expect(on.outbounds.find((o) => o.tag === '香港')!.domain_resolver).toBe('dns-node-race');
+  });
+
   it('多节点 + 选中第二个 → proxy-selector.default=第二节点，members 含全部', () => {
     const servers = [vless('s1', '香港'), vless('s2', '日本')];
     const r = buildOutbounds(
@@ -198,19 +217,31 @@ describe('buildOutbounds — endpoint + 门控', () => {
     expect(ep!.peers![0].allowed_ips).toEqual(['10.8.0.0/24']);
   });
 
-  // R4（§14.4，回退 E2）：WG endpoint 的 domain_resolver 回 getNodeResolverTag(config,'dial')（race 多上游，仅 peer 解析）。
-  it('R4：域名-peer WG endpoint → domain_resolver=dns-node-race（race 默认；仅 peer 解析用）', () => {
-    const wg = {
-      id: 'w1',
-      name: 'WG-peerdomain',
-      protocol: 'wireguard',
-      address: 'wg.example.com', // 域名 peer → needsResolver
-      port: 51820,
-      wireguardSettings: { privateKey: 'pk', peerPublicKey: 'pub', localAddress: ['10.0.0.2/32'] },
-    } as unknown as ServerConfig;
-    const r = buildOutbounds(wg, cfg([wg]), idMap([wg]), deps());
+  // R4（§14.4，回退 E2）：WG endpoint 的 domain_resolver 回 getNodeDialDomainResolver(config)（race 多上游，仅 peer 解析）。
+  // 装配面断言（**M5 的真正杀手**）：单函数单测只能证 builder 透传，「buildOutbounds 里漏把 WG 那条 call site
+  // 一起改成 getNodeDialDomainResolver」只有在这里（经 buildOutbounds 走完整装配）才会被抓到。
+  const wgPeerDomain = {
+    id: 'w1',
+    name: 'WG-peerdomain',
+    protocol: 'wireguard',
+    address: 'wg.example.com', // 域名 peer → needsResolver
+    port: 51820,
+    wireguardSettings: { privateKey: 'pk', peerPublicKey: 'pub', localAddress: ['10.0.0.2/32'] },
+  } as unknown as ServerConfig;
+
+  it('R4：域名-peer WG endpoint + 关 IPv6（缺省）→ domain_resolver={server:dns-node-race,strategy:prefer_ipv4}', () => {
+    const r = buildOutbounds(wgPeerDomain, cfg([wgPeerDomain]), idMap([wgPeerDomain]), deps());
     const ep = r.pendingEndpoints.find((e) => e.tag === 'WG-peerdomain')!;
-    expect(ep.domain_resolver).toBe('dns-node-race'); // race on 缺省
+    // race on 缺省 → tag=dns-node-race；关 IPv6（enableIPv6 缺省 false）→ 结构化放宽 AAAA（IPv6-only 节点修复）。
+    // toEqual 锁精确形状：sing-box check 对对象内键名 typo 无牙，唯此断言可杀。
+    expect(ep.domain_resolver).toEqual({ server: 'dns-node-race', strategy: 'prefer_ipv4' });
+  });
+
+  it('R4：域名-peer WG endpoint + 开 IPv6 → 回字符串 tag（该分支 config 字节零变化）', () => {
+    const c = cfg([wgPeerDomain], { enableIPv6: true } as Partial<UserConfig>);
+    const r = buildOutbounds(wgPeerDomain, c, idMap([wgPeerDomain]), deps());
+    const ep = r.pendingEndpoints.find((e) => e.tag === 'WG-peerdomain')!;
+    expect(ep.domain_resolver).toBe('dns-node-race');
   });
 
   it('R4：IP-peer WG → needsResolver=false → 无 domain_resolver', () => {

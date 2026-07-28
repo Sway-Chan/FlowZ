@@ -497,7 +497,7 @@
     },
     "network": {
       "connection": "Connection",
-      "enableIPv6Desc": "Enable global IPv6 resolution & routing; may hang on nodes without IPv6, not recommended",
+      "enableIPv6Desc": "Affects IPv6 access to target websites; the proxy node's own IPv6 resolution is not restricted by this switch",
       "ipv6NodeFakeIpHint": "If the node lacks IPv6, some sites may be unreachable; enabling FakeIP is recommended.",
       "enableFakeIpAction": "Enable FakeIP",
       "updateAndSpeedTest": "Updates & Speed Test",
