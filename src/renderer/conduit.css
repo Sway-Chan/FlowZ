@@ -136,18 +136,23 @@
 .pill.info { background: hsl(var(--flow-weak)); color: hsl(var(--flow-hi)); }
 .pill.idle { background: hsl(var(--surface-3)); color: hsl(var(--fg-faint)); }
 
-/* 折叠分组（原生 details，零脚本） */
-.set-collapse > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 8px; padding: 11px 15px; font-size: 12.5px; font-weight: 600; color: hsl(var(--fg-dim)); user-select: none; }
+/* 折叠分组（原生 details，零脚本）
+   折叠头 = 独立「区段表面」：整幅 surface-2 底衬把「可展开的容器」与「单个设置行」在扫视层分开
+   （二者原本同构：左标签 + 右小元素，被读成一个看不懂的设置项）。
+   字号/颜色对齐 .srow-lbl 且字重更高 → 容器权重不低于其中任一条目（修层级倒挂）；
+   hover 提亮到 surface-3 作可点提示（原 hover 改字色的信号已被常态 --fg 吃掉）。
+   栅格不动：padding 不变（标签起点同 .srow），chevron 仍 margin-left:auto 贴行尾。 */
+.set-collapse > summary { list-style: none; cursor: pointer; display: flex; align-items: center; gap: 8px; padding: 11px 15px; font-size: 13px; font-weight: 600; color: hsl(var(--fg)); background: hsl(var(--surface-2)); user-select: none; }
 .set-collapse > summary::-webkit-details-marker { display: none; }
-.set-collapse > summary:hover { color: hsl(var(--fg)); }
-.set-collapse > summary .chev { width: 14px; height: 14px; margin-left: auto; color: hsl(var(--fg-faint)); transition: transform 0.16s; }
+.set-collapse > summary:hover { background: hsl(var(--surface-3)); }
+.set-collapse > summary .chev { width: 14px; height: 14px; margin-left: auto; color: hsl(var(--fg-dim)); transition: transform 0.16s; }
 .set-collapse[open] > summary .chev { transform: rotate(90deg); }
 .sc-label { display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .sc-body { padding: 0 15px 6px; border-top: 1px solid hsl(var(--hair)); display: flex; flex-direction: column; }
 .sc-body > .srow { padding-left: 0; padding-right: 0; }
 .sc-body > .srow:first-child { border-top: 0; }
-/* 嵌套折叠（竞速上游）：缩进 + 更浅背景 */
-.set-collapse.nested { border: 1px solid hsl(var(--hair)); border-radius: 9px; background: hsl(var(--surface-2) / 0.4); margin: 4px 0 8px; }
+/* 嵌套折叠（竞速上游）：缩进 + 更浅背景；overflow 让折叠头底衬被 9px 圆角裁掉（否则方角溢出边框） */
+.set-collapse.nested { border: 1px solid hsl(var(--hair)); border-radius: 9px; background: hsl(var(--surface-2) / 0.4); margin: 4px 0 8px; overflow: hidden; }
 .set-collapse.nested > summary { padding: 9px 12px; }
 .set-collapse.nested .sc-body { padding: 0 12px 10px; }
 .set-collapse.flush > summary { padding: 13px 15px; }
