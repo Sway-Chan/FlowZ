@@ -21,8 +21,9 @@ import {
   prunedSelectorDefault,
   shouldEmitTlsEngine,
 } from '../singbox-outbound-builder';
+import { getNodeDialDomainResolver } from '../singbox-config-helpers';
 import { resourceManager } from '../ResourceManager';
-import type { ServerConfig } from '../../../shared/types';
+import type { ServerConfig, UserConfig } from '../../../shared/types';
 
 afterAll(() => {
   try {
@@ -32,6 +33,21 @@ afterAll(() => {
     /* ignore */
   }
 });
+
+/**
+ * buildProxyOutbound 第三参 `nodeResolverTag` 已改**必填**（原 `= 'dns-bootstrap'` 默认值是静默后门：漏传与
+ * 「显式选字符串形态」在类型上不可区分 → 实测删掉一处实参后全量 3451 测试零红）。
+ *
+ * 下面三个常量 = **生产中真实出现的全部形态**，供本文件里与 domain_resolver 正交的用例轮换使用（而非全填
+ * 同一个字面量）：被测字段与解析器形态无关，轮换则顺带保证「任一形态下这些字段都照常下发」。
+ * domain_resolver 形态本身的锁在下方 `domain_resolver 形态 — IPv6-only 域名节点修复` 组，走 toEqual 深等。
+ */
+/** config-gen 关 IPv6（出厂默认档）：getNodeDialDomainResolver → { server:'dns-node-race', strategy:'prefer_ipv4' }。 */
+const DR_V6_OFF = getNodeDialDomainResolver({ enableIPv6: false } as unknown as UserConfig);
+/** config-gen 开 IPv6：字符串 tag 'dns-node-race'（顶层已 prefer_ipv4，结构化冗余）。 */
+const DR_V6_ON = getNodeDialDomainResolver({ enableIPv6: true } as unknown as UserConfig);
+/** 测速链路（ProxyManager.buildSpeedTestConfig）硬传的固定 tag。 */
+const DR_SPEEDTEST = 'dns-direct';
 
 const wgServer = (over: Partial<ServerConfig> = {}): ServerConfig =>
   ({
@@ -204,6 +220,96 @@ describe('buildWireGuardEndpoint', () => {
   });
 });
 
+// ── IPv6-only（AAAA-only）域名节点修复：dial 侧结构化 domain_resolver ────────────────────────
+// 病因：关 IPv6 时顶层 dns.strategy=ipv4_only（#57，抑制**目标站点** AAAA）连带使内核对**节点域名**也从不发
+// AAAA 查询 → AAAA-only 域名节点解析不到地址、整个代理不可用。修复 = 节点 dial 侧单独下发结构化
+// `{ server, strategy:'prefer_ipv4' }`（per-outbound strategy 覆盖顶层，loopback 实证），顶层一字不动。
+//
+// 本组刻意按 **production 装配方式**组合（config → getNodeDialDomainResolver → builder），断言最终 config 形态——
+// 直接给 builder 喂手写形态只能验「透传」，验不到「关 IPv6 时到底发什么」这个修复对象本身。
+//
+// 为什么必须 toEqual（不得降级 toMatchObject / 属性点检）：`sing-box check` 对对象内**键名** typo 无牙
+// （实测 `stratgy:` 仍 exit=0 → strategy 被静默丢弃、修复静默失效），对**值**才有牙。键名逃逸的唯一杀手
+// 就是此处的精确形状深等断言。
+describe('domain_resolver 形态 — IPv6-only 域名节点修复（关 IPv6 时 dial 侧放宽 AAAA）', () => {
+  const tags = new Map<string, string>();
+  const domainNode = (over: Partial<ServerConfig> = {}): ServerConfig =>
+    ({
+      id: 'n',
+      name: 'N',
+      protocol: 'trojan',
+      address: 'node.v6only.test',
+      port: 443,
+      password: 'pw',
+      security: 'tls',
+      ...over,
+    }) as unknown as ServerConfig;
+
+  /** dnsConfig 缺省 = race on（isNodeRaceOn !== false）→ dial tag = dns-node-race。 */
+  const ipv6Cfg = (enableIPv6: boolean, over: Partial<UserConfig> = {}): UserConfig =>
+    ({
+      servers: [],
+      selectedServerId: null,
+      proxyMode: 'smart',
+      proxyModeType: 'tun',
+      enableIPv6,
+      ...over,
+    }) as unknown as UserConfig;
+
+  it('关 IPv6 + 域名节点 → outbound.domain_resolver 深等于 { server:<tag>, strategy:"prefer_ipv4" }', () => {
+    const ob = buildProxyOutbound(domainNode(), tags, getNodeDialDomainResolver(ipv6Cfg(false)));
+    // toEqual 深等：键名 typo（stratgy/Strategy）、多余键、strategy 值改回 ipv4_only 均在此处死。
+    expect(ob.domain_resolver).toEqual({ server: 'dns-node-race', strategy: 'prefer_ipv4' });
+  });
+
+  it('关 IPv6 + race off（单上游档 auto）→ 换的只是 server tag，strategy 包裹层不变（档位与修复正交）', () => {
+    const ob = buildProxyOutbound(
+      domainNode(),
+      tags,
+      getNodeDialDomainResolver(
+        ipv6Cfg(false, { dnsConfig: { resolveNodeDomainsAhead: false } } as Partial<UserConfig>)
+      )
+    );
+    expect(ob.domain_resolver).toEqual({ server: 'dns-bootstrap', strategy: 'prefer_ipv4' });
+  });
+
+  it('开 IPv6 → 回字符串 tag（顶层已 prefer_ipv4，结构化冗余；该分支 config 字节零变化）', () => {
+    const ob = buildProxyOutbound(domainNode(), tags, getNodeDialDomainResolver(ipv6Cfg(true)));
+    // 条件反转（=true 结构化 / =false 字符串）在此与上面两条一起被封死。
+    expect(ob.domain_resolver).toBe('dns-node-race');
+  });
+
+  it('IP 字面量节点 → 形态与域名节点一致（builder 不按地址类型分叉；IP 直拨不经 DNS，无行为影响）', () => {
+    const ob = buildProxyOutbound(
+      domainNode({ address: '198.51.100.9' }),
+      tags,
+      getNodeDialDomainResolver(ipv6Cfg(false))
+    );
+    expect(ob.server).toBe('198.51.100.9'); // 不烧 IP/不改写
+    expect(ob.domain_resolver).toEqual({ server: 'dns-node-race', strategy: 'prefer_ipv4' });
+  });
+
+  // M5：只改 buildProxyOutbound 漏改 buildWireGuardEndpoint —— 域名 peer 的 WG endpoint 同病同修。
+  it('WG 域名 endpoint + 关 IPv6 → endpoint.domain_resolver 深等于 { server:<tag>, strategy:"prefer_ipv4" }', () => {
+    const ep = buildWireGuardEndpoint(wgServer(), 'WG', getNodeDialDomainResolver(ipv6Cfg(false)));
+    expect(ep.domain_resolver).toEqual({ server: 'dns-node-race', strategy: 'prefer_ipv4' });
+  });
+
+  it('WG 域名 endpoint + 开 IPv6 → 字符串 tag', () => {
+    const ep = buildWireGuardEndpoint(wgServer(), 'WG', getNodeDialDomainResolver(ipv6Cfg(true)));
+    expect(ep.domain_resolver).toBe('dns-node-race');
+  });
+
+  it('WG IP 字面量 peer + 关 IPv6 → 仍不下发 domain_resolver（IP 直拨无需解析，结构化形态不误触发发射）', () => {
+    const ep = buildWireGuardEndpoint(
+      wgServer({ address: '162.159.192.1' }),
+      'WG',
+      getNodeDialDomainResolver(ipv6Cfg(false))
+    );
+    expect(ep.domain_resolver).toBeUndefined();
+  });
+});
+
 describe('isNodeUsable', () => {
   it('非 naive → 恒可用', () => {
     expect(isNodeUsable({ protocol: 'vless' } as ServerConfig)).toBe(true);
@@ -298,7 +404,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
         password: 'p',
         tuicSettings: { udpRelayMode: 'native', zeroRttHandshake: true, heartbeat: '12s' },
       }),
-      tags
+      tags,
+      DR_V6_OFF
     ) as any;
     expect(ob.zero_rtt_handshake).toBe(true);
     expect(ob.heartbeat).toBe('12s');
@@ -312,7 +419,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
         password: 'p',
         tuicSettings: { zeroRttHandshake: false },
       }),
-      tags
+      tags,
+      DR_V6_ON
     ) as any;
     expect(ob.zero_rtt_handshake).toBe(false);
     expect(ob.heartbeat).toBeUndefined();
@@ -330,7 +438,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
           minIdleSession: 0,
         },
       }),
-      tags
+      tags,
+      DR_SPEEDTEST
     ) as any;
     expect(ob.idle_session_check_interval).toBe('30s');
     expect(ob.idle_session_timeout).toBe('60s');
@@ -350,7 +459,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
           idleSessionTimeout: '8000', // 纯数字串
         },
       }),
-      tags
+      tags,
+      DR_V6_OFF
     ) as any;
     expect(ob.idle_session_check_interval).toBe('5000ms');
     expect(ob.idle_session_timeout).toBe('8000ms');
@@ -364,7 +474,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
         password: 'p',
         tuicSettings: { heartbeat: 10000 as unknown as string },
       }),
-      tags
+      tags,
+      DR_V6_ON
     ) as any;
     expect(ob.heartbeat).toBe('10000ms');
   });
@@ -380,7 +491,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
           clientVersion: 'SSH-2.0-OpenSSH_9.0',
         },
       }),
-      tags
+      tags,
+      DR_SPEEDTEST
     ) as any;
     expect(ob.host_key_algorithms).toEqual(['ssh-ed25519', 'rsa-sha2-256']);
     expect(ob.client_version).toBe('SSH-2.0-OpenSSH_9.0');
@@ -400,7 +512,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
           kexAlgorithm: ['curve25519-sha256'],
         },
       }),
-      tags
+      tags,
+      DR_V6_OFF
     ) as any;
     expect(ob.cipher).toEqual(['aes128-gcm@openssh.com', 'chacha20-poly1305@openssh.com']);
     expect(ob.mac).toEqual(['hmac-sha2-256']);
@@ -414,7 +527,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
         port: 22,
         sshSettings: { user: 'root', cipher: [], mac: [], kexAlgorithm: [] },
       }),
-      tags
+      tags,
+      DR_V6_ON
     ) as any;
     expect(ob.cipher).toBeUndefined();
     expect(ob.mac).toBeUndefined();
@@ -430,7 +544,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
         password: 'psk-secret',
         snellSettings: { version: 4, obfsMode: 'http' },
       }),
-      tags
+      tags,
+      DR_SPEEDTEST
     ) as any;
     expect(ob.type).toBe('snell');
     expect(ob.version).toBe(4);
@@ -448,7 +563,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
         password: 'p',
         snellSettings: { version: 4, obfsMode: 'http', obfsHost: 'cdn.example.com' },
       }),
-      tags
+      tags,
+      DR_V6_OFF
     ) as any;
     expect(ob.obfs_host).toBe('cdn.example.com');
   });
@@ -456,13 +572,15 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
   it('snell v4 + obfs none/缺省 → 不下发 obfs_*', () => {
     const ob = buildProxyOutbound(
       node({ protocol: 'snell', password: 'p', snellSettings: { version: 4, obfsMode: 'none' } }),
-      tags
+      tags,
+      DR_V6_ON
     ) as any;
     expect(ob.obfs_mode).toBeUndefined();
     expect(ob.obfs_host).toBeUndefined();
     const ob2 = buildProxyOutbound(
       node({ protocol: 'snell', password: 'p', snellSettings: { version: 4 } }),
-      tags
+      tags,
+      DR_SPEEDTEST
     ) as any;
     expect(ob2.obfs_mode).toBeUndefined();
   });
@@ -470,13 +588,15 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
   it('snell v6 default/缺省 → 不下发 mode；unsafe-raw → 下发；v6 忽略 obfs_*（脏字段防线）', () => {
     const ob = buildProxyOutbound(
       node({ protocol: 'snell', password: 'p', snellSettings: { version: 6, mode: 'default' } }),
-      tags
+      tags,
+      DR_V6_OFF
     ) as any;
     expect(ob.version).toBe(6);
     expect(ob.mode).toBeUndefined();
     const raw = buildProxyOutbound(
       node({ protocol: 'snell', password: 'p', snellSettings: { version: 6, mode: 'unsafe-raw' } }),
-      tags
+      tags,
+      DR_V6_ON
     ) as any;
     expect(raw.mode).toBe('unsafe-raw');
     // 脏数据（v6 却带 obfs 字段，手改/导入残留）→ 构建侧不下发 obfs_*
@@ -486,7 +606,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
         password: 'p',
         snellSettings: { version: 6, obfsMode: 'http', obfsHost: 'x.com' } as any,
       }),
-      tags
+      tags,
+      DR_SPEEDTEST
     ) as any;
     expect(dirty.obfs_mode).toBeUndefined();
     expect(dirty.obfs_host).toBeUndefined();
@@ -495,7 +616,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
   it('snell：reuse/network/userkey 条件下发（false/both/空 = 省略）', () => {
     const minimal = buildProxyOutbound(
       node({ protocol: 'snell', password: 'p', snellSettings: { version: 4 } }),
-      tags
+      tags,
+      DR_V6_OFF
     ) as any;
     expect(minimal.reuse).toBeUndefined();
     expect(minimal.network).toBeUndefined();
@@ -506,7 +628,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
         password: 'p',
         snellSettings: { version: 4, reuse: true, network: 'tcp', userkey: 'uk' },
       }),
-      tags
+      tags,
+      DR_V6_ON
     ) as any;
     expect(full.reuse).toBe(true);
     expect(full.network).toBe('tcp');
@@ -524,7 +647,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
           obfs: { type: 'salamander', password: 'o', minPacketSize: 100, maxPacketSize: 1200 },
         },
       }),
-      tags
+      tags,
+      DR_SPEEDTEST
     ) as any;
     expect(ob.obfs.type).toBe('salamander');
     expect(ob.obfs.password).toBe('o');
@@ -543,7 +667,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
           obfs: { type: 'gecko', password: 'o', minPacketSize: 100, maxPacketSize: 1200 },
         },
       }),
-      tags
+      tags,
+      DR_V6_OFF
     ) as any;
     expect(ob.obfs.type).toBe('gecko');
     expect(ob.obfs.min_packet_size).toBe(100);
@@ -558,7 +683,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
         security: 'tls',
         hysteria2Settings: { obfs: { type: 'gecko' } },
       }),
-      tags
+      tags,
+      DR_V6_ON
     ) as any;
     expect(ob.obfs).toBeUndefined();
   });
@@ -571,7 +697,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
         security: 'tls',
         hysteria2Settings: { bbrProfile: 'aggressive' },
       }),
-      tags
+      tags,
+      DR_SPEEDTEST
     ) as any;
     expect(ob.bbr_profile).toBe('aggressive');
   });
@@ -579,7 +706,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
   it('hysteria2：未设 obfs/bbrProfile → 均不下发（向后兼容）', () => {
     const ob = buildProxyOutbound(
       node({ protocol: 'hysteria2', password: 'pw', security: 'tls', hysteria2Settings: {} }),
-      tags
+      tags,
+      DR_V6_OFF
     ) as any;
     expect(ob.obfs).toBeUndefined();
     expect(ob.bbr_profile).toBeUndefined();
@@ -596,7 +724,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
           security: 'tls',
           tlsSettings: { serverName: 'a.com', engine: 'windows' },
         }),
-        tags
+        tags,
+        DR_V6_ON
       ) as any;
     try {
       Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
@@ -617,7 +746,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
         security: 'tls',
         tlsSettings: { serverName: 'a.com', engine: 'go' },
       }),
-      tags
+      tags,
+      DR_SPEEDTEST
     ) as any;
     expect(goOb.tls.engine).toBeUndefined();
     const noneOb = buildProxyOutbound(
@@ -627,7 +757,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
         security: 'tls',
         tlsSettings: { serverName: 'a.com' },
       }),
-      tags
+      tags,
+      DR_V6_OFF
     ) as any;
     expect(noneOb.tls.engine).toBeUndefined();
   });
@@ -640,7 +771,8 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
         security: 'tls',
         tlsSettings: { serverName: 'a.com', engine: 'apple' },
       }),
-      tags
+      tags,
+      DR_V6_ON
     ) as any;
     expect(ob.tls?.engine).toBeUndefined();
   });
@@ -648,19 +780,22 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
   it('未设置这些可选项 → 不下发（向后兼容）', () => {
     const tuic = buildProxyOutbound(
       node({ protocol: 'tuic', uuid: 'u', password: 'p', tuicSettings: {} }),
-      tags
+      tags,
+      DR_SPEEDTEST
     ) as any;
     expect(tuic.zero_rtt_handshake).toBeUndefined();
     expect(tuic.heartbeat).toBeUndefined();
     const ssh = buildProxyOutbound(
       node({ protocol: 'ssh', port: 22, sshSettings: { user: 'root' } }),
-      tags
+      tags,
+      DR_V6_OFF
     ) as any;
     expect(ssh.host_key_algorithms).toBeUndefined();
     expect(ssh.client_version).toBeUndefined();
     const anytls = buildProxyOutbound(
       node({ protocol: 'anytls', password: 'p', security: 'tls', anyTlsSettings: {} }),
-      tags
+      tags,
+      DR_V6_ON
     ) as any;
     expect(anytls.idle_session_check_interval).toBeUndefined();
     expect(anytls.min_idle_session).toBeUndefined();
@@ -689,7 +824,8 @@ describe('buildProxyOutbound — http(H2)/gRPC 传输生成', () => {
         network: 'http',
         httpSettings: { path: '/h2', host: ['a.com', 'b.com'] },
       }),
-      tags
+      tags,
+      DR_SPEEDTEST
     );
     expect(ob.transport).toEqual({ type: 'http', host: ['a.com', 'b.com'], path: '/h2' });
   });
@@ -697,7 +833,8 @@ describe('buildProxyOutbound — http(H2)/gRPC 传输生成', () => {
   it('http 无 httpSettings：仍生成 http 传输（path 默认 /），不回退裸 TCP', () => {
     const ob = buildProxyOutbound(
       node({ protocol: 'vless', uuid: 'u', security: 'tls', network: 'http' }),
-      tags
+      tags,
+      DR_V6_OFF
     );
     expect(ob.transport?.type).toBe('http');
     expect(ob.transport?.path).toBe('/');
@@ -712,7 +849,8 @@ describe('buildProxyOutbound — http(H2)/gRPC 传输生成', () => {
         network: 'grpc',
         grpcSettings: { serviceName: 'GunSvc' },
       }),
-      tags
+      tags,
+      DR_V6_ON
     );
     expect(ob.transport).toEqual({ type: 'grpc', service_name: 'GunSvc' });
   });
@@ -720,7 +858,8 @@ describe('buildProxyOutbound — http(H2)/gRPC 传输生成', () => {
   it('network=tcp：无 transport', () => {
     const ob = buildProxyOutbound(
       node({ protocol: 'vless', uuid: 'u', security: 'tls', network: 'tcp' }),
-      tags
+      tags,
+      DR_SPEEDTEST
     );
     expect(ob.transport).toBeUndefined();
   });
@@ -737,7 +876,8 @@ describe('buildProxyOutbound — http(H2)/gRPC 传输生成', () => {
         security: 'tls',
         network: 'h2',
       } as unknown as ServerConfig,
-      tags
+      tags,
+      DR_V6_OFF
     );
     expect(ob.transport?.type).toBe('http');
   });
@@ -832,7 +972,8 @@ describe('buildProxyOutbound — TLS spoof（P3a 抗审查）', () => {
           spoofMethod: 'wrong-ack',
         },
       }),
-      tags
+      tags,
+      DR_V6_ON
     ) as any;
     expect(ob.tls.server_name).toBe('real.example.com');
     expect(ob.tls.spoof).toBe('decoy.microsoft.com'); // 诱饵，非真 SNI
@@ -851,7 +992,8 @@ describe('buildProxyOutbound — TLS spoof（P3a 抗审查）', () => {
           spoofMethod: 'wrong-timestamp',
         },
       }),
-      tags
+      tags,
+      DR_SPEEDTEST
     ) as any;
     expect(ob.tls.spoof).toBeUndefined();
     expect(ob.tls.spoof_method).toBeUndefined();
@@ -869,7 +1011,8 @@ describe('buildProxyOutbound — TLS spoof（P3a 抗审查）', () => {
           spoofMethod: 'wrong-ack',
         },
       }),
-      tags
+      tags,
+      DR_V6_OFF
     ) as any;
     expect(ob.tls.spoof).toBeUndefined();
     expect(ob.tls.spoof_method).toBeUndefined();
@@ -887,7 +1030,8 @@ describe('buildProxyOutbound — TLS spoof（P3a 抗审查）', () => {
           spoofMethod: 'wrong-ack',
         },
       }),
-      tags
+      tags,
+      DR_V6_ON
     ) as any;
     expect(ob.tls.server_name).toBe('198.51.100.7'); // 回退为 IP 字面量
     expect(ob.tls.spoof).toBeUndefined();
@@ -907,7 +1051,8 @@ describe('buildProxyOutbound — TLS spoof（P3a 抗审查）', () => {
           spoofMethod: 'wrong-ack',
         },
       }),
-      tags
+      tags,
+      DR_SPEEDTEST
     ) as any;
     expect(ob.tls.server_name).toBe('real.example.com');
     expect(ob.tls.spoof).toBe('decoy.microsoft.com');
@@ -922,7 +1067,8 @@ describe('buildProxyOutbound — TLS spoof（P3a 抗审查）', () => {
         security: 'tls',
         tlsSettings: { serverName: 'real.example.com', spoofMethod: 'wrong-ack' },
       }),
-      tags
+      tags,
+      DR_V6_OFF
     ) as any;
     expect(ob.tls.spoof).toBeUndefined();
     expect(ob.tls.spoof_method).toBeUndefined();
@@ -940,7 +1086,8 @@ describe('buildProxyOutbound — TLS spoof（P3a 抗审查）', () => {
           spoofMethod: 'wrong-ack',
         },
       }),
-      tags
+      tags,
+      DR_V6_ON
     ) as any;
     expect(ob.tls?.spoof).toBeUndefined();
     expect(ob.tls?.spoof_method).toBeUndefined();
@@ -954,7 +1101,8 @@ describe('buildProxyOutbound — TLS spoof（P3a 抗审查）', () => {
         security: 'tls',
         tlsSettings: { serverName: 'a.com' },
       }),
-      tags
+      tags,
+      DR_SPEEDTEST
     ) as any;
     expect(ob.tls.spoof).toBeUndefined();
     expect(ob.tls.spoof_method).toBeUndefined();
@@ -975,7 +1123,8 @@ describe('buildProxyOutbound — TLS spoof（P3a 抗审查）', () => {
             spoofMethod: 'wrong-ack',
           },
         }),
-        tags
+        tags,
+        DR_V6_OFF
       ) as any;
       expect(ob.tls.spoof).toBeUndefined();
       expect(ob.tls.spoof_method).toBeUndefined();

@@ -208,7 +208,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -1502,7 +1505,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -2159,7 +2165,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -2768,7 +2777,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-node",
+        "domain_resolver": {
+          "server": "dns-node",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -3364,7 +3376,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -3919,7 +3934,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -4474,7 +4492,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -5036,7 +5057,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -5670,7 +5694,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "password": "pw",
         "server": "a.example.com",
         "server_port": 443,
@@ -6300,7 +6327,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "password": "pw",
         "server": "a.example.com",
         "server_port": 443,
@@ -6963,7 +6993,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "password": "pw",
         "server": "a.example.com",
         "server_port": 443,
@@ -7563,7 +7596,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
         "address": [
           "10.0.0.2/32",
         ],
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "mtu": 1408,
         "peers": [
           {
@@ -8208,7 +8244,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -8889,7 +8928,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -9476,7 +9518,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -10087,7 +10132,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "method": "aes-256-gcm",
         "password": "sspw",
         "server": "a.example.com",
@@ -10671,7 +10719,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -11290,7 +11341,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "password": "p",
         "quic": true,
         "server": "a.example.com",
@@ -11940,7 +11994,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -12565,7 +12622,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -13176,7 +13236,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -13817,7 +13880,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     "outbounds": [
       {
         "client_version": "SSH-2.0-FlowZ",
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "host_key": [
           "ssh-ed25519 AAA",
         ],
@@ -14436,7 +14502,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -15047,7 +15116,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -15066,7 +15138,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
       },
       {
         "alter_id": 0,
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "security": "auto",
         "server": "a.example.com",
@@ -15668,7 +15743,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -16095,7 +16173,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -16716,7 +16797,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -16740,7 +16824,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
       },
       {
         "detour": "stls-out-st",
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "method": "aes-256-gcm",
         "password": "p",
         "server": "a.example.com",
@@ -17383,7 +17470,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -18020,7 +18110,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -18646,7 +18739,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -19257,7 +19353,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -19875,7 +19974,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -20493,7 +20595,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -21077,7 +21182,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "down_mbps": 500,
         "network": "udp",
         "obfs": {
@@ -21099,7 +21207,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
       },
       {
         "congestion_control": "bbr",
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "password": "p",
         "server": "a.example.com",
         "server_port": 443,
@@ -21116,7 +21227,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
       },
       {
         "alter_id": 0,
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "security": "auto",
         "server": "a.example.com",
@@ -21126,7 +21240,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
         "uuid": "uuid-1",
       },
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "idle_session_timeout": "30s",
         "password": "p",
         "server": "a.example.com",
@@ -21145,7 +21262,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
         "type": "anytls",
       },
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "obfs_host": "bing.com",
         "obfs_mode": "http",
         "psk": "psk",
@@ -21157,7 +21277,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
         "version": 4,
       },
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "mode": "unsafe-raw",
         "network": "tcp",
         "psk": "psk",
@@ -21169,7 +21292,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
         "version": 6,
       },
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "password": "p",
         "server": "a.example.com",
         "server_port": 443,
@@ -21179,7 +21305,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
         "version": "5",
       },
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "password": "p",
         "server": "a.example.com",
         "server_port": 443,
@@ -21804,7 +21933,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -21813,7 +21945,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
         "uuid": "uuid-1",
       },
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "packet_encoding": "xudp",
         "server": "a.example.com",
         "server_port": 443,
@@ -22426,7 +22561,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
     },
     "outbounds": [
       {
-        "domain_resolver": "dns-bootstrap",
+        "domain_resolver": {
+          "server": "dns-bootstrap",
+          "strategy": "prefer_ipv4",
+        },
         "multiplex": {
           "enabled": true,
           "max_connections": 4,

@@ -151,6 +151,41 @@ describe('buildDnsConfig — P4b Tailscale 按名解析', () => {
   });
 });
 
+/**
+ * #57 守门：顶层 dns.strategy 随 enableIPv6 收敛，且 **IPv6-only 域名节点的修复不得殃及目标站点侧**。
+ *
+ * 关 IPv6 → `ipv4_only`：抑制**目标站点** AAAA，杜绝「双栈站 + 节点无 v6」时浏览器试 v6 失败又不回落 v4
+ * （TUN 本地握手骗过 Happy Eyeballs → ERR_CONNECTION_CLOSED，issue #57）。
+ * IPv6-only **节点**的修复走 dial 侧 per-outbound `domain_resolver.strategy`（两个解析面在 1.14 可分离），
+ * 顶层这里**一个字节不动**——顺手把它改成 prefer_ipv4 就等于把 #57 的收益丢了。
+ *
+ * 为什么要显式断言而非靠 config-snapshot：快照是隐式覆盖，基线可被一次 `jest -u` 整体重录接受（改坏了也“绿”）；
+ * 显式断言才是不可绕的牙。正反两向都锁，防「恒 ipv4_only」式的另一种误修。
+ */
+describe('buildDnsConfig — #57 顶层 dns.strategy（节点侧修复不得殃及目标站点侧）', () => {
+  const strategyCfg = (over: Record<string, unknown>): UserConfig =>
+    ({
+      servers: [],
+      selectedServerId: null,
+      proxyMode: 'global',
+      proxyModeType: 'tun',
+      dnsConfig: { enableFakeIp: false },
+      ...over,
+    }) as unknown as UserConfig;
+
+  it('enableIPv6=false → dns.strategy === "ipv4_only"（#57 目标站点侧 AAAA 抑制保留）', () => {
+    expect(build(strategyCfg({ enableIPv6: false })).strategy).toBe('ipv4_only');
+  });
+
+  it('未设 enableIPv6（默认关）→ 同样 "ipv4_only"（默认配置即 #57 保护态）', () => {
+    expect(build(strategyCfg({})).strategy).toBe('ipv4_only');
+  });
+
+  it('enableIPv6=true → dns.strategy === "prefer_ipv4"（反向锚点，防被改成恒 ipv4_only）', () => {
+    expect(build(strategyCfg({ enableIPv6: true })).strategy).toBe('prefer_ipv4');
+  });
+});
+
 describe('根治 §3.6：dns-bootstrap-udp 已删 + DoH server 域名解析改 IP-DoH', () => {
   it('dns.servers 无 dns-bootstrap-udp；DoH server 域名(doh.pub)解析 rule 用 dns-bootstrap(IP-DoH 非 UDP53)', () => {
     const dns = build(baseConfig([tsNode()], 'ts1'));

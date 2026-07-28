@@ -497,7 +497,7 @@
     },
     "network": {
       "connection": "連線",
-      "enableIPv6Desc": "啟用全域 IPv6 解析及路由；節點不支援時可能假死，不建議開啟",
+      "enableIPv6Desc": "影響目標網站的 IPv6 存取；代理節點自身的 IPv6 解析不受此開關限制",
       "ipv6NodeFakeIpHint": "若節點不支援 IPv6，部分網站可能無法存取；建議開啟 FakeIP。",
       "enableFakeIpAction": "開啟 FakeIP",
       "updateAndSpeedTest": "更新與測速",

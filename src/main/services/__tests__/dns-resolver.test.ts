@@ -33,6 +33,7 @@ jest.mock('electron', () => ({
 
 import { ProxyManager } from '../ProxyManager';
 import { ProxyErrorCode } from '../../../shared/types';
+import type { ServerConfig, UserConfig } from '../../../shared/types';
 import {
   buildFixtures,
   extractDnsRoute,
@@ -97,10 +98,21 @@ describe('#57 节点域名解析器：生成配置断言（3档×3模式）', ()
         expect(node.path).toBe('/dns-query');
       });
 
-      it('① 节点 outbound.domain_resolver == 期望 tag', () => {
+      // 夹具恒 enableIPv6:false → dial 侧下发结构化 { server:<档位 tag>, strategy:'prefer_ipv4' }：
+      // 顶层 dns.strategy=ipv4_only（#57，抑制目标站点 AAAA）会连带让内核对**节点域名**也不发 AAAA
+      // → AAAA-only 域名节点整个代理不可用；per-outbound strategy 覆盖顶层即修复，档位 tag 一字不动。
+      // toEqual 锁精确形状：sing-box check 对对象内键名 typo 无牙（`stratgy:` 实测 exit=0），只有这里能杀。
+      it('① 节点 outbound.domain_resolver == { server:期望 tag, strategy:prefer_ipv4 }（关 IPv6）', () => {
         const obs = nodeOutbounds(cfg);
         expect(obs.length).toBeGreaterThanOrEqual(3);
-        for (const o of obs) expect(o.domain_resolver).toBe(fx.expectDialTag);
+        for (const o of obs) {
+          expect(o.domain_resolver).toEqual({ server: fx.expectDialTag, strategy: 'prefer_ipv4' });
+        }
+      });
+
+      it('①′ 开 IPv6 → 回字符串 tag（顶层已 prefer_ipv4，结构化冗余；该分支形态零变化）', () => {
+        const v6 = pm.generateSingBoxConfig({ ...fx.config, enableIPv6: true }) as AnyCfg;
+        for (const o of nodeOutbounds(v6)) expect(o.domain_resolver).toBe(fx.expectDialTag);
       });
 
       it('③ rule1 含全部节点域名、不含 IP 字面量、不含 domain_keyword', () => {
@@ -131,6 +143,112 @@ describe('#57 节点域名解析器：生成配置断言（3档×3模式）', ()
       });
     });
   }
+});
+
+// ── race on（生产默认形态）：dns-node-race 装配面 + domain_resolver 引用闭合 ─────────────────────
+// 为什么必须在**纯单测**里补（门审查 §2.2 实证的覆盖洞）：全仓唯一把 raceServerPort 设 >0 的测试是
+// singbox-check-gate.test.ts，而它依赖随包内核、只在本机/打包链路跑 → **生产默认形态（race on）的整机装配面，
+// 以及 `domain_resolver.server → dns.servers[].tag` 的跨字段引用完整性，在 CI 上零覆盖**。
+// 实证逃逸（变异 M7-dns）：把 buildDnsConfig emit 的 dns-node-race tag 改名、dial 侧一字不动 → 全量单测 +
+// snapshot 全绿放行，只有本机 `sing-box check` 才红（内核 FATAL `domain resolver not found`）。
+// 本组把那条闭环降解成纯 JS 断言（生成 config → 取 domain_resolver.server → 断言 ∈ dns.servers[].tag），
+// 不需内核、不碰网络、跨平台恒有效。
+describe('#147 race on：dns-node-race 装配面 + domain_resolver 引用闭合（纯 JS，跨平台）', () => {
+  const RACE_PORT = 15353;
+  const EXPECTED_DIAL = { server: 'dns-node-race', strategy: 'prefer_ipv4' };
+
+  /** 域名 peer 的 WG 节点：endpoint 侧与 outbound 同口径（只改 outbound 漏改 endpoint 的 M5 在此可见）。 */
+  const NODE_WG = {
+    id: 'node-wg',
+    name: 'WG 节点',
+    protocol: 'wireguard',
+    address: 'wg.example-argo.com',
+    port: 51820,
+    wireguardSettings: {
+      privateKey: 'cHJpdmtleQ==',
+      peerPublicKey: 'cHVia2V5',
+      localAddress: ['10.0.0.2/32'],
+    },
+  } as unknown as ServerConfig;
+
+  /** racePort>0 = race server 已就绪（生产默认）；0 = 未就绪 → withRaceOff 强制单上游档。 */
+  function genWith(racePort: number): AnyCfg {
+    const pm = new ProxyManager();
+    (pm as any).raceServerPort = racePort;
+    const fx = buildFixtures().find((f) => f.name === 'tun-smart__auto')!;
+    const cfg = { ...fx.config, servers: [...fx.config.servers, NODE_WG] } as UserConfig;
+    return pm.generateSingBoxConfig(cfg) as AnyCfg;
+  }
+
+  const dnsTags = (c: AnyCfg): string[] => ((c.dns?.servers ?? []) as AnyCfg[]).map((s) => s.tag);
+  /** 全部下发了 domain_resolver 的载体 + 它引用的 server tag（字符串形态与结构化形态统一取 tag）。 */
+  function resolverRefs(c: AnyCfg): { where: string; tag: string }[] {
+    const refs: { where: string; tag: string }[] = [];
+    const push = (where: string, dr: unknown): void => {
+      if (dr === undefined || dr === null) return;
+      refs.push({ where, tag: typeof dr === 'string' ? dr : (dr as AnyCfg).server });
+    };
+    for (const o of (c.outbounds ?? []) as AnyCfg[]) push(`outbound:${o.tag}`, o.domain_resolver);
+    for (const e of (c.endpoints ?? []) as AnyCfg[]) push(`endpoint:${e.tag}`, e.domain_resolver);
+    for (const s of (c.dns?.servers ?? []) as AnyCfg[])
+      push(`dns-server:${s.tag}`, s.domain_resolver);
+    push('route.default_domain_resolver', c.route?.default_domain_resolver);
+    return refs;
+  }
+
+  describe('race server 就绪（raceServerPort>0，生产默认路径）', () => {
+    const cfg = genWith(RACE_PORT);
+
+    it('dns.servers 生成 dns-node-race（udp 127.0.0.1:<racePort>，loopback 不进 TUN、口非 53 不被 hijack）', () => {
+      const race = ((cfg.dns.servers ?? []) as AnyCfg[]).filter((s) => s.tag === 'dns-node-race');
+      expect(race).toHaveLength(1); // 恰一条：重复 tag 会致内核 FATAL
+      expect(race[0]).toEqual({
+        tag: 'dns-node-race',
+        type: 'udp',
+        server: '127.0.0.1',
+        server_port: RACE_PORT,
+      });
+    });
+
+    it('节点 outbound.domain_resolver 全部深等 { server:dns-node-race, strategy:prefer_ipv4 }（关 IPv6）', () => {
+      const obs = nodeOutbounds(cfg);
+      expect(obs.length).toBeGreaterThanOrEqual(3);
+      for (const o of obs) expect(o.domain_resolver).toEqual(EXPECTED_DIAL);
+    });
+
+    it('域名 peer 的 WG endpoint.domain_resolver 与 outbound 同形态同 tag', () => {
+      const ep = ((cfg.endpoints ?? []) as AnyCfg[]).find((e) => e.tag === 'WG 节点');
+      expect(ep).toBeDefined();
+      expect(ep.domain_resolver).toEqual(EXPECTED_DIAL);
+    });
+
+    // 本条是 M7-dns 的杀手：DNS 侧改 emit 的 tag / dial 侧改引用，任一单边动都会在此断链。
+    it('引用闭合：所有 domain_resolver 引用的 tag ∈ dns.servers[].tag（无悬空引用）', () => {
+      const tags = new Set(dnsTags(cfg));
+      const refs = resolverRefs(cfg);
+      // 非空前提（否则「一个 domain_resolver 都不下发」的退化 config 也会平凡通过）：
+      // 必须真有载体引用到 race server，本断言才在射程内。
+      expect(refs.filter((r) => r.tag === 'dns-node-race').length).toBeGreaterThanOrEqual(2);
+      const dangling = refs.filter((r) => !tags.has(r.tag));
+      expect(dangling).toEqual([]);
+    });
+  });
+
+  // 反证（防「恒发射 race server」的平凡绿）：未就绪时既不生成也不引用，引用同样闭合。
+  // 这正是 snapshot/preflight/诊断等非运行路径的形态——引用与生成必须同进同退，否则内核 FATAL。
+  describe('race server 未就绪（raceServerPort=0）→ 不生成也不引用', () => {
+    const cfg = genWith(0);
+
+    it('dns.servers 不含 dns-node-race，且无任何 domain_resolver 引用它', () => {
+      expect(dnsTags(cfg)).not.toContain('dns-node-race');
+      expect(resolverRefs(cfg).filter((r) => r.tag === 'dns-node-race')).toEqual([]);
+    });
+
+    it('引用仍闭合（单上游档同样不得悬空）', () => {
+      const tags = new Set(dnsTags(cfg));
+      expect(resolverRefs(cfg).filter((r) => !tags.has(r.tag))).toEqual([]);
+    });
+  });
 });
 
 // 平台限定：baseline 为 Linux 捕获，而生成 config 含平台相关字段（如 Windows TUN inbound 的 route_exclude_address
@@ -230,8 +348,23 @@ byteDiffDescribe(
         expect(cur.routeDefaultDomainResolver).toBe(base.routeDefaultDomainResolver);
         expect(JSON.stringify(cur.inbounds)).toBe(JSON.stringify(base.inbounds));
 
-        // --- F. 节点 outbound resolver 在 auto 档零变化（仍 dns-bootstrap） ---
-        expect(JSON.stringify(cur.outboundResolvers)).toBe(JSON.stringify(base.outboundResolvers));
+        // --- F. 节点 outbound resolver：**tag 与基线逐个不变**，唯一 delta = 关 IPv6 时外包一层
+        //        strategy:'prefer_ipv4'（IPv6-only 域名节点修复：per-outbound strategy 覆盖顶层 ipv4_only，
+        //        让内核对节点域名发出 AAAA；顶层 dns.strategy 一字不动，见上方 C 段零变化断言）。
+        //        基线 JSON 保持 frozen（改前字节）——delta 写成显式「包裹」而不是重录基线：换了 tag、换了
+        //        strategy 值、键名 typo、少包或多包一层，都在此死。
+        const wrapped = (base.outboundResolvers as AnyCfg[]).map((o) => ({
+          ...o,
+          domain_resolver: { server: o.domain_resolver, strategy: 'prefer_ipv4' },
+        }));
+        expect(JSON.stringify(cur.outboundResolvers)).toBe(JSON.stringify(wrapped));
+
+        // --- F′. 开 IPv6 分支：节点 resolver **逐字节回到 frozen 基线原样字符串**（该分支零变化）。
+        //         条件反转（=true 结构化 / =false 字符串）在此与 F 一起被封死。
+        const v6on = extractDnsRoute(
+          pm.generateSingBoxConfig({ ...fx.config, enableIPv6: true } as AnyCfg)
+        );
+        expect(JSON.stringify(v6on.outboundResolvers)).toBe(JSON.stringify(base.outboundResolvers));
       });
     }
   }
