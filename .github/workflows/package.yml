@@ -91,14 +91,31 @@ jobs:
 
       # PR 冒烟：完整 prep（helper 编译 + 资产 fetch + build）+ `electron-builder --dir`——验证打包链能过，
       # 跳过 nsis/portable/压缩/签名/上传（省 PR 时长且语义诚实：冒烟就是冒烟，不假装出安装包）。
+      #
+      # ⚠️ 各行之间的 `&&` 不可删（两处实测踩坑，都别再踩回去）：
+      #
+      # 1) 多行 run 块在 **Windows 上默认走 pwsh**，原生命令的非零退出码既不中断脚本、也不决定步骤成败
+      #    ——步骤退出码只取**最后一条**命令。后果（PR #342 → run 30936437582）：`fetch:cronet` 已打印
+      #    `0 ready, 2 failed` 并退 1，却被随后 `electron-builder --dir` 的 0 覆盖，该步骤报 SUCCESS、
+      #    PR 全绿合入；缺陷直到 main push 跑单命令 `npm run package:win` 才炸出来。即这块冒烟当时对
+      #    「资产 fetch 失败」是零信息量的绿——比没有这道门更糟，它给了「已验证过」的错觉。
+      #
+      # 2) 但**不能改用 `shell: bash` 来拿 `-e`**：换 shell 会连带换掉工具解析。实测（run 30966966135）
+      #    pwsh 下 `tar` 取到 Windows 自带 `system32\tar.exe`（bsdtar，认 `C:\...` 路径），而 Git-bash 下
+      #    PATH 里 GNU tar 优先，它把 `C:\Users\...` 当成 `host:path` 远程语法 → `Cannot connect to C:
+      #    resolve failed`，`fetch:core` 变成 1 ready / 3 failed。
+      #
+      # 故保持各平台默认 shell（Windows 侧与 main push 走 npm script 时的解析一致），改用 `&&` 串联拿
+      # fail-fast：pwsh 7 与 bash 都支持该操作符，前一条非零即短路，$LASTEXITCODE 由 GitHub 包装器带出。
+      # 新增多行 run 块时照此串联。
       - name: Package smoke (PR, --dir, no artifact)
         if: github.event_name == 'pull_request'
         run: |
-          npm run build:helper
-          npm run fetch:core
-          npm run fetch:cronet
-          npm run fetch:dashboard
-          npm run build
+          npm run build:helper &&
+          npm run fetch:core &&
+          npm run fetch:cronet &&
+          npm run fetch:dashboard &&
+          npm run build &&
           npx electron-builder --${{ matrix.platform }} --dir
 
       # main push / 手动：完整打包（与 release.yml 同源脚本，含正确 arch flag）。
