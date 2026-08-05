@@ -72,7 +72,10 @@ const CORE_VERSION = coreManifest.bundledCoreVersion;
 const CRONET_SHA = coreManifest.cronetArchiveSha256 || {}; // module zip 本体 sha256
 const CRONET_LIB_SHA = coreManifest.cronetLibSha256 || {}; // 落地库本体 sha256（skip 分支自证用）
 const PROXY = 'https://proxy.golang.org';
-const MODULE_BASE = `${PROXY}/github.com/sagernet/cronet-go/lib`;
+// module path（不含 proxy host）：既用于拼下载 URL，也用于拼 zip 内的条目名（Go module zip 布局固定为
+// `<module path>@<version>/<file>`）。两者同源，杜绝「URL 改了但解压路径没跟着改」。
+const MODULE_PATH = 'github.com/sagernet/cronet-go/lib';
+const MODULE_BASE = `${PROXY}/${MODULE_PATH}`;
 const FORCE = process.argv.includes('--force');
 // 新增外部 host（Google 网段，可达性与 github.com 不同）→ 显式超时，避免无代理环境下静默卡死数分钟。
 const CURL_TIMEOUTS = ['--connect-timeout', '15', '--max-time', '600'];
@@ -180,12 +183,19 @@ for (const t of pending) {
       throw new Error(`module zip sha256 不符：期望 ${want}，实得 ${got}（版本漂移 / 投毒 / 截断）`);
     }
 
-    // 只解目标文件并拍平路径（-j）：module zip 内为 `<module path>@<version>/` 多层前缀，`-j` 后直接落
-    // extractDir/<lib>。无匹配时 unzip 退 11 → execFileSync 抛 → 下方 catch 接住，仍 fail-closed。
-    // 同时避免顺带解出同目录 57MB 的 libcronet.a（本脚本不需要）。
+    // 只解目标文件并拍平路径（-j）：`-j` 后直接落 extractDir/<lib>；同时避免顺带解出同目录 57MB 的
+    // libcronet.a（本脚本不需要）。无匹配时 unzip 退 11 → execFileSync 抛 → 下方 catch 接住，仍 fail-closed。
+    //
+    // **条目名必须写全、不能用 `*/<lib>` 通配**：Go module zip 的布局由 golang.org/x/mod/zip 规定为
+    // `<module path>@<version>/<file>`（此处 module path 本身含 3 层斜杠，故条目深 4 层）。而 `*` 是否跨
+    // `/` 匹配是 unzip 的**实现相关行为**——Info-ZIP 在 Linux 上默认跨，Windows 端口默认编译
+    // WILD_STOP_AT_DIR（`*` 不跨 `/`）→ 同一条命令 Linux 通过、Windows runner 上 "filename not matched"
+    // 后 0 ready / 2 failed（实测：CI run 30964765672）。写全路径既绕开该差异，也把「取的到底是哪个条目」
+    // 变成显式断言：上游若改布局，这里立即 fail-closed，而不是靠通配悄悄匹配到别的文件。
+    const entry = `${MODULE_PATH}/${t.mod}@${CRONET_VERSION}/${t.lib}`;
     const extractDir = join(work, 'x');
     mkdirSync(extractDir, { recursive: true });
-    execFileSync('unzip', ['-q', '-o', '-j', archive, `*/${t.lib}`, '-d', extractDir], {
+    execFileSync('unzip', ['-q', '-o', '-j', archive, entry, '-d', extractDir], {
       stdio: 'inherit',
     });
     const libPath = join(extractDir, t.lib);
