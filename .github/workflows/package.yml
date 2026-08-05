@@ -91,8 +91,16 @@ jobs:
 
       # PR 冒烟：完整 prep（helper 编译 + 资产 fetch + build）+ `electron-builder --dir`——验证打包链能过，
       # 跳过 nsis/portable/压缩/签名/上传（省 PR 时长且语义诚实：冒烟就是冒烟，不假装出安装包）。
+      #
+      # ⚠️ `shell: bash` 不可删：多行 run 块在 **Windows 上默认走 pwsh**，原生命令的非零退出码既不中断
+      # 脚本、也不决定步骤成败——步骤退出码只取**最后一条**命令。实测后果（PR #342 → run 30936437582）：
+      # `fetch:cronet` 已打印 `0 ready, 2 failed` 并退 1，却被后续 `electron-builder --dir` 的 0 覆盖，
+      # 该步骤报 SUCCESS、PR 全绿合入，缺陷直到 main push 跑单命令 `npm run package:win` 才炸出来。
+      # 即这块冒烟当时对「资产 fetch 失败」是零信息量的绿。GitHub 的 bash 默认带 `-eo pipefail`，中间
+      # 任一条失败即整步失败，这正是冒烟该有的语义。新增多行 run 块时同样要显式指定。
       - name: Package smoke (PR, --dir, no artifact)
         if: github.event_name == 'pull_request'
+        shell: bash
         run: |
           npm run build:helper
           npm run fetch:core
