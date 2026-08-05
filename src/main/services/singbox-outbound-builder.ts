@@ -264,6 +264,16 @@ export function buildProxyOutbound(
       outbound.bbr_profile = server.hysteria2Settings.bbrProfile;
     }
 
+    // 关闭 Chrome QUIC 指纹拟态（sing-box 1.14 disable_chrome_parrot，默认 false=拟态开启）。
+    // **仅在用户显式开启时下发 true**，缺省/false 一律省略——省略即上游默认，抗指纹能力白拿，
+    // 且未来上游若改默认或改语义，FlowZ 不会因为写死了一个 false 而把自己钉在旧行为上。
+    // 存在的唯一理由是逃生门：拟态照搬 Chrome 的 QUIC 参数，而 Chrome 不声明支持 Ed25519 →
+    // 服务端用 Ed25519 证书的 hy2 节点会直接握手失败（上游 release note 明列）。那种场景下用户
+    // 除了关掉拟态没有别的自救手段，症状还是「连不上」这种最难自查的形态。
+    if (server.hysteria2Settings?.disableChromeParrot === true) {
+      outbound.disable_chrome_parrot = true;
+    }
+
     // 网络类型 (tcp/udp)
     if (server.hysteria2Settings?.network) {
       outbound.network = server.hysteria2Settings.network;

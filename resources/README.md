@@ -32,10 +32,10 @@ resources/
 > 说明：`data/` geo 规则集、图标与 `LICENSE` **入库**；`sing-box` 二进制、`libcronet.*`、`dashboard/`、
 > `com.flowz.helper{,.exe}` 体积大或属构建产物 **不入库**，由下列命令在开发/CI 现拉现编后随 `resources/` 一起打包：
 >
-> - `npm run fetch:core`     → 各平台 `sing-box[.exe]`（SagerNet 官方 release，按 core-manifest.json 的 `bundledCoreVersion` 拉、`coreArchiveSha256` 校验压缩包）
-> - `npm run fetch:cronet`   → 各平台 `libcronet.*`（NaïveProxy/cronet，运行时 dlopen）
+> - `npm run fetch:core` → 各平台 `sing-box[.exe]`（SagerNet 官方 release，按 core-manifest.json 的 `bundledCoreVersion` 拉、`coreArchiveSha256` 校验压缩包）
+> - `npm run fetch:cronet` → 各平台 `libcronet.*`（NaïveProxy/cronet，运行时 dlopen）
 > - `npm run fetch:dashboard`→ `dashboard/`（官方面板，gh-pages 构建产物）
-> - `npm run build:helper`   → 各平台 `com.flowz.helper{,.exe}`（提权服务，交叉编译）
+> - `npm run build:helper` → 各平台 `com.flowz.helper{,.exe}`（提权服务，交叉编译）
 >
 > 应用图标本体见 `build/icon.ico` / `build/icon.icns`（electron-builder 打包用）；`resources/app*.png` 仅作托盘图标。
 
@@ -61,14 +61,24 @@ resources/
    值 = 官方 release REST API 的 asset digest，一行取：
    `gh api repos/SagerNet/sing-box/releases/tags/v<新版本> --jq '.assets[]|select(.name|test("(linux-amd64.tar.gz|windows-amd64.zip|darwin-amd64.tar.gz|darwin-arm64.tar.gz)$"))|{name,digest}'`，
    digest 形如 `sha256:<hex>`，**可原样填入** coreArchiveSha256，`fetch:core` 会自动 strip `sha256:` 前缀后比对），
-   再 `npm run fetch:core -- --force` 拉新核（无需手动下载/替换二进制；不入库）。换核须确认二进制 `Tags`
+   再 `npm run fetch:core` 拉新核（无需手动下载/替换二进制；不入库）。换核须确认二进制 `Tags`
    含 `with_naive_outbound`（naive 支持前提）。
+
+   **`coreBinarySha256` 也要一并更新**（4 平台落地二进制本体 sha）。它让「已落地则跳过」可自证：
+   磁盘 sha 与 pin 对得上才跳过，对不上即当陈旧核自动重下——**所以换版本不必再记得加 `--force`**。
+   取值方式：先跑一次 `npm run fetch:core -- --force`，脚本对每个平台打印 `bin sha <hex>`，抄进 manifest 即可
+   （缺 pin 不会静默：脚本打 `skip (unverified)` 明说无法确认磁盘上是不是新版本，单测亦断言四平台齐全）。
+
+   > 这条是 2026-08-05 踩出来的：旧实现无条件跳过、汇总行却照打 manifest 版本，于是磁盘还是 beta.5 时
+   > 仍显示 `4 ready (version 1.14.0-beta.7)`，据此跑的真核 check 把新字段误判成 unknown field。
 
    **`libcronet` 必须同步换**（2026-08-05 起）：它不再独立管理——`cronetVersion` 就是从「随包 sing-box 的
    go.mod」抄来的 Go module 伪版本，取源亦从已停更的 cronet-go Releases 改为 Go module proxy。步骤：
+
    ```bash
    curl -fsSL "https://proxy.golang.org/github.com/sagernet/sing-box/@v/v<新版本>.mod" | grep 'cronet-go/lib/linux_amd64'
    ```
+
    把伪版本回填 `cronetVersion`，按 `scripts/fetch-cronet.mjs` 头注取两类 sha（`cronetArchiveSha256`=module
    zip、`cronetLibSha256`=落地库本体），再 `npm run fetch:cronet -- --force`。忘同步不会静默——脚本每次实际
    下载前会拿 sing-box 的 `.mod` 校验同源，不一致直接 fail。

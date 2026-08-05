@@ -46,6 +46,32 @@ describe('core-manifest：供应链 pin 齐全（缺 pin 时 fetch 脚本拒拉�
   });
 
   /**
+   * core 两类 pin 的分工与 cronet 同构（见 fetch-core.mjs）：
+   *   · coreArchiveSha256 = 下载的压缩包本体 → 防传输损坏/投毒，解压前 fail-fast
+   *   · coreBinarySha256  = 解出并落地的二进制本体 → ①锁定「取出来的是哪个文件」②**让「已落地则跳过」
+   *     可自证**：对得上才 skip，对不上即当陈旧核重下，故换 bundledCoreVersion 后不必再记得加 --force
+   *
+   * 缺 coreBinarySha256 时脚本会退回「存在即跳过」并打 unverified 警告——那正是 2026-08-05 踩到的坑：
+   * 磁盘还是 beta.5，汇总行却照打 `4 ready (version 1.14.0-beta.7)`，据此跑的真核 check 把新字段误判
+   * 成 unknown field。本断言把「换版本忘补 bin pin」提前到单测暴露。
+   */
+  it('coreBinarySha256 覆盖四平台且为 64 位 hex（缺则 skip 分支退化为不可验证）', () => {
+    const m = (manifest as { coreBinarySha256?: Record<string, string> }).coreBinarySha256 || {};
+    for (const key of ['linux', 'win', 'mac-x64', 'mac-arm64']) {
+      expect(m[key]).toMatch(HEX64);
+    }
+  });
+
+  it('core 的 archive sha 与 binary sha 不相等（防把同一个值误填两处）', () => {
+    const arc =
+      (manifest as { coreArchiveSha256?: Record<string, string> }).coreArchiveSha256 || {};
+    const bin = (manifest as { coreBinarySha256?: Record<string, string> }).coreBinarySha256 || {};
+    for (const key of ['linux', 'win', 'mac-x64', 'mac-arm64']) {
+      expect(arc[key]).not.toBe(bin[key]);
+    }
+  });
+
+  /**
    * cronet 两类 pin 分工（都不可删，见 fetch-cronet.mjs 头注）：
    *   · cronetArchiveSha256 = 下载的 module zip 本体 → 防传输损坏/投毒，落位前 fail-fast
    *   · cronetLibSha256     = 解出并落地的库本体 → ①锁定「解出来的是哪个文件」②让 skip 分支可自证
