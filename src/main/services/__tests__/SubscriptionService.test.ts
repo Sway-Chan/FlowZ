@@ -758,6 +758,56 @@ describe('issue #263 review 补测 — ssh 算法字段 / 行首空白', () => {
 });
 
 // ── Snell（一等公民，issue #146）：sing-box JSON 订阅路径映射 + 能力门控 ──
+describe('parseSingboxOutbounds — hysteria2 disable_chrome_parrot', () => {
+  /**
+   * sing-box 1.14 起 Chrome QUIC 指纹拟态**默认开启**，而 Chrome 不声明支持 Ed25519 → 服务端用 Ed25519
+   * 证书时，机场只能靠下发 `disable_chrome_parrot: true` 让客户端握得上手。**本格式必须收这个键**
+   * （与 Clash 订阅不同：那边压根没有对应字段，故不解析）。
+   *
+   * 漏收的后果不是「少个优化」而是连不上，且不可自愈：用户在节点编辑框手动打开开关自救后，下次订阅
+   * 刷新按「以订阅值为准」对账会再次把它抹掉 → 死循环。这条用例就是钉住这个回归。
+   */
+  it('订阅带 disable_chrome_parrot:true → 收进 hysteria2Settings（Ed25519 证书节点的连通性前提）', () => {
+    const svc = newService(new FakeLog());
+    const servers = (svc as any).parseSingboxOutbounds(
+      [
+        {
+          type: 'hysteria2',
+          tag: 'ed25519-node',
+          server: 'a.com',
+          server_port: 443,
+          password: 'pw',
+          disable_chrome_parrot: true,
+        },
+      ],
+      'sub-x'
+    );
+    expect(servers).toHaveLength(1);
+    expect(servers[0].hysteria2Settings?.disableChromeParrot).toBe(true);
+  });
+
+  /** 缺省与显式 false 都不该在存储里留痕——存 undefined 即「跟随上游默认（拟态开启）」，与生成侧三态一致。 */
+  it('订阅未带该键 / 带 false → 不落 disableChromeParrot（不把上游默认固化进存储）', () => {
+    const svc = newService(new FakeLog());
+    for (const extra of [{}, { disable_chrome_parrot: false }]) {
+      const servers = (svc as any).parseSingboxOutbounds(
+        [
+          {
+            type: 'hysteria2',
+            tag: 'plain',
+            server: 'a.com',
+            server_port: 443,
+            password: 'pw',
+            ...extra,
+          },
+        ],
+        'sub-x'
+      );
+      expect(servers[0].hysteria2Settings?.disableChromeParrot).toBeUndefined();
+    }
+  });
+});
+
 describe('parseSingboxOutbounds — snell', () => {
   it('v4 obfs http + v6 mode/userkey/reuse/network → 一等映射', () => {
     const log = new FakeLog();

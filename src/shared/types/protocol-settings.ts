@@ -70,6 +70,13 @@ export interface Hysteria2Settings {
   serverPorts?: string; // 端口跳跃范围，如 "20000:30000"；sing-box server_ports
   hopInterval?: string; // 端口跳跃间隔，如 "30s"；sing-box hop_interval
   bbrProfile?: Hysteria2BbrProfile; // BBR 拥塞控制 profile；sing-box bbr_profile
+  // 关闭 Chrome QUIC 指纹拟态（sing-box 1.14 disable_chrome_parrot）。**缺省/false = 不下发 = 拟态开启**
+  // （上游默认），握手指纹照抄 Chrome，更难被握手指纹识别。
+  // 仅在一种情况下需要打开本项：服务端证书是 **Ed25519** —— Chrome 不声明支持该算法，拟态下握手直接失败
+  // （上游 release note 明列）。代价是恢复可识别的 Hysteria 握手指纹，故 UI 默认关、并写明这是逃生门。
+  // 另注：拟态会覆盖 idle_timeout(固定 30s)/max_concurrent_streams/initial_packet_size 与接收窗口初值——
+  // 这些 FlowZ 目前均未对 hy2 暴露，故无冲突；将来若暴露需在此处一并说明交互。
+  disableChromeParrot?: boolean;
 }
 
 // Snell 协议版本（sing-box 1.14.0-alpha.38+ 官方 outbound）：4=v4（obfs 系）/ 6=v6（mode 系），主开关。

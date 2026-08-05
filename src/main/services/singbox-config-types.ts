@@ -164,6 +164,8 @@ export interface SingBoxOutbound {
   };
   // Hysteria2 BBR 拥塞控制 profile（sing-box 1.14）：standard / aggressive / conservative
   bbr_profile?: string;
+  // Hysteria2 关闭 Chrome QUIC 指纹拟态（sing-box 1.14）。省略 = 上游默认 false = 拟态开启。
+  disable_chrome_parrot?: boolean;
   network?: string;
   // naive specific: 走 HTTP/3 (QUIC) 传输
   quic?: boolean;

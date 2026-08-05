@@ -80,6 +80,7 @@ type SingboxOutbound = {
   server_port?: number;
   server_ports?: string[];
   hop_interval?: string;
+  disable_chrome_parrot?: boolean; // hysteria2，sing-box 1.14；漏收会杀 Ed25519 证书节点的连通性
   uuid?: string;
   flow?: string;
   packet_encoding?: string;
@@ -466,6 +467,14 @@ export class SubscriptionService {
           if (ob.server_ports && ob.server_ports.length > 0) {
             hy2Settings.serverPorts = ob.server_ports.join(',');
             if (ob.hop_interval) hy2Settings.hopInterval = ob.hop_interval;
+          }
+          // Chrome QUIC 指纹拟态开关（sing-box 1.14）。**本格式必须收**，与 Clash 订阅不同：Clash 无对应
+          // 字段故不解析，而这里解析的就是 sing-box 原生 outbound，该键真实存在。
+          // 漏收的后果不是「少个优化」而是**连不上**：服务端证书为 Ed25519 时，机场只能靠下发
+          // disable_chrome_parrot:true 让客户端能握手；剥掉它 → 拟态开启 → 握手直接失败。且用户手动
+          // 打开开关自救后，下次订阅刷新按「以订阅值为准」对账会再次抹掉 → 死循环。
+          if (ob.disable_chrome_parrot === true) {
+            hy2Settings.disableChromeParrot = true;
           }
           if (Object.keys(hy2Settings).length > 0) {
             hy2.hysteria2Settings = hy2Settings;

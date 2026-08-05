@@ -713,6 +713,42 @@ describe('buildProxyOutbound — 可选协议设置下发（B 组编辑项）', 
     expect(ob.bbr_profile).toBeUndefined();
   });
 
+  /**
+   * disable_chrome_parrot（sing-box 1.14）：上游默认 false = Chrome QUIC 指纹拟态**开启**。
+   * 三态必须分清——「显式 false」与「缺省」都应**省略**该键而非下发 `false`：
+   * 省略即跟随上游默认，抗指纹白拿；写死 false 会在上游改默认/改语义时把 FlowZ 钉在旧行为上。
+   * 只有显式 true（用户为 Ed25519 证书服务端开的逃生门）才下发。
+   */
+  it('hysteria2：disableChromeParrot=true → 下发 disable_chrome_parrot（Ed25519 证书逃生门）', () => {
+    const ob = buildProxyOutbound(
+      node({
+        protocol: 'hysteria2',
+        password: 'pw',
+        security: 'tls',
+        hysteria2Settings: { disableChromeParrot: true },
+      }),
+      tags,
+      DR_SPEEDTEST
+    ) as any;
+    expect(ob.disable_chrome_parrot).toBe(true);
+  });
+
+  it('hysteria2：disableChromeParrot 显式 false / 缺省 → 均省略该键（跟随上游默认，不写死）', () => {
+    for (const settings of [{ disableChromeParrot: false }, {}] as const) {
+      const ob = buildProxyOutbound(
+        node({
+          protocol: 'hysteria2',
+          password: 'pw',
+          security: 'tls',
+          hysteria2Settings: settings,
+        }),
+        tags,
+        DR_V6_OFF
+      ) as any;
+      expect(ob).not.toHaveProperty('disable_chrome_parrot');
+    }
+  });
+
   // P3c：TLS engine。仅对 TCP-TLS 协议下发；'go'/空省略；Hy2/TUIC（QUIC）即便设了也不下发。
   it('tls engine：trojan engine=windows 在 win32 → tls.engine=windows；非 win32 → 降级省略', () => {
     const orig = process.platform;

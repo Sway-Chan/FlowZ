@@ -1166,6 +1166,8 @@
     "bbrProfileStandard": "Standard",
     "bbrProfileAggressive": "Aggressive",
     "bbrProfileConservative": "Conservative",
+    "disableChromeParrot": "Disable Chrome QUIC fingerprint parroting",
+    "disableChromeParrotDesc": "Left off (the default), parroting is active: the client QUIC handshake mimics Chrome, making Hysteria traffic harder to identify by handshake fingerprinting. Turn it on only when the server certificate uses Ed25519 — Chrome does not advertise support for that algorithm, so the handshake fails outright while parroting. Turning it on restores the identifiable Hysteria handshake fingerprint. Note: parroting also overrides QUIC parameters such as idle timeout (fixed at 30s), max concurrent streams and initial packet size.",
     "tlsEngine": "TLS Engine",
     "tlsEngineGo": "Go (Default)",
     "tlsEngineWindows": "Windows (Schannel)",

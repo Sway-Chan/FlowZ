@@ -1166,6 +1166,8 @@
     "bbrProfileStandard": "Standard",
     "bbrProfileAggressive": "Aggressive",
     "bbrProfileConservative": "Conservative",
+    "disableChromeParrot": "关闭 Chrome QUIC 指纹拟态",
+    "disableChromeParrotDesc": "默认关闭本项，即启用拟态：客户端的 QUIC 握手照抄 Chrome，使 Hysteria 流量更难被握手指纹识别。仅当服务端证书使用 Ed25519 时才需要打开——Chrome 不声明支持该算法，拟态下握手会直接失败。打开即恢复可识别的 Hysteria 握手指纹。另注：拟态会覆盖空闲超时（固定 30 秒）、最大并发流与初始包长等 QUIC 参数。",
     "tlsEngine": "TLS 引擎",
     "tlsEngineGo": "Go（默认）",
     "tlsEngineWindows": "Windows (Schannel)",

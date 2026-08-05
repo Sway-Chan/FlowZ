@@ -16,6 +16,7 @@ import { AddressField, PortField } from './shared/basic-fields';
 import { TlsServerNameField, AllowInsecureField } from './shared/tls-fields';
 import { echSchemaShape, echDefaults, readEchDefault } from './shared/field-schemas';
 import { FormSection, FieldGrid, FieldSpan } from './shared/form-layout';
+import { SwitchField } from './shared/switch-field';
 import type { ServerConfig } from '@/bridge/types';
 import { useTranslation } from 'react-i18next';
 
@@ -38,6 +39,7 @@ const createHysteria2Schema = (t: any) =>
       ...echSchemaShape,
       serverPorts: z.string().optional(),
       hopInterval: z.string().optional(),
+      disableChromeParrot: z.boolean(),
     })
     .refine(
       // A-1：gecko obfs 的 min/max 包长仅各自 >0 校验，可 min>max 下发致核 FATAL。前置拦 min≤max
@@ -94,6 +96,7 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
         ...readEchDefault(serverConfig),
         serverPorts: serverConfig.hysteria2Settings?.serverPorts || '',
         hopInterval: serverConfig.hysteria2Settings?.hopInterval || '',
+        disableChromeParrot: serverConfig.hysteria2Settings?.disableChromeParrot === true,
       };
     }
     return {
@@ -113,6 +116,7 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
       ...echDefaults,
       serverPorts: '',
       hopInterval: '',
+      disableChromeParrot: false, // 默认不勾 = 不下发 = 拟态开启（上游默认）
     };
   };
 
@@ -157,6 +161,8 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
             : undefined,
         serverPorts: values.serverPorts?.trim() || undefined,
         hopInterval: values.hopInterval?.trim() || undefined,
+        // 仅 true 落库；false 存 undefined，与本表单其余可选项一致，也让「未设置」与「显式关闭拟态」不混淆
+        disableChromeParrot: values.disableChromeParrot || undefined,
       },
     };
 
@@ -407,6 +413,14 @@ export function Hysteria2Form({ serverConfig, onSubmit }: Hysteria2FormProps) {
                 </div>
               )}
             />
+            <FieldSpan>
+              <SwitchField
+                control={form.control}
+                name="disableChromeParrot"
+                label={t('servers.disableChromeParrot', '关闭 Chrome QUIC 指纹拟态')}
+                tooltip={t('servers.disableChromeParrotDesc')}
+              />
+            </FieldSpan>
           </FieldGrid>
         </FormSection>
       </form>

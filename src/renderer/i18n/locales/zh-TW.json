@@ -1166,6 +1166,8 @@
     "bbrProfileStandard": "Standard",
     "bbrProfileAggressive": "Aggressive",
     "bbrProfileConservative": "Conservative",
+    "disableChromeParrot": "關閉 Chrome QUIC 指紋擬態",
+    "disableChromeParrotDesc": "預設關閉本項，即啟用擬態：用戶端的 QUIC 交握照抄 Chrome，使 Hysteria 流量更難被交握指紋識別。僅當伺服器憑證使用 Ed25519 時才需要開啟——Chrome 未宣告支援該演算法，擬態下交握會直接失敗。開啟即恢復可識別的 Hysteria 交握指紋。另註：擬態會覆蓋閒置逾時（固定 30 秒）、最大並行串流與初始封包長度等 QUIC 參數。",
     "tlsEngine": "TLS 引擎",
     "tlsEngineGo": "Go（預設）",
     "tlsEngineWindows": "Windows (Schannel)",
