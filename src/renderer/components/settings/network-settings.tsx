@@ -10,7 +10,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog';
 import { useAppStore } from '@/store/app-store';
-import { parseDnsServerSpec } from '@shared/dns';
+import { parseDnsServerSpec, DNS_TIMEOUT_MIN_MS, DNS_TIMEOUT_MAX_MS } from '@shared/dns';
 import {
   BUILTIN_UPSTREAMS,
   isValidCustomUpstreamSpec,
@@ -23,7 +23,16 @@ import {
 import type { CustomDnsUpstream, DnsConfig, TunStack } from '@shared/types';
 import { DEFAULT_BYPASS_LAN } from '@shared/system-proxy-bypass';
 import { parseSpeedTestUrl, DEFAULT_SPEED_TEST_URL } from '@shared/speed-test';
-import { resolveTunStack, CONCRETE_TUN_STACKS } from '@shared/tun-stack';
+import {
+  resolveTunStack,
+  resolveTunMtu,
+  parseTunMtuInput,
+  isDegradedMtuCombo,
+  CONCRETE_TUN_STACKS,
+  TUN_MTU_MIN,
+  TUN_MTU_MAX,
+  TUN_MTU_SAFE_MAX_NON_GVISOR,
+} from '@shared/tun-defaults';
 import { toast } from 'sonner';
 import { useTranslation } from 'react-i18next';
 import { InfoTooltip } from './shared/info-tooltip';
@@ -37,8 +46,17 @@ const isMac = window.electron?.platform === 'darwin';
 const isWin = window.electron?.platform === 'win32';
 const isLinux = window.electron?.platform === 'linux';
 
+const platform = window.electron?.platform ?? 'linux';
 // Auto 档在本平台解析到的具体栈（UI 显示 "Auto (gvisor)" 用），与主进程 resolveTunStack 同源单一真值。
-const autoResolvedStack = resolveTunStack('auto', window.electron?.platform ?? 'linux');
+const autoResolvedStack = resolveTunStack('auto', platform);
+
+/**
+ * 表单可选的本地端口区间。**下界 1024 是 UI 侧的额外约束，不是 config 的合法区间**——
+ * `ConfigManager.validateConfig` 放行 1..65535（要容忍存量低端口配置）。故这里刻意**不**抽成 shared 常量：
+ * 抽了会把「表单不让选特权端口」与「配置层可接受」这两件不同的事伪装成同一个真值。
+ */
+const LOCAL_PORT_MIN = 1024;
+const LOCAL_PORT_MAX = 65535;
 
 const DNS_DEFAULTS = {
   domesticDns: 'https://doh.pub/dns-query',
@@ -77,6 +95,10 @@ export function NetworkSettings() {
   const [dnsTimeout, setDnsTimeout] = useState(
     config?.dnsConfig?.dnsTimeoutMs != null ? String(config.dnsConfig.dnsTimeoutMs) : ''
   );
+  // TUN MTU（空 = Auto，存 'auto' 而非具体数字——存的是意图，解析期才落 (平台×栈) 值）。
+  const [tunMtu, setTunMtu] = useState(
+    typeof config?.tunConfig?.mtu === 'number' ? String(config.tunConfig.mtu) : ''
+  );
 
   // F26：config 异步到达 / 挂载期间被外部替换（托盘改配置、备份恢复、规则 CRUD 后 loadConfig）时，
   // 回填「未被用户改动」的字段；dirty 守卫（本地值 ≠ 上次种子）避免打断正在输入的用户。
@@ -87,6 +109,7 @@ export function NetworkSettings() {
     foreignDns: string;
     speedTestUrl: string;
     dnsTimeout: string;
+    tunMtu: string;
   } | null>(null);
   useEffect(() => {
     if (!config) return;
@@ -98,6 +121,7 @@ export function NetworkSettings() {
       speedTestUrl: config.speedTestUrl || DEFAULT_SPEED_TEST_URL,
       dnsTimeout:
         config.dnsConfig?.dnsTimeoutMs != null ? String(config.dnsConfig.dnsTimeoutMs) : '',
+      tunMtu: typeof config.tunConfig?.mtu === 'number' ? String(config.tunConfig.mtu) : '',
     };
     const prev = seededRef.current;
     setLocalPort((cur) => (prev && cur !== prev.localPort ? cur : snap.localPort));
@@ -106,6 +130,7 @@ export function NetworkSettings() {
     setForeignDns((cur) => (prev && cur !== prev.foreignDns ? cur : snap.foreignDns));
     setSpeedTestUrl((cur) => (prev && cur !== prev.speedTestUrl ? cur : snap.speedTestUrl));
     setDnsTimeout((cur) => (prev && cur !== prev.dnsTimeout ? cur : snap.dnsTimeout));
+    setTunMtu((cur) => (prev && cur !== prev.tunMtu ? cur : snap.tunMtu));
     seededRef.current = snap;
   }, [
     config?.mixedPort,
@@ -115,6 +140,7 @@ export function NetworkSettings() {
     config?.dnsConfig?.foreignDns,
     config?.speedTestUrl,
     config?.dnsConfig?.dnsTimeoutMs,
+    config?.tunConfig?.mtu,
   ]);
 
   if (!config) return null;
@@ -190,7 +216,7 @@ export function NetworkSettings() {
     saveConfig({ ...config, speedTestUrl: next }).catch(() => toast.error(t('common.saveFailed')));
   };
 
-  // P2c DNS 查询超时：onBlur 提交。空 = 清除（不下发，用核默认）；非空须为 1..60000 的整数毫秒，越界提示并回滚。
+  // P2c DNS 查询超时：onBlur 提交。空 = 清除（不下发，用核默认）；非空须在 shared/dns 的区间内，越界提示并回滚。
   const commitDnsTimeout = () => {
     const v = dnsTimeout.trim();
     const stored = config.dnsConfig?.dnsTimeoutMs;
@@ -201,8 +227,13 @@ export function NetworkSettings() {
       return;
     }
     const ms = parseInt(v, 10);
-    if (isNaN(ms) || ms < 1 || ms > 60000) {
-      toast.error(t('settings.advanced.dnsTimeoutRange', 'DNS 超时须为 1-60000 毫秒'));
+    if (isNaN(ms) || ms < DNS_TIMEOUT_MIN_MS || ms > DNS_TIMEOUT_MAX_MS) {
+      toast.error(
+        t('settings.advanced.dnsTimeoutRange', {
+          min: DNS_TIMEOUT_MIN_MS,
+          max: DNS_TIMEOUT_MAX_MS,
+        })
+      );
       setDnsTimeout(stored != null ? String(stored) : ''); // 回滚到已存值
       return;
     }
@@ -216,8 +247,10 @@ export function NetworkSettings() {
     const portNum = parseInt(localPort, 10);
     const cur = config.mixedPort || config.httpPort || 7890;
     const revert = () => setLocalPort(cur.toString());
-    if (isNaN(portNum) || portNum < 1024 || portNum > 65535) {
-      toast.error(t('settings.advanced.localPortRange', '端口须为 1024-65535'));
+    if (isNaN(portNum) || portNum < LOCAL_PORT_MIN || portNum > LOCAL_PORT_MAX) {
+      toast.error(
+        t('settings.advanced.localPortRange', { min: LOCAL_PORT_MIN, max: LOCAL_PORT_MAX })
+      );
       revert();
       return;
     }
@@ -226,16 +259,44 @@ export function NetworkSettings() {
     saveConfig({ ...config, mixedPort: portNum }).catch(() => toast.error(t('common.saveFailed')));
   };
 
+  // TUN MTU：失焦即生效。清空 = 复位 Auto（写 'auto'，而非把当前平台值固化成数字——固化会让后续
+  // 平台默认演进对该用户失效，正是本次模型统一要消除的问题）。越界给提示并回滚到已存值。
+  const commitTunMtu = () => {
+    const stored = config.tunConfig?.mtu;
+    const next = parseTunMtuInput(tunMtu);
+    if (next === null) {
+      toast.error(t('settings.advanced.tunMtuRange', { min: TUN_MTU_MIN, max: TUN_MTU_MAX }));
+      setTunMtu(typeof stored === 'number' ? String(stored) : ''); // 回滚到已存值
+      return;
+    }
+    // 缺省（旧配置无该键）等价 'auto'，故与 'auto' 一并视为无变化，避免空写触发一次核重启。
+    if (next === stored || (next === 'auto' && stored == null)) return;
+    setTunMtu(next === 'auto' ? '' : String(next));
+    updateTun({ mtu: next });
+  };
+
   // 数字输入（Conduit `.input.w-port`：窄口右对齐 mono tnum）。
-  const numInput = (value: string, onChange: (v: string) => void, onBlur?: () => void) => (
+  // placeholder 是本次新增的第 4 参（MTU 行用它显示 Auto 落值）；其余调用点不传，行为与原先一致。
+  const numInput = (
+    value: string,
+    onChange: (v: string) => void,
+    onBlur?: () => void,
+    placeholder?: string
+  ) => (
     <input
       className="input w-port mono tnum"
       type="text"
       inputMode="numeric"
       pattern="[0-9]*"
       value={value}
+      placeholder={placeholder}
       onChange={(e) => onChange(e.target.value.replace(/[^0-9]/g, ''))}
       onBlur={onBlur}
+      // Enter 即提交（blur 触发 onBlur）。与同面板 dnsTimeout 的内联 input 对齐——否则填完按 Enter 无反馈、
+      // 切页即丢输入。
+      onKeyDown={(e) => {
+        if (e.key === 'Enter') e.currentTarget.blur();
+      }}
     />
   );
 
@@ -421,7 +482,12 @@ export function NetworkSettings() {
             label={
               <>
                 {t('settings.advanced.dnsTimeout', 'DNS 查询超时')}
-                <InfoTooltip content={t('settings.advanced.dnsTimeoutDescFull')} />
+                <InfoTooltip
+                  content={t('settings.advanced.dnsTimeoutDescFull', {
+                    min: DNS_TIMEOUT_MIN_MS,
+                    max: DNS_TIMEOUT_MAX_MS,
+                  })}
+                />
               </>
             }
             desc={t('settings.advanced.dnsTimeoutDesc')}
@@ -674,6 +740,46 @@ export function NetworkSettings() {
               </select>
             </div>
           </Srow>
+          {/* MTU：空 = Auto，占位符显示 Auto 在【当前所选栈】下的实际落值（同一 MTU 在不同栈下差异可达数量级，
+              只按平台显示会误导）。放在栈选择器下方，因其取值语义依赖栈。 */}
+          <Srow
+            label={
+              <>
+                {t('settings.advanced.tunMtu', 'MTU')}
+                <InfoTooltip
+                  content={t('settings.advanced.tunMtuDescFull', {
+                    min: TUN_MTU_MIN,
+                    max: TUN_MTU_MAX,
+                  })}
+                />
+              </>
+            }
+            desc={t('settings.advanced.tunMtuDesc')}
+          >
+            {numInput(
+              tunMtu,
+              setTunMtu,
+              commitTunMtu,
+              `${t('settings.advanced.tunStackAuto', 'Auto')} (${resolveTunMtu(
+                'auto',
+                platform,
+                resolveTunStack(config.tunConfig?.stack, platform)
+              )})`
+            )}
+          </Srow>
+          {/* 已知坏组合非阻断提示（不禁止：与 mac 允许显式选 system/mixed 的 honor 原则一致，由用户知情决定）。
+              判据用【已解析的具体栈】，因为 Auto 在 Windows 落 gvisor 时该组合并不成立。 */}
+          {isDegradedMtuCombo(
+            resolveTunStack(config.tunConfig?.stack, platform),
+            config.tunConfig?.mtu,
+            platform
+          ) && (
+            <div className="srow-warn">
+              {t('settings.advanced.tunMtuBadComboWarn', {
+                safeMax: TUN_MTU_SAFE_MAX_NON_GVISOR,
+              })}
+            </div>
+          )}
         </div>
       )}
 
