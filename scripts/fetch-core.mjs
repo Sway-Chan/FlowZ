@@ -12,12 +12,16 @@
  * 完整性 pin：core-manifest.json 的 coreArchiveSha256 是「下载的压缩包(tar.gz/zip)本体」的 sha256，其值
  * == 官方 release REST API 返回的 asset digest（gh api repos/SagerNet/sing-box/releases/tags/v<版本>
  * --jq '.assets[]|{name,digest}'，一行可取，换核直接抄、不必下载解压计算）。下载后对压缩包逐字节校验，不符
- * 即失败（fail-fast：损坏 / 截断 / 投毒在解压前就拦）。压缩包正确则解出的二进制必正确（tar/zip 解压确定性），
- * 故不必再对解压后二进制单独算 sha。
+ * 即失败（fail-fast：损坏 / 截断 / 投毒在解压前就拦）。
+ *
+ * 第二类 pin `coreBinarySha256` = 落地二进制本体的 sha256。压缩包 sha 已能确保解出物正确（解压确定性），
+ * 故它不是为「防解压出错」而设，而是为了**让「已落地则跳过」可自证**：磁盘 sha 与 pin 对得上才跳过，
+ * 对不上即当陈旧核重新下载。与 fetch-cronet 的 cronetLibSha256 同款分工。
  *
  * 跨平台一致：全 4 平台核一律下载（不按当前 runner 过滤）——支持在 Linux 上 electron-builder --win/--mac
- * --dir 交叉构建（部署流程依赖）；skip-exists 已落地则跳过（换版本需 --force 或先删旧核；CI fresh checkout
- * 无旧核故每次都下载+校验）。解压：tar.gz→tar、zip→unzip（与 fetch-dashboard 同，CI 全平台已证可用）。各平台
+ * --dir 交叉构建（部署流程依赖）；已落地且 sha 与 coreBinarySha256 相符则跳过，**换版本无需 --force**
+ * （pin 变了即对不上，自动重下）；`--force` 仅用于无条件重拉。CI fresh checkout 无旧核故每次都下载+校验。
+ * 解压：tar.gz→tar、zip→unzip（与 fetch-dashboard 同，CI 全平台已证可用）。各平台
  * 核仍是 SagerNet 官方 release（README §换核），cronet 集成因平台而异（mac-arm64 静态编入 / mac-x64 无 cronet
  * / linux+win dlopen 外部 libcronet 走 fetch:cronet），本脚本只取 sing-box 本体。
  */
@@ -44,6 +48,9 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const manifest = JSON.parse(readFileSync(join(ROOT, 'src/shared/core-manifest.json'), 'utf-8'));
 const VERSION = manifest.bundledCoreVersion; // 资产名不带 v；release tag 带 v（如 v1.14.0-alpha.34）
 const SHA = manifest.coreArchiveSha256 || {}; // 压缩包 sha == 官方 release API 的 asset digest
+// 落地二进制本体 sha（可选 pin）。它让「已落地则跳过」这件事**可验证**：对得上才算数，对不上即当陈旧核
+// 重新下载。缺它时退回旧的「存在即跳过」，并把「可能是旧核」明确喊出来（见 skip 分支）。
+const BIN_SHA = manifest.coreBinarySha256 || {};
 const REPO = 'SagerNet/sing-box';
 const FORCE = process.argv.includes('--force');
 
@@ -51,25 +58,68 @@ const FORCE = process.argv.includes('--force');
 // 官方资产解出单一顶层目录 sing-box-${VERSION}-${os}-${arch}/，内含 sing-box[.exe]（+ LICENSE；
 // linux 资产另含 libcronet.so，本脚本只取 sing-box，cronet 仍由 fetch:cronet 按独立版本管理）。
 const TARGETS = [
-  { dir: 'resources/linux', asset: `sing-box-${VERSION}-linux-amd64.tar.gz`, bin: 'sing-box', key: 'linux' },
-  { dir: 'resources/win', asset: `sing-box-${VERSION}-windows-amd64.zip`, bin: 'sing-box.exe', key: 'win' },
-  { dir: 'resources/mac-x64', asset: `sing-box-${VERSION}-darwin-amd64.tar.gz`, bin: 'sing-box', key: 'mac-x64' },
-  { dir: 'resources/mac-arm64', asset: `sing-box-${VERSION}-darwin-arm64.tar.gz`, bin: 'sing-box', key: 'mac-arm64' },
+  {
+    dir: 'resources/linux',
+    asset: `sing-box-${VERSION}-linux-amd64.tar.gz`,
+    bin: 'sing-box',
+    key: 'linux',
+  },
+  {
+    dir: 'resources/win',
+    asset: `sing-box-${VERSION}-windows-amd64.zip`,
+    bin: 'sing-box.exe',
+    key: 'win',
+  },
+  {
+    dir: 'resources/mac-x64',
+    asset: `sing-box-${VERSION}-darwin-amd64.tar.gz`,
+    bin: 'sing-box',
+    key: 'mac-x64',
+  },
+  {
+    dir: 'resources/mac-arm64',
+    asset: `sing-box-${VERSION}-darwin-arm64.tar.gz`,
+    bin: 'sing-box',
+    key: 'mac-arm64',
+  },
 ];
 
 const sha256 = (file) => createHash('sha256').update(readFileSync(file)).digest('hex');
 
 let ok = 0;
 let failed = 0;
+let unverified = 0; // 跳过但无 pin 可验：算 ready 但不该混进「已确认是这个版本」
 for (const t of TARGETS) {
   const absDir = join(ROOT, t.dir);
   const dest = join(absDir, t.bin);
 
-  // 已落地则跳过（换版本需 --force 或先删旧核）。CI fresh checkout 无旧核 → 每次下载+校验。
+  // 已落地时的处置。**跳过必须可验证**：拿磁盘上的二进制算 sha 比对 coreBinarySha256——
+  //   · 对得上 → skip (verified)，此时「ready (version X)」才是真话；
+  //   · 对不上 → 视作陈旧/被替换，落到下面重新下载（换 bundledCoreVersion 后**无需再记得加 --force**）；
+  //   · 无 pin  → 退回「存在即跳过」，但必须把「可能是旧核」喊出来，不能让汇总行替它撒谎。
+  // 为什么非做不可（2026-08-05 实测踩坑）：旧实现无条件 skip，而汇总行照打 manifest 版本，于是
+  // 「4 ready (version 1.14.0-beta.7)」在磁盘还是 beta.5 时依然打印——据此跑的真核 check 把新字段
+  // 误判成 unknown field。绿/ready 必须有信息量，否则比没有更坏。
+  const wantBin = (BIN_SHA[t.key] || '').replace(/^sha256:/, '');
   if (existsSync(dest) && !FORCE) {
-    console.log(`skip (exists): ${t.dir}/${t.bin} — 若刚改 bundledCoreVersion(当前 ${VERSION})，须加 --force 重拉，否则沿用旧核`);
-    ok++;
-    continue;
+    if (wantBin) {
+      const gotBin = sha256(dest);
+      if (gotBin === wantBin) {
+        console.log(`skip (verified): ${t.dir}/${t.bin} (bin sha ${gotBin.slice(0, 12)}…)`);
+        ok++;
+        continue;
+      }
+      console.log(
+        `stale: ${t.dir}/${t.bin} 与 coreBinarySha256 不符（磁盘 ${gotBin.slice(0, 12)}… ≠ pin ${wantBin.slice(0, 12)}…）→ 重新下载`
+      );
+    } else {
+      console.log(
+        `skip (unverified): ${t.dir}/${t.bin} — core-manifest.json 缺 coreBinarySha256[${t.key}]，无法确认磁盘上是否就是 ${VERSION}；若刚改 bundledCoreVersion 须加 --force`
+      );
+      ok++;
+      unverified++;
+      continue;
+    }
   }
 
   // 完整性 pin 是供应链防护核心：缺 pin 直接 fail（绝不无校验拉可执行核），强制换版本时同步补 coreArchiveSha256。
@@ -123,16 +173,39 @@ for (const t of TARGETS) {
     rmSync(tmpDest, { force: true });
     copyFileSync(binPath, tmpDest);
     if (t.bin !== 'sing-box.exe') chmodSync(tmpDest, 0o755);
+
+    // 完整性校验②：落地二进制本体 sha。压缩包 sha 已确保来源可信，本条锁的是「从包里取出来的到底是哪个
+    // 文件」，并为下次运行的 verified-skip 留下可自证的锚（与 fetch-cronet 的 cronetLibSha256 同款分工）。
+    // 无 pin 时打印实得值，供换版本时抄进 manifest（同 fetch-cronet 的用法）。
+    const gotBin = sha256(tmpDest);
+    if (wantBin && gotBin !== wantBin) {
+      rmSync(tmpDest, { force: true });
+      throw new Error(
+        `二进制 sha256 不符：期望 ${wantBin}，实得 ${gotBin}（官方资产内容变化 / 取错文件）`
+      );
+    }
     renameSync(tmpDest, dest);
-    console.log(`  ok: ${t.dir}/${t.bin} (archive sha ${got.slice(0, 12)}…)`);
+    console.log(
+      `  ok: ${t.dir}/${t.bin} (archive sha ${got.slice(0, 12)}…, bin sha ${gotBin}${wantBin ? '' : ' ← 请抄进 coreBinarySha256'})`
+    );
     ok++;
   } catch (e) {
     console.error(`  FAILED ${t.key}: ${e.message}`);
     failed++;
   } finally {
     rmSync(work, { recursive: true, force: true });
+    // 同清目标目录的半成品：copyFileSync/chmodSync 中途失败会把 `<bin>.tmp` 留在 resources/<平台>/，
+    // 而 electron-builder 的 extraResources 是 filter `**/*` —— 失败后若跳过 fetch 直接打包，残留会被
+    // 原样打进安装包。下次成功运行虽会自愈，但那要等到「下次」，中间窗口足以产出脏包。
+    rmSync(`${dest}.tmp`, { force: true });
   }
 }
 
-console.log(`\nsing-box cores: ${ok} ready, ${failed} failed (version ${VERSION}).`);
+// 汇总行只在**全部可验证**时才敢把版本号说死；有 unverified 项就把话说回去——这行正是当初骗人的那行。
+console.log(
+  `\nsing-box cores: ${ok} ready, ${failed} failed` +
+    (unverified > 0
+      ? ` — 其中 ${unverified} 个未经校验，磁盘上未必是 ${VERSION}（补 coreBinarySha256 或加 --force）`
+      : ` (version ${VERSION}).`)
+);
 process.exit(failed > 0 ? 1 : 0);

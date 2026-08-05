@@ -31,10 +31,10 @@ resources/
 
 > The `data/` geo rule-sets, icons, and `LICENSE` are **committed**; the `sing-box` binary, `libcronet.*`, `dashboard/`, and `com.flowz.helper{,.exe}` are large or build artifacts and are **not committed** — they're fetched/built in dev/CI and packaged together with `resources/`:
 >
-> - `npm run fetch:core`      → per-platform `sing-box[.exe]` (SagerNet official release; pulled per `core-manifest.json` `bundledCoreVersion`, archive verified by `coreArchiveSha256`)
-> - `npm run fetch:cronet`    → per-platform `libcronet.*` (NaiveProxy/cronet, runtime dlopen)
+> - `npm run fetch:core` → per-platform `sing-box[.exe]` (SagerNet official release; pulled per `core-manifest.json` `bundledCoreVersion`, archive verified by `coreArchiveSha256`)
+> - `npm run fetch:cronet` → per-platform `libcronet.*` (NaiveProxy/cronet, runtime dlopen)
 > - `npm run fetch:dashboard` → `dashboard/` (official panel, gh-pages build output)
-> - `npm run build:helper`    → per-platform `com.flowz.helper{,.exe}` (privilege service, cross-compiled)
+> - `npm run build:helper` → per-platform `com.flowz.helper{,.exe}` (privilege service, cross-compiled)
 >
 > The app icon itself is `build/icon.ico` / `build/icon.icns` (used by electron-builder); `resources/app*.png` are tray icons only.
 
@@ -56,16 +56,24 @@ The app accesses these files through the `ResourceManager` class:
 1. **Executable bit**: `sing-box` and the helper on macOS / Linux need the executable bit (`chmod +x`).
 2. **File size**: the `sing-box` binary is large (~65–77 MB per platform) and affects installer size; hence it's not committed and is fetched at build time by `npm run fetch:core` (see above and "Swapping the core").
 3. **Updates**: GeoIP/GeoSite data (`data/*.srs`) should be refreshed periodically; at runtime they can also be updated online into userData via the Rule Resources manager.
-4. **Swapping the core**: edit `src/shared/core-manifest.json` `bundledCoreVersion` + `coreArchiveSha256` (per-platform archive sha; the value equals the official release REST API asset digest), then `npm run fetch:core -- --force`. One-liner to read the digests:
+4. **Swapping the core**: edit `src/shared/core-manifest.json` `bundledCoreVersion` + `coreArchiveSha256` (per-platform archive sha; the value equals the official release REST API asset digest), then `npm run fetch:core`. One-liner to read the digests:
+
    ```bash
    gh api repos/SagerNet/sing-box/releases/tags/v<version> --jq '.assets[]|select(.name|test("(linux-amd64.tar.gz|windows-amd64.zip|darwin-amd64.tar.gz|darwin-arm64.tar.gz)$"))|{name,digest}'
    ```
+
    The digest looks like `sha256:<hex>` and can be pasted **as-is** into `coreArchiveSha256` (`fetch:core` strips the `sha256:` prefix before comparing). When swapping, confirm the binary's `Tags` include `with_naive_outbound` (prerequisite for naive support).
 
+   **Update `coreBinarySha256` too** (per-platform sha of the installed binary). It makes "already present, skip" self-verifying: the on-disk sha must match the pin to be skipped, otherwise the file is treated as a stale core and re-downloaded — **so bumping the version no longer requires remembering `--force`**. To obtain the values, run `npm run fetch:core -- --force` once; the script prints `bin sha <hex>` per platform. A missing pin is not silent: the script prints `skip (unverified)`, stating it cannot confirm the on-disk binary matches the configured version, and a unit test asserts all four platforms are pinned.
+
+   > Learned the hard way on 2026-08-05: the old implementation skipped unconditionally while the summary line still stamped the manifest version, so `4 ready (version 1.14.0-beta.7)` was printed while beta.5 was on disk — a real-core `check` run against it misreported a new field as an unknown field.
+
    **`libcronet` must be swapped together with the core** (since 2026-08-05): it is no longer managed independently — `cronetVersion` is the Go module pseudo-version copied from the bundled sing-box's own `go.mod`, and the source moved from the (now stale) cronet-go Releases to the Go module proxy:
+
    ```bash
    curl -fsSL "https://proxy.golang.org/github.com/sagernet/sing-box/@v/v<version>.mod" | grep 'cronet-go/lib/linux_amd64'
    ```
+
    Put that pseudo-version into `cronetVersion`, obtain both pins as documented at the top of `scripts/fetch-cronet.mjs` (`cronetArchiveSha256` = module zip, `cronetLibSha256` = the installed library itself), then run `npm run fetch:cronet -- --force`. Forgetting to sync is not silent: before any actual download the script fetches sing-box's `.mod` and fails if the versions disagree.
 
 ## sing-box version
