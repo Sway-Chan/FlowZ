@@ -4,6 +4,7 @@
  */
 
 import { app, dialog } from 'electron';
+import { createHash } from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -29,6 +30,7 @@ import { CoreDownloader } from './core-downloader';
 import type { UpdateNetwork } from './UpdateNetwork';
 import coreManifest from '../../shared/core-manifest.json';
 import { IPC_CHANNELS } from '../../shared/ipc-channels';
+import { normalizeAssetDigest } from './singbox-asset';
 import { system32 } from '../utils/win-system32';
 
 export interface CoreUpdateCheckResult {
@@ -36,6 +38,8 @@ export interface CoreUpdateCheckResult {
   currentVersion: string;
   latestVersion?: string;
   downloadUrl?: string;
+  /** 该资产的 sha256（小写裸 hex，取自 GitHub API 的 asset.digest）。运行期换核的完整性锚。 */
+  downloadSha256?: string;
   releaseNotes?: string;
   crossBand?: boolean; // latestVersion 是否跨当前 minor 带（restrict 关闭时让 UI 标「跨大版本、风险更高」）
   error?: string;
@@ -89,6 +93,11 @@ export class CoreUpdateService {
   private helperManager: Pick<HelperManager, 'getStatus' | 'installCore'> | null = null;
   private privilegeService: PlatformPrivilegeService | null = null; // T16：copyFileElevatedWindows delegate
   private isUpdating: boolean = false;
+  /**
+   * 最近一次 checkUpdate 解析出的「下载 URL → sha256」映射。updateCore 只认这里（或现取），
+   * **不接受调用方传入摘要**——否则渲染层/IPC 侧一个疏忽就能把校验降级成不校验，而这正是要防的。
+   */
+  private assetDigestByUrl = new Map<string, string>();
   // 更新后等待「首次成功运行」验证的新版本号；首启成功→清除并删备份，首启失败→自动回滚
   private pendingUpdateVersion: string | null = null;
   private pendingUpdateAt: number = 0; // 更新落盘时间戳，用于"待验证"过期保护（防陈旧 pending 误回滚）
@@ -233,11 +242,14 @@ export class CoreUpdateService {
         // 找到适合当前平台的资源
         const asset = this.coreDownloader.findSuitableAsset(latestRelease.assets);
         if (asset) {
+          const digest = normalizeAssetDigest(asset);
+          if (digest) this.assetDigestByUrl.set(asset.browser_download_url, digest);
           const result = {
             hasUpdate: true,
             currentVersion,
             latestVersion,
             downloadUrl: asset.browser_download_url,
+            downloadSha256: digest ?? undefined,
             releaseNotes: latestRelease.body,
             // 跨当前 minor 带（如 1.13→1.14）→ UI 标风险。能走到这说明带内或 restrict 关闭，跨带必是 restrict 关闭所致。
             crossBand: !sameMajorMinor(latestVersion, currentVersion),
@@ -263,6 +275,38 @@ export class CoreUpdateService {
     }
   }
 
+  /**
+   * 解析某下载 URL 对应的 sha256（小写裸 hex）；解析不出返回 null。
+   *
+   * 顺序：本次会话 checkUpdate 写下的缓存 → 现拉一次 releases 重新解析（缓存冷：App 重启后用户直接点更新，
+   * 或自动更新腿跨会话触发）。**刻意不接受调用方传入的摘要**——摘要是安全断言，来源必须由服务自己掌握，
+   * 否则任何一个漏传/传错的调用点都会把校验静默降级成不校验。
+   *
+   * 实测依据：GitHub REST 对全部 asset 回填 `digest`（v1.12.0 / v1.13.0 / v1.14.0-beta.7 逐个验过），
+   * 故「解析不出」属异常而非常态，调用方据此 fail-closed 是可行的、不会卡住正常更新。
+   */
+  private async resolveAssetSha256(downloadUrl: string): Promise<string | null> {
+    const cached = this.assetDigestByUrl.get(downloadUrl);
+    if (cached) return cached;
+    try {
+      const releases = await this.coreDownloader.fetchReleases();
+      for (const rel of releases || []) {
+        for (const a of rel?.assets || []) {
+          const d = normalizeAssetDigest(a);
+          if (d && a?.browser_download_url) this.assetDigestByUrl.set(a.browser_download_url, d);
+        }
+      }
+    } catch (e) {
+      this.logManager.addLog(
+        'warn',
+        `重新解析内核资产摘要失败（将拒绝安装未校验的内核）: ${e}`,
+        'CoreUpdateService'
+      );
+      return null;
+    }
+    return this.assetDigestByUrl.get(downloadUrl) ?? null;
+  }
+
   async updateCore(downloadUrl: string): Promise<boolean> {
     if (this.isUpdating) {
       throw new Error('更新正在进行中');
@@ -279,9 +323,15 @@ export class CoreUpdateService {
     let backupMade = false;
 
     try {
-      // 1. 下载文件
+      // 1. 下载文件（先取摘要：拿不到就不装——运行期换核会回落第三方镜像，无摘要即无从判断拿到的是什么）
+      const sha256 = await this.resolveAssetSha256(downloadUrl);
+      if (!sha256) {
+        throw new Error(
+          '无法获取该内核资产的官方 sha256 摘要，已中止更新（拒绝安装未经校验的内核）。请稍后重试或检查网络。'
+        );
+      }
       this.logManager.addLog('info', '开始下载核心文件...', 'CoreUpdateService');
-      const tempPath = await this.coreDownloader.downloadFile(downloadUrl);
+      const tempPath = await this.coreDownloader.downloadFile(downloadUrl, false, sha256);
 
       // 2. 解压文件 (如果需要)
       // Sing-box release 通常是 .tar.gz 或 .zip
@@ -794,7 +844,17 @@ export class CoreUpdateService {
       let tempPath: string | null = null;
       let extractDir: string | null = null;
       try {
-        tempPath = await this.coreDownloader.downloadFile(check.downloadUrl);
+        // 与手动路径同一道门：无摘要不装。这条腿是**自动**的（无人值守），降级校验的后果更严重。
+        const sha256 = check.downloadSha256 ?? (await this.resolveAssetSha256(check.downloadUrl));
+        if (!sha256) {
+          this.logManager.addLog(
+            'warn',
+            '自动更新中止：无法获取内核资产的官方 sha256 摘要（拒绝安装未经校验的内核）',
+            'CoreUpdateService'
+          );
+          return;
+        }
+        tempPath = await this.coreDownloader.downloadFile(check.downloadUrl, false, sha256);
         const extracted = await this.coreDownloader.extractCore(tempPath);
         extractDir = extracted.extractDir;
         const preflight = await this.preflightValidate(extracted.corePath);
@@ -1475,9 +1535,48 @@ export class CoreUpdateService {
   /** 重置内核到出厂版本：把随 App 出厂的 bundled 核 force 落位回受保护目录（macOS-v5）/bundle。
    *  skipBackup=true：出厂核是用户要的终态，现役核是用户要丢弃的——不备份/不验证闩/不回退（去冗余）。
    *  force 跳过同版本短路（出厂核常与现役同版本，重置仍要覆盖回去）。 */
+
+  /**
+   * 校验随包出厂核是否仍是 manifest 里 pin 的那一份（`coreBinarySha256`）。
+   *
+   * 存在的理由：`resetCoreToFactory` 的语义是「回到已知良好的出厂状态」。若 app 安装目录里的出厂核已被
+   * 替换（portable 安装目录用户可写，普通权限的恶意程序即可改），reset 就会把恶意核**当作干净核装回去**，
+   * 而且这是用户主动求助时最信任的一步。
+   *
+   * **仅 win/linux 校验，macOS 跳过**——不是偷懒，是 pin 在 mac 上本就对不上：release 流程对 .app 做
+   * `codesign --force --deep --sign -`，深签会重写嵌套二进制（真机实测：同一文件签名前后 sha 不同），
+   * 而 pin 取自上游 release 原件。硬校验会对每个 mac 用户误报。mac 侧的等价保护由 .app 自身的代码签名
+   * （Gatekeeper 校验嵌套内容）承担。
+   *
+   * @returns null=通过或不适用；字符串=拒绝理由
+   */
+  private verifyFactoryCore(bundlePath: string): string | null {
+    if (process.platform === 'darwin') return null; // 见上：深签重写字节，pin 不适用
+    const key =
+      process.platform === 'win32' ? 'win' : process.platform === 'linux' ? 'linux' : null;
+    if (!key) return null;
+    const pin = (coreManifest as { coreBinarySha256?: Record<string, string> }).coreBinarySha256?.[
+      key
+    ];
+    if (!pin) return null; // 无 pin 不阻断（与 fetch-core 同口径：pin 是自证锚，缺它退回原行为）
+    try {
+      const actual = createHash('sha256').update(fs.readFileSync(bundlePath)).digest('hex');
+      if (actual === pin) return null;
+      return `随包出厂内核与官方指纹不符（期望 ${pin.slice(0, 12)}…，实得 ${actual.slice(0, 12)}…）。安装目录内的内核可能已被替换，已拒绝重置；请重新安装 FlowZ。`;
+    } catch (e) {
+      return `无法读取随包出厂内核以校验完整性：${e}`;
+    }
+  }
+
   async resetCoreToFactory(): Promise<{ ok: boolean; error?: string }> {
     this.logManager.addLog('info', '重置内核到出厂版本...', 'CoreUpdateService');
     const bundlePath = resourceManager.getBundledSingBoxPath();
+    // 出厂核完整性：reset 是「回到已知良好」的动作，装回一个已被替换的二进制比不 reset 更糟。
+    const bad = this.verifyFactoryCore(bundlePath);
+    if (bad) {
+      this.logManager.addLog('error', `重置内核被拒绝：${bad}`, 'CoreUpdateService');
+      return { ok: false, error: bad };
+    }
     const r = await this.replaceManualCore({ filePath: bundlePath, force: true, skipBackup: true });
     if (r.ok) {
       this.pruneBackup(); // 清理旧备份（reset 到出厂 = 干净状态，残留 .bak 无意义）
