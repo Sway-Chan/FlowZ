@@ -91,6 +91,14 @@ function baseConfig(over: Partial<UserConfig> = {}): UserConfig {
   } as unknown as UserConfig;
 }
 
+/**
+ * #347 默认关之后：凡是验证 resolve 及其配套影子规则的用例，夹具必须**显式打开**开关。
+ * 默认档（未设）由 INV-EXIT-3 的 3a 单独钉住 = 不注入。
+ */
+function resolveOn(over: Partial<UserConfig> = {}): UserConfig {
+  return baseConfig({ resolveDestination: true, ...over } as Partial<UserConfig>);
+}
+
 const pm = new ProxyManager();
 const gen = (c: UserConfig): AnyCfg => pm.generateSingBoxConfig(c) as AnyCfg;
 const dnsRules = (cfg: AnyCfg): AnyCfg[] => (cfg.dns.rules || []) as AnyCfg[];
@@ -201,8 +209,12 @@ describe('#347 INV-EXIT-3 — resolve 规则的注入条件', () => {
   const countResolve = (cfg: AnyCfg): number =>
     routeRules(cfg).filter((r) => r.action === 'resolve').length;
 
-  it('3a FakeIP 开 + 开关默认（未设）→ 注入恰好一条 resolve', () => {
-    expect(countResolve(gen(baseConfig()))).toBe(1);
+  it('3a FakeIP 开 + 开关默认（未设）→ 不注入（默认关）', () => {
+    expect(countResolve(gen(baseConfig()))).toBe(0);
+  });
+
+  it('3a2 开关显式开 → 注入恰好一条 resolve（正向对照）', () => {
+    expect(countResolve(gen(resolveOn()))).toBe(1);
   });
 
   it('3b 开关显式关 → 不注入', () => {
@@ -211,7 +223,7 @@ describe('#347 INV-EXIT-3 — resolve 规则的注入条件', () => {
 
   it('3c FakeIP 关 → 不注入（目的地本就是真实 IP）', () => {
     const cfg = gen(
-      baseConfig({
+      resolveOn({
         dnsConfig: {
           domesticDns: 'https://doh.pub/dns-query',
           foreignDns: 'https://dns.google/dns-query',
@@ -223,11 +235,11 @@ describe('#347 INV-EXIT-3 — resolve 规则的注入条件', () => {
   });
 
   it('3d direct 模式 → 不注入（出口恒直连）', () => {
-    expect(countResolve(gen(baseConfig({ proxyMode: 'direct' })))).toBe(0);
+    expect(countResolve(gen(resolveOn({ proxyMode: 'direct' })))).toBe(0);
   });
 
   it('3e resolve 带的 server（若有）必须闭合到已定义的 dns server', () => {
-    const cfg = gen(baseConfig());
+    const cfg = gen(resolveOn());
     const tags = new Set((cfg.dns.servers as AnyCfg[]).map((s) => s.tag));
     for (const r of routeRules(cfg).filter((x) => x.action === 'resolve')) {
       if (typeof r.server === 'string') expect(tags).toContain(r.server);
@@ -237,7 +249,7 @@ describe('#347 INV-EXIT-3 — resolve 规则的注入条件', () => {
 
 describe('#347 INV-ORDER — resolve 的位置不变量', () => {
   const cfg = gen(
-    baseConfig({
+    resolveOn({
       customRules: [
         proxyRule('r-proxy', ['epochtimes.com']),
       ] as unknown as UserConfig['customRules'],
@@ -259,7 +271,7 @@ describe('#347 INV-ORDER — resolve 的位置不变量', () => {
     probePm.probePoolPorts = [34111, 34112];
     probePm.updateInPort = 34121;
     const probeCfg = (probePm as unknown as ProxyManager).generateSingBoxConfig(
-      baseConfig({
+      resolveOn({
         customRules: [
           proxyRule('r-proxy', ['epochtimes.com']),
         ] as unknown as UserConfig['customRules'],
@@ -352,7 +364,7 @@ describe('#347 INV-EXIT-4 — 出口影子规则：route 强制直连的自定�
   // 用 bypassFakeIP=true 的夹具在原理上测不出它：bypass 桶那条（无 query_type、排在 fakeip catch-all
   // 之前）先命中，影子规则那条对该域名不可达 —— 判据会被夹具喂饱而恒绿。
   const cfg = gen(
-    baseConfig({
+    resolveOn({
       customRules: [
         {
           id: 'r-fd',
@@ -409,12 +421,12 @@ describe('#347 INV-EXIT-5 — 应用分流强制直连 → 两条腿都必须非
   // 判据用差分（开/关应用分流的同配置之差），零夹具依赖：防环/DNS-客户端那批 process_name→direct
   // 在两侧都有、自动抵消。直接取「所有 process_name→direct」会过采集，在未变异代码上就红。
   const cfg = gen(
-    baseConfig({
+    resolveOn({
       appRoutingEnabled: true,
       appRules: [{ appId: 'telegram', action: 'direct', enabled: true }],
     } as unknown as Partial<UserConfig>)
   );
-  const off = gen(baseConfig());
+  const off = gen(resolveOn());
 
   it('5a process_name 腿', () => {
     const procsOf = (c: AnyCfg): Set<string> => {
@@ -482,7 +494,7 @@ describe('#347 INV-EXIT-6 — 出口已整体回退 direct 时不得注入 resol
   for (const mode of ['smart', 'global'] as const) {
     it(`${mode}：exitFallback 已把出口整体回退直连，resolve 必须缺席`, () => {
       const cfg = gen(
-        baseConfig({ servers: [NODE, meshNode], selectedServerId: 'm1', proxyMode: mode })
+        resolveOn({ servers: [NODE, meshNode], selectedServerId: 'm1', proxyMode: mode })
       );
       expect(cfg.route.final).toBe('direct'); // 正向对照：夹具确实触发了 exitFallback
       expect(routeRules(cfg).filter((r) => r.action === 'resolve')).toHaveLength(0);
@@ -499,7 +511,7 @@ describe('#347 INV-EXIT-6 — 出口已整体回退 direct 时不得注入 resol
         allowInternet: true,
       },
     } as unknown as ServerConfig;
-    const cfg = gen(baseConfig({ servers: [NODE, full], selectedServerId: 'm2' }));
+    const cfg = gen(resolveOn({ servers: [NODE, full], selectedServerId: 'm2' }));
     expect(cfg.route.final).not.toBe('direct');
     expect(routeRules(cfg).filter((r) => r.action === 'resolve')).toHaveLength(1);
   });

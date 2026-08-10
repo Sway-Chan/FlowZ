@@ -351,24 +351,25 @@ byteDiffDescribe(
         expect(JSON.stringify(topOnly(cur.dns))).toBe(JSON.stringify(topOnly(base.dns)));
 
         // --- D. route.rules：除「含 1.12.12.12/32 的直连规则」+「#347 resolve 规则」外逐字节相同 ---
-        // #347 有意 delta：FakeIP 档恒注入一条 `{action:'resolve', timeout:'5s'}`（拨号前把目的域名解析成真实
-        // IP 再交给出站）。先正向断言它存在且位置正确，再从逐字节对比里剥离——只剥不断言等于把回归一起剥掉。
+        // #347：`resolve` **默认关**（真机实测开启会打掉节点侧按域名做的解锁分流），故这批夹具（均未设该开关）
+        // 的 route.rules 不含它——基线字节因此不受本特性影响。正向覆盖用同一夹具显式开一次生成变体，
+        // 断言「开了才有、位置正确」；只断言缺席等于让默认关把回归一起遮掉。
         const curRouteRules = cur.routeRules as AnyCfg[];
-        const idxResolve = curRouteRules.findIndex((r) => r.action === 'resolve');
+        expect(curRouteRules.findIndex((r) => r.action === 'resolve')).toBe(-1);
         if (hasFakeIp) {
+          const onCfg = { ...fx.config, resolveDestination: true } as typeof fx.config;
+          const onRules = extractDnsRoute(pm.generateSingBoxConfig(onCfg)).routeRules as AnyCfg[];
+          const idxResolve = onRules.findIndex((r) => r.action === 'resolve');
           expect(idxResolve).toBeGreaterThanOrEqual(0);
-          expect(curRouteRules[idxResolve]).toEqual({ action: 'resolve', timeout: '5s' });
-          // 位置不变量：必须在网银强制直连之后（那些域名公网 NXDOMAIN，resolve 失败会硬断连接），
-          // 且在私网直连之前（私网 ip_cidr 规则要靠 resolve 出来的 IP 才对域名流量生效）。
-          const idxBank = curRouteRules.findIndex(
+          expect(onRules[idxResolve]).toEqual({ action: 'resolve', timeout: '5s' });
+          // 位置不变量：必须在网银强制直连之后（那些域名公网 NXDOMAIN，resolve 失败会硬断连接）。
+          const idxBank = onRules.findIndex(
             (r) =>
               Array.isArray(r.domain_suffix) &&
               (r.domain_suffix as string[]).some((d) => d.includes('icbc.com.cn'))
           );
           expect(idxBank).toBeGreaterThanOrEqual(0);
           expect(idxBank).toBeLessThan(idxResolve);
-        } else {
-          expect(idxResolve).toBe(-1);
         }
         const stripNodeIp = (rules: AnyCfg[]) =>
           rules

@@ -201,11 +201,21 @@ export function usesFakeIp(config: UserConfig): boolean {
  *   · FakeIP 开 —— 关 FakeIP 时 TUN 拿到的本就是真实 IP，resolve 是 no-op；
  *   · 非 direct 模式 —— 出口恒直连，direct 出站自带 happy-eyeballs 并行拨号，插 resolve 只会换掉解析器且丢并行；
  *   · 出口未整体回退直连 —— 见下方 exitFallback 段，与 direct 模式同根因；
- *   · 用户未显式关闭。
+ *   · **用户显式打开**（`=== true`）。
  *
- * 默认开的代价（必须知情）：resolve 失败在 `route/route.go:663-667` 是 fatalErr，**没有「退回发域名」的兜底**，
- * 连接直接终止。这把 dns-remote 从「只影响 endpoint 拨号解析」升级成「每条经代理连接的硬前置」。故给用户可见
- * 开关：真机翻车时能把变量降回一维，而不必连 FakeIP 整套拓扑一起换掉。
+ * **默认关，且默认值是实测定的，不是保守取向。** 真机 A/B（同节点同配置，只切本开关）：
+ *   开：`www.netflix.com` 与 `claude.ai` 建连后精确 5.0s 被对端关闭（curl `000`）；`www.tiktok.com` 302。
+ *   关：分别 302 / 403 / 200，且全部目标的延迟一致更低。
+ * 机制：机场普遍在**节点侧按 SNI 做出口分流**（哪条解锁线路由域名决定）。交付 IP 后节点看不到域名，
+ * 该分流失效，且经隧道解析拿到的 IP 未必落在其解锁线路覆盖的段内。#347 那类「节点按主机名拒绝」是少数
+ * 机场的特例，默认开等于让多数正常用户为少数场景付费。
+ *
+ * 开启的代价（必须知情）：resolve 失败在 `route/route.go:663-667` 是 fatalErr，**没有「退回发域名」的兜底**，
+ * 连接直接终止。这把 dns-remote 从「只影响 endpoint 拨号解析」升级成「每条经代理连接的硬前置」。
+ *
+ * 与「关掉 FakeIP」的区别（两者对节点都交付 IP，不可区分；差别全在客户端侧）：本开关保留 fakeip 反查，
+ * 域名分流不依赖嗅探成功、且合成应答零延迟；关 FakeIP 则靠嗅探恢复域名（嗅不出就只剩 IP 规则）、
+ * 每个境外域名首查要等一次隧道往返，但彻底不存在 fakeip 映射错配。
  */
 export function resolvesDestinationAhead(config: UserConfig): boolean {
   if (!usesFakeIp(config)) return false;
@@ -216,7 +226,7 @@ export function resolvesDestinationAhead(config: UserConfig): boolean {
   // 'proxy-selector'，dns-builder 不 import 本谓词），resolve 会把每条连接的目的解析打进被 cryptokey
   // routing 丢弃的组网节点，超时后 fatalErr 断连——即回退兜底本要避免的黑洞，改从解析侧原样重现。
   if (meshSelectedExitFallsBackToDirect(config)) return false;
-  return config.resolveDestination !== false;
+  return config.resolveDestination === true;
 }
 
 /**

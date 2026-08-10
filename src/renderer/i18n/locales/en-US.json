@@ -754,8 +754,8 @@
       "singboxDashboardCardSub": "sing-box native control API",
       "singboxDashboardEnable": "Enable external control",
       "resolveDestination": "Resolve destination before dialing",
-      "resolveDestinationDesc": "Resolve the domain to an IP locally, then hand the IP to the node. On by default.",
-      "resolveDestinationDescFull": "When on, the destination domain is resolved locally (through the current node tunnel) and the IP is handed to the node; when off, the domain is sent to the node and resolved there. Some nodes reject or mis-resolve particular domains, which shows up as specific sites connecting and then dropping — turning this on bypasses that. Costs: one extra DNS round trip on first connect; a failed lookup fails that connection outright; node-side routing or unblocking that keys on the domain may stop working."
+      "resolveDestinationDesc": "Resolve the domain to an IP locally, then hand the IP to the node. Off by default; turn it on if specific sites connect and then drop.",
+      "resolveDestinationDescFull": "When on, the destination domain is resolved locally (through the current node tunnel) and the IP is handed to the node; when off, the domain is sent to the node and resolved there. Some nodes reject or mis-resolve particular domains, which shows up as specific sites connecting and then dropping — turning this on bypasses that. Off by default: turning it on was measured to break provider-side unblocking that keys on the domain (Netflix and Claude were closed right after connecting). Other costs: one extra DNS round trip on first connect; a failed lookup fails that connection outright."
     },
     "about": {
       "version": "Version",

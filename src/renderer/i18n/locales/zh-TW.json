@@ -754,8 +754,8 @@
       "singboxDashboardCardSub": "sing-box 原生控制 API",
       "singboxDashboardEnable": "啟用外部控制",
       "resolveDestination": "撥號前解析目標網域",
-      "resolveDestinationDesc": "本機先把網域解析成 IP 再交給節點。預設開啟。",
-      "resolveDestinationDescFull": "開啟後由本機（經目前節點隧道）先把目標網域解析成 IP，再把 IP 交給節點；關閉則把網域隨封包發給節點、由節點自行解析。少數節點會對特定網域拒絕或解析異常，表現為個別網站連上就斷，開啟可繞開。代價：首次連線多一次 DNS 往返；解析失敗時該連線直接失敗；節點側按網域做的分流或解鎖可能失效。"
+      "resolveDestinationDesc": "本機先把網域解析成 IP 再交給節點。預設關閉；個別網站連上就斷時再開。",
+      "resolveDestinationDescFull": "開啟後由本機（經目前節點隧道）先把目標網域解析成 IP，再把 IP 交給節點；關閉則把網域隨封包發給節點、由節點自行解析。少數節點會對特定網域拒絕或解析異常，表現為個別網站連上就斷，開啟可繞開。預設關閉：實測開啟會打掉機場在節點側按網域做的解鎖分流（Netflix、Claude 等連上後隨即被中斷）。其他代價：首次連線多一次 DNS 往返；解析失敗時該連線直接失敗。"
     },
     "about": {
       "version": "版本",

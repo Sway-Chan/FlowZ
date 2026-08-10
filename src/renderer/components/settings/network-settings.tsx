@@ -431,7 +431,7 @@ export function NetworkSettings() {
               desc={t('settings.advanced.resolveDestinationDesc')}
             >
               <Swt
-                checked={config.resolveDestination !== false}
+                checked={config.resolveDestination === true}
                 onChange={(c) => setBool('resolveDestination', c)}
               />
             </Srow>

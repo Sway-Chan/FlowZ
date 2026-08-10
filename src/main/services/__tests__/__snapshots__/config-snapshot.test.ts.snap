@@ -533,10 +533,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
-          "action": "resolve",
-          "timeout": "5s",
-        },
-        {
           "action": "route",
           "domain_suffix": [
             "bank.example.com",
@@ -1187,10 +1183,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
-          "action": "resolve",
-          "timeout": "5s",
-        },
-        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -1819,10 +1811,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             ".tdx.com.cn",
           ],
           "outbound": "direct",
-        },
-        {
-          "action": "resolve",
-          "timeout": "5s",
         },
         {
           "action": "route",
@@ -2485,10 +2473,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
-          "action": "resolve",
-          "timeout": "5s",
-        },
-        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -3104,10 +3088,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
-          "action": "resolve",
-          "timeout": "5s",
-        },
-        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -3712,10 +3692,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             ".tdx.com.cn",
           ],
           "outbound": "direct",
-        },
-        {
-          "action": "resolve",
-          "timeout": "5s",
         },
         {
           "action": "route",
@@ -6044,10 +6020,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
-          "action": "resolve",
-          "timeout": "5s",
-        },
-        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -6680,10 +6652,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             ".tdx.com.cn",
           ],
           "outbound": "direct",
-        },
-        {
-          "action": "resolve",
-          "timeout": "5s",
         },
         {
           "action": "route",
@@ -7353,10 +7321,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
-          "action": "resolve",
-          "timeout": "5s",
-        },
-        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -7988,10 +7952,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
-          "action": "resolve",
-          "timeout": "5s",
-        },
-        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -8615,10 +8575,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             ".tdx.com.cn",
           ],
           "outbound": "direct",
-        },
-        {
-          "action": "resolve",
-          "timeout": "5s",
         },
         {
           "action": "reject",
@@ -9296,10 +9252,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
-          "action": "resolve",
-          "timeout": "5s",
-        },
-        {
           "action": "route",
           "network": [
             "icmp",
@@ -9889,10 +9841,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             ".tdx.com.cn",
           ],
           "outbound": "direct",
-        },
-        {
-          "action": "resolve",
-          "timeout": "5s",
         },
         {
           "action": "route",
@@ -10502,10 +10450,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
-          "action": "resolve",
-          "timeout": "5s",
-        },
-        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -11097,10 +11041,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             ".tdx.com.cn",
           ],
           "outbound": "direct",
-        },
-        {
-          "action": "resolve",
-          "timeout": "5s",
         },
         {
           "action": "route",
@@ -11726,10 +11666,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             ".tdx.com.cn",
           ],
           "outbound": "direct",
-        },
-        {
-          "action": "resolve",
-          "timeout": "5s",
         },
         {
           "action": "route",
@@ -12393,10 +12329,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
-          "action": "resolve",
-          "timeout": "5s",
-        },
-        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -13010,10 +12942,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             ".tdx.com.cn",
           ],
           "outbound": "direct",
-        },
-        {
-          "action": "resolve",
-          "timeout": "5s",
         },
         {
           "action": "route",
@@ -13639,10 +13567,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             ".tdx.com.cn",
           ],
           "outbound": "direct",
-        },
-        {
-          "action": "resolve",
-          "timeout": "5s",
         },
         {
           "action": "route",
@@ -14288,10 +14212,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
-          "action": "resolve",
-          "timeout": "5s",
-        },
-        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -14905,10 +14825,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             ".tdx.com.cn",
           ],
           "outbound": "direct",
-        },
-        {
-          "action": "resolve",
-          "timeout": "5s",
         },
         {
           "action": "route",
@@ -15552,10 +15468,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             ".tdx.com.cn",
           ],
           "outbound": "direct",
-        },
-        {
-          "action": "resolve",
-          "timeout": "5s",
         },
         {
           "action": "route",
@@ -16595,10 +16507,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
-          "action": "resolve",
-          "timeout": "5s",
-        },
-        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -17263,10 +17171,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
-          "action": "resolve",
-          "timeout": "5s",
-        },
-        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -17907,10 +17811,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
         {
           "action": "reject",
           "protocol": "stun",
-        },
-        {
-          "action": "resolve",
-          "timeout": "5s",
         },
         {
           "action": "route",
@@ -18555,10 +18455,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "protocol": "stun",
         },
         {
-          "action": "resolve",
-          "timeout": "5s",
-        },
-        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -19172,10 +19068,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             ".tdx.com.cn",
           ],
           "outbound": "direct",
-        },
-        {
-          "action": "resolve",
-          "timeout": "5s",
         },
         {
           "action": "route",
@@ -19805,10 +19697,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
-          "action": "resolve",
-          "timeout": "5s",
-        },
-        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -20431,10 +20319,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
-          "action": "resolve",
-          "timeout": "5s",
-        },
-        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -21035,10 +20919,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             ".tdx.com.cn",
           ],
           "outbound": "direct",
-        },
-        {
-          "action": "resolve",
-          "timeout": "5s",
         },
         {
           "action": "route",
@@ -21759,10 +21639,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
-          "action": "resolve",
-          "timeout": "5s",
-        },
-        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -22396,10 +22272,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             ".tdx.com.cn",
           ],
           "outbound": "direct",
-        },
-        {
-          "action": "resolve",
-          "timeout": "5s",
         },
         {
           "action": "route",
@@ -23043,10 +22915,6 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             ".tdx.com.cn",
           ],
           "outbound": "direct",
-        },
-        {
-          "action": "resolve",
-          "timeout": "5s",
         },
         {
           "action": "route",
