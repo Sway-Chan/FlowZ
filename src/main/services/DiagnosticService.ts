@@ -31,6 +31,7 @@ import {
   getLogsPath,
   getSingBoxLogPath,
   getSingBoxStartupLogPath,
+  getSingBoxConfigPath,
   getWindowsWatchdogLogPath,
 } from '../utils/paths';
 import path from 'path';
@@ -240,9 +241,26 @@ export class DiagnosticService {
     }
 
     const effLevel = effectiveLogLevel(config.logLevel || 'info', this.privacyProvider());
+    // #347：effLevel 是「按导出时的 config 重算」的值，而核加载的是**启动那一刻**写到磁盘的那份配置，两者可能
+    // 不同（报告者首份诊断包头部显示 info、日志实为 debug，首轮判断因此被误导，差点把可用的 debug 证据当成
+    // 「级别不够、证据缺失」丢掉）。真值在磁盘上核实际加载的那份 config：优先读它的 log.level，读不到（核未运行 /
+    // 文件缺失 / JSON 损坏）才回落 effLevel，并**在字段值里标注来源**——不让两个不同来源共用一个无标注字段。
+    let runningLevel: string | undefined;
+    try {
+      const onDisk = JSON.parse(await fs.readFile(getSingBoxConfigPath(), 'utf-8'));
+      const lv = onDisk?.log?.level;
+      if (typeof lv === 'string' && lv) runningLevel = lv;
+    } catch {
+      runningLevel = undefined;
+    }
+    const levelForHint = runningLevel ?? effLevel;
+    const logLevelField =
+      runningLevel !== undefined
+        ? `${runningLevel}（运行中核实例）`
+        : `${effLevel}（配置值，核未运行或配置文件不可读）`;
     const captureActive = !!config.diagnosticCapture;
     const wantDeeper =
-      effLevel !== 'debug' &&
+      levelForHint !== 'debug' &&
       !captureActive &&
       TROUBLE_RE.test(appLogTail) &&
       !config.disableLogFile;
@@ -264,7 +282,7 @@ export class DiagnosticService {
           ? sysProxy.httpProxy || sysProxy.httpsProxy || sysProxy.socksProxy || '(已启用)'
           : '(未启用)',
         nodeDomainResolver: config.dnsConfig?.nodeDomainResolver || 'auto',
-        logLevel: effLevel,
+        logLevel: logLevelField,
         captureActive,
         // libcronet 现状 + 本会话自愈计数：naive 缺/坏库根因 + 「库被反复删（疑杀软）」可观测（取数 best-effort，绝不阻断报告）。
         cronetLibStatus: (() => {
@@ -296,7 +314,7 @@ export class DiagnosticService {
       // issue #147：节点 outbound.server 已恒为域名（不再烧 IP），无额外预解析 IP 需补脱敏 → 仅扫 config.servers。
       nodeIdentifiers: collectNodeIdentifiers(config),
       hint: wantDeeper
-        ? `当前日志级别为 ${effLevel}，未含 DNS 解析等连接详情，但日志中已出现连接/DNS 类错误。建议到 主页 → 日志 → 诊断 开启「诊断采集」，复现问题后再次导出可获得更完整的根因数据。`
+        ? `当前日志级别为 ${levelForHint}，未含 DNS 解析等连接详情，但日志中已出现连接/DNS 类错误。建议到 主页 → 日志 → 诊断 开启「诊断采集」，复现问题后再次导出可获得更完整的根因数据。`
         : undefined,
     };
 
