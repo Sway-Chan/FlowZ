@@ -11,6 +11,7 @@
 import { createHash } from 'crypto';
 import type { Rule, RuleCondition, RuleType, UserConfig } from '../../shared/types';
 import { parsePortValues, ruleConditions } from '../../shared/rules';
+import { meshSelectedExitFallsBackToDirect } from '../../shared/endpoint-routes';
 
 /** 可外化的条件类型：均有 headless source 等价字段（geosite/geoip/ruleSet 不可——headless 不能嵌套 rule_set）。 */
 export const EXT_TYPES: ReadonlySet<RuleType> = new Set<RuleType>([
@@ -186,6 +187,36 @@ export function customRuleFileBase(id: string): string {
  */
 export function usesFakeIp(config: UserConfig): boolean {
   return config.dnsConfig?.enableFakeIp ?? true;
+}
+
+/**
+ * #347：拨号前把目的域名解析成真实 IP 再交给出站（route action `resolve`）——单一真值，默认值只在这一处定义。
+ *
+ * 为什么需要：sing-box 1.13+ 移除 `sniff_override_destination` 且无替代，FakeIP 反查出的域名会原样随包发给
+ * 节点（`outbound connection to www.example.org:443`）。节点侧的策略或其自身解析器于是成为单点——#347 报告者
+ * 的三个站点全部在建连后 78–107ms 被对端 FIN，同机场同时段的对照站点零关闭；同机场的 NekoBox（开着 FakeDNS
+ * 但拨号前解析成真 IP）一切正常。A/B 对照的唯一变量就是目的地交付形态。
+ *
+ * 四个条件全真才发射：
+ *   · FakeIP 开 —— 关 FakeIP 时 TUN 拿到的本就是真实 IP，resolve 是 no-op；
+ *   · 非 direct 模式 —— 出口恒直连，direct 出站自带 happy-eyeballs 并行拨号，插 resolve 只会换掉解析器且丢并行；
+ *   · 出口未整体回退直连 —— 见下方 exitFallback 段，与 direct 模式同根因；
+ *   · 用户未显式关闭。
+ *
+ * 默认开的代价（必须知情）：resolve 失败在 `route/route.go:663-667` 是 fatalErr，**没有「退回发域名」的兜底**，
+ * 连接直接终止。这把 dns-remote 从「只影响 endpoint 拨号解析」升级成「每条经代理连接的硬前置」。故给用户可见
+ * 开关：真机翻车时能把变量降回一维，而不必连 FakeIP 整套拓扑一起换掉。
+ */
+export function resolvesDestinationAhead(config: UserConfig): boolean {
+  if (!usesFakeIp(config)) return false;
+  if ((config.proxyMode || 'smart').toLowerCase() === 'direct') return false;
+  // 与 direct 模式同根因：主节点是「关外网组网节点」时 route 侧 userExitTag 已整体回退 direct（D4/D7），
+  // final=direct、零条 proxy-selector 规则 —— 出口本就直连，节点根本收不到目的地，resolve 零收益。
+  // 而 dns-remote 的 detour 不跟随该回退（buildDnsConfig 的 selectedServerTag 由 ProxyManager 硬编码传
+  // 'proxy-selector'，dns-builder 不 import 本谓词），resolve 会把每条连接的目的解析打进被 cryptokey
+  // routing 丢弃的组网节点，超时后 fatalErr 断连——即回退兜底本要避免的黑洞，改从解析侧原样重现。
+  if (meshSelectedExitFallsBackToDirect(config)) return false;
+  return config.resolveDestination !== false;
 }
 
 /**

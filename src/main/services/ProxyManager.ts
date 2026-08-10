@@ -3596,6 +3596,10 @@ done
           // 续命），旧 cache.db 里的 face:b00c decoy 会跨核重启命中。新 cache_id='flowz-dns-v2' 令冷启动走新命名空间，
           // 旧投毒条目成不可达垃圾（bbolt 文件不缩，~2MB 可接受）。cache_id 对 store_dns bucket 的命名空间语义须真机
           // 实证（§14.7 W1）；若不生效降级为发版引导手动 rm cache.db。
+          // **射程更正（#347）**：上述论断只对 store_dns bucket 成立，**对 store_fakeip bucket 不成立**——
+          // fakeip 的地址↔域名映射与地址池计数器不随 cache_id 换命名空间失效，bump 它不清理任何陈旧假 IP 映射。
+          // fakeip 侧的反查错配只能靠压客户端缓存时长收窄窗口（见 singbox-dns-builder 的 FAKEIP_REWRITE_TTL），
+          // 或直接删 cache.db。别再据此注释推断「bump 一次就把 fakeip 也清干净了」。
           cache_id: 'flowz-dns-v2',
           store_fakeip: true,
           store_dns: true,

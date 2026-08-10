@@ -77,6 +77,10 @@ export interface SingBoxDnsRule {
   inbound?: string | string[];
   // disable_cache（§15）：探测池槽跨节点轮换，缓存的 geo 答案会污染下一节点，故该规则禁缓存。
   disable_cache?: boolean;
+  // rewrite_ttl（1.14 AbstractDNSRouteActionOptions，*uint32）：重写**下发给客户端**那份应答的 TTL（秒）。
+  // 与 route action resolve 上的同名字段不是一回事——后者只改核内部 lookup 结果的缓存时长，客户端看不到。
+  // 内核对 dns.rules 的未知键有牙（拼错即 FATAL unknown field），故笔误不会静默通过。
+  rewrite_ttl?: number;
 }
 
 export interface SingBoxFakeIPConfig {

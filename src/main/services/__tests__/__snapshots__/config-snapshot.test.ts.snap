@@ -104,13 +104,14 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "direct.example",
             ".direct.example",
           ],
-          "server": "dns-bootstrap",
+          "server": "dns-remote",
         },
         {
           "query_type": [
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -532,6 +533,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "domain_suffix": [
             "bank.example.com",
@@ -781,6 +786,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -1181,6 +1187,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -1416,6 +1426,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -1810,6 +1821,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -2045,6 +2060,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -2469,6 +2485,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -2694,6 +2714,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -3083,6 +3104,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -3277,7 +3302,15 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "my-ntp.example.com",
             ".my-ntp.example.com",
           ],
+          "rule_set": "geosite-cn",
           "server": "dns-domestic",
+        },
+        {
+          "domain_suffix": [
+            "my-ntp.example.com",
+            ".my-ntp.example.com",
+          ],
+          "server": "dns-remote",
         },
         {
           "domain_keyword": [
@@ -3291,6 +3324,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -3678,6 +3712,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             ".tdx.com.cn",
           ],
           "outbound": "direct",
+        },
+        {
+          "action": "resolve",
+          "timeout": "5s",
         },
         {
           "action": "route",
@@ -5586,6 +5624,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -6005,6 +6044,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -6230,6 +6273,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -6638,6 +6682,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -6873,6 +6921,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -7304,6 +7353,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -7529,6 +7582,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -7934,6 +7988,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -8159,6 +8217,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -8558,6 +8617,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "reject",
           "domain_suffix": [
             "proxied.example",
@@ -8843,6 +8906,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -9230,6 +9294,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             ".tdx.com.cn",
           ],
           "outbound": "direct",
+        },
+        {
+          "action": "resolve",
+          "timeout": "5s",
         },
         {
           "action": "route",
@@ -9433,6 +9501,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -9820,6 +9889,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             ".tdx.com.cn",
           ],
           "outbound": "direct",
+        },
+        {
+          "action": "resolve",
+          "timeout": "5s",
         },
         {
           "action": "route",
@@ -10047,15 +10120,8 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
-        },
-        {
-          "query_type": [
-            "A",
-            "AAAA",
-          ],
-          "rule_set": "geosite-cn",
-          "server": "dns-domestic",
         },
         {
           "query_type": [
@@ -10436,6 +10502,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -10634,6 +10704,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -11028,6 +11099,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -11256,6 +11331,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -11652,6 +11728,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -11889,6 +11969,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -12312,6 +12393,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -12537,6 +12622,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -12926,6 +13012,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -13151,6 +13241,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -13550,6 +13641,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "domain_suffix": [
             "example.com",
@@ -13794,6 +13889,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -14192,6 +14288,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -14417,6 +14517,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -14806,6 +14907,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -15031,6 +15136,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -15446,6 +15552,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             ".tdx.com.cn",
           ],
           "outbound": "direct",
+        },
+        {
+          "action": "resolve",
+          "timeout": "5s",
         },
         {
           "action": "route",
@@ -16082,6 +16192,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -16484,6 +16595,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -16712,6 +16827,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -17147,6 +17263,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -17373,6 +17493,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -17786,6 +17907,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
         {
           "action": "reject",
           "protocol": "stun",
+        },
+        {
+          "action": "resolve",
+          "timeout": "5s",
         },
         {
           "action": "route",
@@ -18013,6 +18138,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -18429,6 +18555,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "protocol": "stun",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -18654,6 +18784,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -19043,6 +19174,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -19268,6 +19403,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -19669,6 +19805,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -19889,6 +20029,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -20290,6 +20431,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -20510,15 +20655,8 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
-        },
-        {
-          "query_type": [
-            "A",
-            "AAAA",
-          ],
-          "rule_set": "geosite-cn",
-          "server": "dns-domestic",
         },
         {
           "query_type": [
@@ -20899,6 +21037,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -21097,6 +21239,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -21616,6 +21759,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -21848,6 +21995,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -22250,6 +22398,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
           "outbound": "direct",
         },
         {
+          "action": "resolve",
+          "timeout": "5s",
+        },
+        {
           "action": "route",
           "ip_cidr": [
             "10.0.0.0/8",
@@ -22476,6 +22628,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 5,
           "server": "fakeip",
         },
         {
@@ -22890,6 +23043,10 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             ".tdx.com.cn",
           ],
           "outbound": "direct",
+        },
+        {
+          "action": "resolve",
+          "timeout": "5s",
         },
         {
           "action": "route",

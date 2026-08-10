@@ -419,6 +419,23 @@ export function NetworkSettings() {
               )}
             />
           )}
+          {/* #347 拨号前解析目的域名：仅 FakeIP 开启时有意义（关 FakeIP 时目的地本就是真实 IP），故与 FakeIP 同可见性。 */}
+          {config.dnsConfig?.enableFakeIp !== false && (
+            <Srow
+              label={
+                <>
+                  {t('settings.advanced.resolveDestination', '拨号前解析目标域名')}
+                  <InfoTooltip content={t('settings.advanced.resolveDestinationDescFull')} />
+                </>
+              }
+              desc={t('settings.advanced.resolveDestinationDesc')}
+            >
+              <Swt
+                checked={config.resolveDestination !== false}
+                onChange={(c) => setBool('resolveDestination', c)}
+              />
+            </Srow>
+          )}
           {/* 节点域名解析容错（issue #147 多源 race）：Switch 开关在上控制下方上游选择 on(多选 race 池)/off(单选)。 */}
           <Srow
             label={
