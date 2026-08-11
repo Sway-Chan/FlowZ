@@ -324,18 +324,18 @@ byteDiffDescribe(
             !r.rule_set
         );
         expect(curR1Idx).toBe(baseR1Idx); // rule1 位置不变
-        // #347 有意 delta：fakeip catch-all 恒带 rewrite_ttl=5（压反查错配窗口，600s→5s）。
+        // #347 有意 delta：fakeip catch-all 恒带 rewrite_ttl=60（压反查错配窗口，600s→60s；根因已由上游
+        // sing-box#4406 修复，本值只兜住残留的 10s 分配窗口，故从最初的 5 下调保护强度）。
         // 先正向断言它真的在（否则下面剥离等于把回归也一起剥掉），再从逐字节对比里剥离该键。
         const curFakeIpRule = curRules.find((r) => r.server === 'fakeip');
-        expect(hasFakeIp ? curFakeIpRule?.rewrite_ttl : undefined).toBe(hasFakeIp ? 5 : undefined);
+        expect(hasFakeIp ? curFakeIpRule?.rewrite_ttl : undefined).toBe(hasFakeIp ? 60 : undefined);
         const stripTtl = (r: AnyCfg): AnyCfg => {
           if (r.server !== 'fakeip' || r.rewrite_ttl === undefined) return r;
           const { rewrite_ttl: _drop, ...rest } = r;
           return rest;
         };
         // 除 rule1 外的所有 DNS 规则逐字节相同
-        const stripR1 = (rs: AnyCfg[], idx: number) =>
-          rs.filter((_, i) => i !== idx).map(stripTtl);
+        const stripR1 = (rs: AnyCfg[], idx: number) => rs.filter((_, i) => i !== idx).map(stripTtl);
         expect(JSON.stringify(stripR1(curRules, curR1Idx))).toBe(
           JSON.stringify(stripR1(baseRules, baseR1Idx))
         );

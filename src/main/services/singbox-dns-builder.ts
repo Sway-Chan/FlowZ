@@ -59,9 +59,13 @@ const withDotPrefix = (d: string): string[] => [d, `.${d}`];
 
 /**
  * FakeIP 合成应答下发给客户端的 TTL（秒）。不设时内核用 C.DefaultDNSTTL=600。
- * 理由全文见发射点（fakeip catch-all）的注释。与 Polaris config-engine 的 FAKEIP_REWRITE_TTL 取值对齐。
+ * 理由全文见发射点（fakeip catch-all）的注释。
+ *
+ * **与 Polaris 有意分叉，勿盲目对齐**：Polaris config-engine 的 `FAKEIP_REWRITE_TTL` 仍为 5，因为它的随包核
+ * 还是 1.14.0-beta.7、不含上游 sing-box#4406；本仓随包核已升到 beta.14（含该修复），故可下调保护强度。
+ * 重新对齐的条件 = Polaris 随包核升到含 #4406 的版本。
  */
-const FAKEIP_REWRITE_TTL = 5;
+const FAKEIP_REWRITE_TTL = 60;
 
 // P4b 内部预留 tag：tailscale 按名解析 DNS server 的固定 tag。不与节点 tag 撞车（节点 tag=节点显示名，
 // 不会取此前缀；与 ProxyManager.usedTags 内置保留 tag 同理为内部固定 tag）。
@@ -548,8 +552,16 @@ export function buildDnsConfig(
         server: 'fakeip',
         // #347：压 fakeip 反查错配的暴露窗口。fakeip 映射本身无 TTL、永不过期，只在地址池回卷时被覆盖；
         // 真实错配窗口 =「某假 IP 被回卷复用给新域名」∩「客户端仍持有旧域名的该假 IP 缓存」，本值只压后半个
-        // 条件：600s（C.DefaultDNSTTL）→ 5s。写成「消除错配」不成立，写成「把窗口从 600s 压到秒级」才准确。
-        // 取 5 不取 1：本地合成应答零外部往返，下界由「别把客户端解析器打成忙等」定，两侧留余量。
+        // 条件：600s（C.DefaultDNSTTL）→ 60s。写成「消除错配」不成立，写成「把窗口压小一个数量级」才准确。
+        //
+        // **取值 60 的由来（原为 5，随内核升级下调保护强度）**：前半个条件的根因已由上游
+        // SagerNet/sing-box#4406 修复（计数器落盘只写本进程首次分配位置 → 改为定时器读受 mutex 保护的最新值），
+        // 随包核 1.14.0-beta.14 起包含。修复后非优雅退出最多丢一个 FakeIPMetadataSaveInterval(10s) 的进度，
+        // 地址回卷从「每次重启必然重洗低位」降为「硬杀前 10 秒内分配的地址」，碰撞已属罕见。
+        // 代价侧实测（Windows，20 个活跃域名，getaddrinfo 路径）：TTL=5 → 242 次查询/分钟、sing-box CPU
+        // 93.8ms/min（≈0.16% 单核）；TTL=60 → 约 1/12。Windows DNS Client 严格遵守本 TTL（缓存条目实测
+        // 按秒递减），故倍率是真实的。为一个已修复的缺陷长期给所有用户 12 倍查询放大不划算，60 保留一个
+        // 数量级的兜底、代价降一档。下界仍由「别把客户端解析器打成忙等」约束，两侧留余量。
         rewrite_ttl: FAKEIP_REWRITE_TTL,
       } as SingBoxDnsRule);
       // #347 出口影子规则（仅 resolve 生效时发射）：核内部 lookup（allowFakeIP=false）会跳过 fakeip server

@@ -111,7 +111,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -782,7 +782,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -1418,7 +1418,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -2048,7 +2048,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -2698,7 +2698,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -3304,7 +3304,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -5600,7 +5600,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -6245,7 +6245,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -6889,7 +6889,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -7546,7 +7546,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -8177,7 +8177,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -8862,7 +8862,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -9453,7 +9453,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -10068,7 +10068,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -10648,7 +10648,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -11271,7 +11271,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -11905,7 +11905,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -12554,7 +12554,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -13169,7 +13169,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -13813,7 +13813,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -14437,7 +14437,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -15052,7 +15052,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -16104,7 +16104,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -16735,7 +16735,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -17397,7 +17397,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -18038,7 +18038,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -18680,7 +18680,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -19295,7 +19295,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -19917,7 +19917,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -20539,7 +20539,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -21119,7 +21119,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -21871,7 +21871,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -22500,7 +22500,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
-          "rewrite_ttl": 5,
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {

@@ -330,11 +330,11 @@ describe('#347 INV-ORDER — resolve 的位置不变量', () => {
 describe('#347 INV-TTL — fakeip 合成应答下发 TTL', () => {
   const cfg = gen(baseConfig());
 
-  it('fakeip catch-all 带 rewrite_ttl=5，且其余 dns.rules 一条都不带（全量对账）', () => {
+  it('fakeip catch-all 带 rewrite_ttl=60，且其余 dns.rules 一条都不带（全量对账）', () => {
     const withTtl = dnsRules(cfg).filter((r) => r.rewrite_ttl !== undefined);
     expect(withTtl).toHaveLength(1);
     expect(withTtl[0].server).toBe('fakeip');
-    expect(withTtl[0].rewrite_ttl).toBe(5);
+    expect(withTtl[0].rewrite_ttl).toBe(60);
   });
 });
 
