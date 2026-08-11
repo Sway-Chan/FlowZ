@@ -755,7 +755,6 @@
       "singboxDashboardEnable": "Enable external control",
       "resolveDestination": "Resolve destination before dialing",
       "resolveDestinationDesc": "Resolve the domain to an IP locally, then hand the IP to the node. Off by default; turn it on if specific sites connect and then drop.",
-      "resolveDestinationNeedsFakeIp": "Requires FakeIP. This feature relies on FakeIP’s reverse domain lookup and has no effect while FakeIP is off.",
       "resolveDestinationDescFull": "When on, the destination domain is resolved locally (through the current node tunnel) and the IP is handed to the node; when off, the domain is sent to the node and resolved there. Some nodes reject or mis-resolve particular domains, which shows up as specific sites connecting and then dropping — turning this on bypasses that. Off by default: with it on the node only ever sees an IP, so provider-side routing or unblocking that keys on the domain may stop working; one extra DNS round trip on first connect; a failed lookup fails that connection outright, with no fallback to sending the domain."
     },
     "about": {

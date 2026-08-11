@@ -197,8 +197,7 @@ export function usesFakeIp(config: UserConfig): boolean {
  * 的三个站点全部在建连后 78–107ms 被对端 FIN，同机场同时段的对照站点零关闭；同机场的 NekoBox（开着 FakeDNS
  * 但拨号前解析成真 IP）一切正常。A/B 对照的唯一变量就是目的地交付形态。
  *
- * 四个条件全真才发射：
- *   · FakeIP 开 —— 关 FakeIP 时 TUN 拿到的本就是真实 IP，resolve 是 no-op；
+ * 三个条件全真才发射：
  *   · 非 direct 模式 —— 出口恒直连，direct 出站自带 happy-eyeballs 并行拨号，插 resolve 只会换掉解析器且丢并行；
  *   · 出口未整体回退直连 —— 见下方 exitFallback 段，与 direct 模式同根因；
  *   · **用户显式打开**（`=== true`）。
@@ -219,7 +218,12 @@ export function usesFakeIp(config: UserConfig): boolean {
  * 每个境外域名首查要等一次隧道往返，但彻底不存在 fakeip 映射错配。
  */
 export function resolvesDestinationAhead(config: UserConfig): boolean {
-  if (!usesFakeIp(config)) return false;
+  // **刻意不看 FakeIP 开关**：`mixed-in` 入站是**无条件**发射的（singbox-inbounds-builder「无论哪种模式，
+  // 都添加 HTTP + SOCKS inbound」），走它的流量（终端代理变量、指向本地端口的应用、探测/更新入站）目的地
+  // **恒为域名**，与 FakeIP 无关。早期版本以 usesFakeIp 为前置门，等于让「关了 FakeIP」的用户既拿不到
+  // IP 交付、又失去这条逃生口——正是 #347 的病症本身。
+  // 关 FakeIP + TUN 的那批真 IP 目的地不受影响：`actionResolve` 首行即 `if metadata.Destination.IsDomain()`
+  // （route/route.go:879-880，v1.14.0-beta.14 实读），非域名严格 no-op、零代价、不报错。
   if ((config.proxyMode || 'smart').toLowerCase() === 'direct') return false;
   // 与 direct 模式同根因：主节点是「关外网组网节点」时 route 侧 userExitTag 已整体回退 direct（D4/D7），
   // final=direct、零条 proxy-selector 规则 —— 出口本就直连，节点根本收不到目的地，resolve 零收益。

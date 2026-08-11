@@ -221,9 +221,22 @@ describe('#347 INV-EXIT-3 — resolve 规则的注入条件', () => {
     expect(countResolve(gen(baseConfig({ resolveDestination: false })))).toBe(0);
   });
 
-  it('3c FakeIP 关 → 不注入（目的地本就是真实 IP）', () => {
+  it('3c FakeIP 关 + 开关显式开 → 仍注入（mixed-in 入站无条件发射，其目的地恒为域名）', () => {
     const cfg = gen(
       resolveOn({
+        dnsConfig: {
+          domesticDns: 'https://doh.pub/dns-query',
+          foreignDns: 'https://dns.google/dns-query',
+          enableFakeIp: false,
+        } as unknown as UserConfig['dnsConfig'],
+      })
+    );
+    expect(countResolve(cfg)).toBe(1);
+  });
+
+  it('3c2 FakeIP 关 + 开关默认（未设）→ 不注入（默认关仍是唯一总闸）', () => {
+    const cfg = gen(
+      baseConfig({
         dnsConfig: {
           domesticDns: 'https://doh.pub/dns-query',
           foreignDns: 'https://dns.google/dns-query',

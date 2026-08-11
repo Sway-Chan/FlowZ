@@ -419,11 +419,8 @@ export function NetworkSettings() {
               )}
             />
           )}
-          {/* #347 拨号前解析目的域名：与 FakeIP 联动——本功能依赖 fakeip 的域名反查，谓词
-              resolvesDestinationAhead 以 usesFakeIp 为前置门。FakeIP 关时**常显但置灰**而非隐藏：
-              隐藏会让用户既看不到它存在、也不知道为何不生效；置灰 + 说明理由才可自解释。
-              置灰不改 resolveDestination 字段值本身（与 reverseMesh→allowInternet 同款联动语义），
-              重新开启 FakeIP 后用户原先的选择原样回来。 */}
+          {/* #347 拨号前解析目的域名：**不与 FakeIP 联动**——mixed-in 入站无条件发射，走它的流量目的地
+              恒为域名，关掉 FakeIP 并不会让本开关失去意义（谓词 resolvesDestinationAhead 同口径）。 */}
           <Srow
             label={
               <>
@@ -431,17 +428,10 @@ export function NetworkSettings() {
                 <InfoTooltip content={t('settings.advanced.resolveDestinationDescFull')} />
               </>
             }
-            desc={
-              config.dnsConfig?.enableFakeIp === false
-                ? t('settings.advanced.resolveDestinationNeedsFakeIp')
-                : t('settings.advanced.resolveDestinationDesc')
-            }
+            desc={t('settings.advanced.resolveDestinationDesc')}
           >
             <Swt
-              checked={
-                config.resolveDestination === true && config.dnsConfig?.enableFakeIp !== false
-              }
-              disabled={config.dnsConfig?.enableFakeIp === false}
+              checked={config.resolveDestination === true}
               onChange={(c) => setBool('resolveDestination', c)}
             />
           </Srow>
