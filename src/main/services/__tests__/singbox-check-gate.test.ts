@@ -243,6 +243,41 @@ describe('sing-box check 门 — 生成的全量 config', () => {
     expectCheckOk(c, 'race-on-tun-wg');
   });
 
+  it('#347 FakeIP 关 + 拨号前解析开 + 强制直连自定义规则 → 非-FakeIP 分支的出口影子规则被真核接受', () => {
+    // 撤掉 usesFakeIp 前置门后**新可达**的一格（存量 systemProxy 用户的默认态就是 FakeIP 关）。
+    // 该分支的影子规则由本 PR 新加，引用 getDomesticResolverTag 的 tag；悬空引用 check 会 FATAL。
+    const c = svcFor().gen(
+      cfg({
+        servers: [domainNode()],
+        dnsConfig: { enableFakeIp: false },
+        resolveDestination: true,
+        customRules: [
+          {
+            id: 'r-fd',
+            type: 'domainSuffix',
+            values: ['forcedirect.example'],
+            action: 'direct',
+            enabled: true,
+            bypassFakeIP: false,
+          },
+        ],
+      } as unknown as Partial<UserConfig>)
+    );
+    // ① 验的是不是声称的对象：route 侧 resolve 在、DNS 侧影子腿在（缺一则 check 绿也无意义）。
+    expect(
+      (c.route?.rules ?? []).some((r) => (r as { action?: string }).action === 'resolve')
+    ).toBe(true);
+    const shadow = (c.dns?.rules ?? []).find((r) =>
+      ((r as { domain_suffix?: string[] }).domain_suffix ?? []).some((d) =>
+        d.includes('forcedirect.example')
+      )
+    ) as { server?: string } | undefined;
+    expect(shadow).toBeDefined();
+    // ② 影子腿必须指向真实存在的境内解析器 tag（引用完整性先验，check 的 FATAL 是最终裁判）。
+    expect(dnsTags(c)).toContain(shadow?.server);
+    expectCheckOk(c, 'fakeip-off-resolve-on');
+  });
+
   it('race off + 单上游档 dnspod（tag=dns-node）→ 结构化包裹层与档位正交，check 通过', () => {
     const c = svcFor().gen(
       cfg({

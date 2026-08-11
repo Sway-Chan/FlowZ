@@ -61,9 +61,9 @@ const withDotPrefix = (d: string): string[] => [d, `.${d}`];
  * FakeIP 合成应答下发给客户端的 TTL（秒）。不设时内核用 C.DefaultDNSTTL=600。
  * 理由全文见发射点（fakeip catch-all）的注释。
  *
- * **与 Polaris 有意分叉，勿盲目对齐**：Polaris config-engine 的 `FAKEIP_REWRITE_TTL` 仍为 5，因为它的随包核
- * 还是 1.14.0-beta.7、不含上游 sing-box#4406；本仓随包核已升到 beta.14（含该修复），故可下调保护强度。
- * 重新对齐的条件 = Polaris 随包核升到含 #4406 的版本。
+ * **取 60 的前提**：地址回卷的根因已由上游 sing-box#4406 修复，该修复自 1.14.0-beta.14 起包含在内核里。
+ * 本仓随包核版本以 `src/shared/core-manifest.json` 的 `bundledCoreVersion` 为准（此处不复写版本号——跨文件
+ * 状态写进注释必然腐坏）；若随包核低于 beta.14，本值应回到 5 以补足保护强度。
  */
 const FAKEIP_REWRITE_TTL = 60;
 
@@ -541,6 +541,90 @@ export function buildDnsConfig(
     pushBypassBucket(viaDirect, 'dns-bootstrap');
   }
 
+  // #347 出口影子规则：为「去向=直连」的用户自定义规则 / 应用分流补回境内解析器。
+  //
+  // 为什么需要：route 侧 `action:'resolve'` 一开，目的域名的解析就从「direct 出站自己的 domain_resolver
+  // （getDomesticResolverTag，境内、无 detour）」被抢占成「走 dns.rules 首命中」，而 dns.rules 的兜底腿是
+  // dns-remote（detour=proxy-selector=隧道）。于是「被用户强制直连的域名」变成 出口=直连、解析器=隧道 ——
+  // 正是本 issue 的镜像错配，且让本该直连的流量反过来依赖隧道可用性；内网/私网域名经隧道解必 NXDOMAIN，
+  // 而 resolve 失败在 route/route.go:663-667 是 fatalErr、**无「退回发域名」兜底** → 连接直接被杀。
+  // 位置不变量写在 singbox-route-builder 的 resolve 发射点（第三条）。
+  //
+  // 发射条件三条：
+  //   · **两个 FakeIP 分支都发**。FakeIP 开：核内部 lookup（allowFakeIP=false）跳过 fakeip server 继续往下
+  //     匹配，落 S0/S1 的 geo 二分。FakeIP 关：根本没有 fakeip 那条，兜底腿（smart 正向=dns-remote）同样把它
+  //     吸走。后者是撤掉 usesFakeIp 前置门（见 custom-rule-files#resolvesDestinationAhead）后**新可达**的格子
+  //     —— 经 mixed-in 入站（无条件发射）进来的流量目的地恒为域名，与 FakeIP 无关，故必须同样补。
+  //   · **只镜像直连向**。去向=代理的规则落兜底腿已经是隧道解析（除非该域名同时在 region-local geo 内，
+  //     那属既有的少数派错配，不在本 PR 射程）。
+  //   · **不必再判 smart**。global 是真·全局、忽略用户分流，而该门控已在单一真值点上：effectiveCustomRules /
+  //     effectiveAppRules 对非-smart 一律返空（singbox-config-helpers），本函数于是自然空转。在此重复判一次
+  //     是死条件（变异实测不红），反而制造「有两处门」的假象。route 侧没有 direct 去向时 DNS 侧不得单方面
+  //     拐向境内 —— 该跨模块契约由 INV-EXIT-7 钉住。
+  // toggle 关 ⇒ 一条都不发 ⇒ 逐字节回到历史形态，回退路径干净。
+  const pushDirectExitShadowRules = (): void => {
+    const directDomains: string[] = [];
+    const directSuffixes: string[] = [];
+    const directKeywords: string[] = [];
+    for (const rule of dnsCustomRules) {
+      if (!rule.enabled || rule.action !== 'direct') continue;
+      // 恒取 inline 值（不复用外化的 <base>-dns rule_set：那批 tag 只为 bypassFakeIP 注册，语义不同）。
+      for (const cond of ruleConditions(rule)) {
+        const vals = (cond.values || []).map((v) => v.trim()).filter(Boolean);
+        if (vals.length === 0) continue;
+        if (cond.type === 'domain') {
+          directDomains.push(...vals);
+        } else if (cond.type === 'domainSuffix') {
+          directSuffixes.push(...vals.map((d) => (d.startsWith('*.') ? d.slice(2) : d)));
+        } else if (cond.type === 'domainKeyword') {
+          directKeywords.push(...vals);
+        }
+      }
+    }
+    if (directDomains.length || directSuffixes.length || directKeywords.length) {
+      const shadow: Record<string, unknown> = {
+        query_type: ['A', 'AAAA'],
+        server: getDomesticResolverTag(config, 'dns-domestic'),
+      };
+      if (directDomains.length) shadow.domain = directDomains;
+      if (directSuffixes.length) shadow.domain_suffix = directSuffixes.flatMap(withDotPrefix);
+      if (directKeywords.length) shadow.domain_keyword = directKeywords;
+      dnsRules.push(shadow as unknown as SingBoxDnsRule);
+    }
+    // 应用分流同理。两条腿分别镜像 route 侧的 process_name 腿与 rule_set 腿；geosite tag 须先过
+    // .srs 存在性过滤（DNS 侧无末尾悬空剪枝，悬空 rule_set 会令内核 FATAL）。geoip 腿不镜像：
+    // 那是 IP 判据，解析阶段还没有 IP。
+    const directAppProcesses: string[] = [];
+    const directAppGeosites: string[] = [];
+    for (const appRule of effectiveAppRules(config)) {
+      if (appRule.enabled === false || appRule.action !== 'direct') continue;
+      const preset = getAppPreset(appRule.appId, config.customAppPresets);
+      if (!preset) continue;
+      if (preset.processNames?.length) directAppProcesses.push(...preset.processNames);
+      for (const tag of preset.geositeTags || []) {
+        const geoTag = `geosite-${tag.toLowerCase()}`;
+        const fileName = findBuiltin(geoTag)?.fileName ?? `${geoTag}.srs`;
+        if (!isValidSrsFile(path.join(getRuntimeRulesDir(), fileName))) continue;
+        if (!directAppGeosites.includes(geoTag)) directAppGeosites.push(geoTag);
+      }
+    }
+    const domesticForApps = getDomesticResolverTag(config, 'dns-domestic');
+    if (directAppProcesses.length) {
+      dnsRules.push({
+        query_type: ['A', 'AAAA'],
+        process_name: dedupe(directAppProcesses),
+        server: domesticForApps,
+      } as unknown as SingBoxDnsRule);
+    }
+    if (directAppGeosites.length) {
+      dnsRules.push({
+        query_type: ['A', 'AAAA'],
+        rule_set: directAppGeosites.length === 1 ? directAppGeosites[0] : directAppGeosites,
+        server: domesticForApps,
+      } as unknown as SingBoxDnsRule);
+    }
+  };
+
   // 智能分流/全局代理模式下的 DNS 规则
   if (proxyMode === 'smart' || proxyMode === 'global') {
     if (enableFakeIp) {
@@ -564,75 +648,8 @@ export function buildDnsConfig(
         // 数量级的兜底、代价降一档。下界仍由「别把客户端解析器打成忙等」约束，两侧留余量。
         rewrite_ttl: FAKEIP_REWRITE_TTL,
       } as SingBoxDnsRule);
-      // #347 出口影子规则（仅 resolve 生效时发射）：核内部 lookup（allowFakeIP=false）会跳过 fakeip server
-      // 继续往下匹配，落到 S0/S1 的 geo 二分。但用户自定义规则与应用分流在 route 侧是**终止规则且排在 geo 块
-      // 之前**，其去向优先于 geo 二分。resolve 规则同样排在它们之前（否则命中即 break、根本走不到 resolve），
-      // 于是「被用户强制直连的境外域名」会落 S1 经隧道解析 —— 出口=直连、解析器=隧道，正是本 issue 的镜像错配，
-      // 且让本该直连的流量反过来依赖隧道可用性。故在此为**去向=直连**的用户规则补回境内解析器。
-      // 只镜像直连向：去向=代理的规则落 S1 已经是隧道解析（除非该域名同时在 region-local geo 内，那属既有的
-      // 少数派错配，不在本 PR 射程）。toggle 关 ⇒ 一条都不发 ⇒ 逐字节回到历史形态，回退路径干净。
-      if (resolveAhead) {
-        const directDomains: string[] = [];
-        const directSuffixes: string[] = [];
-        const directKeywords: string[] = [];
-        for (const rule of dnsCustomRules) {
-          if (!rule.enabled || rule.action !== 'direct') continue;
-          // 恒取 inline 值（不复用外化的 <base>-dns rule_set：那批 tag 只为 bypassFakeIP 注册，语义不同）。
-          for (const cond of ruleConditions(rule)) {
-            const vals = (cond.values || []).map((v) => v.trim()).filter(Boolean);
-            if (vals.length === 0) continue;
-            if (cond.type === 'domain') {
-              directDomains.push(...vals);
-            } else if (cond.type === 'domainSuffix') {
-              directSuffixes.push(...vals.map((d) => (d.startsWith('*.') ? d.slice(2) : d)));
-            } else if (cond.type === 'domainKeyword') {
-              directKeywords.push(...vals);
-            }
-          }
-        }
-        if (directDomains.length || directSuffixes.length || directKeywords.length) {
-          const shadow: Record<string, unknown> = {
-            query_type: ['A', 'AAAA'],
-            server: getDomesticResolverTag(config, 'dns-domestic'),
-          };
-          if (directDomains.length) shadow.domain = directDomains;
-          if (directSuffixes.length) shadow.domain_suffix = directSuffixes.flatMap(withDotPrefix);
-          if (directKeywords.length) shadow.domain_keyword = directKeywords;
-          dnsRules.push(shadow as unknown as SingBoxDnsRule);
-        }
-        // 应用分流同理。两条腿分别镜像 route 侧的 process_name 腿与 rule_set 腿；geosite tag 须先过
-        // .srs 存在性过滤（DNS 侧无末尾悬空剪枝，悬空 rule_set 会令内核 FATAL）。geoip 腿不镜像：
-        // 那是 IP 判据，解析阶段还没有 IP。
-        const directAppProcesses: string[] = [];
-        const directAppGeosites: string[] = [];
-        for (const appRule of effectiveAppRules(config)) {
-          if (appRule.enabled === false || appRule.action !== 'direct') continue;
-          const preset = getAppPreset(appRule.appId, config.customAppPresets);
-          if (!preset) continue;
-          if (preset.processNames?.length) directAppProcesses.push(...preset.processNames);
-          for (const tag of preset.geositeTags || []) {
-            const geoTag = `geosite-${tag.toLowerCase()}`;
-            const fileName = findBuiltin(geoTag)?.fileName ?? `${geoTag}.srs`;
-            if (!isValidSrsFile(path.join(getRuntimeRulesDir(), fileName))) continue;
-            if (!directAppGeosites.includes(geoTag)) directAppGeosites.push(geoTag);
-          }
-        }
-        const domesticForApps = getDomesticResolverTag(config, 'dns-domestic');
-        if (directAppProcesses.length) {
-          dnsRules.push({
-            query_type: ['A', 'AAAA'],
-            process_name: dedupe(directAppProcesses),
-            server: domesticForApps,
-          } as unknown as SingBoxDnsRule);
-        }
-        if (directAppGeosites.length) {
-          dnsRules.push({
-            query_type: ['A', 'AAAA'],
-            rule_set: directAppGeosites.length === 1 ? directAppGeosites[0] : directAppGeosites,
-            server: domesticForApps,
-          } as unknown as SingBoxDnsRule);
-        }
-      }
+      // 位置：fakeip catch-all 之后（app 侧查询命中 fakeip 即停、走不到这里）、S0/S1 之前（用户去向优先于 geo 二分）。
+      if (resolveAhead) pushDirectExitShadowRules();
       // R1（§14.4，P6/P7 ROOT）：FakeIP 分支补回境内/境外分类的「影子规则」。上游语义：app 侧查询 Exchange 命中
       // fakeip 即停（到不了下面这些规则 → 字节不变）；endpoint（WARP/WG/TS，必须本机解析目的域名 IP 才能灌进隧道）
       // dial 的 Lookup 跳过 fakeip 继续走这些规则 → **天然只作用于 dial-time 目的解析**。修根因：endpoint 目的域名原
@@ -687,6 +704,11 @@ export function buildDnsConfig(
           ? 'dns-remote'
           : getDomesticResolverTag(config, 'dns-domestic');
         const fallthroughResolver = region.reverse ? 'dns-domestic' : 'dns-remote';
+        // #347 出口影子规则（与 FakeIP 分支同源，理由见 pushDirectExitShadowRules）。位置：geo 二分与兜底腿
+        // **之前** —— 用户规则在 route 侧是终止规则且排在 geo 之前，DNS 侧首命中即停，顺序必须一致。
+        // 本分支无 fakeip catch-all，故这批规则同时作用于客户端自身查询：对「被强制直连」的域名而言，
+        // 用本机视角解析正是正确语义（与 route 侧去向一致），不是副作用。
+        if (resolveAhead) pushDirectExitShadowRules();
         if (localGeo.length > 0) {
           dnsRules.push({
             // 单 tag 与历史一致序列化为标量字符串（保 cn 逐字节）；多 tag 走数组。

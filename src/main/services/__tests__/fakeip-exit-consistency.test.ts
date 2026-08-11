@@ -99,6 +99,23 @@ function resolveOn(over: Partial<UserConfig> = {}): UserConfig {
   return baseConfig({ resolveDestination: true, ...over } as Partial<UserConfig>);
 }
 
+/** FakeIP 关档：存量 systemProxy 用户的默认态（ConfigManager 迁移把 enableFakeIp 冻结为 false）。 */
+const FAKEIP_OFF = {
+  domesticDns: 'https://doh.pub/dns-query',
+  foreignDns: 'https://dns.google/dns-query',
+  enableFakeIp: false,
+} as unknown as UserConfig['dnsConfig'];
+
+/**
+ * 出口一致性不变量必须在 FakeIP 开/关**两档**都成立。
+ * 谓词撤掉 usesFakeIp 前置门后，「FakeIP 关 + 开关开」从不可达变为可达，且恰是存量 systemProxy 用户的默认态；
+ * 夹具只覆盖 FakeIP 开档 = 新格零判据，把「影子规则漏发、直连域名改由隧道解析」整类缺陷放过去。
+ */
+const FAKEIP_ARMS: Array<[string, Partial<UserConfig>]> = [
+  ['FakeIP 开', {}],
+  ['FakeIP 关', { dnsConfig: FAKEIP_OFF } as Partial<UserConfig>],
+];
+
 const pm = new ProxyManager();
 const gen = (c: UserConfig): AnyCfg => pm.generateSingBoxConfig(c) as AnyCfg;
 const dnsRules = (cfg: AnyCfg): AnyCfg[] => (cfg.dns.rules || []) as AnyCfg[];
@@ -222,29 +239,11 @@ describe('#347 INV-EXIT-3 — resolve 规则的注入条件', () => {
   });
 
   it('3c FakeIP 关 + 开关显式开 → 仍注入（mixed-in 入站无条件发射，其目的地恒为域名）', () => {
-    const cfg = gen(
-      resolveOn({
-        dnsConfig: {
-          domesticDns: 'https://doh.pub/dns-query',
-          foreignDns: 'https://dns.google/dns-query',
-          enableFakeIp: false,
-        } as unknown as UserConfig['dnsConfig'],
-      })
-    );
-    expect(countResolve(cfg)).toBe(1);
+    expect(countResolve(gen(resolveOn({ dnsConfig: FAKEIP_OFF })))).toBe(1);
   });
 
   it('3c2 FakeIP 关 + 开关默认（未设）→ 不注入（默认关仍是唯一总闸）', () => {
-    const cfg = gen(
-      baseConfig({
-        dnsConfig: {
-          domesticDns: 'https://doh.pub/dns-query',
-          foreignDns: 'https://dns.google/dns-query',
-          enableFakeIp: false,
-        } as unknown as UserConfig['dnsConfig'],
-      })
-    );
-    expect(countResolve(cfg)).toBe(0);
+    expect(countResolve(gen(baseConfig({ dnsConfig: FAKEIP_OFF })))).toBe(0);
   });
 
   it('3d direct 模式 → 不注入（出口恒直连）', () => {
@@ -372,118 +371,179 @@ describe('#347 INV-S0 — 影子规则的 geo 二分必须与 route 侧同门控
   });
 });
 
-describe('#347 INV-EXIT-4 — 出口影子规则：route 强制直连的自定义域名不得落到隧道解析器', () => {
-  // bypassFakeIP=false（默认值）：不进 bypass 桶 → 只能靠出口影子规则兜底。
-  // 用 bypassFakeIP=true 的夹具在原理上测不出它：bypass 桶那条（无 query_type、排在 fakeip catch-all
-  // 之前）先命中，影子规则那条对该域名不可达 —— 判据会被夹具喂饱而恒绿。
-  const cfg = gen(
-    resolveOn({
-      customRules: [
-        {
-          id: 'r-fd',
-          type: 'domainSuffix',
-          values: ['forcedirect.example'],
-          action: 'direct',
-          enabled: true,
-          bypassFakeIP: false,
-        },
-      ] as unknown as UserConfig['customRules'],
-    })
-  );
-
-  it('4a 正向对照：route 侧确实把它强制直连（否则下面两条是空检查）', () => {
-    const idx = routeRules(cfg).findIndex(
-      (r) =>
-        Array.isArray(r.domain_suffix) &&
-        (r.domain_suffix as string[]).some((d: string) => d.includes('forcedirect.example')) &&
-        r.outbound === 'direct'
+describe.each(FAKEIP_ARMS)(
+  '#347 INV-EXIT-4 — 出口影子规则：route 强制直连的自定义域名不得落到隧道解析器（%s）',
+  (_arm, arm) => {
+    // bypassFakeIP=false（默认值）：不进 bypass 桶 → 只能靠出口影子规则兜底。
+    // 用 bypassFakeIP=true 的夹具在原理上测不出它：bypass 桶那条（无 query_type、排在 fakeip catch-all
+    // 之前）先命中，影子规则那条对该域名不可达 —— 判据会被夹具喂饱而恒绿。
+    const cfg = gen(
+      resolveOn({
+        customRules: [
+          {
+            id: 'r-fd',
+            type: 'domainSuffix',
+            values: ['forcedirect.example'],
+            action: 'direct',
+            enabled: true,
+            bypassFakeIP: false,
+          },
+        ] as unknown as UserConfig['customRules'],
+        ...arm,
+      })
     );
-    expect(idx).toBeGreaterThanOrEqual(0);
-  });
 
-  it('4b 内核 dial-time lookup（allowFakeIP=false）首命中的非 fakeip 规则必须是非隧道解析器', () => {
-    const first = dnsRules(cfg).find(
-      (r) => r.server !== 'fakeip' && covers(r, 'forcedirect.example')
-    );
-    expect(first).toBeDefined();
-    expect(isTunnelResolver(cfg, first.server)).toBe(false);
-  });
-
-  it('4c 必须排在无域名判据的隧道 catch-all 之前（否则该腿永远走不到）', () => {
-    const rs = dnsRules(cfg);
-    const idxShadow = rs.findIndex(
-      (r) => r.server !== 'fakeip' && covers(r, 'forcedirect.example')
-    );
-    const idxCatchAll = rs.findIndex(
-      (r) =>
-        typeof r.server === 'string' &&
-        isTunnelResolver(cfg, r.server) &&
-        !r.domain &&
-        !r.domain_suffix &&
-        !r.domain_keyword &&
-        !r.rule_set &&
-        !r.process_name
-    );
-    expect(idxShadow).toBeGreaterThanOrEqual(0);
-    expect(idxCatchAll).toBeGreaterThanOrEqual(0);
-    expect(idxShadow).toBeLessThan(idxCatchAll);
-  });
-});
-
-describe('#347 INV-EXIT-5 — 应用分流强制直连 → 两条腿都必须非隧道解析', () => {
-  // 判据用差分（开/关应用分流的同配置之差），零夹具依赖：防环/DNS-客户端那批 process_name→direct
-  // 在两侧都有、自动抵消。直接取「所有 process_name→direct」会过采集，在未变异代码上就红。
-  const cfg = gen(
-    resolveOn({
-      appRoutingEnabled: true,
-      appRules: [{ appId: 'telegram', action: 'direct', enabled: true }],
-    } as unknown as Partial<UserConfig>)
-  );
-  const off = gen(resolveOn());
-
-  it('5a process_name 腿', () => {
-    const procsOf = (c: AnyCfg): Set<string> => {
-      const out = new Set<string>();
-      for (const r of routeRules(c))
-        if (r.outbound === 'direct' && Array.isArray(r.process_name))
-          for (const p of r.process_name as string[]) out.add(p);
-      return out;
-    };
-    const baseProcs = procsOf(off);
-    const added = [...procsOf(cfg)].filter((p) => !baseProcs.has(p));
-    expect(added.length).toBeGreaterThan(0); // 正向对照
-    for (const p of added) {
-      const leg = dnsRules(cfg).find(
-        (r) => Array.isArray(r.process_name) && (r.process_name as string[]).includes(p)
+    it('4a 正向对照：route 侧确实把它强制直连（否则下面两条是空检查）', () => {
+      const idx = routeRules(cfg).findIndex(
+        (r) =>
+          Array.isArray(r.domain_suffix) &&
+          (r.domain_suffix as string[]).some((d: string) => d.includes('forcedirect.example')) &&
+          r.outbound === 'direct'
       );
-      expect(leg).toBeDefined();
-      expect(isTunnelResolver(cfg, leg.server)).toBe(false);
-    }
-  });
+      expect(idx).toBeGreaterThanOrEqual(0);
+    });
 
-  it('5b geosite 腿', () => {
-    const geoOf = (c: AnyCfg): Set<string> => {
-      const out = new Set<string>();
-      for (const r of routeRules(c)) {
-        if (r.outbound !== 'direct') continue;
-        const rs = Array.isArray(r.rule_set) ? r.rule_set : r.rule_set ? [r.rule_set] : [];
-        for (const t of rs) if (String(t).startsWith('geosite-')) out.add(String(t));
+    it('4b 内核 dial-time lookup（allowFakeIP=false）首命中的非 fakeip 规则必须是非隧道解析器', () => {
+      const first = dnsRules(cfg).find(
+        (r) => r.server !== 'fakeip' && covers(r, 'forcedirect.example')
+      );
+      expect(first).toBeDefined();
+      expect(isTunnelResolver(cfg, first.server)).toBe(false);
+    });
+
+    it('4c 必须排在无域名判据的隧道 catch-all 之前（否则该腿永远走不到）', () => {
+      const rs = dnsRules(cfg);
+      const idxShadow = rs.findIndex(
+        (r) => r.server !== 'fakeip' && covers(r, 'forcedirect.example')
+      );
+      const idxCatchAll = rs.findIndex(
+        (r) =>
+          typeof r.server === 'string' &&
+          isTunnelResolver(cfg, r.server) &&
+          !r.domain &&
+          !r.domain_suffix &&
+          !r.domain_keyword &&
+          !r.rule_set &&
+          !r.process_name
+      );
+      expect(idxShadow).toBeGreaterThanOrEqual(0);
+      expect(idxCatchAll).toBeGreaterThanOrEqual(0);
+      expect(idxShadow).toBeLessThan(idxCatchAll);
+    });
+  }
+);
+
+describe.each(FAKEIP_ARMS)(
+  '#347 INV-EXIT-5 — 应用分流强制直连 → 两条腿都必须非隧道解析（%s）',
+  (_arm, arm) => {
+    // 判据用差分（开/关应用分流的同配置之差），零夹具依赖：防环/DNS-客户端那批 process_name→direct
+    // 在两侧都有、自动抵消。直接取「所有 process_name→direct」会过采集，在未变异代码上就红。
+    const cfg = gen(
+      resolveOn({
+        appRoutingEnabled: true,
+        appRules: [{ appId: 'telegram', action: 'direct', enabled: true }],
+        ...arm,
+      } as unknown as Partial<UserConfig>)
+    );
+    const off = gen(resolveOn({ ...arm }));
+
+    it('5a process_name 腿', () => {
+      const procsOf = (c: AnyCfg): Set<string> => {
+        const out = new Set<string>();
+        for (const r of routeRules(c))
+          if (r.outbound === 'direct' && Array.isArray(r.process_name))
+            for (const p of r.process_name as string[]) out.add(p);
+        return out;
+      };
+      const baseProcs = procsOf(off);
+      const added = [...procsOf(cfg)].filter((p) => !baseProcs.has(p));
+      expect(added.length).toBeGreaterThan(0); // 正向对照
+      for (const p of added) {
+        const leg = dnsRules(cfg).find(
+          (r) => Array.isArray(r.process_name) && (r.process_name as string[]).includes(p)
+        );
+        expect(leg).toBeDefined();
+        expect(isTunnelResolver(cfg, leg.server)).toBe(false);
       }
-      return out;
-    };
-    const baseGeo = geoOf(off);
-    const added = [...geoOf(cfg)].filter((t) => !baseGeo.has(t));
-    expect(added.length).toBeGreaterThan(0); // 正向对照
-    for (const tag of added) {
-      const leg = dnsRules(cfg).find((r) => {
-        const rs = Array.isArray(r.rule_set) ? r.rule_set : r.rule_set ? [r.rule_set] : [];
-        return rs.includes(tag);
-      });
-      expect(leg).toBeDefined();
-      expect(isTunnelResolver(cfg, leg.server)).toBe(false);
-    }
-  });
-});
+    });
+
+    it('5b geosite 腿', () => {
+      const geoOf = (c: AnyCfg): Set<string> => {
+        const out = new Set<string>();
+        for (const r of routeRules(c)) {
+          if (r.outbound !== 'direct') continue;
+          const rs = Array.isArray(r.rule_set) ? r.rule_set : r.rule_set ? [r.rule_set] : [];
+          for (const t of rs) if (String(t).startsWith('geosite-')) out.add(String(t));
+        }
+        return out;
+      };
+      const baseGeo = geoOf(off);
+      const added = [...geoOf(cfg)].filter((t) => !baseGeo.has(t));
+      expect(added.length).toBeGreaterThan(0); // 正向对照
+      for (const tag of added) {
+        const leg = dnsRules(cfg).find((r) => {
+          const rs = Array.isArray(r.rule_set) ? r.rule_set : r.rule_set ? [r.rule_set] : [];
+          return rs.includes(tag);
+        });
+        expect(leg).toBeDefined();
+        expect(isTunnelResolver(cfg, leg.server)).toBe(false);
+      }
+    });
+  }
+);
+
+describe.each(FAKEIP_ARMS)(
+  '#347 INV-EXIT-7 — 出口影子规则与 route 侧用户分流同门控：global 一条都不得发（%s）',
+  (_arm, arm) => {
+    // 与 INV-S0 同根因。global 是真·全局、route 侧 buildCustomRules 与应用分流都在 `proxyMode === 'smart'`
+    // 块内不执行，出口恒是代理；此时 DNS 侧若还为「用户标了直连」的域名拐向境内解析器，就是把境内视角地址
+    // 送进隧道 —— route 侧根本没有对应的 direct 去向。
+    const cfgOf = (proxyMode: string) =>
+      gen(
+        resolveOn({
+          proxyMode,
+          customRules: [
+            {
+              id: 'r-g',
+              type: 'domainSuffix',
+              values: ['forcedirect.example'],
+              action: 'direct',
+              enabled: true,
+              bypassFakeIP: false,
+            },
+          ] as unknown as UserConfig['customRules'],
+          ...arm,
+        } as unknown as Partial<UserConfig>)
+      );
+
+    it('7a global：route 侧确实没有该域名的直连规则（正向对照，否则 7b 是空检查）', () => {
+      const cfg = cfgOf('global');
+      const hit = routeRules(cfg).find(
+        (r) =>
+          Array.isArray(r.domain_suffix) &&
+          (r.domain_suffix as string[]).some((d: string) => d.includes('forcedirect.example'))
+      );
+      expect(hit).toBeUndefined();
+    });
+
+    it('7b global：DNS 侧不得出现覆盖该域名的非隧道解析规则', () => {
+      const cfg = cfgOf('global');
+      for (const r of rulesCovering(cfg, 'forcedirect.example')) {
+        if (r.server === 'fakeip') continue;
+        expect(isTunnelResolver(cfg, r.server)).toBe(true);
+      }
+    });
+
+    it('7c smart 仍必须发（负向对照，防把门写成恒假）', () => {
+      const cfg = cfgOf('smart');
+      const first = dnsRules(cfg).find(
+        (r) => r.server !== 'fakeip' && covers(r, 'forcedirect.example')
+      );
+      expect(first).toBeDefined();
+      expect(isTunnelResolver(cfg, first.server)).toBe(false);
+    });
+  }
+);
 
 describe('#347 INV-EXIT-6 — 出口已整体回退 direct 时不得注入 resolve', () => {
   // dns-remote 的 detour 恒 'proxy-selector'（buildDnsConfig 的 selectedServerTag 由 ProxyManager 硬编码

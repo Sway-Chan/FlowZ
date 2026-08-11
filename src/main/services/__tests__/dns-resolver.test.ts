@@ -351,12 +351,14 @@ byteDiffDescribe(
         expect(JSON.stringify(topOnly(cur.dns))).toBe(JSON.stringify(topOnly(base.dns)));
 
         // --- D. route.rules：除「含 1.12.12.12/32 的直连规则」+「#347 resolve 规则」外逐字节相同 ---
-        // #347：`resolve` **默认关**（真机实测开启会打掉节点侧按域名做的解锁分流），故这批夹具（均未设该开关）
-        // 的 route.rules 不含它——基线字节因此不受本特性影响。正向覆盖用同一夹具显式开一次生成变体，
-        // 断言「开了才有、位置正确」；只断言缺席等于让默认关把回归一起遮掉。
+        // #347：`resolve` **默认关**（失败即 fatalErr 无兜底，默认开等于给每条连接加一个新单点），故这批夹具
+        // （均未设该开关）的 route.rules 不含它——基线字节因此不受本特性影响。正向覆盖用同一夹具显式开一次生成
+        // 变体，断言「开了才有、位置正确」；只断言缺席等于让默认关把回归一起遮掉。
+        // **不按 hasFakeIp 门控**：谓词已撤掉 usesFakeIp 前置门，而本组夹具里 systemProxy 档
+        // （dns-resolver-fixtures：enableFakeIp=false）恰是「FakeIP 关」这一新可达格的唯一样本。
         const curRouteRules = cur.routeRules as AnyCfg[];
         expect(curRouteRules.findIndex((r) => r.action === 'resolve')).toBe(-1);
-        if (hasFakeIp) {
+        {
           const onCfg = { ...fx.config, resolveDestination: true } as typeof fx.config;
           const onRules = extractDnsRoute(pm.generateSingBoxConfig(onCfg)).routeRules as AnyCfg[];
           const idxResolve = onRules.findIndex((r) => r.action === 'resolve');
