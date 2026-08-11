@@ -419,23 +419,32 @@ export function NetworkSettings() {
               )}
             />
           )}
-          {/* #347 拨号前解析目的域名：仅 FakeIP 开启时有意义（关 FakeIP 时目的地本就是真实 IP），故与 FakeIP 同可见性。 */}
-          {config.dnsConfig?.enableFakeIp !== false && (
-            <Srow
-              label={
-                <>
-                  {t('settings.advanced.resolveDestination', '拨号前解析目标域名')}
-                  <InfoTooltip content={t('settings.advanced.resolveDestinationDescFull')} />
-                </>
+          {/* #347 拨号前解析目的域名：与 FakeIP 联动——本功能依赖 fakeip 的域名反查，谓词
+              resolvesDestinationAhead 以 usesFakeIp 为前置门。FakeIP 关时**常显但置灰**而非隐藏：
+              隐藏会让用户既看不到它存在、也不知道为何不生效；置灰 + 说明理由才可自解释。
+              置灰不改 resolveDestination 字段值本身（与 reverseMesh→allowInternet 同款联动语义），
+              重新开启 FakeIP 后用户原先的选择原样回来。 */}
+          <Srow
+            label={
+              <>
+                {t('settings.advanced.resolveDestination', '拨号前解析目标域名')}
+                <InfoTooltip content={t('settings.advanced.resolveDestinationDescFull')} />
+              </>
+            }
+            desc={
+              config.dnsConfig?.enableFakeIp === false
+                ? t('settings.advanced.resolveDestinationNeedsFakeIp')
+                : t('settings.advanced.resolveDestinationDesc')
+            }
+          >
+            <Swt
+              checked={
+                config.resolveDestination === true && config.dnsConfig?.enableFakeIp !== false
               }
-              desc={t('settings.advanced.resolveDestinationDesc')}
-            >
-              <Swt
-                checked={config.resolveDestination === true}
-                onChange={(c) => setBool('resolveDestination', c)}
-              />
-            </Srow>
-          )}
+              disabled={config.dnsConfig?.enableFakeIp === false}
+              onChange={(c) => setBool('resolveDestination', c)}
+            />
+          </Srow>
           {/* 节点域名解析容错（issue #147 多源 race）：Switch 开关在上控制下方上游选择 on(多选 race 池)/off(单选)。 */}
           <Srow
             label={
