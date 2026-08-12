@@ -499,8 +499,15 @@ export interface UserConfig {
   // fake-ip-filter 默认清单（NTP/STUN/Captive 等在 FakeIP 下会坏的域名 → 真实解析）。默认开（undefined/true=开），仅 false=关。
   fakeIpFilter?: boolean;
   // FakeIP 例外域名清单（用户可编辑）：undefined=用内置默认（DEFAULT_FAKEIP_FILTER_DOMAINS，与历史字节一致）；
-  // 已编辑则存全量。仅 fakeIpFilter 开时生效。内置 captive 域名仍走内网解析器，其余走 dns-domestic（见 singbox-dns-builder）。
+  // 已编辑则存全量。仅 fakeIpFilter 开时生效。内置 captive 域名仍走内网解析器，其余按出口选解析器（见 singbox-dns-builder）。
   fakeIpFilterList?: string[];
+  // #347：拨号前把目的域名解析成真实 IP 再交给出站（sing-box route action `resolve`），而非把域名随包发给节点。
+  // **默认关**（仅 === true 才开）：#347 根因确认在机场侧屏蔽，本开关只是逃生口；且 resolve 失败即断连
+  // （fail-closed，无兜底），默认开等于给所有连接加一个新单点。节点侧按域名做的分流/解锁在 IP 交付下机制上
+  // 无法工作，实际影响面视机场而定。非 direct 模式、出口未整体回退直连、用户显式打开，三条全真才生效；
+  // **不看 FakeIP 开关**（mixed-in 入站无条件发射，其目的地恒为域名）。
+  // 单一真值见 custom-rule-files#resolvesDestinationAhead。
+  resolveDestination?: boolean;
   // 核心更新：仅在配置生成器已验证的 sing-box minor 版本带内自动更新（默认 true）。关闭后允许自动
   // 更新跨越 minor（如 1.13→1.14），但跨 minor 的 schema 变更可能导致配置不兼容、需手动处理。
   restrictCoreUpdateToCompatibleMinor?: boolean;

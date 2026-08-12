@@ -104,13 +104,14 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "direct.example",
             ".direct.example",
           ],
-          "server": "dns-bootstrap",
+          "server": "dns-remote",
         },
         {
           "query_type": [
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -781,6 +782,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -1416,6 +1418,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -2045,6 +2048,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -2694,6 +2698,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -3277,7 +3282,15 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "my-ntp.example.com",
             ".my-ntp.example.com",
           ],
+          "rule_set": "geosite-cn",
           "server": "dns-domestic",
+        },
+        {
+          "domain_suffix": [
+            "my-ntp.example.com",
+            ".my-ntp.example.com",
+          ],
+          "server": "dns-remote",
         },
         {
           "domain_keyword": [
@@ -3291,6 +3304,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -5586,6 +5600,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -6230,6 +6245,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -6873,6 +6889,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -7529,6 +7546,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -8159,6 +8177,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -8843,6 +8862,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -9433,6 +9453,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -10047,15 +10068,8 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
-        },
-        {
-          "query_type": [
-            "A",
-            "AAAA",
-          ],
-          "rule_set": "geosite-cn",
-          "server": "dns-domestic",
         },
         {
           "query_type": [
@@ -10634,6 +10648,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -11256,6 +11271,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -11889,6 +11905,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -12537,6 +12554,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -13151,6 +13169,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -13794,6 +13813,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -14417,6 +14437,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -15031,6 +15052,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -16082,6 +16104,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -16712,6 +16735,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -17373,6 +17397,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -18013,6 +18038,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -18654,6 +18680,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -19268,6 +19295,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -19889,6 +19917,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -20510,15 +20539,8 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
-        },
-        {
-          "query_type": [
-            "A",
-            "AAAA",
-          ],
-          "rule_set": "geosite-cn",
-          "server": "dns-domestic",
         },
         {
           "query_type": [
@@ -21097,6 +21119,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -21848,6 +21871,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {
@@ -22476,6 +22500,7 @@ exports[`generateSingBoxConfig — characterization 快照（抽取前锁基线�
             "A",
             "AAAA",
           ],
+          "rewrite_ttl": 60,
           "server": "fakeip",
         },
         {

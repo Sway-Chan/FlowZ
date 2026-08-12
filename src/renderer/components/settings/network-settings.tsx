@@ -419,6 +419,22 @@ export function NetworkSettings() {
               )}
             />
           )}
+          {/* #347 拨号前解析目的域名：**不与 FakeIP 联动**——mixed-in 入站无条件发射，走它的流量目的地
+              恒为域名，关掉 FakeIP 并不会让本开关失去意义（谓词 resolvesDestinationAhead 同口径）。 */}
+          <Srow
+            label={
+              <>
+                {t('settings.advanced.resolveDestination', '拨号前解析目标域名')}
+                <InfoTooltip content={t('settings.advanced.resolveDestinationDescFull')} />
+              </>
+            }
+            desc={t('settings.advanced.resolveDestinationDesc')}
+          >
+            <Swt
+              checked={config.resolveDestination === true}
+              onChange={(c) => setBool('resolveDestination', c)}
+            />
+          </Srow>
           {/* 节点域名解析容错（issue #147 多源 race）：Switch 开关在上控制下方上游选择 on(多选 race 池)/off(单选)。 */}
           <Srow
             label={

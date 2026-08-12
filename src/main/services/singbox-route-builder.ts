@@ -31,7 +31,7 @@ import {
 import { ruleIpCidrs } from '../../shared/rules';
 import { getAppPreset } from '../../shared/app-rules-preset';
 import { getRuleResourcesPath } from '../utils/paths';
-import { usesFakeIp } from './custom-rule-files';
+import { usesFakeIp, resolvesDestinationAhead } from './custom-rule-files';
 import { getRuleSetRuntimeDir as getRuntimeRulesDir, isValidSrsFile } from './builtin-geo-rulesets';
 import type {
   SingBoxConfig,
@@ -421,6 +421,31 @@ export function buildRouteConfig(
     rules.push({ protocol: 'stun', action: 'route', outbound: selectedServerTag });
   } else if (webrtcLeak === 'block') {
     rules.push({ protocol: 'stun', action: 'reject' });
+  }
+
+  // #347：拨号前把目的域名解析成真实 IP 再交给出站（sing-box route action `resolve`）。
+  // 背景：1.13+ 移除 `sniff_override_destination` 且无替代，FakeIP 反查出的域名会原样随包发给节点，节点侧的
+  //   策略或其自身解析器成为单点。同机场同时段的 NekoBox（开着 FakeDNS 但拨号前解析成真 IP）一切正常，
+  //   FlowZ 发域名则被对端在 78–107ms 内 FIN —— A/B 对照的唯一变量就是目的地交付形态。
+  // 机制：actionResolve 只写 metadata.DestinationAddresses、**不动 Destination** →
+  //   ① 后续 domain/domain_suffix/domain_keyword/geosite 规则逐字等效（DomainItem.Match 读 metadata.Domain
+  //      或 Destination.Fqdn，两者都还在）；② 出站因 DestinationAddresses 非空改走 DialSerialNetwork，收到纯 IP。
+  //   真机判据：`outbound connection to www.x.org:443` 变成 `outbound connection to [IP]:443`。
+  // 不带 server：Transport 为 nil 时走 dns.rules 且内部解析恒 allowFakeIP=false（跳过 fakeip 自循环），
+  //   自动落到 DNS 侧 S0/S1 与出口影子规则 —— 出口一致性由 DNS 侧单一真值免费保证，此处不重复 geo 分类
+  //   （带 rule_set 的 resolve 会在 .srs 缺失时被悬空剪枝整条剪掉 → 规则静默消失、缺陷静默复发）。
+  // 不带 strategy：AsIS 回落 dns.strategy，复用已按 enableIPv6 设好的单一真值。
+  // timeout 5s：不设则吃 dns.timeout 未配时的内核默认 10s；A/AAAA 并行，最坏≈5s。
+  // **位置不变量（三条同时成立才正确，测试已钉）**：
+  //   · 必须在节点域名排除 / 节点 IP 排除 / U盾 override_address / 网银 / bootstrap DNS 直连**之后**——
+  //     其中 U盾域名公网 NXDOMAIN，而 resolve 失败在 matchRule 里是 fatalErr（无「退回发域名」兜底）→ 直接
+  //     断连接；这些规则是终止规则且排在本条之前，故它们的域名永不落到 resolve。
+  //   · 必须在自定义规则 / 应用分流**之前**——那些是终止规则，排在其后则 smart 模式永远走不到 resolve。
+  //     代价：endpoint force-route / bypassLAN / DoH 上游 IP 三条 ip_cidr 规则从此对域名流量首次可命中
+  //     （解析出的 IP 落进这些段才会），语义外扩已知且可接受。
+  //   · 直连去向的用户规则由 DNS 侧出口影子规则补回境内解析器，否则本该直连的流量会反过来依赖隧道。
+  if (resolvesDestinationAhead(config)) {
+    rules.push({ action: 'resolve', timeout: '5s' });
   }
 
   // 3. 自定义规则 + 应用分流（用户路由）——**仅 smart 模式**：global=真·全局忽略用户分流（一律走选中节点，

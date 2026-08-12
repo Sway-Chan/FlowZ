@@ -300,8 +300,13 @@ byteDiffDescribe(
         const curRules = allCurRules.filter((r) => !isFakeIpFilter(r) && !isShadowRule(r));
         const hasFakeIp = (cur.dns.servers as AnyCfg[]).some((s) => s.tag === 'fakeip');
         expect(allCurRules.filter(isFakeIpFilter).length).toBe(hasFakeIp ? 2 : 0);
-        // FakeIP 档 S0(geosite srs 齐)+S1 = 2；无 FakeIP 档 0。srs 缺失时 S0 跳过（1），本测试环境 srs 齐全故 2。
-        expect(allCurRules.filter(isShadowRule).length).toBe(hasFakeIp ? 2 : 0);
+        // FakeIP 档影子规则条数：
+        //   · smart + region 开 → S0(region-local geo→境内) + S1(catch-all→隧道) = 2（本测试环境 srs 齐全）；
+        //   · global → **1**（#347：S0 与 route 侧 geo 块同门控。global 恒 final=代理、route 侧没有
+        //     geosite-cn→direct，此时再把 geosite-cn 交给境内解析器就是「境内视角地址送进隧道」的错配）。
+        //   · 无 FakeIP 档 → 0。
+        const expectShadow = hasFakeIp ? (fx.config.proxyMode === 'smart' ? 2 : 1) : 0;
+        expect(allCurRules.filter(isShadowRule).length).toBe(expectShadow);
         expect(curRules.length).toBe(baseRules.length); // 规则条数不变（rule1 原位替换，fake-ip-filter/影子规则已剥离）
         // 基线 rule1：含 node-a 域名的那条
         const baseR1Idx = baseRules.findIndex(
@@ -319,8 +324,18 @@ byteDiffDescribe(
             !r.rule_set
         );
         expect(curR1Idx).toBe(baseR1Idx); // rule1 位置不变
+        // #347 有意 delta：fakeip catch-all 恒带 rewrite_ttl=60（压反查错配窗口，600s→60s；根因已由上游
+        // sing-box#4406 修复，本值只兜住残留的 10s 分配窗口，故从最初的 5 下调保护强度）。
+        // 先正向断言它真的在（否则下面剥离等于把回归也一起剥掉），再从逐字节对比里剥离该键。
+        const curFakeIpRule = curRules.find((r) => r.server === 'fakeip');
+        expect(hasFakeIp ? curFakeIpRule?.rewrite_ttl : undefined).toBe(hasFakeIp ? 60 : undefined);
+        const stripTtl = (r: AnyCfg): AnyCfg => {
+          if (r.server !== 'fakeip' || r.rewrite_ttl === undefined) return r;
+          const { rewrite_ttl: _drop, ...rest } = r;
+          return rest;
+        };
         // 除 rule1 外的所有 DNS 规则逐字节相同
-        const stripR1 = (rs: AnyCfg[], idx: number) => rs.filter((_, i) => i !== idx);
+        const stripR1 = (rs: AnyCfg[], idx: number) => rs.filter((_, i) => i !== idx).map(stripTtl);
         expect(JSON.stringify(stripR1(curRules, curR1Idx))).toBe(
           JSON.stringify(stripR1(baseRules, baseR1Idx))
         );
@@ -335,13 +350,37 @@ byteDiffDescribe(
         const topOnly = (d: AnyCfg) => ({ final: d.final, strategy: d.strategy, fakeip: d.fakeip });
         expect(JSON.stringify(topOnly(cur.dns))).toBe(JSON.stringify(topOnly(base.dns)));
 
-        // --- D. route.rules：除「含 1.12.12.12/32 的直连规则」外逐字节相同 ---
-        const stripNodeIp = (rules: AnyCfg[]) =>
-          rules.map((r) =>
-            Array.isArray(r.ip_cidr)
-              ? { ...r, ip_cidr: r.ip_cidr.filter((c: string) => c !== '1.12.12.12/32') }
-              : r
+        // --- D. route.rules：除「含 1.12.12.12/32 的直连规则」+「#347 resolve 规则」外逐字节相同 ---
+        // #347：`resolve` **默认关**（失败即 fatalErr 无兜底，默认开等于给每条连接加一个新单点），故这批夹具
+        // （均未设该开关）的 route.rules 不含它——基线字节因此不受本特性影响。正向覆盖用同一夹具显式开一次生成
+        // 变体，断言「开了才有、位置正确」；只断言缺席等于让默认关把回归一起遮掉。
+        // **不按 hasFakeIp 门控**：谓词已撤掉 usesFakeIp 前置门，而本组夹具里 systemProxy 档
+        // （dns-resolver-fixtures：enableFakeIp=false）恰是「FakeIP 关」这一新可达格的唯一样本。
+        const curRouteRules = cur.routeRules as AnyCfg[];
+        expect(curRouteRules.findIndex((r) => r.action === 'resolve')).toBe(-1);
+        {
+          const onCfg = { ...fx.config, resolveDestination: true } as typeof fx.config;
+          const onRules = extractDnsRoute(pm.generateSingBoxConfig(onCfg)).routeRules as AnyCfg[];
+          const idxResolve = onRules.findIndex((r) => r.action === 'resolve');
+          expect(idxResolve).toBeGreaterThanOrEqual(0);
+          expect(onRules[idxResolve]).toEqual({ action: 'resolve', timeout: '5s' });
+          // 位置不变量：必须在网银强制直连之后（那些域名公网 NXDOMAIN，resolve 失败会硬断连接）。
+          const idxBank = onRules.findIndex(
+            (r) =>
+              Array.isArray(r.domain_suffix) &&
+              (r.domain_suffix as string[]).some((d) => d.includes('icbc.com.cn'))
           );
+          expect(idxBank).toBeGreaterThanOrEqual(0);
+          expect(idxBank).toBeLessThan(idxResolve);
+        }
+        const stripNodeIp = (rules: AnyCfg[]) =>
+          rules
+            .filter((r) => r.action !== 'resolve')
+            .map((r) =>
+              Array.isArray(r.ip_cidr)
+                ? { ...r, ip_cidr: r.ip_cidr.filter((c: string) => c !== '1.12.12.12/32') }
+                : r
+            );
         expect(JSON.stringify(stripNodeIp(cur.routeRules))).toBe(JSON.stringify(base.routeRules));
 
         // --- E. default_domain_resolver / inbounds 零变化 ---
