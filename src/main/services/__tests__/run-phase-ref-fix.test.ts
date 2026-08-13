@@ -124,6 +124,21 @@ async function settle<T>(
   }
 }
 
+/**
+ * 本用例走完整的 start() → run 阶段 FATAL → retry → onRetry 修正 → 二次 start 链路，涉及真实 fs 与进程装配。
+ * 本机（Linux）实测 **112 ms**，但 **Windows CI 上曾超出 jest 默认的 5000 ms 判红**（同次 macOS 与本机全绿，
+ * 且那次 main 的改动完全不沾 run-phase/ProxyManager/retry —— 是 flake 不是回归）。故给足超时。
+ *
+ * **成因未确证，且已排除一个候选**（我没有 Windows 环境复现，如实记，不要据此推断）：
+ *  · 已排除「测试把 `global.setTimeout` 全局改成立即触发 → 自我重排的定时器变热循环」这条：本机把
+ *    `process.platform` 伪装成 'win32' 后，两个用例仍各只花几十毫秒，未复现变慢。
+ *  · 顺带核实到一条**与平台无关的既有问题**：本文件跑完后 jest 进程不会自行退出（`timeout` 下 rc=124，
+ *    需 `--forceExit`；全量跑时表现为 `A worker process has failed to exit gracefully`）。即 start() 路径
+ *    留下了未清理的句柄/定时器。它不是本次超时的已证成因，但确实存在，且会拖长收尾——单独议题。
+ *  · 剩余候选：Windows runner 的冷文件系统 + AV 扫描把 fs 密集路径拖慢一两个数量级。
+ *
+ * 要给出确证结论需在真 Windows 上跑本文件并计时，尚未做。
+ */
 describe('A7 run-phase 备用腿：retry 的 shouldRetry / onRetry 对 dependency[X] not found 的处理', () => {
   it('dependency-not-found → onRetry 解析幽灵 tag + pruneTagsClosure(detour) 修正；refFixAttempted 单次闸只修一次、第二次不再重试', async () => {
     const { pm, pruneSpy } = makePm();
@@ -160,7 +175,7 @@ describe('A7 run-phase 备用腿：retry 的 shouldRetry / onRetry 对 dependenc
 
     // refFixAttempted 闸最终为 true（已用过一次修正腿）。
     expect(pm.refFixAttempted).toBe(true);
-  });
+  }, 30_000);
 
   it('非 dependency 类的 run 错误：不走 ref-fix 腿（pruneTagsClosure 不因 ref-fix 被调），按通用 retry 规则处理', async () => {
     const { pm, pruneSpy } = makePm();
