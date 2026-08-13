@@ -1,7 +1,5 @@
 import { useState, useEffect, useMemo } from 'react';
 import { toast } from 'sonner';
-import { X, Loader2 } from 'lucide-react';
-import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog';
 import {
   Select,
   SelectContent,
@@ -26,6 +24,7 @@ import { WireGuardForm } from './wireguard-form';
 import { TailscaleForm } from './tailscale-form';
 import { CustomForm } from './custom-form';
 import { WarpPanel } from './warp-panel';
+import { NodeFormDialog } from './node-form-dialog';
 import { FormSection } from './shared/form-layout';
 import { getSortedProtocolOptions } from './shared/protocol-options';
 import { isEndpointProtocol } from '../../../shared/endpoint-routes';
@@ -119,9 +118,6 @@ export function ServerConfigDialog({
   const [currentServerConfig, setCurrentServerConfig] = useState<any>(null);
   const [detour, setDetour] = useState<string | undefined>(undefined);
   const [nameError, setNameError] = useState('');
-  // 保存态：footer 的保存按钮固定在 dialog 底部（不随表单主体滚动），isSubmitting 不再由各表单内按钮承载，
-  // 故 dialog 层自持保存态驱动按钮 loading/禁用。
-  const [saving, setSaving] = useState(false);
 
   const isEditing = !!server;
   // 锁协议只针对组网节点（WireGuard/WARP/Tailscale）：协议=组网身份不可变，换协议=删了重建，防止误改成代理协议；
@@ -179,17 +175,14 @@ export function ServerConfigDialog({
       ...protocolConfig,
     };
 
-    setSaving(true);
     try {
       await onSave(serverConfig);
       onOpenChange(false);
     } catch (e) {
-      // 后端保存失败也要可见（原先 throw 被表单 submit 吞掉、无提示）。
+      // 后端保存失败也要可见（原先 throw 被表单 submit 吞掉、无提示）。提交态由 NodeFormDialog 自管。
       toast.error(t('servers.saveFailed', 'Failed to save'), {
         description: e instanceof Error ? e.message : String(e),
       });
-    } finally {
-      setSaving(false);
     }
   };
 
@@ -207,43 +200,32 @@ export function ServerConfigDialog({
   };
 
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="[&>button]:hidden flex max-h-[90vh] w-[min(452px,94vw)] max-w-none flex-col gap-0 overflow-hidden rounded-[12px] border-line bg-surface p-0">
-        {/* a11y：radix 需 Title/Description；视觉标题另在 `.nd-dlg-h`，此处仅供辅助技术。 */}
-        <DialogTitle className="sr-only">
-          {isEditing
-            ? t('servers.editServer', 'Edit Server Config')
-            : t('servers.addServerConfig', 'Add Server Config')}
-        </DialogTitle>
-        <DialogDescription className="sr-only">
-          {isEditing
-            ? t(
-                'servers.editServerDesc',
-                'Modify server configuration. Proxy will not restart automatically after saving.'
-              )
-            : t(
-                'servers.addServerDesc',
-                'Add a new proxy server. Supports VLESS, Trojan, Hysteria2, Shadowsocks, AnyTLS.'
-              )}
-        </DialogDescription>
-
-        <div className="nd-dlg-h">
-          <span className="nd-dlg-title">
-            {isEditing
-              ? t('servers.editServer', 'Edit Server Config')
-              : t('servers.addServerConfig', 'Add Server Config')}
-          </span>
-          <button
-            type="button"
-            className="nd-dlg-x"
-            aria-label={t('common.cancel', 'Cancel')}
-            onClick={() => onOpenChange(false)}
-          >
-            <X />
-          </button>
-        </div>
-
-        <div className="nd-dlg-body">
+    <NodeFormDialog
+      open={open}
+      onOpenChange={onOpenChange}
+      title={
+        isEditing
+          ? t('servers.editServer', 'Edit Server Config')
+          : t('servers.addServerConfig', 'Add Server Config')
+      }
+      description={
+        isEditing
+          ? t(
+              'servers.editServerDesc',
+              'Modify server configuration. Proxy will not restart automatically after saving.'
+            )
+          : t(
+              'servers.addServerDesc',
+              'Add a new proxy server. Supports VLESS, Trojan, Hysteria2, Shadowsocks, AnyTLS.'
+            )
+      }
+      submitLabel={t('common.save')}
+      onSubmit={handleSave}
+      // warp（一键生成）/ custom（JSON 直填）自带按钮，不挂协议表单 ⇒ 不套页脚。
+      hideFooter={selectedProtocol === 'warp' || selectedProtocol === 'custom'}
+    >
+      {(submit) => (
+        <>
           {isEditing && server?.subscriptionId && (
             <div className="nd-amber">
               <svg
@@ -329,7 +311,7 @@ export function ServerConfigDialog({
 
           <div className="contents">
             {selectedProtocol === 'warp' && (
-              <WarpPanel onSubmit={handleSave} nameMissing={!serverName.trim()} />
+              <WarpPanel onSubmit={submit} nameMissing={!serverName.trim()} />
             )}
             {selectedProtocol === 'vless' && (
               <VlessForm
@@ -339,7 +321,7 @@ export function ServerConfigDialog({
                     ? currentServerConfig
                     : undefined
                 }
-                onSubmit={handleSave}
+                onSubmit={submit}
               />
             )}
             {selectedProtocol === 'trojan' && (
@@ -350,7 +332,7 @@ export function ServerConfigDialog({
                     ? currentServerConfig
                     : undefined
                 }
-                onSubmit={handleSave}
+                onSubmit={submit}
               />
             )}
             {selectedProtocol === 'hysteria2' && (
@@ -361,7 +343,7 @@ export function ServerConfigDialog({
                     ? currentServerConfig
                     : undefined
                 }
-                onSubmit={handleSave}
+                onSubmit={submit}
               />
             )}
             {selectedProtocol === 'shadowsocks' && (
@@ -372,7 +354,7 @@ export function ServerConfigDialog({
                     ? currentServerConfig
                     : undefined
                 }
-                onSubmit={handleSave}
+                onSubmit={submit}
               />
             )}
             {selectedProtocol === 'anytls' && (
@@ -383,7 +365,7 @@ export function ServerConfigDialog({
                     ? currentServerConfig
                     : undefined
                 }
-                onSubmit={handleSave}
+                onSubmit={submit}
               />
             )}
             {selectedProtocol === 'tuic' && (
@@ -394,7 +376,7 @@ export function ServerConfigDialog({
                     ? currentServerConfig
                     : undefined
                 }
-                onSubmit={handleSave}
+                onSubmit={submit}
               />
             )}
             {selectedProtocol === 'snell' && (
@@ -405,7 +387,7 @@ export function ServerConfigDialog({
                     ? currentServerConfig
                     : undefined
                 }
-                onSubmit={handleSave}
+                onSubmit={submit}
               />
             )}
             {selectedProtocol === 'naive' && (
@@ -416,7 +398,7 @@ export function ServerConfigDialog({
                     ? currentServerConfig
                     : undefined
                 }
-                onSubmit={handleSave}
+                onSubmit={submit}
               />
             )}
             {selectedProtocol === 'vmess' && (
@@ -427,7 +409,7 @@ export function ServerConfigDialog({
                     ? currentServerConfig
                     : undefined
                 }
-                onSubmit={handleSave}
+                onSubmit={submit}
               />
             )}
             {selectedProtocol === 'socks' && (
@@ -438,7 +420,7 @@ export function ServerConfigDialog({
                     ? currentServerConfig
                     : undefined
                 }
-                onSubmit={handleSave}
+                onSubmit={submit}
               />
             )}
             {selectedProtocol === 'http' && (
@@ -449,7 +431,7 @@ export function ServerConfigDialog({
                     ? currentServerConfig
                     : undefined
                 }
-                onSubmit={handleSave}
+                onSubmit={submit}
               />
             )}
             {selectedProtocol === 'ssh' && (
@@ -460,7 +442,7 @@ export function ServerConfigDialog({
                     ? currentServerConfig
                     : undefined
                 }
-                onSubmit={handleSave}
+                onSubmit={submit}
               />
             )}
             {selectedProtocol === 'wireguard' && (
@@ -471,7 +453,7 @@ export function ServerConfigDialog({
                     ? currentServerConfig
                     : undefined
                 }
-                onSubmit={handleSave}
+                onSubmit={submit}
               />
             )}
             {selectedProtocol === 'tailscale' && (
@@ -482,7 +464,7 @@ export function ServerConfigDialog({
                     ? currentServerConfig
                     : undefined
                 }
-                onSubmit={handleSave}
+                onSubmit={submit}
               />
             )}
             {selectedProtocol === 'custom' && (
@@ -493,7 +475,7 @@ export function ServerConfigDialog({
                     ? currentServerConfig
                     : undefined
                 }
-                onSubmit={handleSave}
+                onSubmit={submit}
               />
             )}
           </div>
@@ -516,23 +498,8 @@ export function ServerConfigDialog({
               )}
             </div>
           </FormSection>
-        </div>
-
-        {/* 固定底部操作区：保存/重置贴 dialog 底、不随表单主体滚动。经 HTML form= 关联当前挂载的
-            协议表单（id="node-cfg-form"）——submit 触发其 RHF 校验+提交，reset 经表单 onReset 走 form.reset()。
-            warp（一键生成）/custom（JSON）自带按钮、不套用本 footer。 */}
-        {selectedProtocol !== 'warp' && selectedProtocol !== 'custom' && (
-          <div className="nd-dlg-foot">
-            <button type="reset" form="node-cfg-form" className="btn ghost sm" disabled={saving}>
-              {t('common.reset')}
-            </button>
-            <button type="submit" form="node-cfg-form" className="btn flow sm" disabled={saving}>
-              {saving && <Loader2 className="animate-spin" size={14} />}
-              {t('common.save')}
-            </button>
-          </div>
-        )}
-      </DialogContent>
-    </Dialog>
+        </>
+      )}
+    </NodeFormDialog>
   );
 }
