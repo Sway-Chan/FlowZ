@@ -146,6 +146,7 @@ import {
   type AdapterPresence,
   type TunAdapterObservation,
   probeWinIpv4AddressUsage,
+  nodeSeesInterface,
 } from './win-tun-adapter';
 import {
   probeTcpReachable,
@@ -640,8 +641,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   //   死后验尸不可靠（适配器随进程句柄消失），故必须窗口内观测。就绪后 grace 内仍未见 = 本腿失败（硬闸，拒假连接）。
   private adapterPresenceProbe: (name: string) => Promise<AdapterPresence> =
     probeWinTunAdapterPresence;
-  // 就绪窗/grace 内的适配器观测轮询间隔（1s）。就绪窗 ≤12s → ≤~12 次 PS spawn；见到即停观测省 spawn。真机项 #2 校准。
+  // B8：就绪窗内观测腿专用的**零 spawn** 快检（Node 接口枚举）。只产肯定结论——看不见 ≠ 不存在（见
+  //   nodeSeesInterface 头注），故窗内只据它记 present，absent 证据一律由完整探测（硬闸 / 失败出口补探）提供。
+  //   注入点供单测替换，生产恒为 nodeSeesInterface。
+  private adapterPresenceFastProbe: (name: string) => boolean = nodeSeesInterface;
+  // grace 硬闸的适配器轮询间隔（1s）。那一轮每次都是真 netsh，且此刻就绪窗已过、杀软扫核的风暴已散。
   private static readonly TUN_READY_OBSERVE_POLL_MS = 1000;
+  // B8：就绪窗内观测腿的节拍（200ms）。改零 spawn 后每轮成本 ≈ 一次 os.networkInterfaces()，
+  //   故节拍可比硬闸细 5 倍——adapterEverSeen 的时刻更准，且不再有任何进程创建落在起核关键路径上。
+  private static readonly TUN_READY_FAST_OBSERVE_POLL_MS = 200;
   // 就绪（API 绑定）后再给适配器出现的 grace 上限（8s）：适配器晚于 API bind 出现属正常时序，避免误杀 #159/#176 瞬态。真机项 #2 校准。
   //   同上（姊妹腿）：8000/1000 的真实墙钟是 ~16.6s，deadline 化后 8000 会把 #324 硬闸的判定窗口砍掉一半 →
   //   更早判 absent-timeout → 更多「永久拒连」误报。故提到 17000 保持等价。
@@ -4670,11 +4678,21 @@ rm -f "$STOPFLAG"
     } catch {
       /* 忽略 */
     }
+    // B6：PID 文件写入单独一格。它与下面的探活原本合记一格，而那一格真机量到 2.0–2.6s——
+    //   不切开就只能靠推测说「多半是探活」，切开即自证。
+    this.markStartLeg(startGen, 'pidFile');
 
-    if (!this.isProcessAlive(res.pid)) {
+    if (!this.processExistsNoSpawn(res.pid)) {
       this.cleanup();
       throw new Error('helper 报告已启动但进程不存在');
     }
+    // B6：这一格 = 一次**零 spawn** 的存在性判定。
+    //   改前它是 `isProcessAlive`（execSync → cmd.exe + tasklist），真机实测**这一格 2018–2584ms**，
+    //   占当时整个起核（~4.7s）的一半以上。同批数据里 `L1.spawn` 也从平时 9–12ms 抖到 155–168ms、
+    //   `configGen` 从 12ms 抖到 25–59ms —— 这一刀恰好落在「82MB 的新核刚起来、杀软正在扫它」的窗口里，
+    //   此刻这台机上**任何**进程创建都被拖慢。故正确的修法不是「改成异步」（异步只是不堵 event loop，
+    //   钱照付），而是**根本不在这里起进程**：`process.kill(pid, 0)` 真机实测 0.1ms。
+    this.markStartLeg(startGen, 'aliveCheck');
 
     // issue #159：等核真就绪（管理 API 绑定）再判成功，而非「spawn 即 started」。起核期内核死/超时 → 抛可重试
     // 错误交 runStartWithRetry 快速重起（届时 wintun 适配器/端口已释放），替代「假成功 + 10s 健康检查兜底」。
@@ -4707,20 +4725,25 @@ rm -f "$STOPFLAG"
     //   在就绪等待窗内并行探自家 wintun 适配器是否出现，sticky 落 tracker——即便本腿随后进程死（验尸不可靠），也已知
     //   「本次 start 是否曾见适配器」。见到即停观测省 spawn。macOS/Linux/非 TUN：obs=null → 全程 no-op、零改动。
     const obs = this.tunReadyObservation;
+    // B6：首次就绪探测只打一次点（见下方 isReady 包装）。
+    let firstReadyProbeMarked = false;
     const adapterName = obs ? resolveWinTunInterfaceName(this.currentConfig as UserConfig) : '';
     let observing = obs !== null;
     const recordPresence = (p: AdapterPresence): void => {
       if (obs) recordAdapterPresence(obs, p); // sticky monotonic 累计（纯函数，单测覆盖）
     };
+    // B8：就绪窗内的观测腿改**零 spawn**。原先每轮走 `adapterPresenceProbe`（F2 之后是 netsh），而适配器要到
+    //   +660–997ms 才出现，窗口前段每轮都真的起进程——`execFile` 的异步只是回调异步，`uv_spawn` 在 event loop
+    //   线程上同步执行，CreateProcessW 多慢主线程就堵多久。真机实测这个窗口里一次 netsh 要 819ms（空载 50–80ms），
+    //   而同期 FlowZ 的首次就绪探测（一次 loopback connect，正常 <5ms）被拖到 2538–4036ms。
+    //   Node 枚举与 `Get-NetAdapter -Name` 同一个名字空间，只是**只产肯定结论**：故窗内只记 present、绝不记
+    //   absent（看不见 ≠ 不存在）；absent 证据改由成功路径的 grace 硬闸、失败出口的补探提供（见下）。
     const observerDone: Promise<void> = observing
       ? (async () => {
           while (observing && !obs!.adapterEverSeen) {
-            const p = await this.adapterPresenceProbe(adapterName).catch(
-              () => 'unknown' as AdapterPresence
-            );
-            recordPresence(p);
+            if (this.adapterPresenceFastProbe(adapterName)) recordPresence('present');
             if (!observing || obs!.adapterEverSeen) break;
-            await sleep(ProxyManager.TUN_READY_OBSERVE_POLL_MS);
+            await sleep(ProxyManager.TUN_READY_FAST_OBSERVE_POLL_MS);
           }
         })()
       : Promise.resolve();
@@ -4732,10 +4755,24 @@ rm -f "$STOPFLAG"
         alivePollMs: ProxyManager.CORE_READY_ALIVE_POLL_MS,
       },
       {
-        // B4：换异步探活——同步版是 execSync，起核窗内每轮阻塞主进程 50–100ms（拖拽/动画可感）。
-        //   判定逻辑与 isProcessAlive 严格一致（见其头注），仅是不再堵 event loop。
-        isAlive: () => this.isProcessAliveAsync(pid),
-        isReady: () => this.coreReadyProbe('127.0.0.1', port),
+        // B8：探活换零 spawn。B4 把这条腿从 execSync 换成 execFile，只解决了「回调不堵 event loop」，钱照付：
+        //   `uv_spawn` 本身在 event loop 线程上同步执行。而这条腿的射程正是起核窗（alivePollMs=500，且 i=0 必探），
+        //   与杀软扫 82MB 新核的窗口完全重合——真机实测同窗口一次 tasklist 要 150–673ms（空载 50–80ms）。
+        //   `process.kill(pid, 0)` 零 spawn（真机 0.1ms），且顺带把探测失败的语义从 fail-closed 修成 fail-open：
+        //   tasklist 版 catch 一律 false（spawn 失败/超时 = 判核已死 → stopCore + 重试），kill 版只有 ESRCH 判死。
+        isAlive: () => this.processExistsNoSpawn(pid),
+        // B6：把**首次**就绪探测单独切一格。要回答的问题是「那两秒里，管理 API 到底是还没开，还是开了没被
+        //   及时发现」——首探若已 true，说明门进来时端口早就通了，钱花在了门之前；首探 false 则 `coreReady`
+        //   那一格量的才真是「等端口开」。标签带上首探结果，两种情形在汇总行里一眼可分。
+        //   只标一次（`readyProbe0` 之后的轮次不再打点），故对起核路径零额外开销。
+        isReady: async () => {
+          const r = await this.coreReadyProbe('127.0.0.1', port);
+          if (!firstReadyProbeMarked) {
+            firstReadyProbeMarked = true;
+            this.markStartLeg(startGen, `readyProbe0:${r}`);
+          }
+          return r;
+        },
         sleep,
         isSuperseded: () => this.lifecycleGeneration !== startGen,
       }
@@ -4746,7 +4783,7 @@ rm -f "$STOPFLAG"
     //   让位腿不打点的不变量靠 `measured` 保住（原先靠「放在 superseded 出口之后」，现在出口在下面）。
     const measured = outcome !== 'superseded';
     if (measured) this.markStartLeg(startGen, `coreReady:${outcome}`);
-    observing = false; // 停就绪窗观测，等其 drain（在途 sleep 至多 1s；若卡在在途 probe，Get-NetAdapter 的 execFile timeout 4s 封顶）
+    observing = false; // 停就绪窗观测，等其 drain（B8 之后窗内已无 spawn，drain 至多一个 200ms 的在途 sleep）
     await observerDone.catch(() => {});
     if (measured) this.markStartLeg(startGen, 'observerDrain'); // drain 本身单独一格：它是真实成本，只是不该混进就绪耗时
 
@@ -4799,6 +4836,21 @@ rm -f "$STOPFLAG"
       throw new CoreStartRetryError(
         `sing-box 已就绪但 TUN 适配器 ${adapterName} 未建立，正在自动重试`
       );
+    }
+
+    // B8：失败出口（dead/timeout）补一次**完整**存在性探测。窗内观测腿改零 spawn 后只产 present，
+    //   于是失败路径上 `probeEverConclusive` 会恒 false，#324 的终态判据（!adapterEverSeen && probeEverConclusive）
+    //   随之恒不成立——「wintun 装不起来」的机器退回无限重试 + 全程「正在自动重试」，正是 #324 报告者的抱怨。
+    //   **必须在 stopCore 之前**：拆核后适配器随即释放，那时的 absent 说明不了本腿是否建起过。
+    //   仅在「从未见过适配器」时才探（见过即已有 present 结论，无需再花一次 spawn）；此刻就绪窗已结束、
+    //   风暴已散，且这条路径本来就要 stopCore + 重试，这次 spawn 不在任何人的等待路径上。
+    //   被接管则跳过（接管方正在拆核，本腿再探也只是给它的适配器计数，且不该为让位腿花 spawn）。
+    if (obs && !obs.adapterEverSeen && this.lifecycleGeneration === startGen) {
+      const post = await this.adapterPresenceProbe(adapterName).catch(
+        () => 'unknown' as AdapterPresence
+      );
+      recordPresence(post);
+      this.markStartLeg(startGen, `tunAdapterPostmortem:${post}`);
     }
 
     // 失败：尽力停掉这个起不来的核（best-effort，其 wintun 适配器随即开始释放，给 retry 让路），再抛 CoreStartRetryError
@@ -5173,6 +5225,10 @@ rm -f "$STOPFLAG"
       this.startupLogOffset = 0; // 文件还不存在（首启）→ 整文件都是本次的
     }
 
+    // 核日志的清空必须发生在**起核之前**（见 truncateCoreLogFile 头注：原先长在 startLogFileWatcher 里，
+    //   而那是就绪之后才调的，等于每轮都把核自己的启动日志抹掉）。放在本方法顶部 → 三条支路与每条重试腿共用。
+    this.truncateCoreLogFile();
+
     // issue #159：起核前（win32&&TUN）等上一轮自家 wintun 适配器释放。置于本方法顶部（而非 startInternal）→ 每次
     //   runStartWithRetry 重启腿、以及下方 helper / UAC 两条启动支路都经此门控（不止首次），杜绝重试立刻再撞僵尸适配器。
     const launchCfg = this.currentConfig;
@@ -5486,7 +5542,8 @@ rm -f "$STOPFLAG"
         // 必须【在 spawn 后立即起 logFileWatcher】（而非等 1s 成功后）。否则启动失败路径（进程在 1s 内退出、
         // watcher 尚未起）下 singbox.log 里的 FATAL 配置错误/端口冲突无人读取 → lastErrorOutput 链路
         // （parseStartupError/classifyCoreError）拿不到具体错误，用户只得到通用退出码（H2 回归）。
-        // startLogFileWatcher 内部会清空日志文件（writeFileSync ''），sing-box 从空文件续写，时序正确。
+        // 日志文件已由 startSingBoxProcess 顶部的 truncateCoreLogFile() 在 spawn 之前清空，sing-box 从空文件
+        // 续写；watcher 从 0 读起，故本腿核写的启动日志会被完整投递，时序正确。
         // macOS/Windows 系统代理 + Linux 系统代理/manual：sing-box 仍走 stdout（上面已监听），不起 watcher。
         if (process.platform === 'linux' && this.isTunModeNow()) {
           this.startLogFileWatcher();
@@ -6292,6 +6349,31 @@ rm -f "$STOPFLAG"
    *
    * T16 子 commit 2：改 public 供 PlatformPrivilegeService.ctx 回调注入（killOrphans 复核存活用）。
    */
+  /**
+   * 零 spawn 的进程存在性判定（`process.kill(pid, 0)`：只做权限/存在性检查，不投递信号）。
+   *
+   * 为什么需要它：`isProcessAlive` 走 `execSync`（Windows 上必过 cmd.exe）+ `tasklist`，真机单独量是
+   * 81–160ms，但**落在起核路径上时量到 2018–2584ms**——那一刀紧跟着 82MB 的新核启动，杀软正在扫它，
+   * 此刻这台机上任何进程创建都被拖慢。零 spawn 版真机 0.1ms。
+   *
+   * **判据的三态，尤其是 EPERM**：
+   *  - 不抛 → 存在；
+   *  - `ESRCH` → **确证不存在**（唯一可以判「没有」的情形）；
+   *  - `EPERM` → **存在**。这不是模棱两可：内核先查到进程、再拒绝访问，才会给 EPERM。
+   *    helper 路径下核由 LocalSystem 起、FlowZ 非提权，**正是 EPERM 的常见产地**——判成「不存在」
+   *    会让每次 helper 起核都被自己这道检查判死。
+   *  - 其余错误码 → 说不了 → **fail-open 判存在**。这道检查只为抓「helper 报成功但进程压根没起来」，
+   *    抓不准时绝不能替代它下结论；真死了由就绪门（`waitForCoreReady` 的 dead 分支）兜住。
+   */
+  private processExistsNoSpawn(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (e) {
+      return (e as NodeJS.ErrnoException)?.code !== 'ESRCH';
+    }
+  }
+
   isProcessAlive(pid: number): boolean {
     try {
       const { execSync } = require('child_process');
@@ -7247,21 +7329,37 @@ rm -f "$STOPFLAG"
     }
   }
 
+  /**
+   * 清空核日志文件（sing-box 配置里 `log.output` 指向的那个）。**必须在起核之前调用。**
+   *
+   * 原先这一步长在 `startLogFileWatcher()` 里，而那个方法在 **`waitForCoreReadyOrThrow()` 返回之后**才被调用
+   * ——于是 helper 路径上，核自己的启动日志刚写完就被抹掉，每一轮都如此（真机实证：`singbox.log` 里最早的一行
+   * 恒是就绪之后的运行期流量；`singbox_startup.log` 恒 0 字节，因为核走 `log.output` 不走 stdout）。
+   * 后果是「起核那两三秒里核在干什么」这个问题**在产品里根本不可观测**，只能靠外部高频快照去抢，
+   * 本轮就是这么抢到 `sing-box started (0.93s)` 的。
+   *
+   * 前移到 spawn 之前后：清空 → 核写启动日志 → 就绪 → watcher 从 0 读起，把这段启动日志一并投进 app.log 与
+   * 诊断报告。三条起核支路（helper / UAC 看护 / Linux 直起）与每条重试腿共用本方法，语义一致。
+   */
+  private truncateCoreLogFile(): void {
+    try {
+      require('fs').writeFileSync(this.getLogFilePath(), '');
+    } catch {
+      /* 清不掉只是日志里混入上一轮内容，绝不该阻断起核 */
+    }
+    this.lastLogFileSize = 0;
+  }
+
   private startLogFileWatcher(): void {
     if (this.logFileWatcher) {
       return;
     }
 
     const logFilePath = this.getLogFilePath();
+    // 从 0 起读：清空动作已前移到 `truncateCoreLogFile()`（起核之前），此刻文件里躺着的正是**本腿核自己的
+    //   启动日志**，要原样喂进 app.log。本方法进入即早退于 `logFileWatcher` 非空，故不存在「没清空又从 0 重读」
+    //   导致的重复投递。
     this.lastLogFileSize = 0;
-
-    // 清空旧的日志文件
-    const fsSync = require('fs');
-    try {
-      fsSync.writeFileSync(logFilePath, '');
-    } catch {
-      // 忽略错误
-    }
 
     // 每 500ms 检查一次日志文件
     this.logFileWatcher = setInterval(async () => {
