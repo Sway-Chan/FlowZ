@@ -32,6 +32,8 @@ import {
   CoreStartTunPersistentError,
 } from '../core-readiness';
 import type { AdapterPresence, TunAdapterObservation } from '../win-tun-adapter';
+import { StartTimeline } from '../start-timeline';
+import { withPlatformAsync } from './platform-test-utils';
 
 afterAll(() => {
   try {
@@ -1119,5 +1121,167 @@ describe('issue #324 P0-2 — 撞了才避：startWithTunAddressAvoidance', () =
 
     await svc.startWithTunAddressAvoidance(cfg, {});
     expect(h.armedAt).toEqual([false]);
+  });
+});
+
+/**
+ * B6：把 `coreReady` 那一格拆细 + 把核日志的清空前移到 spawn 之前。
+ *
+ * 两件事同一个由来。真机把起核压到 ~4.3s 之后，`L1.coreReady:ready` 剩 2.3–2.8s，占了一半以上；抢救出来的核
+ * 日志显示核自报 `sing-box started (0.93s)`，也就是说那一格里**大部分不是核在初始化**。而之所以要「抢救」，
+ * 是因为清空日志的动作长在 `startLogFileWatcher()` 里、那又是就绪之后才调的——核自己的启动日志每轮刚写完就被抹掉。
+ *
+ * 这一组守的就是这两条：新格子确实打得出来（否则下一轮又只能靠外部抢快照），以及清空确实发生在起核之前。
+ */
+describe('B6：核日志清空前移到 spawn 之前', () => {
+  const fsSync = require('fs');
+
+  it('truncateCoreLogFile 清空文件并把 watcher 读游标复位到 0', () => {
+    const svc = makeSvc();
+    const p = svc.getLogFilePath();
+    fsSync.mkdirSync(path.dirname(p), { recursive: true });
+    fsSync.writeFileSync(p, '上一轮的残留\n');
+    svc.lastLogFileSize = 12345;
+
+    svc.truncateCoreLogFile();
+
+    expect(fsSync.readFileSync(p, 'utf-8')).toBe('');
+    expect(svc.lastLogFileSize).toBe(0);
+  });
+
+  it('startLogFileWatcher **不再**清空文件——那正是核启动日志被抹掉的原因', async () => {
+    const svc = makeSvc();
+    const p = svc.getLogFilePath();
+    fsSync.mkdirSync(path.dirname(p), { recursive: true });
+    // 模拟「核已经把本腿的启动日志写进来了」，此刻 watcher 才启动（真实时序：就绪之后）
+    fsSync.writeFileSync(p, '+0800 INFO sing-box started (0.93s)\n');
+
+    svc.startLogFileWatcher();
+    try {
+      // 变异守卫：把 writeFileSync(logFilePath, '') 放回 startLogFileWatcher → 这里读到空串
+      expect(fsSync.readFileSync(p, 'utf-8')).toContain('sing-box started (0.93s)');
+      // 且游标从 0 起，本腿启动日志会被完整投递进 app.log（而不是被跳过）
+      expect(svc.lastLogFileSize).toBe(0);
+    } finally {
+      svc.stopLogFileWatcher();
+    }
+  });
+
+  it('startSingBoxProcess 在交给任何启动支路**之前**就已清空', async () => {
+    const order: string[] = [];
+    const svc = makeSvc();
+    svc.currentConfig = { proxyModeType: 'tun', servers: [], tunConfig: {} };
+    svc.truncateCoreLogFile = jest.fn(() => order.push('truncate'));
+    svc.waitForOwnTunAdapterReleased = jest.fn(async () => {});
+    svc.helperManager = { isReady: jest.fn(async () => true), stopCore: jest.fn() };
+    // 直接钉住分支判定，避免本用例依赖 needsRootPrivilege / needsLinuxTun 的内部条件——
+    // 它们各有各的门，混进来会让这条「顺序」判据在别人改那些门时莫名其妙地红。
+    svc.needsOsascript = () => false;
+    svc.needsWindowsUAC = () => true;
+    // 哨兵必须用 CoreStartRetryError：helper 分支的 catch 会**吞掉**普通错误并回落 UAC 路径，
+    // 用普通 Error 的话本用例会一路跑到后面的支路上去，测出来的就不是「顺序」而是别的东西。
+    svc.startViaHelper = jest.fn(async () => {
+      order.push('launch');
+      throw new CoreStartRetryError('停在这里即可，本用例只看顺序');
+    });
+
+    await withPlatformAsync('win32', async () => {
+      await expect(svc.startSingBoxProcess(svc.lifecycleGeneration)).rejects.toThrow('停在这里即可');
+    });
+
+    // 变异守卫：把 truncateCoreLogFile() 挪回就绪之后（或删掉）→ order 不再是 ['truncate','launch']
+    expect(order).toEqual(['truncate', 'launch']);
+  });
+});
+
+/**
+ * B6：`coreReady` 那一格的细分埋点。
+ * 要回答的问题是「那两秒里，管理 API 到底是还没开、还是开了没被及时发现」——首次就绪探测的结果就是判据。
+ */
+describe('B6：首次就绪探测单独一格（readyProbe0）', () => {
+  function withTimeline(svc: any): StartTimeline {
+    const tl = new StartTimeline();
+    svc.startTimeline = tl;
+    return tl;
+  }
+
+  it('首探即 true → 打 readyProbe0:true（说明门进来时端口早已通，钱花在门之前）', async () => {
+    const svc = makeSvc();
+    armTun(svc);
+    const tl = withTimeline(svc);
+    svc.coreReadyProbe = jest.fn(async () => true);
+    svc.adapterPresenceProbe = jest.fn(async () => 'present' as AdapterPresence);
+    svc.isProcessAliveAsync = async () => true;
+
+    await svc.waitForCoreReadyOrThrow(4321, svc.lifecycleGeneration);
+
+    const labels = tl.phases().map((p: { label: string }) => p.label);
+    expect(labels).toContain('readyProbe0:true');
+  });
+
+  it('首探 false → 打 readyProbe0:false（coreReady 那一格量的才真是「等端口开」）', async () => {
+    const svc = makeSvc();
+    armTun(svc);
+    const tl = withTimeline(svc);
+    let n = 0;
+    svc.coreReadyProbe = jest.fn(async () => ++n > 1); // 首探 false，第二探 true
+    svc.adapterPresenceProbe = jest.fn(async () => 'present' as AdapterPresence);
+    svc.isProcessAliveAsync = async () => true;
+
+    await svc.waitForCoreReadyOrThrow(4321, svc.lifecycleGeneration);
+
+    const labels = tl.phases().map((p: { label: string }) => p.label);
+    expect(labels).toContain('readyProbe0:false');
+  });
+
+  it('只打一次——后续轮次不再打点（否则病态路径下会把时间轴刷爆）', async () => {
+    const svc = makeSvc();
+    armTun(svc);
+    const tl = withTimeline(svc);
+    let n = 0;
+    svc.coreReadyProbe = jest.fn(async () => ++n > 5); // 前 5 探 false
+    svc.adapterPresenceProbe = jest.fn(async () => 'present' as AdapterPresence);
+    svc.isProcessAliveAsync = async () => true;
+
+    await svc.waitForCoreReadyOrThrow(4321, svc.lifecycleGeneration);
+
+    const marks = tl
+      .phases()
+      .map((p: { label: string }) => p.label)
+      .filter((l: string) => l.startsWith('readyProbe0'));
+    expect(marks).toEqual(['readyProbe0:false']);
+  });
+});
+
+/**
+ * B6：`aliveCheck` 格（写 PID 文件 + 一次同步探活）。
+ * 它原先没有自己的格子，耗时被整片记进 `coreReady` —— 于是那一格看起来像「核起得慢」，
+ * 实则掺着主进程被 `execSync`（cmd.exe + tasklist，真机 81–160ms）堵住的时间。
+ */
+describe('B6：aliveCheck 单独一格', () => {
+  it('startViaHelper 在探活之后、就绪门之前打 aliveCheck，且早于 coreReady 那一格', async () => {
+    const svc = makeSvc();
+    // singboxPath 必须真实存在：startViaHelper 顶部有 existsSync 早退
+    const realBin = path.join(TMP, 'fake-sing-box');
+    fsSync.writeFileSync(realBin, 'x');
+    svc.singboxPath = realBin;
+    svc.currentConfig = { proxyModeType: 'tun', servers: [], allowLan: false, tunConfig: {} };
+    svc.helperManager = { startCore: jest.fn(async () => ({ ok: true, pid: 4321 })) };
+    svc.isProcessAlive = jest.fn(() => true);
+    // 就绪门本身在别处测；这里只看它**之前**的那一格确实打了
+    svc.waitForCoreReadyOrThrow = jest.fn(async () => {});
+    svc.startLogFileWatcher = jest.fn();
+    svc.startHealthCheck = jest.fn();
+    svc.sendEventToRenderer = jest.fn();
+
+    const tl = new StartTimeline();
+    svc.startTimeline = tl;
+    await svc.startViaHelper(svc.lifecycleGeneration);
+
+    const labels = tl.phases().map((p: { label: string }) => p.label);
+    // 变异守卫：删掉 markStartLeg(startGen, 'aliveCheck') → 这条红
+    expect(labels).toContain('aliveCheck');
+    expect(labels.indexOf('spawn')).toBeLessThan(labels.indexOf('aliveCheck'));
+    expect(svc.isProcessAlive).toHaveBeenCalledWith(4321);
   });
 });

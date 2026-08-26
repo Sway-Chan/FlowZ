@@ -4675,6 +4675,11 @@ rm -f "$STOPFLAG"
       this.cleanup();
       throw new Error('helper 报告已启动但进程不存在');
     }
+    // B6：这一格 = 写 PID 文件 + 一次**同步**探活。原先它没有自己的格子，耗时被整片记进 `coreReady`，
+    //   于是那一格看起来像「核起得慢」，实则掺着主进程被 execSync 堵住的时间。真机实测该调用 81–160ms
+    //   （execSync 必过 cmd.exe + tasklist；对照 execFileSync 67–72ms、`process.kill(pid,0)` 0.1ms）。
+    //   B4 当初只把**就绪循环里**的探活换成异步版，漏了这个调用点——先量出来，再决定怎么改。
+    this.markStartLeg(startGen, 'aliveCheck');
 
     // issue #159：等核真就绪（管理 API 绑定）再判成功，而非「spawn 即 started」。起核期内核死/超时 → 抛可重试
     // 错误交 runStartWithRetry 快速重起（届时 wintun 适配器/端口已释放），替代「假成功 + 10s 健康检查兜底」。
@@ -4707,6 +4712,8 @@ rm -f "$STOPFLAG"
     //   在就绪等待窗内并行探自家 wintun 适配器是否出现，sticky 落 tracker——即便本腿随后进程死（验尸不可靠），也已知
     //   「本次 start 是否曾见适配器」。见到即停观测省 spawn。macOS/Linux/非 TUN：obs=null → 全程 no-op、零改动。
     const obs = this.tunReadyObservation;
+    // B6：首次就绪探测只打一次点（见下方 isReady 包装）。
+    let firstReadyProbeMarked = false;
     const adapterName = obs ? resolveWinTunInterfaceName(this.currentConfig as UserConfig) : '';
     let observing = obs !== null;
     const recordPresence = (p: AdapterPresence): void => {
@@ -4735,7 +4742,18 @@ rm -f "$STOPFLAG"
         // B4：换异步探活——同步版是 execSync，起核窗内每轮阻塞主进程 50–100ms（拖拽/动画可感）。
         //   判定逻辑与 isProcessAlive 严格一致（见其头注），仅是不再堵 event loop。
         isAlive: () => this.isProcessAliveAsync(pid),
-        isReady: () => this.coreReadyProbe('127.0.0.1', port),
+        // B6：把**首次**就绪探测单独切一格。要回答的问题是「那两秒里，管理 API 到底是还没开，还是开了没被
+        //   及时发现」——首探若已 true，说明门进来时端口早就通了，钱花在了门之前；首探 false 则 `coreReady`
+        //   那一格量的才真是「等端口开」。标签带上首探结果，两种情形在汇总行里一眼可分。
+        //   只标一次（`readyProbe0` 之后的轮次不再打点），故对起核路径零额外开销。
+        isReady: async () => {
+          const r = await this.coreReadyProbe('127.0.0.1', port);
+          if (!firstReadyProbeMarked) {
+            firstReadyProbeMarked = true;
+            this.markStartLeg(startGen, `readyProbe0:${r}`);
+          }
+          return r;
+        },
         sleep,
         isSuperseded: () => this.lifecycleGeneration !== startGen,
       }
@@ -5173,6 +5191,10 @@ rm -f "$STOPFLAG"
       this.startupLogOffset = 0; // 文件还不存在（首启）→ 整文件都是本次的
     }
 
+    // 核日志的清空必须发生在**起核之前**（见 truncateCoreLogFile 头注：原先长在 startLogFileWatcher 里，
+    //   而那是就绪之后才调的，等于每轮都把核自己的启动日志抹掉）。放在本方法顶部 → 三条支路与每条重试腿共用。
+    this.truncateCoreLogFile();
+
     // issue #159：起核前（win32&&TUN）等上一轮自家 wintun 适配器释放。置于本方法顶部（而非 startInternal）→ 每次
     //   runStartWithRetry 重启腿、以及下方 helper / UAC 两条启动支路都经此门控（不止首次），杜绝重试立刻再撞僵尸适配器。
     const launchCfg = this.currentConfig;
@@ -5486,7 +5508,8 @@ rm -f "$STOPFLAG"
         // 必须【在 spawn 后立即起 logFileWatcher】（而非等 1s 成功后）。否则启动失败路径（进程在 1s 内退出、
         // watcher 尚未起）下 singbox.log 里的 FATAL 配置错误/端口冲突无人读取 → lastErrorOutput 链路
         // （parseStartupError/classifyCoreError）拿不到具体错误，用户只得到通用退出码（H2 回归）。
-        // startLogFileWatcher 内部会清空日志文件（writeFileSync ''），sing-box 从空文件续写，时序正确。
+        // 日志文件已由 startSingBoxProcess 顶部的 truncateCoreLogFile() 在 spawn 之前清空，sing-box 从空文件
+        // 续写；watcher 从 0 读起，故本腿核写的启动日志会被完整投递，时序正确。
         // macOS/Windows 系统代理 + Linux 系统代理/manual：sing-box 仍走 stdout（上面已监听），不起 watcher。
         if (process.platform === 'linux' && this.isTunModeNow()) {
           this.startLogFileWatcher();
@@ -7247,21 +7270,37 @@ rm -f "$STOPFLAG"
     }
   }
 
+  /**
+   * 清空核日志文件（sing-box 配置里 `log.output` 指向的那个）。**必须在起核之前调用。**
+   *
+   * 原先这一步长在 `startLogFileWatcher()` 里，而那个方法在 **`waitForCoreReadyOrThrow()` 返回之后**才被调用
+   * ——于是 helper 路径上，核自己的启动日志刚写完就被抹掉，每一轮都如此（真机实证：`singbox.log` 里最早的一行
+   * 恒是就绪之后的运行期流量；`singbox_startup.log` 恒 0 字节，因为核走 `log.output` 不走 stdout）。
+   * 后果是「起核那两三秒里核在干什么」这个问题**在产品里根本不可观测**，只能靠外部高频快照去抢，
+   * 本轮就是这么抢到 `sing-box started (0.93s)` 的。
+   *
+   * 前移到 spawn 之前后：清空 → 核写启动日志 → 就绪 → watcher 从 0 读起，把这段启动日志一并投进 app.log 与
+   * 诊断报告。三条起核支路（helper / UAC 看护 / Linux 直起）与每条重试腿共用本方法，语义一致。
+   */
+  private truncateCoreLogFile(): void {
+    try {
+      require('fs').writeFileSync(this.getLogFilePath(), '');
+    } catch {
+      /* 清不掉只是日志里混入上一轮内容，绝不该阻断起核 */
+    }
+    this.lastLogFileSize = 0;
+  }
+
   private startLogFileWatcher(): void {
     if (this.logFileWatcher) {
       return;
     }
 
     const logFilePath = this.getLogFilePath();
+    // 从 0 起读：清空动作已前移到 `truncateCoreLogFile()`（起核之前），此刻文件里躺着的正是**本腿核自己的
+    //   启动日志**，要原样喂进 app.log。本方法进入即早退于 `logFileWatcher` 非空，故不存在「没清空又从 0 重读」
+    //   导致的重复投递。
     this.lastLogFileSize = 0;
-
-    // 清空旧的日志文件
-    const fsSync = require('fs');
-    try {
-      fsSync.writeFileSync(logFilePath, '');
-    } catch {
-      // 忽略错误
-    }
 
     // 每 500ms 检查一次日志文件
     this.logFileWatcher = setInterval(async () => {
