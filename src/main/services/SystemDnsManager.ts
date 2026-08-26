@@ -501,19 +501,29 @@ export class WindowsSystemDns extends SystemDnsBase {
     // 逐**已连接**接口读 DNS（与 listTargets 同口径，避免 VMware/Hyper-V/VPN 虚拟网卡的私网 DNS 抢先被选）。
     // 单接口 show dnsservers 同时含 static 与 dhcp 行 → extractIpv4s 两者都取；输出本地化不影响 IPv4 提取。
     // 仅 READ（show，非提权可跑），供 getLanResolverForDns(方案B) 用——SET(setDns) 已收敛为 no-op，见下。
+    // 起核关键路径上的耗时（真机埋点 `lanResolver` 一格 391–873ms，且拆格后已证明**全部**在这里——
+    //   同格里那步同步 fs 归一恒 0ms）。两处改动，都不改结论：
+    //   ① 逐接口的读**并行**跑。它们互不依赖，串行只是把 N 次进程启动的墙钟叠起来。
+    //   ② `execFile` 而非 `exec`：`exec` 每条命令都要先起一个 cmd.exe 来解析命令行，等于每个接口付两次进程
+    //      创建；顺带消掉接口名进 shell 命令行的拼接面（名字可含空格/`&`，本来就是靠引号硬扛的）。
+    //   **顺序仍按接口顺序去重**：pickLanResolverIp 取第一个私网地址，乱序会让它在多网卡机器上选到别的网卡
+    //   的解析器——那是行为变化，不是性能优化，故 Promise.all 后按 ifaces 原序合并。
     const ifaces = await this.listTargets();
-    const all: string[] = [];
-    for (const iface of ifaces) {
-      try {
-        const { stdout } = await execAsync(
-          `"${this.netshExe}" interface ipv4 show dnsservers name="${iface}"`,
+    const perIface = await Promise.all(
+      ifaces.map((iface) =>
+        execFileAsync(
+          this.netshExe,
+          ['interface', 'ipv4', 'show', 'dnsservers', `name=${iface}`],
           { timeout: DNS_CMD_TIMEOUT_MS }
-        );
-        for (const ip of extractIpv4s(stdout)) {
-          if (!all.includes(ip)) all.push(ip);
-        }
-      } catch {
-        /* 单接口读失败跳过 */
+        )
+          .then(({ stdout }) => extractIpv4s(String(stdout)))
+          .catch((): string[] => []) // 单接口读失败跳过
+      )
+    );
+    const all: string[] = [];
+    for (const ips of perIface) {
+      for (const ip of ips) {
+        if (!all.includes(ip)) all.push(ip);
       }
     }
     return all;

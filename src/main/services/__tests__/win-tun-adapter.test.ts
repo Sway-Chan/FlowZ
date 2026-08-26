@@ -29,7 +29,7 @@ import {
   type AdapterPresence,
   type TunAdapterObservation,
 } from '../win-tun-adapter';
-import { powershellPath } from '../../utils/win-system32';
+import { powershellPath, system32 } from '../../utils/win-system32';
 import { resolveWinTunInterfaceName, FLOWZ_WIN_TUN_INTERFACE } from '../../../shared/tun-interface';
 import type { UserConfig } from '../../../shared/types';
 
@@ -332,6 +332,22 @@ function okStdout(...lines: string[]): string {
   return ['PROBE_OK', ...lines].join('\r\n') + '\r\n';
 }
 
+/** F2：netsh 存在性探测走的绝对路径（与产出侧同一口径，杜绝两处漂移）。 */
+function netshPath(): string {
+  return system32('netsh.exe');
+}
+
+/**
+ * `netsh interface show interface` 的真机输出形态（2026-08-26 实测抄回）：本地化表头 + 一整行连续 `-`
+ * 分隔线（哨兵，与语言无关）+ 每行四列、列间空白对齐、接口名在最后一列。
+ */
+function netshStdout(...names: string[]): string {
+  const head = '管理员状态    状态           类型             接口名称';
+  const sep = '-------------------------------------------------------------------------';
+  const rows = names.map((n) => `已启用           已连接           专用               ${n}`);
+  return [head, sep, ...rows].join('\r\n') + '\r\n';
+}
+
 /**
  * 真机实证过的脚本原文（逐字，issue #324）。
  *
@@ -371,17 +387,6 @@ try {
 } catch { }
 exit 0`;
 
-const SCRIPT_ADAPTER = `$ErrorActionPreference = 'SilentlyContinue'
-$Error.Clear()
-try {
-  $r = @(Get-NetAdapter -Name 'flowz-tun0' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Name)
-  if (@($Error | Where-Object { $_.CategoryInfo.Category -ne 'ObjectNotFound' }).Count -eq 0) {
-    Write-Output 'PROBE_OK'
-    foreach ($x in $r) { Write-Output $x }
-  }
-} catch { }
-exit 0`;
-
 describe('PowerShell 探测脚本形态（#324 真机契约）', () => {
   // 姊妹腿：与 `describe('probeWinTunAdapterPresence')` 同一条理由——本组守的是**外部进程契约文本**
   // （PowerShell 全文 `toBe`），被 B3 快检短路掉的话连脚本都不会生成，失效代价比那组更高。
@@ -401,10 +406,13 @@ describe('PowerShell 探测脚本形态（#324 真机契约）', () => {
     expect(h.lastCommand()).toBe(SCRIPT_IP_WITH_ALIAS);
   });
 
-  it('网卡探测生成的脚本逐字等于真机实证过的原文', async () => {
-    const h = stubExecFile(null, okStdout());
+  it('存在性探测不得回退 PowerShell（F2：真机 netsh 66–71ms vs PowerShell 713–1005ms）', async () => {
+    // 原本这里断言的是「网卡探测脚本逐字等于真机原文」。F2 把这条腿整个换成了 netsh，脚本不复存在，
+    // 故判据改为「spawn 的不是 powershell」——守的仍是同一件事：这条腿的外部进程契约没被人悄悄改回去。
+    const h = stubExecFile(null, netshStdout('flowz-tun0'));
     await probeWinTunAdapterPresence('flowz-tun0');
-    expect(h.lastCommand()).toBe(SCRIPT_ADAPTER);
+    expect(h.lastBin()).not.toBe(powershellPath());
+    expect(h.lastBin()).toBe(netshPath());
   });
 
   /**
@@ -442,9 +450,9 @@ describe('PowerShell 探测脚本形态（#324 真机契约）', () => {
   it('恶意别名：引号被转义、其余字符原样落在单引号串内，且 argv 仍是一个元素', async () => {
     const h = stubExecFile(null, okStdout());
     // 同时含单引号、双引号、空格、换行——覆盖上表「别名含 `"` / 空格 / 换行」与「含 `'`」两行。
-    await probeWinTunAdapterPresence('a\'b"c d\ne');
+    await probeWinIpv4AddressUsage('172.19.0.1', 'a\'b"c d\ne');
     expect(h.lastArgs()).toHaveLength(4);
-    expect(h.lastCommand()).toContain(`Get-NetAdapter -Name 'a''b"c d\ne'`);
+    expect(h.lastCommand()).toContain(`$_.InterfaceAlias -ne 'a''b"c d\ne'`);
   });
 
   it('spawn 的是 powershellPath() 的绝对路径，且带 timeout / windowsHide', async () => {
@@ -539,52 +547,81 @@ describe('probeWinIpv4AddressUsage', () => {
  * `probeWinTunAdapterPresence` 的 execFile 级契约（此前只有注入桩的 waitForAdapterPresent 用例，
  * 这一层从未被覆盖——#324 的同源缺陷正是从这个缺口漏出去的）。
  */
-describe('probeWinTunAdapterPresence', () => {
+describe('probeWinTunAdapterPresence（F2：netsh 契约）', () => {
   beforeEach(() => (execFile as unknown as jest.Mock).mockReset());
-  // 本组验的是 **PowerShell 契约**（哨兵/退出码/三态），必须让 B3 快检恒不命中，否则判据会被短路吃掉。
+  // 本组验的是 **netsh 契约**（分隔线哨兵/列切分/三态），必须让 B3 快检恒不命中，否则判据会被短路吃掉。
   // 不加这行的话：本机 Linux 无 `flowz-tun0` 恰好全绿，但在真跑着 FlowZ 的 Windows 开发机上（那里确实存在
-  // 同名接口）这 8 条会集体短路成 present —— 一个只在特定机器上失效的门，比没有门更坏。
+  // 同名接口）这几条会集体短路成 present —— 一个只在特定机器上失效的门，比没有门更坏。
   beforeEach(() => mockIfaces(() => ({})));
 
-  it('哨兵在、命中本名 → present', async () => {
-    stubExecFile(null, okStdout('flowz-tun0'));
+  it('表里有本名 → present', async () => {
+    stubExecFile(null, netshStdout('flowz-tun0'));
     await expect(probeWinTunAdapterPresence('flowz-tun0')).resolves.toBe('present');
   });
 
-  it('哨兵在、无结果行 → absent（据此可判「从未创建」→ 硬闸失败本腿）', async () => {
-    // 真机上这正是「网卡不存在」的场景，旧实现因退出码 1 落 unknown → waitForAdapterPresent 的 sawAbsent
-    // 恒 false → outcome 恒 'unknown' → 硬闸永远 fail-open，#327 的就绪验证形同虚设。
-    stubExecFile(null, okStdout());
+  it('表里无本名 → absent（据此可判「从未创建」→ 硬闸失败本腿）', async () => {
+    // 真机上这正是「网卡不存在」的场景。absent 必须真的能产出，否则 waitForAdapterPresent 的 sawAbsent
+    // 恒 false → outcome 恒 'unknown' → #324 硬闸永远 fail-open，就绪验证形同虚设。
+    stubExecFile(null, netshStdout('以太网'));
     await expect(probeWinTunAdapterPresence('flowz-tun0')).resolves.toBe('absent');
   });
 
-  it('无哨兵 → unknown，绝不是 absent（不把「查不了」误判成「确实没有」）', async () => {
+  it('无表头分隔线 → unknown，绝不是 absent（不把「查不了」误判成「确实没有」）', async () => {
     stubExecFile(null, '');
+    await expect(probeWinTunAdapterPresence('flowz-tun0')).resolves.toBe('unknown');
+    // 有输出但不是那张表（被拦/换了形态）同样不作数
+    stubExecFile(null, '拒绝访问。\n');
     await expect(probeWinTunAdapterPresence('flowz-tun0')).resolves.toBe('unknown');
   });
 
-  it('PowerShell 失败/超时 → unknown（fail-open，绝不据此判终态失败）', async () => {
+  it('netsh 失败/超时 → unknown（fail-open，绝不据此判终态失败）', async () => {
     stubExecFile(new Error('spawn ENOENT'), '');
     await expect(probeWinTunAdapterPresence('flowz-tun0')).resolves.toBe('unknown');
   });
 
-  it('按整行精确匹配，同前缀网卡名不误判', async () => {
-    stubExecFile(null, okStdout('flowz-tun00', 'flowz-tun0-old'));
-    await expect(probeWinTunAdapterPresence('flowz-tun0')).resolves.toBe('absent');
+  it('同前缀网卡名不误判（按列切分取全称，不做子串匹配）', async () => {
+    stubExecFile(null, netshStdout('flowz-tun00', 'flowz-tun0-old'));
+    await expect(probeWinTunAdapterPresence('flowz-tun0')).resolves.toBe('unknown');
   });
 
-  it('网卡名里的单引号被转义（PowerShell 字面量闭合）', async () => {
-    const h = stubExecFile(null, okStdout());
-    await probeWinTunAdapterPresence("it's");
-    expect(h.lastCommand()).toContain("-Name 'it''s'");
+  it('名字里带空格的**别的**网卡不误判成本名命中（「取最后一个空白 token」会栽在这里）', async () => {
+    // `VPN flowz-tun0` 的最后一个空白分隔 token 正好是 `flowz-tun0`；按 `\s{2,}` 切列则拿到全称，不命中。
+    stubExecFile(null, netshStdout('VPN flowz-tun0'));
+    await expect(probeWinTunAdapterPresence('flowz-tun0')).resolves.not.toBe('present');
+  });
+
+  it('含糊（本名以子串出现但切不出干净字段）→ unknown 而非 absent', async () => {
+    // 这是新判据的安全阀：对 #324 正向门，假 absent 会走到 absent-timeout → 硬闸 → 永久拒连，
+    // 是最贵的误判方向；含糊时必须 fail-open。
+    stubExecFile(null, netshStdout('VPN flowz-tun0'));
+    await expect(probeWinTunAdapterPresence('flowz-tun0')).resolves.toBe('unknown');
+  });
+
+  it('表头本地化/OEM 乱码不影响判定（哨兵与比对对象都是 ASCII）', async () => {
+    // 中文 Windows 的 netsh 按 OEM codepage(936) 写 stdout，Node 按 utf8 解码必成乱码——真机实测形态。
+    const garbled = `管理员状�?    状�?          类型             接口名称
+-------------------------------------------------------------------------
+已启�?           已连�?           专用               flowz-tun0
+`;
+    stubExecFile(null, garbled);
+    await expect(probeWinTunAdapterPresence('flowz-tun0')).resolves.toBe('present');
+  });
+
+  it('spawn 的是 netsh 绝对路径，argv 形态固定，且带 timeout / windowsHide', async () => {
+    // 变异守卫：删 `timeout: 4000` → 被拦住的 netsh 永不回调，起核卡死无兜底；bin 换裸名 → PATH 劫持面。
+    const h = stubExecFile(null, netshStdout('flowz-tun0'));
+    await probeWinTunAdapterPresence('flowz-tun0');
+    expect(h.lastBin()).toBe(netshPath());
+    expect(h.lastArgs()).toEqual(['interface', 'show', 'interface']);
+    expect(h.lastOpts()).toMatchObject({ timeout: 4000, windowsHide: true });
   });
 
   it('布尔版 probeWinTunAdapterPresent：absent/unknown 均塌成 false（#159 反向门 fail-open）', async () => {
-    stubExecFile(null, okStdout());
+    stubExecFile(null, netshStdout('以太网'));
     await expect(probeWinTunAdapterPresent('flowz-tun0')).resolves.toBe(false);
     stubExecFile(null, '');
     await expect(probeWinTunAdapterPresent('flowz-tun0')).resolves.toBe(false);
-    stubExecFile(null, okStdout('flowz-tun0'));
+    stubExecFile(null, netshStdout('flowz-tun0'));
     await expect(probeWinTunAdapterPresent('flowz-tun0')).resolves.toBe(true);
   });
 });
@@ -638,7 +675,7 @@ describe('nodeSeesInterface（B3 快检）', () => {
 describe('probeWinTunAdapterPresence — B3 短路接线', () => {
   afterEach(restoreIfaces);
 
-  it('Node 看得见 → 直接 present，且**零 spawn**（省掉真机实测 ~950ms 的那次 PowerShell）', async () => {
+  it('Node 看得见 → 直接 present，且**零 spawn**（省掉真机实测 ~70ms 的那次 netsh）', async () => {
     (execFile as unknown as jest.Mock).mockClear();
     mockIfaces(() => ({ 'flowz-tun0': [{ address: '172.19.0.1' }] }));
 
@@ -646,12 +683,12 @@ describe('probeWinTunAdapterPresence — B3 短路接线', () => {
     expect(execFile as unknown as jest.Mock).not.toHaveBeenCalled();
   });
 
-  it('Node 看不见 → 仍回落 PowerShell 由它给权威结论（absent 只能来自 PS）', async () => {
+  it('Node 看不见 → 仍回落 netsh 由它给权威结论（absent 只能来自外部查询）', async () => {
     (execFile as unknown as jest.Mock).mockClear();
     mockIfaces(() => ({}));
     (execFile as unknown as jest.Mock).mockImplementation(
       (_c: string, _a: string[], _o: unknown, cb: (e: unknown, out: string) => void) =>
-        cb(null, 'PROBE_OK\n')
+        cb(null, netshStdout('以太网'))
     );
 
     await expect(probeWinTunAdapterPresence('flowz-tun0')).resolves.toBe('absent');

@@ -661,6 +661,18 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   // issue #324 P0-2：本次起核经冲突预检选定的 TUN IPv4 裸地址（掩码由 buildInbounds 按平台拼）。null=未预检
   //   （非 TUN / 用户已显式配置 / 预检未跑）→ 沿用平台默认，行为零变化。每次 startInternal 重算。
   private effectiveTunInet4Address: string | null = null;
+  /**
+   * issue #324 P0-2 的「懒预检」开关（start-scoped，由 startWithTunAddressAvoidance 管）。
+   *
+   * 为什么改懒：预检是一次 PowerShell `Get-NetIPAddress`，真机实测 681–760ms，**每台机每次起核都付**，
+   *   而它要躲的地址冲突只发生在装了残留 TAP/TUN 网卡的少数机器上。B0 埋点把这笔账摆到台面上后
+   *   （`tunAddrPreflightWait` 0–954ms，且它 ≈ 探测耗时 − 并行窗口，前面的准备步骤被优化得越快它越显形），
+   *   正确的形状是**倒过来**：默认乐观起核，撞了才避。
+   * 撞了怎么办：核 FATAL 被 classifySingBoxFatal 判成 `tun-address-conflict`（#324 真机实证过的分类）→
+   *   本字段置真 → 整个 startInternal 重跑一遍，那一遍才付探测的钱并换地址。代价落在**确有冲突的机器**上
+   *   （多一遍起核），而不是所有人身上。
+   */
+  private tunAddressAvoidanceArmed = false;
   // issue #176 诊断计数：本次启动经几次「就绪重试」才成功（runStartWithRetry 累计）。>0 = 起核慢（多因 Windows
   // 重启争用下 wintun 适配器未及时释放），与「核崩溃自动重启」（restartCount/AUTO_RESTARTING）是不同轴，纳入诊断
   // 区分「核崩」vs「争用慢起」。每次 startInternal 复位。
@@ -743,7 +755,7 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     this.startTimeline = timeline;
     let outcome = 'failed';
     try {
-      await this.startInternal(config, options);
+      await this.startWithTunAddressAvoidance(config, options);
       outcome = 'ok';
     } catch (e) {
       // issue #176：本腿在就绪等待期被更新的 start/stop 接管 → 静默让位，**绝不 cleanup**（接管方已拥有/正在
@@ -1030,6 +1042,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     //   open 不了 root 600 的 tailscaled.* → endpoint post-start `permission denied` → 拖垮**整个**启动
     //   （即便没选 tailscale 节点，它在 endpoints[] 里也会被 post-start；系统代理模式同样中招）。
     this.reconcileRuntimeOwnershipBeforeStart();
+    // 真机实测 lanResolver 一格 874–2460ms（波动 3 倍）。那一格里同时装着本行的同步 fs 归一和下面按接口
+    // 逐个跑 netsh 读解析器，合成一格看不出是谁在波动，故拆开——与 seedRules/customRules 同一处置。
+    this.markStart('reconcileOwnership');
 
     // 3.8 方案B：DNS 接管激活时,先读接管前的内网 LAN 解析器(私网 IPv4),供 generateDnsConfig 把内网/captive 域名
     //     重定向到它(takeover 把系统 DNS 改公网 8.8.8.8 后 dns-local 解不了内网/可能环)。必须在 generateSingBoxConfig
@@ -4912,6 +4927,43 @@ rm -f "$STOPFLAG"
   }
 
   /**
+   * issue #324 P0-2「懒预检」的重跑腿：默认乐观起核；**只有**本次 start 因 TUN 地址冲突终态失败时，
+   * 才武装预检并把整个 startInternal 重跑一遍（那一遍才付 PowerShell 探测的钱、才可能换地址）。
+   *
+   * 为什么重跑整个 startInternal 而不是只重跑起核腿：地址要随配置下发给核，换地址就得重生成配置；而
+   * `singboxConfig` 在 startInternal 里还经过了 `checkAndPruneConfig` 的**就地剔除**（坏节点已被摘掉）。
+   * 在失败分支里单独重生成配置会把那些坏节点放回来（T9 已踩过同一个坑），单独就地改 TUN 地址又要复刻
+   * buildInbounds 的平台掩码逻辑——两条都是重复实现。重入 startInternal 走的是用户手动重连的同一条路径，
+   * 零新增分支、零重复。
+   *
+   * 只重跑一次：`tunAddressAvoidanceArmed` 在本方法入口复位、命中后置真，第二遍再撞就照常上抛终态错误
+   * （占用方不挪走，第三遍也不会好）。
+   */
+  private async startWithTunAddressAvoidance(
+    config: UserConfig,
+    options: { interactive?: boolean }
+  ): Promise<void> {
+    this.tunAddressAvoidanceArmed = false;
+    try {
+      await this.startInternal(config, options);
+    } catch (e) {
+      // 判据取 `lastStartupFatal.kind`（核自己写的失败原因）而不是错误文案：文案会随 i18n/措辞变，
+      // kind 是 classifySingBoxFatal 的结构化结论，#324 真机实证过。终态类型也要对上——瞬态族
+      // （CoreStartRetryError）本来就还在重试预算里，不该被这条腿抢走。
+      if (
+        !(e instanceof CoreStartTunPersistentError) ||
+        this.lastStartupFatal?.kind !== 'tun-address-conflict'
+      ) {
+        throw e;
+      }
+      this.tunAddressAvoidanceArmed = true;
+      this.logToManager('warn', 'TUN 地址冲突：正在探测可用地址并重试一次...');
+      this.markStart('tunAddrConflictRetry');
+      await this.startInternal(config, options);
+    }
+  }
+
+  /**
    * issue #324 P0-2：发起 TUN 地址冲突预检（不阻塞，结果由 applyTunAddressPreflight 收）。
    *
    * 硬编码的 `172.19.0.1` 撞上本机已有的同址接口时，sing-box 在 `configure tun interface: set ipv4 address`
@@ -4919,9 +4971,11 @@ rm -f "$STOPFLAG"
    * 重试、用户无从得知。起核前探一次，**确证冲突**才换到备选；探不了或无冲突一律沿用默认（fail-open——
    * 换地址本身有代价：用户钉着旧地址的路由/防火墙规则会失效，不能因一次探测失败就乱换）。
    *
-   * 不预检的两种情况都返回 null（沿用平台默认，行为零变化）：
+   * 不预检的三种情况都返回 null（沿用平台默认，行为零变化）：
    *  - 非 TUN 模式；
-   *  - 用户显式配置了 `tunConfig.inet4Address` —— 用户显式约束优先于「更优解」，照办不避让。
+   *  - 用户显式配置了 `tunConfig.inet4Address` —— 用户显式约束优先于「更优解」，照办不避让；
+   *  - **本次 start 尚未撞过地址冲突**（懒预检，见 `tunAddressAvoidanceArmed`）。默认乐观起核，
+   *    把这 681–760ms 从所有人的关键路径上拿掉；撞了才由 startWithTunAddressAvoidance 武装并重跑一遍。
    */
   private async startTunAddressPreflight(
     config: UserConfig,
@@ -4933,6 +4987,9 @@ rm -f "$STOPFLAG"
     const prevAddress = this.effectiveTunInet4Address;
     this.effectiveTunInet4Address = null;
     if (!isTunMode || config.tunConfig?.inet4Address) return null;
+    // 懒预检：没撞过就不探。**必须放在上面两行之后**——`effectiveTunInet4Address` 的复位是每次起核都要做的
+    // （否则上一次避让选的地址会粘到这一次），只有「探不探」这件事才受本闸门控。
+    if (!this.tunAddressAvoidanceArmed) return null;
     // 旧核仍在跑（#176 supersede 交错：用户连点连接）→ **跳过探测**。此刻本机接口上挂着的 `172.19.0.1` 是
     // **我们自己**的 TUN，探成 in-use 会让新腿静默切到备选、下次正常重启又切回——地址乒乓。Windows 侧已由
     // InterfaceAlias 过滤挡住（自家网卡名固定），但 macOS 的 utun 名由内核分配、无法按名排除，只能从状态侧堵。
