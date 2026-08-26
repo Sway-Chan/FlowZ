@@ -8,11 +8,20 @@ jest.mock('child_process', () => ({
   execFile: jest.fn(),
 }));
 
+// B3 快检读 os.networkInterfaces()，而 Node 的 os 模块属性不可重定义（jest.spyOn 会抛
+// `Cannot redefine property`）→ 只能整模块 mock。默认实现即真实实现，故其余用例行为不变。
+jest.mock('os', () => {
+  const actual = jest.requireActual('os');
+  return { ...actual, networkInterfaces: jest.fn(actual.networkInterfaces) };
+});
+
 import { execFile } from 'child_process';
+import * as os from 'os';
 import {
   probeWinIpv4AddressUsage,
   probeWinTunAdapterPresence,
   probeWinTunAdapterPresent,
+  nodeSeesInterface,
   waitForAdapterReleased,
   waitForAdapterPresent,
   recordAdapterPresence,
@@ -306,12 +315,10 @@ function stubExecFile(
   return {
     lastBin: () => lastBin,
     lastOpts: () => lastOpts,
-    // 脚本经 -EncodedCommand（UTF-16LE base64）传入，还原回文本供断言。
+    // 脚本作为单个 argv 元素经 -Command 传入，直接取回供断言。
     lastCommand: () => {
-      const i = lastArgs.indexOf('-EncodedCommand');
-      return i < 0 || i + 1 >= lastArgs.length
-        ? ''
-        : Buffer.from(lastArgs[i + 1], 'base64').toString('utf16le');
+      const i = lastArgs.indexOf('-Command');
+      return i < 0 || i + 1 >= lastArgs.length ? '' : lastArgs[i + 1];
     },
     lastArgs: () => lastArgs,
   };
@@ -376,6 +383,10 @@ try {
 exit 0`;
 
 describe('PowerShell 探测脚本形态（#324 真机契约）', () => {
+  // 姊妹腿：与 `describe('probeWinTunAdapterPresence')` 同一条理由——本组守的是**外部进程契约文本**
+  // （PowerShell 全文 `toBe`），被 B3 快检短路掉的话连脚本都不会生成，失效代价比那组更高。
+  beforeEach(() => mockIfaces(() => ({})));
+
   beforeEach(() => (execFile as unknown as jest.Mock).mockReset());
 
   it('地址探测（无别名）生成的脚本逐字等于真机实证过的原文', async () => {
@@ -396,12 +407,44 @@ describe('PowerShell 探测脚本形态（#324 真机契约）', () => {
     expect(h.lastCommand()).toBe(SCRIPT_ADAPTER);
   });
 
-  it('走 -EncodedCommand 而非 -Command（命令行转义面 + 脚本可含多行/exit）', async () => {
-    // 这条不在脚本文本里，故仍需单独断言 argv 形态。
+  /**
+   * argv 形态门（脚本文本里没有，故单独断言）。
+   *
+   * **判据改写记录（2026-08-26）**：原门断言的是「必须走 `-EncodedCommand`」，理由写的是「命令行转义面 +
+   * 脚本可含多行/exit」。真机实测推翻了它的性价比——`-EncodedCommand` 让 `CreateProcessW` **同步阻塞主线程**
+   * 2.3–4.7s/次（同脚本改 `-Command` 后 8–10ms，见 runPsProbe 头注）。改判据前先核对新旧判据的强弱：
+   *
+   * | 输入 | 旧判据（-EncodedCommand） | 新判据（单 argv 元素 + 校验器） | 差 |
+   * |---|---|---|---|
+   * | `flowz-tun0`（合法） | 正常探测 | 正常探测 | 无 |
+   * | 别名含 `'` | 调用方 `''` 转义后落单引号串 | 同左（转义逻辑未动） | 无 |
+   * | 别名含 `"` / 空格 / 换行 | base64 后不经命令行解析 | `execFile` 不过 shell，仍是**一个** argv 元素，不经命令行解析 | 无 |
+   * | 别名含 PowerShell 语法（`$(...)`） | **不拦**（编码只消命令行层，语法层照旧） | **不拦**（同左） | 无 |
+   * | 非法 IP 字面量 | 校验器早退 unknown，不 spawn | 同左 | 无 |
+   *
+   * 结论：编码传参消掉的只有**命令行层**，而 `execFile`（无 shell）本来就没有那一层——两者对输入的约束
+   * 逐格相同，故换传参方式**不放宽任何东西**。下面三条把「逐格相同」落成门。
+   */
+  it('脚本以单个 argv 元素经 -Command 传入（argv 边界即转义边界）', async () => {
     const h = stubExecFile(null, okStdout());
     await probeWinIpv4AddressUsage('172.19.0.1');
-    expect(h.lastArgs()).toContain('-EncodedCommand');
-    expect(h.lastArgs()).not.toContain('-Command');
+    // 变异守卫：若脚本被按行/按空格拆成多个参数，argv 长度会变，且 PowerShell 会按命令行规则重新解析它们。
+    expect(h.lastArgs()).toEqual(['-NoProfile', '-NonInteractive', '-Command', SCRIPT_IP_PLAIN]);
+  });
+
+  it('不得回退 -EncodedCommand（真机实测：每次 2.3–4.7s 主进程同步冻结）', async () => {
+    // 这条守的是**性能**性质，单测测不出耗时，故按传参形态钉。数据与理由见 runPsProbe 头注。
+    const h = stubExecFile(null, okStdout());
+    await probeWinIpv4AddressUsage('172.19.0.1');
+    expect(h.lastArgs()).not.toContain('-EncodedCommand');
+  });
+
+  it('恶意别名：引号被转义、其余字符原样落在单引号串内，且 argv 仍是一个元素', async () => {
+    const h = stubExecFile(null, okStdout());
+    // 同时含单引号、双引号、空格、换行——覆盖上表「别名含 `"` / 空格 / 换行」与「含 `'`」两行。
+    await probeWinTunAdapterPresence('a\'b"c d\ne');
+    expect(h.lastArgs()).toHaveLength(4);
+    expect(h.lastCommand()).toContain(`Get-NetAdapter -Name 'a''b"c d\ne'`);
   });
 
   it('spawn 的是 powershellPath() 的绝对路径，且带 timeout / windowsHide', async () => {
@@ -498,6 +541,10 @@ describe('probeWinIpv4AddressUsage', () => {
  */
 describe('probeWinTunAdapterPresence', () => {
   beforeEach(() => (execFile as unknown as jest.Mock).mockReset());
+  // 本组验的是 **PowerShell 契约**（哨兵/退出码/三态），必须让 B3 快检恒不命中，否则判据会被短路吃掉。
+  // 不加这行的话：本机 Linux 无 `flowz-tun0` 恰好全绿，但在真跑着 FlowZ 的 Windows 开发机上（那里确实存在
+  // 同名接口）这 8 条会集体短路成 present —— 一个只在特定机器上失效的门，比没有门更坏。
+  beforeEach(() => mockIfaces(() => ({})));
 
   it('哨兵在、命中本名 → present', async () => {
     stubExecFile(null, okStdout('flowz-tun0'));
@@ -539,5 +586,83 @@ describe('probeWinTunAdapterPresence', () => {
     await expect(probeWinTunAdapterPresent('flowz-tun0')).resolves.toBe(false);
     stubExecFile(null, okStdout('flowz-tun0'));
     await expect(probeWinTunAdapterPresent('flowz-tun0')).resolves.toBe(true);
+  });
+});
+
+/**
+ * B3：零 spawn 快检。合同的全部要害在于**它只被允许产出肯定结论**——看不见一律回落 PowerShell，
+ * 绝不据此判 absent（否则 #159 释放门恒放行、#324 正向门把健康机器判成终态失败）。
+ */
+/** 把 os.networkInterfaces 换成给定实现；用完 restoreIfaces 还原到真实实现。 */
+function mockIfaces(impl: () => unknown): void {
+  (os.networkInterfaces as unknown as jest.Mock).mockImplementation(impl);
+}
+function restoreIfaces(): void {
+  (os.networkInterfaces as unknown as jest.Mock).mockImplementation(
+    jest.requireActual('os').networkInterfaces
+  );
+}
+
+describe('nodeSeesInterface（B3 快检）', () => {
+  afterEach(restoreIfaces);
+
+  const withAddr = [{ address: '172.19.0.1' }] as unknown as ReturnType<
+    typeof os.networkInterfaces
+  >[string];
+
+  it('枚举里有本名且带地址 → true', () => {
+    expect(nodeSeesInterface('flowz-tun0', { 'flowz-tun0': withAddr })).toBe(true);
+  });
+
+  it('枚举里没有本名 → false（含义是「说不了」，由调用方回落 PowerShell）', () => {
+    expect(nodeSeesInterface('flowz-tun0', { 以太网: withAddr })).toBe(false);
+  });
+
+  it('键在但无地址（空数组 / undefined）→ false：无地址不构成肯定结论', () => {
+    expect(nodeSeesInterface('flowz-tun0', { 'flowz-tun0': [] as never })).toBe(false);
+    expect(nodeSeesInterface('flowz-tun0', { 'flowz-tun0': undefined })).toBe(false);
+  });
+
+  it('名字为空 → false（不拿空串去撞枚举）', () => {
+    expect(nodeSeesInterface('', { '': withAddr })).toBe(false);
+  });
+
+  it('枚举本身抛错 → false（说不了，绝不冒充结论）', () => {
+    mockIfaces(() => {
+      throw new Error('boom');
+    });
+    expect(nodeSeesInterface('flowz-tun0')).toBe(false);
+  });
+});
+
+describe('probeWinTunAdapterPresence — B3 短路接线', () => {
+  afterEach(restoreIfaces);
+
+  it('Node 看得见 → 直接 present，且**零 spawn**（省掉真机实测 ~950ms 的那次 PowerShell）', async () => {
+    (execFile as unknown as jest.Mock).mockClear();
+    mockIfaces(() => ({ 'flowz-tun0': [{ address: '172.19.0.1' }] }));
+
+    await expect(probeWinTunAdapterPresence('flowz-tun0')).resolves.toBe('present');
+    expect(execFile as unknown as jest.Mock).not.toHaveBeenCalled();
+  });
+
+  it('Node 看不见 → 仍回落 PowerShell 由它给权威结论（absent 只能来自 PS）', async () => {
+    (execFile as unknown as jest.Mock).mockClear();
+    mockIfaces(() => ({}));
+    (execFile as unknown as jest.Mock).mockImplementation(
+      (_c: string, _a: string[], _o: unknown, cb: (e: unknown, out: string) => void) =>
+        cb(null, 'PROBE_OK\n')
+    );
+
+    await expect(probeWinTunAdapterPresence('flowz-tun0')).resolves.toBe('absent');
+    expect(execFile as unknown as jest.Mock).toHaveBeenCalled();
+  });
+
+  it('布尔版（#159 释放门）继承短路：Node 看见 → true 且零 spawn', async () => {
+    (execFile as unknown as jest.Mock).mockClear();
+    mockIfaces(() => ({ 'flowz-tun0': [{ address: '172.19.0.1' }] }));
+
+    await expect(probeWinTunAdapterPresent('flowz-tun0')).resolves.toBe(true);
+    expect(execFile as unknown as jest.Mock).not.toHaveBeenCalled();
   });
 });
