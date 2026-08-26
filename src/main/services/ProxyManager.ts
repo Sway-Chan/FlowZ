@@ -1030,6 +1030,9 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
     //   open 不了 root 600 的 tailscaled.* → endpoint post-start `permission denied` → 拖垮**整个**启动
     //   （即便没选 tailscale 节点，它在 endpoints[] 里也会被 post-start；系统代理模式同样中招）。
     this.reconcileRuntimeOwnershipBeforeStart();
+    // 真机实测 lanResolver 一格 874–2460ms（波动 3 倍）。那一格里同时装着本行的同步 fs 归一和下面按接口
+    // 逐个跑 netsh 读解析器，合成一格看不出是谁在波动，故拆开——与 seedRules/customRules 同一处置。
+    this.markStart('reconcileOwnership');
 
     // 3.8 方案B：DNS 接管激活时,先读接管前的内网 LAN 解析器(私网 IPv4),供 generateDnsConfig 把内网/captive 域名
     //     重定向到它(takeover 把系统 DNS 改公网 8.8.8.8 后 dns-local 解不了内网/可能环)。必须在 generateSingBoxConfig
