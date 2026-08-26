@@ -25,6 +25,7 @@ jest.mock('child_process', () => ({
   execFile: jest.fn(),
 }));
 
+import { execFile } from 'child_process';
 import { ProxyManager } from '../ProxyManager';
 import {
   CoreStartRetryError,
@@ -1254,34 +1255,104 @@ describe('B6：首次就绪探测单独一格（readyProbe0）', () => {
 });
 
 /**
- * B6：`aliveCheck` 格（写 PID 文件 + 一次同步探活）。
- * 它原先没有自己的格子，耗时被整片记进 `coreReady` —— 于是那一格看起来像「核起得慢」，
- * 实则掺着主进程被 `execSync`（cmd.exe + tasklist，真机 81–160ms）堵住的时间。
+ * B6：`pidFile` / `aliveCheck` 两格，以及那次探活**不得再起进程**。
+ *
+ * 由来：这两条语句原本合记一格，真机量到 2018–2584ms，占当时整个起核（~4.7s）的一半以上。切开之后
+ * 才能自证是谁；而探活那一刀之所以贵，是因为它紧跟在 82MB 的新核启动之后——杀软正在扫它，此刻这台机上
+ * **任何**进程创建都被拖慢（同批数据里 `L1.spawn` 也从 9–12ms 抖到 155–168ms）。故判据是「零 spawn」，
+ * 不是「改成异步」——异步只是不堵 event loop，钱照付。
  */
-describe('B6：aliveCheck 单独一格', () => {
-  it('startViaHelper 在探活之后、就绪门之前打 aliveCheck，且早于 coreReady 那一格', async () => {
+describe('B6：零 spawn 探活 + pidFile 单独一格', () => {
+  /** 让 startViaHelper 能一路跑到就绪门之前；返回时间轴与「是否起过进程」的观测点。 */
+  function makeHelperSvc(): { svc: any; tl: StartTimeline; execSyncSpy: jest.SpyInstance } {
     const svc = makeSvc();
-    // singboxPath 必须真实存在：startViaHelper 顶部有 existsSync 早退
     const realBin = path.join(TMP, 'fake-sing-box');
     fsSync.writeFileSync(realBin, 'x');
     svc.singboxPath = realBin;
     svc.currentConfig = { proxyModeType: 'tun', servers: [], allowLan: false, tunConfig: {} };
-    svc.helperManager = { startCore: jest.fn(async () => ({ ok: true, pid: 4321 })) };
-    svc.isProcessAlive = jest.fn(() => true);
-    // 就绪门本身在别处测；这里只看它**之前**的那一格确实打了
+    svc.helperManager = { startCore: jest.fn(async () => ({ ok: true, pid: process.pid })) };
     svc.waitForCoreReadyOrThrow = jest.fn(async () => {});
     svc.startLogFileWatcher = jest.fn();
     svc.startHealthCheck = jest.fn();
     svc.sendEventToRenderer = jest.fn();
-
+    // 变异守卫的观测点：改回 isProcessAlive（execSync 版）→ 这个 spy 会被调用
+    const execSyncSpy = jest.spyOn(svc, 'isProcessAlive');
     const tl = new StartTimeline();
     svc.startTimeline = tl;
+    return { svc, tl, execSyncSpy };
+  }
+
+  afterEach(() => jest.restoreAllMocks());
+
+  it('processExistsNoSpawn：不抛 → 存在，且**零 spawn**', () => {
+    const svc = makeSvc();
+    const kill = jest.spyOn(process, 'kill').mockImplementation(() => true as never);
+    const execFileMock = execFile as unknown as jest.Mock;
+    execFileMock.mockClear();
+
+    expect(svc.processExistsNoSpawn(4321)).toBe(true);
+    expect(kill).toHaveBeenCalledWith(4321, 0);
+    expect(execFileMock).not.toHaveBeenCalled();
+  });
+
+  it('processExistsNoSpawn：EPERM → **存在**（helper 起的核归 LocalSystem，这是常态而非例外）', () => {
+    // 变异守卫：把判据写成「抛了就是不存在」→ 每次 helper 起核都会被自己这道检查判死。
+    const svc = makeSvc();
+    jest.spyOn(process, 'kill').mockImplementation(() => {
+      const e: NodeJS.ErrnoException = new Error('operation not permitted');
+      e.code = 'EPERM';
+      throw e;
+    });
+    expect(svc.processExistsNoSpawn(4321)).toBe(true);
+  });
+
+  it('processExistsNoSpawn：ESRCH → 不存在（唯一可以判「没有」的情形）', () => {
+    const svc = makeSvc();
+    jest.spyOn(process, 'kill').mockImplementation(() => {
+      const e: NodeJS.ErrnoException = new Error('no such process');
+      e.code = 'ESRCH';
+      throw e;
+    });
+    expect(svc.processExistsNoSpawn(4321)).toBe(false);
+  });
+
+  it('processExistsNoSpawn：其余错误码 → fail-open 判存在（抓不准就不替就绪门下结论）', () => {
+    const svc = makeSvc();
+    jest.spyOn(process, 'kill').mockImplementation(() => {
+      const e: NodeJS.ErrnoException = new Error('weird');
+      e.code = 'EINVAL';
+      throw e;
+    });
+    expect(svc.processExistsNoSpawn(4321)).toBe(true);
+  });
+
+  it('startViaHelper 打出 spawn → pidFile → aliveCheck 三格，顺序固定', async () => {
+    const { svc, tl } = makeHelperSvc();
     await svc.startViaHelper(svc.lifecycleGeneration);
 
     const labels = tl.phases().map((p: { label: string }) => p.label);
-    // 变异守卫：删掉 markStartLeg(startGen, 'aliveCheck') → 这条红
+    expect(labels).toContain('pidFile');
     expect(labels).toContain('aliveCheck');
-    expect(labels.indexOf('spawn')).toBeLessThan(labels.indexOf('aliveCheck'));
-    expect(svc.isProcessAlive).toHaveBeenCalledWith(4321);
+    expect(labels.indexOf('spawn')).toBeLessThan(labels.indexOf('pidFile'));
+    expect(labels.indexOf('pidFile')).toBeLessThan(labels.indexOf('aliveCheck'));
+  });
+
+  it('探活不得回退到 execSync 版 isProcessAlive（真机实测该调用在此处 2.0–2.6s）', async () => {
+    const { svc, execSyncSpy } = makeHelperSvc();
+    await svc.startViaHelper(svc.lifecycleGeneration);
+    expect(execSyncSpy).not.toHaveBeenCalled();
+  });
+
+  it('确证不存在（ESRCH）→ 仍然抛「进程不存在」并 cleanup（这道检查没被削弱）', async () => {
+    const { svc } = makeHelperSvc();
+    svc.cleanup = jest.fn();
+    jest.spyOn(process, 'kill').mockImplementation(() => {
+      const e: NodeJS.ErrnoException = new Error('no such process');
+      e.code = 'ESRCH';
+      throw e;
+    });
+
+    await expect(svc.startViaHelper(svc.lifecycleGeneration)).rejects.toThrow('进程不存在');
+    expect(svc.cleanup).toHaveBeenCalled();
   });
 });

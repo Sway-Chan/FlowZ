@@ -4670,15 +4670,20 @@ rm -f "$STOPFLAG"
     } catch {
       /* 忽略 */
     }
+    // B6：PID 文件写入单独一格。它与下面的探活原本合记一格，而那一格真机量到 2.0–2.6s——
+    //   不切开就只能靠推测说「多半是探活」，切开即自证。
+    this.markStartLeg(startGen, 'pidFile');
 
-    if (!this.isProcessAlive(res.pid)) {
+    if (!this.processExistsNoSpawn(res.pid)) {
       this.cleanup();
       throw new Error('helper 报告已启动但进程不存在');
     }
-    // B6：这一格 = 写 PID 文件 + 一次**同步**探活。原先它没有自己的格子，耗时被整片记进 `coreReady`，
-    //   于是那一格看起来像「核起得慢」，实则掺着主进程被 execSync 堵住的时间。真机实测该调用 81–160ms
-    //   （execSync 必过 cmd.exe + tasklist；对照 execFileSync 67–72ms、`process.kill(pid,0)` 0.1ms）。
-    //   B4 当初只把**就绪循环里**的探活换成异步版，漏了这个调用点——先量出来，再决定怎么改。
+    // B6：这一格 = 一次**零 spawn** 的存在性判定。
+    //   改前它是 `isProcessAlive`（execSync → cmd.exe + tasklist），真机实测**这一格 2018–2584ms**，
+    //   占当时整个起核（~4.7s）的一半以上。同批数据里 `L1.spawn` 也从平时 9–12ms 抖到 155–168ms、
+    //   `configGen` 从 12ms 抖到 25–59ms —— 这一刀恰好落在「82MB 的新核刚起来、杀软正在扫它」的窗口里，
+    //   此刻这台机上**任何**进程创建都被拖慢。故正确的修法不是「改成异步」（异步只是不堵 event loop，
+    //   钱照付），而是**根本不在这里起进程**：`process.kill(pid, 0)` 真机实测 0.1ms。
     this.markStartLeg(startGen, 'aliveCheck');
 
     // issue #159：等核真就绪（管理 API 绑定）再判成功，而非「spawn 即 started」。起核期内核死/超时 → 抛可重试
@@ -6315,6 +6320,31 @@ rm -f "$STOPFLAG"
    *
    * T16 子 commit 2：改 public 供 PlatformPrivilegeService.ctx 回调注入（killOrphans 复核存活用）。
    */
+  /**
+   * 零 spawn 的进程存在性判定（`process.kill(pid, 0)`：只做权限/存在性检查，不投递信号）。
+   *
+   * 为什么需要它：`isProcessAlive` 走 `execSync`（Windows 上必过 cmd.exe）+ `tasklist`，真机单独量是
+   * 81–160ms，但**落在起核路径上时量到 2018–2584ms**——那一刀紧跟着 82MB 的新核启动，杀软正在扫它，
+   * 此刻这台机上任何进程创建都被拖慢。零 spawn 版真机 0.1ms。
+   *
+   * **判据的三态，尤其是 EPERM**：
+   *  - 不抛 → 存在；
+   *  - `ESRCH` → **确证不存在**（唯一可以判「没有」的情形）；
+   *  - `EPERM` → **存在**。这不是模棱两可：内核先查到进程、再拒绝访问，才会给 EPERM。
+   *    helper 路径下核由 LocalSystem 起、FlowZ 非提权，**正是 EPERM 的常见产地**——判成「不存在」
+   *    会让每次 helper 起核都被自己这道检查判死。
+   *  - 其余错误码 → 说不了 → **fail-open 判存在**。这道检查只为抓「helper 报成功但进程压根没起来」，
+   *    抓不准时绝不能替代它下结论；真死了由就绪门（`waitForCoreReady` 的 dead 分支）兜住。
+   */
+  private processExistsNoSpawn(pid: number): boolean {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (e) {
+      return (e as NodeJS.ErrnoException)?.code !== 'ESRCH';
+    }
+  }
+
   isProcessAlive(pid: number): boolean {
     try {
       const { execSync } = require('child_process');
