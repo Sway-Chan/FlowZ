@@ -53,6 +53,12 @@ function makeSvc(): any {
   // B4：就绪门的探活腿已从 isProcessAlive（execSync，阻塞 event loop）换成异步版。默认委托到同一个同步桩，
   //   使各用例既有的 `svc.isProcessAlive = …` 意图逐字保留；个别用例直接改 isProcessAliveAsync 的照旧覆盖本默认。
   svc.isProcessAliveAsync = async () => svc.isProcessAlive();
+  // B8：就绪门的探活腿再换一次——零 spawn 的 processExistsNoSpawn（`process.kill(pid, 0)`）。同样委托到
+  //   `svc.isProcessAlive` 桩，逐字保留各用例意图；不桩的话真实实现会对着假 pid 1234 判 ESRCH → 全线 'dead'。
+  svc.processExistsNoSpawn = () => svc.isProcessAlive();
+  // B8：就绪窗内的观测腿改零 spawn 快检（Node 接口枚举）。默认「窗内看不见」——要模拟窗内见到适配器的用例
+  //   显式置 true，免得桩默认值把「窗内见到」这个前提悄悄送给所有用例。
+  svc.adapterPresenceFastProbe = () => false;
   return svc;
 }
 
@@ -61,6 +67,16 @@ function armTun(svc: any): TunAdapterObservation {
   const obs: TunAdapterObservation = { adapterEverSeen: false, probeEverConclusive: false };
   svc.tunReadyObservation = obs;
   return obs;
+}
+
+/**
+ * B6 那组用例打的是 `processExistsNoSpawn` **真身**（零 spawn 判据），故撤掉 makeSvc 给就绪门装的桩——
+ * 留着桩的话「不起进程」这条门就是在验桩，恒绿且无信息量。
+ */
+function makeNoSpawnSvc(): any {
+  const svc = makeSvc();
+  delete svc.processExistsNoSpawn;
+  return svc;
 }
 
 /** 定序三态 probe（用尽后恒返回末值）。 */
@@ -96,6 +112,7 @@ describe('issue #324 — waitForCoreReadyOrThrow 正向 TUN 就绪门（win32+TU
     const obs = armTun(svc);
     svc.isProcessAlive = () => true;
     svc.coreReadyProbe = async () => true;
+    svc.adapterPresenceFastProbe = () => true; // B8：窗内的「看见」现在由零 spawn 快检给出
     svc.adapterPresenceProbe = seqProbe(['present']);
 
     const p = svc.waitForCoreReadyOrThrow(1234, svc.lifecycleGeneration);
@@ -199,13 +216,160 @@ describe('issue #324 — waitForCoreReadyOrThrow 正向 TUN 就绪门（win32+TU
     const obs = armTun(svc);
     svc.isProcessAlive = () => false;
     svc.coreReadyProbe = async () => false;
-    svc.adapterPresenceProbe = seqProbe(['present']); // 观测窗曾见 → 瞬态族
+    svc.adapterPresenceFastProbe = () => true; // B8：观测窗曾见（零 spawn 快检）→ 瞬态族
+    svc.adapterPresenceProbe = seqProbe(['present']);
 
     const p = svc.waitForCoreReadyOrThrow(1234, svc.lifecycleGeneration);
     const assertion = expect(p).rejects.toThrow(/TUN 初始化未完成/);
     await jest.advanceTimersByTimeAsync(20000);
     await assertion;
     expect(obs.adapterEverSeen).toBe(true);
+  });
+});
+
+describe('B8 — 就绪窗内零 spawn（起核关键路径上不得起进程）', () => {
+  /**
+   * 为什么这组门值一整个 describe：真机实测「杀软扫 82MB 新核」的窗口里，一次 netsh/tasklist 要 150–819ms
+   * （空载 50–80ms），而 `execFile` 的异步只是**回调**异步——`uv_spawn` 在 event loop 线程上同步跑，
+   * 起一次进程就把主线程堵那么久。同窗口 FlowZ 自己的首次就绪探测（一次 loopback connect，正常 <5ms）
+   * 被拖到 2538–4036ms，API 明明 1.2–1.6s 就已可连，就绪却要 3.0–4.4s 才宣布。
+   * 故「窗内不起进程」是这批改动的**判据本身**，不是实现细节——下面每条都钉一个会让它复活的变异。
+   */
+  beforeEach(() => jest.useFakeTimers());
+  afterEach(() => {
+    jest.clearAllTimers();
+    jest.useRealTimers();
+  });
+
+  it('成功路径：完整探测只在 grace 硬闸调一次，就绪窗内一次都不调', async () => {
+    const svc = makeSvc();
+    armTun(svc);
+    svc.isProcessAlive = () => true;
+    let left = 6; // 前几轮 not ready → 就绪窗真的转起来（否则窗内一轮都不转，门无信息量）
+    svc.coreReadyProbe = async () => --left <= 0;
+    const probe = jest.fn(async () => 'present' as AdapterPresence);
+    svc.adapterPresenceProbe = probe;
+
+    const p = svc.waitForCoreReadyOrThrow(1234, svc.lifecycleGeneration);
+    const assertion = expect(p).resolves.toBeUndefined();
+    await jest.advanceTimersByTimeAsync(20000);
+    await assertion;
+    // 变异「观测腿改回 adapterPresenceProbe」→ 窗内每 200ms 一次 → 调用数 > 1 → 此断言爆
+    expect(probe).toHaveBeenCalledTimes(1);
+  });
+
+  it('探活腿零 spawn：走 processExistsNoSpawn，绝不碰 isProcessAliveAsync（tasklist）', async () => {
+    const svc = makeSvc();
+    armTun(svc);
+    const tasklist = jest.fn(async () => true);
+    svc.isProcessAliveAsync = tasklist; // 起进程的那条腿：本门断言它在起核窗内根本不被调用
+    let noSpawnCalls = 0;
+    svc.processExistsNoSpawn = () => {
+      noSpawnCalls++;
+      return false; // 核已死 → 走 dead 出口
+    };
+    svc.coreReadyProbe = async () => false;
+    svc.adapterPresenceProbe = async () => 'absent' as AdapterPresence;
+
+    const p = svc.waitForCoreReadyOrThrow(1234, svc.lifecycleGeneration);
+    const assertion = expect(p).rejects.toBeInstanceOf(CoreStartRetryError);
+    await jest.advanceTimersByTimeAsync(20000);
+    await assertion;
+    expect(noSpawnCalls).toBeGreaterThan(0);
+    // 变异「isAlive 改回 isProcessAliveAsync」→ 此断言爆（且那条腿在真机上每 500ms 起一次 tasklist）
+    expect(tasklist).not.toHaveBeenCalled();
+  });
+
+  it('窗内快检看不见 → 绝不据此记 absent（看不见 ≠ 不存在，sticky 不得被污染）', async () => {
+    const svc = makeSvc();
+    const obs = armTun(svc);
+    svc.isProcessAlive = () => true; // 进程活但 API 始终不绑 → timeout 出口
+    svc.coreReadyProbe = async () => false;
+    svc.adapterPresenceProbe = async () => 'unknown' as AdapterPresence; // 补探也给不出 clean 结论
+
+    const p = svc.waitForCoreReadyOrThrow(1234, svc.lifecycleGeneration);
+    const assertion = expect(p).rejects.toBeInstanceOf(CoreStartRetryError);
+    await jest.advanceTimersByTimeAsync(20000);
+    await assertion;
+    // 变异「快检 false 就 recordPresence('absent')」→ probeEverConclusive 变 true →
+    //   #324 终态判据（!adapterEverSeen && probeEverConclusive）在健康机器上误判「wintun 从未创建」的持续性失败。
+    expect(obs.probeEverConclusive).toBe(false);
+    expect(obs.adapterEverSeen).toBe(false);
+  });
+
+  it('失败出口补一次完整探测，且必须在 stopCore 之前（拆核后的 absent 说明不了本腿）', async () => {
+    const svc = makeSvc();
+    const obs = armTun(svc);
+    const order: string[] = [];
+    svc.isProcessAlive = () => true;
+    svc.coreReadyProbe = async () => false;
+    const probe = jest.fn(async () => {
+      order.push('probe');
+      return 'absent' as AdapterPresence;
+    });
+    svc.adapterPresenceProbe = probe;
+    svc.helperManager = {
+      stopCore: jest.fn(async () => {
+        order.push('stopCore');
+      }),
+    };
+
+    const p = svc.waitForCoreReadyOrThrow(1234, svc.lifecycleGeneration);
+    const assertion = expect(p).rejects.toBeInstanceOf(CoreStartRetryError);
+    await jest.advanceTimersByTimeAsync(20000);
+    await assertion;
+    expect(probe).toHaveBeenCalledTimes(1);
+    // 变异「补探挪到 stopCore 之后」→ order 反序 → 此断言爆（真机上那次探测会恒 absent，证据作废）
+    expect(order).toEqual(['probe', 'stopCore']);
+    // 变异「删掉补探」→ probeEverConclusive 恒 false → #324 的持续性终态永不成立、无限重试
+    expect(obs.probeEverConclusive).toBe(true);
+  });
+
+  it('失败出口：窗内已见适配器 → 不补探（已有 present 结论，不再花一次 spawn）', async () => {
+    const svc = makeSvc();
+    const obs = armTun(svc);
+    svc.isProcessAlive = () => true;
+    svc.coreReadyProbe = async () => false;
+    svc.adapterPresenceFastProbe = () => true; // 窗内已确证 present
+    const probe = jest.fn(async () => 'absent' as AdapterPresence);
+    svc.adapterPresenceProbe = probe;
+
+    const p = svc.waitForCoreReadyOrThrow(1234, svc.lifecycleGeneration);
+    const assertion = expect(p).rejects.toBeInstanceOf(CoreStartRetryError);
+    await jest.advanceTimersByTimeAsync(20000);
+    await assertion;
+    expect(obs.adapterEverSeen).toBe(true);
+    // 变异「补探不看 adapterEverSeen」→ 多一次 spawn，且把 present 结论覆写成 absent（sticky 是 monotonic
+    //   救得回 adapterEverSeen，但 probeEverConclusive 的来源被换掉，分类证据变脏）
+    expect(probe).not.toHaveBeenCalled();
+  });
+
+  it('失败出口被接管 → 不补探（绝不为让位腿起进程）', async () => {
+    const svc = makeSvc();
+    const obs = armTun(svc);
+    const startGen = svc.lifecycleGeneration;
+    svc.isProcessAlive = () => true;
+    // 就绪窗内每轮开头都判 supersede，故只有在**循环跑完之后**的收尾判定里翻世代，才走得到失败出口的守卫。
+    // 轮数由常量算出（不写死）：loop 内 maxPolls 次，之后收尾再判一次 → 第 maxPolls+1 次调用即收尾那次。
+    const maxPolls = Math.ceil(
+      (ProxyManager as any).CORE_READY_TIMEOUT_MS / (ProxyManager as any).CORE_READY_POLL_MS
+    );
+    let readyCalls = 0;
+    svc.coreReadyProbe = async () => {
+      readyCalls++;
+      if (readyCalls >= maxPolls + 1) svc.lifecycleGeneration = startGen + 1; // 收尾判定时被接管
+      return false;
+    };
+    const probe = jest.fn(async () => 'absent' as AdapterPresence);
+    svc.adapterPresenceProbe = probe;
+
+    const p = svc.waitForCoreReadyOrThrow(1234, startGen);
+    const assertion = expect(p).rejects.toBeInstanceOf(CoreStartRetryError);
+    await jest.advanceTimersByTimeAsync(20000);
+    await assertion;
+    // 变异「补探不判世代」→ 让位腿也起一次进程，并把结果写进（本腿自己的）tracker → 此断言爆
+    expect(probe).not.toHaveBeenCalled();
+    expect(obs.probeEverConclusive).toBe(false);
   });
 });
 
@@ -976,10 +1140,18 @@ describe('B4 接线 — 就绪门必须按这三个值调用（复审 High）', 
     }
   });
 
-  it('探活腿必须走异步版 isProcessAliveAsync（同步版会用 execSync 堵住 event loop）', async () => {
+  /**
+   * B8 更正：这条门原本钉的是「必须走**异步版** isProcessAliveAsync」。那个判据不够——异步只解决「回调不堵
+   * event loop」，而 `uv_spawn` 本身仍在 event loop 线程上同步执行，钱照付。真机实测起核窗（杀软扫 82MB 新核）
+   * 内一次 tasklist 要 150–673ms，空载只要 50–80ms。现在的契约更严：就绪门**一个进程都不许起**。
+   */
+  it('探活腿必须走零 spawn 的 processExistsNoSpawn（异步版 tasklist 同样不许碰）', async () => {
     const svc = armedSvc();
-    const asyncProbe = jest.fn(async () => true);
-    svc.isProcessAliveAsync = asyncProbe;
+    const noSpawn = jest.fn(() => true);
+    svc.processExistsNoSpawn = noSpawn;
+    svc.isProcessAliveAsync = jest.fn(async () => {
+      throw new Error('就绪门不得起 tasklist（异步版也不行）');
+    });
     svc.isProcessAlive = jest.fn(() => {
       throw new Error('就绪门不得触碰同步探活腿');
     });
@@ -990,8 +1162,9 @@ describe('B4 接线 — 就绪门必须按这三个值调用（复审 High）', 
 
     await svc.waitForCoreReadyOrThrow(1234, svc.lifecycleGeneration);
 
-    // 变异守卫：接线换回 `this.isProcessAlive(pid)` → 同步桩抛错 → 红
-    expect(asyncProbe).toHaveBeenCalled();
+    // 变异守卫：接线换回 isProcessAliveAsync / isProcessAlive → 桩抛错 → 红
+    expect(noSpawn).toHaveBeenCalled();
+    expect(svc.isProcessAliveAsync).not.toHaveBeenCalled();
     expect(svc.isProcessAlive).not.toHaveBeenCalled();
   });
 });
@@ -1227,7 +1400,7 @@ describe('B6：首次就绪探测单独一格（readyProbe0）', () => {
     let n = 0;
     svc.coreReadyProbe = jest.fn(async () => ++n > 1); // 首探 false，第二探 true
     svc.adapterPresenceProbe = jest.fn(async () => 'present' as AdapterPresence);
-    svc.isProcessAliveAsync = async () => true;
+    svc.isProcessAlive = () => true; // B8：就绪门的探活腿走零 spawn 版，桩在 makeSvc 里委托到这里
 
     await svc.waitForCoreReadyOrThrow(4321, svc.lifecycleGeneration);
 
@@ -1242,7 +1415,7 @@ describe('B6：首次就绪探测单独一格（readyProbe0）', () => {
     let n = 0;
     svc.coreReadyProbe = jest.fn(async () => ++n > 5); // 前 5 探 false
     svc.adapterPresenceProbe = jest.fn(async () => 'present' as AdapterPresence);
-    svc.isProcessAliveAsync = async () => true;
+    svc.isProcessAlive = () => true; // B8：同上
 
     await svc.waitForCoreReadyOrThrow(4321, svc.lifecycleGeneration);
 
@@ -1265,7 +1438,7 @@ describe('B6：首次就绪探测单独一格（readyProbe0）', () => {
 describe('B6：零 spawn 探活 + pidFile 单独一格', () => {
   /** 让 startViaHelper 能一路跑到就绪门之前；返回时间轴与「是否起过进程」的观测点。 */
   function makeHelperSvc(): { svc: any; tl: StartTimeline; execSyncSpy: jest.SpyInstance } {
-    const svc = makeSvc();
+    const svc = makeNoSpawnSvc();
     const realBin = path.join(TMP, 'fake-sing-box');
     fsSync.writeFileSync(realBin, 'x');
     svc.singboxPath = realBin;
@@ -1285,7 +1458,7 @@ describe('B6：零 spawn 探活 + pidFile 单独一格', () => {
   afterEach(() => jest.restoreAllMocks());
 
   it('processExistsNoSpawn：不抛 → 存在，且**零 spawn**', () => {
-    const svc = makeSvc();
+    const svc = makeNoSpawnSvc();
     const kill = jest.spyOn(process, 'kill').mockImplementation(() => true as never);
     const execFileMock = execFile as unknown as jest.Mock;
     execFileMock.mockClear();
@@ -1297,7 +1470,7 @@ describe('B6：零 spawn 探活 + pidFile 单独一格', () => {
 
   it('processExistsNoSpawn：EPERM → **存在**（helper 起的核归 LocalSystem，这是常态而非例外）', () => {
     // 变异守卫：把判据写成「抛了就是不存在」→ 每次 helper 起核都会被自己这道检查判死。
-    const svc = makeSvc();
+    const svc = makeNoSpawnSvc();
     jest.spyOn(process, 'kill').mockImplementation(() => {
       const e: NodeJS.ErrnoException = new Error('operation not permitted');
       e.code = 'EPERM';
@@ -1307,7 +1480,7 @@ describe('B6：零 spawn 探活 + pidFile 单独一格', () => {
   });
 
   it('processExistsNoSpawn：ESRCH → 不存在（唯一可以判「没有」的情形）', () => {
-    const svc = makeSvc();
+    const svc = makeNoSpawnSvc();
     jest.spyOn(process, 'kill').mockImplementation(() => {
       const e: NodeJS.ErrnoException = new Error('no such process');
       e.code = 'ESRCH';
@@ -1317,7 +1490,7 @@ describe('B6：零 spawn 探活 + pidFile 单独一格', () => {
   });
 
   it('processExistsNoSpawn：其余错误码 → fail-open 判存在（抓不准就不替就绪门下结论）', () => {
-    const svc = makeSvc();
+    const svc = makeNoSpawnSvc();
     jest.spyOn(process, 'kill').mockImplementation(() => {
       const e: NodeJS.ErrnoException = new Error('weird');
       e.code = 'EINVAL';

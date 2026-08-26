@@ -146,6 +146,7 @@ import {
   type AdapterPresence,
   type TunAdapterObservation,
   probeWinIpv4AddressUsage,
+  nodeSeesInterface,
 } from './win-tun-adapter';
 import {
   probeTcpReachable,
@@ -640,8 +641,15 @@ export class ProxyManager extends EventEmitter implements IProxyManager {
   //   死后验尸不可靠（适配器随进程句柄消失），故必须窗口内观测。就绪后 grace 内仍未见 = 本腿失败（硬闸，拒假连接）。
   private adapterPresenceProbe: (name: string) => Promise<AdapterPresence> =
     probeWinTunAdapterPresence;
-  // 就绪窗/grace 内的适配器观测轮询间隔（1s）。就绪窗 ≤12s → ≤~12 次 PS spawn；见到即停观测省 spawn。真机项 #2 校准。
+  // B8：就绪窗内观测腿专用的**零 spawn** 快检（Node 接口枚举）。只产肯定结论——看不见 ≠ 不存在（见
+  //   nodeSeesInterface 头注），故窗内只据它记 present，absent 证据一律由完整探测（硬闸 / 失败出口补探）提供。
+  //   注入点供单测替换，生产恒为 nodeSeesInterface。
+  private adapterPresenceFastProbe: (name: string) => boolean = nodeSeesInterface;
+  // grace 硬闸的适配器轮询间隔（1s）。那一轮每次都是真 netsh，且此刻就绪窗已过、杀软扫核的风暴已散。
   private static readonly TUN_READY_OBSERVE_POLL_MS = 1000;
+  // B8：就绪窗内观测腿的节拍（200ms）。改零 spawn 后每轮成本 ≈ 一次 os.networkInterfaces()，
+  //   故节拍可比硬闸细 5 倍——adapterEverSeen 的时刻更准，且不再有任何进程创建落在起核关键路径上。
+  private static readonly TUN_READY_FAST_OBSERVE_POLL_MS = 200;
   // 就绪（API 绑定）后再给适配器出现的 grace 上限（8s）：适配器晚于 API bind 出现属正常时序，避免误杀 #159/#176 瞬态。真机项 #2 校准。
   //   同上（姊妹腿）：8000/1000 的真实墙钟是 ~16.6s，deadline 化后 8000 会把 #324 硬闸的判定窗口砍掉一半 →
   //   更早判 absent-timeout → 更多「永久拒连」误报。故提到 17000 保持等价。
@@ -4724,15 +4732,18 @@ rm -f "$STOPFLAG"
     const recordPresence = (p: AdapterPresence): void => {
       if (obs) recordAdapterPresence(obs, p); // sticky monotonic 累计（纯函数，单测覆盖）
     };
+    // B8：就绪窗内的观测腿改**零 spawn**。原先每轮走 `adapterPresenceProbe`（F2 之后是 netsh），而适配器要到
+    //   +660–997ms 才出现，窗口前段每轮都真的起进程——`execFile` 的异步只是回调异步，`uv_spawn` 在 event loop
+    //   线程上同步执行，CreateProcessW 多慢主线程就堵多久。真机实测这个窗口里一次 netsh 要 819ms（空载 50–80ms），
+    //   而同期 FlowZ 的首次就绪探测（一次 loopback connect，正常 <5ms）被拖到 2538–4036ms。
+    //   Node 枚举与 `Get-NetAdapter -Name` 同一个名字空间，只是**只产肯定结论**：故窗内只记 present、绝不记
+    //   absent（看不见 ≠ 不存在）；absent 证据改由成功路径的 grace 硬闸、失败出口的补探提供（见下）。
     const observerDone: Promise<void> = observing
       ? (async () => {
           while (observing && !obs!.adapterEverSeen) {
-            const p = await this.adapterPresenceProbe(adapterName).catch(
-              () => 'unknown' as AdapterPresence
-            );
-            recordPresence(p);
+            if (this.adapterPresenceFastProbe(adapterName)) recordPresence('present');
             if (!observing || obs!.adapterEverSeen) break;
-            await sleep(ProxyManager.TUN_READY_OBSERVE_POLL_MS);
+            await sleep(ProxyManager.TUN_READY_FAST_OBSERVE_POLL_MS);
           }
         })()
       : Promise.resolve();
@@ -4744,9 +4755,12 @@ rm -f "$STOPFLAG"
         alivePollMs: ProxyManager.CORE_READY_ALIVE_POLL_MS,
       },
       {
-        // B4：换异步探活——同步版是 execSync，起核窗内每轮阻塞主进程 50–100ms（拖拽/动画可感）。
-        //   判定逻辑与 isProcessAlive 严格一致（见其头注），仅是不再堵 event loop。
-        isAlive: () => this.isProcessAliveAsync(pid),
+        // B8：探活换零 spawn。B4 把这条腿从 execSync 换成 execFile，只解决了「回调不堵 event loop」，钱照付：
+        //   `uv_spawn` 本身在 event loop 线程上同步执行。而这条腿的射程正是起核窗（alivePollMs=500，且 i=0 必探），
+        //   与杀软扫 82MB 新核的窗口完全重合——真机实测同窗口一次 tasklist 要 150–673ms（空载 50–80ms）。
+        //   `process.kill(pid, 0)` 零 spawn（真机 0.1ms），且顺带把探测失败的语义从 fail-closed 修成 fail-open：
+        //   tasklist 版 catch 一律 false（spawn 失败/超时 = 判核已死 → stopCore + 重试），kill 版只有 ESRCH 判死。
+        isAlive: () => this.processExistsNoSpawn(pid),
         // B6：把**首次**就绪探测单独切一格。要回答的问题是「那两秒里，管理 API 到底是还没开，还是开了没被
         //   及时发现」——首探若已 true，说明门进来时端口早就通了，钱花在了门之前；首探 false 则 `coreReady`
         //   那一格量的才真是「等端口开」。标签带上首探结果，两种情形在汇总行里一眼可分。
@@ -4769,7 +4783,7 @@ rm -f "$STOPFLAG"
     //   让位腿不打点的不变量靠 `measured` 保住（原先靠「放在 superseded 出口之后」，现在出口在下面）。
     const measured = outcome !== 'superseded';
     if (measured) this.markStartLeg(startGen, `coreReady:${outcome}`);
-    observing = false; // 停就绪窗观测，等其 drain（在途 sleep 至多 1s；若卡在在途 probe，Get-NetAdapter 的 execFile timeout 4s 封顶）
+    observing = false; // 停就绪窗观测，等其 drain（B8 之后窗内已无 spawn，drain 至多一个 200ms 的在途 sleep）
     await observerDone.catch(() => {});
     if (measured) this.markStartLeg(startGen, 'observerDrain'); // drain 本身单独一格：它是真实成本，只是不该混进就绪耗时
 
@@ -4822,6 +4836,21 @@ rm -f "$STOPFLAG"
       throw new CoreStartRetryError(
         `sing-box 已就绪但 TUN 适配器 ${adapterName} 未建立，正在自动重试`
       );
+    }
+
+    // B8：失败出口（dead/timeout）补一次**完整**存在性探测。窗内观测腿改零 spawn 后只产 present，
+    //   于是失败路径上 `probeEverConclusive` 会恒 false，#324 的终态判据（!adapterEverSeen && probeEverConclusive）
+    //   随之恒不成立——「wintun 装不起来」的机器退回无限重试 + 全程「正在自动重试」，正是 #324 报告者的抱怨。
+    //   **必须在 stopCore 之前**：拆核后适配器随即释放，那时的 absent 说明不了本腿是否建起过。
+    //   仅在「从未见过适配器」时才探（见过即已有 present 结论，无需再花一次 spawn）；此刻就绪窗已结束、
+    //   风暴已散，且这条路径本来就要 stopCore + 重试，这次 spawn 不在任何人的等待路径上。
+    //   被接管则跳过（接管方正在拆核，本腿再探也只是给它的适配器计数，且不该为让位腿花 spawn）。
+    if (obs && !obs.adapterEverSeen && this.lifecycleGeneration === startGen) {
+      const post = await this.adapterPresenceProbe(adapterName).catch(
+        () => 'unknown' as AdapterPresence
+      );
+      recordPresence(post);
+      this.markStartLeg(startGen, `tunAdapterPostmortem:${post}`);
     }
 
     // 失败：尽力停掉这个起不来的核（best-effort，其 wintun 适配器随即开始释放，给 retry 让路），再抛 CoreStartRetryError
