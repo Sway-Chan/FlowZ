@@ -848,13 +848,24 @@ describe('issue #324 M-2 — performHealthCheck 的世代守卫', () => {
   });
 });
 
+/**
+ * 懒预检（`tunAddressAvoidanceArmed`）落地后，`startTunAddressPreflight` 默认直接返回 null。
+ * 下面两组验的是**预检自身的语义**（旧核在跑就沿用上次 / prev 的捕获与复位顺序），故一律先武装；
+ * 「默认不探」这条闸门本身由后面独立一组守，两者不混。
+ */
+function armedSvc(): any {
+  const svc = makeSvc();
+  svc.tunAddressAvoidanceArmed = true;
+  return svc;
+}
+
 describe('issue #324 M-1 — 旧核仍在跑时跳过地址探测（防 mac/linux 地址漂移）', () => {
   const tunCfg = { proxyModeType: 'tun', servers: [], tunConfig: {} };
 
   it('旧核在跑 → 跳过探测（不让自家 TUN 地址被探成冲突）', async () => {
     // 变异守卫：去掉这道闸 → supersede 交错（用户连点连接）时自家 utun 上的 172.19.0.1 被探成 in-use →
     // 新腿静默切备选、下次正常重启又切回，R1-H1 的地址乒乓在 mac/linux 复活。
-    const svc = makeSvc();
+    const svc = armedSvc();
     svc.activeCorePid = () => 4321;
     const probe = jest.fn();
     svc.probeIpv4AddressUsage = probe;
@@ -867,7 +878,7 @@ describe('issue #324 M-1 — 旧核仍在跑时跳过地址探测（防 mac/linu
     // 变异守卫：闸中 return null（回落平台默认）→ 在默认地址真冲突的机器上（#324 报告者型），用户连点重连
     // 就会把已经工作着的避让扔掉、再撞一次同一条 FATAL，还给出「请禁用网卡」的假终态。这是 R2→R3 之间
     // 被 review 抓出的真回归。
-    const svc = makeSvc();
+    const svc = armedSvc();
     svc.activeCorePid = () => 4321;
     svc.probeIpv4AddressUsage = jest.fn();
 
@@ -878,7 +889,7 @@ describe('issue #324 M-1 — 旧核仍在跑时跳过地址探测（防 mac/linu
   });
 
   it('旧核在跑但从未避让过 → null（回落平台默认，行为零变化）', async () => {
-    const svc = makeSvc();
+    const svc = armedSvc();
     svc.activeCorePid = () => 4321;
     svc.probeIpv4AddressUsage = jest.fn();
 
@@ -886,7 +897,7 @@ describe('issue #324 M-1 — 旧核仍在跑时跳过地址探测（防 mac/linu
   });
 
   it('无旧核 → 正常探测（prev 不干扰重新决策）', async () => {
-    const svc = makeSvc();
+    const svc = armedSvc();
     svc.activeCorePid = () => null;
     svc.probeIpv4AddressUsage = async () => 'free';
 
@@ -896,7 +907,7 @@ describe('issue #324 M-1 — 旧核仍在跑时跳过地址探测（防 mac/linu
   });
 
   it('非 TUN / 用户已显式配地址 → 不探测', async () => {
-    const svc = makeSvc();
+    const svc = armedSvc();
     svc.activeCorePid = () => null;
     const probe = jest.fn();
     svc.probeIpv4AddressUsage = probe;
@@ -913,7 +924,7 @@ describe('issue #324 M-1 — prev 的捕获与复位归属预检方法本身（�
   const tunCfg = { proxyModeType: 'tun', servers: [], tunConfig: {} };
 
   it('方法内复位 effectiveTunInet4Address（调用方不必也不该再 reset）', async () => {
-    const svc = makeSvc();
+    const svc = armedSvc();
     svc.effectiveTunInet4Address = '172.20.0.1';
     svc.activeCorePid = () => null;
     svc.probeIpv4AddressUsage = async () => 'free';
@@ -926,7 +937,7 @@ describe('issue #324 M-1 — prev 的捕获与复位归属预检方法本身（�
   it('捕获发生在复位之前 —— 旧核在跑时才能沿用上次地址', async () => {
     // 变异守卫：把捕获挪到复位之后（或写死 null）→ prev 恒 null → 真冲突机器上 supersede 重连回落默认。
     // 这条逃逸在 prev 由调用方传参时无门可拦（测试直调方法体会绕过捕获），故把两步收进本方法。
-    const svc = makeSvc();
+    const svc = armedSvc();
     svc.effectiveTunInet4Address = '172.31.0.1';
     svc.activeCorePid = () => 4321;
     svc.probeIpv4AddressUsage = jest.fn();
@@ -943,7 +954,7 @@ describe('issue #324 M-1 — prev 的捕获与复位归属预检方法本身（�
  */
 describe('B4 接线 — 就绪门必须按这三个值调用（复审 High）', () => {
   it('waitForCoreReadyOrThrow 传给 waitForCoreReady 的 opts 恒为 {12000, 50, 500}', async () => {
-    const svc = makeSvc();
+    const svc = armedSvc();
     svc.coreReadyProbe = async () => true; // 首轮即就绪，尽快收束
     const mod = require('../core-readiness');
     const spy = jest.spyOn(mod, 'waitForCoreReady');
@@ -963,7 +974,7 @@ describe('B4 接线 — 就绪门必须按这三个值调用（复审 High）', 
   });
 
   it('探活腿必须走异步版 isProcessAliveAsync（同步版会用 execSync 堵住 event loop）', async () => {
-    const svc = makeSvc();
+    const svc = armedSvc();
     const asyncProbe = jest.fn(async () => true);
     svc.isProcessAliveAsync = asyncProbe;
     svc.isProcessAlive = jest.fn(() => {
@@ -979,5 +990,134 @@ describe('B4 接线 — 就绪门必须按这三个值调用（复审 High）', 
     // 变异守卫：接线换回 `this.isProcessAlive(pid)` → 同步桩抛错 → 红
     expect(asyncProbe).toHaveBeenCalled();
     expect(svc.isProcessAlive).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * issue #324 P0-2「懒预检」：默认乐观起核不探测，撞了地址冲突才武装并重跑一遍。
+ *
+ * 为什么要有这组门：改动把一笔**每台机每次起核都付**的 681–760ms（真机实测的 PowerShell `Get-NetIPAddress`）
+ * 换成了「少数机器多起一遍核」。这笔交换只有在**撞了真的会重跑、且只重跑一次**时才成立——两条都失守的话，
+ * 表现分别是「#324 的 FATAL 直接回归成终态、避让机制等于删了」和「无限重起循环」，都比原来糟。
+ */
+describe('issue #324 P0-2 — 懒预检闸门（默认不探）', () => {
+  const tunCfg = { proxyModeType: 'tun', servers: [], tunConfig: {} };
+
+  it('未武装 → 不探测、返回 null（这才是省下那 681–760ms 的地方）', async () => {
+    const svc = makeSvc();
+    svc.activeCorePid = () => null;
+    const probe = jest.fn();
+    svc.probeIpv4AddressUsage = probe;
+
+    await expect(svc.startTunAddressPreflight(tunCfg, true)).resolves.toBeNull();
+    expect(probe).not.toHaveBeenCalled();
+  });
+
+  it('武装后 → 正常探测（闸门只挡「探不探」，不改探测语义）', async () => {
+    const svc = makeSvc();
+    svc.activeCorePid = () => null;
+    svc.tunAddressAvoidanceArmed = true;
+    const probe = jest.fn(async () => 'free');
+    svc.probeIpv4AddressUsage = probe;
+
+    const pick = await svc.startTunAddressPreflight(tunCfg, true);
+    expect(pick?.address).toBe('172.19.0.1');
+    expect(probe).toHaveBeenCalled();
+  });
+
+  it('闸门在 effectiveTunInet4Address 复位**之后**——上次避让的地址绝不粘到这次', async () => {
+    // 变异守卫：把 `if (!armed) return null` 提到复位之前 → 未武装的那一遍会带着上次选的 172.20.0.1 起核。
+    // 那不是「行为零变化」，而是把一次性的避让变成了永久粘滞，且没有任何一遍会重新验证它还对不对。
+    const svc = makeSvc();
+    svc.activeCorePid = () => null;
+    svc.probeIpv4AddressUsage = jest.fn();
+    svc.effectiveTunInet4Address = '172.20.0.1';
+
+    await svc.startTunAddressPreflight(tunCfg, true);
+    expect(svc.effectiveTunInet4Address).toBeNull();
+  });
+});
+
+describe('issue #324 P0-2 — 撞了才避：startWithTunAddressAvoidance', () => {
+  const cfg: any = { proxyModeType: 'tun', servers: [], selectedServerId: '__direct__' };
+
+  /** 让 startInternal 变成可编排的桩：按次序抛/返回，并记录每次进入时的武装状态。 */
+  function stubStarts(
+    svc: any,
+    plan: Array<Error | null>
+  ): { armedAt: boolean[]; calls: () => number } {
+    const armedAt: boolean[] = [];
+    svc.startInternal = jest.fn(async () => {
+      const step = plan[armedAt.length];
+      armedAt.push(svc.tunAddressAvoidanceArmed);
+      if (step) throw step;
+    });
+    return { armedAt, calls: () => armedAt.length };
+  }
+
+  const conflictErr = (): Error => new CoreStartTunPersistentError('TUN 地址已被占用');
+
+  it('地址冲突终态 → 武装后重跑一遍 startInternal，第二遍成功即整体成功', async () => {
+    const svc = makeSvc();
+    svc.lastStartupFatal = { kind: 'tun-address-conflict', raw: 'set ipv4 address', message: 'x' };
+    const h = stubStarts(svc, [conflictErr(), null]);
+
+    await expect(svc.startWithTunAddressAvoidance(cfg, {})).resolves.toBeUndefined();
+    expect(h.calls()).toBe(2);
+    // 第一遍必须**未**武装（否则那 681–760ms 又回到所有人身上），第二遍必须已武装（否则重跑毫无意义）
+    expect(h.armedAt).toEqual([false, true]);
+  });
+
+  it('只重跑一次：第二遍再撞照常上抛，不无限重起', async () => {
+    const svc = makeSvc();
+    svc.lastStartupFatal = { kind: 'tun-address-conflict', raw: 'set ipv4 address', message: 'x' };
+    const h = stubStarts(svc, [conflictErr(), conflictErr()]);
+
+    await expect(svc.startWithTunAddressAvoidance(cfg, {})).rejects.toBeInstanceOf(
+      CoreStartTunPersistentError
+    );
+    expect(h.calls()).toBe(2);
+  });
+
+  it('同为终态但**不是**地址冲突（如 wintun 创建失败）→ 不重跑', async () => {
+    const svc = makeSvc();
+    svc.lastStartupFatal = { kind: 'tun-adapter-create', raw: 'create adapter', message: 'x' };
+    const h = stubStarts(svc, [new CoreStartTunPersistentError('适配器创建失败'), null]);
+
+    await expect(svc.startWithTunAddressAvoidance(cfg, {})).rejects.toBeInstanceOf(
+      CoreStartTunPersistentError
+    );
+    expect(h.calls()).toBe(1);
+  });
+
+  it('瞬态族（CoreStartRetryError）→ 不重跑（它还在起核重试预算里，不该被这条腿抢走）', async () => {
+    const svc = makeSvc();
+    svc.lastStartupFatal = { kind: 'tun-address-conflict', raw: 'set ipv4 address', message: 'x' };
+    const h = stubStarts(svc, [new CoreStartRetryError('起核较慢'), null]);
+
+    await expect(svc.startWithTunAddressAvoidance(cfg, {})).rejects.toBeInstanceOf(
+      CoreStartRetryError
+    );
+    expect(h.calls()).toBe(1);
+  });
+
+  it('让位（superseded）→ 不重跑（接管方拥有状态，重入会与它抢适配器/端口）', async () => {
+    const svc = makeSvc();
+    svc.lastStartupFatal = { kind: 'tun-address-conflict', raw: 'set ipv4 address', message: 'x' };
+    const h = stubStarts(svc, [new CoreStartSupersededError(), null]);
+
+    await expect(svc.startWithTunAddressAvoidance(cfg, {})).rejects.toBeInstanceOf(
+      CoreStartSupersededError
+    );
+    expect(h.calls()).toBe(1);
+  });
+
+  it('入口复位武装位：上一次 start 遗留的 true 不得让这一次首遍就付探测的钱', async () => {
+    const svc = makeSvc();
+    svc.tunAddressAvoidanceArmed = true; // 上一次 start 留下的
+    const h = stubStarts(svc, [null]);
+
+    await svc.startWithTunAddressAvoidance(cfg, {});
+    expect(h.armedAt).toEqual([false]);
   });
 });
